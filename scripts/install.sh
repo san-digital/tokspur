@@ -270,7 +270,7 @@ fi
 say "Installed tokspur $version"
 say "  command:  $command_file"
 say "  state:    $state"
-say "  API key:  $state/.tokspur/state/api-key (written by tokspur configure)"
+say "  API key:  $state/.tokspur/state/api-key (written by tokspur pull, configure or serve)"
 if [ -e "$off_marker" ]; then
     say "  updates:  off (tokspur update --on turns them on)"
 else
@@ -280,4 +280,4 @@ case ":$PATH:" in
     *":$bin_dir:"*) ;;
     *) say "Add $bin_dir to your PATH, for example: echo 'export PATH=\"$bin_dir:\$PATH\"' >> ~/.zshrc" ;;
 esac
-say "Next: tokspur doctor, then add the model as the README describes."
+say "Next: tokspur pull, then tokspur serve --speed-preset."

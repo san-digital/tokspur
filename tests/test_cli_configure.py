@@ -32,3 +32,10 @@ def test_configuration_links_raw_gguf_not_prunable_generated_folder(
     assert configured["port"] == 18081
     assert configured["model"] == "tokspur"
     assert part.read_bytes() == b"not real weights"
+
+    second_target = tmp_path / "second-existing"
+    second_target.mkdir()
+    data["target"]["directory"] = str(second_target)
+    local.write_json(tmp_path / ".tokspur/adoption.json", data)
+    cli.configure(18081)
+    assert (state / "models/tokspur").resolve() == second_target

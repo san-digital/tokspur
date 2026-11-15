@@ -23,8 +23,10 @@ use tokspur_sys::{
 use crate::error::CliError;
 use crate::layout::RuntimeLayout;
 use crate::state::{
-    StateLock, check_adoption, inference_processes, isolated_environment, private_dir,
-    read_json_file, write_private_json,
+    StateLock, adopt_weights_locked, check_adoption, configure_runtime_locked,
+    dflash2_profile_group_key, directory_has_candidate_assets, inference_processes,
+    isolated_environment, json_str, private_dir, read_json_file, record_dflash2_in_adoption,
+    repo_leaf_name, write_private_json,
 };
 use crate::verify::verify_build;
 
@@ -76,6 +78,8 @@ impl DrainTimeouts {
 /// Runtime, operator and supervision flags for `tokspur serve`, matching `src/tokspur/cli.py`.
 #[derive(Clone, PartialEq)]
 pub struct ServeOptions {
+    pub model_dir: Option<PathBuf>,
+    pub port: Option<u32>,
     pub raw_gguf: bool,
     pub pack_v3: bool,
     pub derived_pack: Option<PathBuf>,
@@ -144,6 +148,8 @@ pub struct ServeOptions {
 impl Default for ServeOptions {
     fn default() -> Self {
         Self {
+            model_dir: None,
+            port: None,
             raw_gguf: false,
             pack_v3: false,
             derived_pack: None,
@@ -215,6 +221,8 @@ impl fmt::Debug for ServeOptions {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ServeOptions")
+            .field("model_dir", &self.model_dir.as_ref().map(|_| "[redacted]"))
+            .field("port", &self.port)
             .field("raw_gguf", &self.raw_gguf)
             .field("pack_v3", &self.pack_v3)
             .field(
@@ -382,6 +390,13 @@ pub fn validate_serve_options(opts: &ServeOptions) -> Result<(), CliError> {
     if !(1..=86400).contains(&opts.request_timeout_seconds) {
         return Err(CliError::Validation(
             "request timeout requires 1..86400 seconds".to_owned(),
+        ));
+    }
+    if let Some(port) = opts.port
+        && !(1024..=65535).contains(&port)
+    {
+        return Err(CliError::Validation(
+            "Use an unprivileged local port".to_owned(),
         ));
     }
     if opts.raw_gguf && (opts.pack_v3 || opts.derived_pack.is_some()) {
@@ -585,7 +600,8 @@ pub fn validate_serve_options(opts: &ServeOptions) -> Result<(), CliError> {
     if opts.drafter == "dflash2" {
         if opts.dflash2_dir.is_none() {
             return Err(CliError::Validation(
-                "--drafter dflash2 requires --dflash2-dir".to_owned(),
+                "--drafter dflash2 requires --dflash2-dir (or run 'tokspur pull --dflash2')"
+                    .to_owned(),
             ));
         }
         if opts.mtp_depth.is_some() {
@@ -1366,17 +1382,226 @@ pub(crate) fn resolve_derived_pack_path(
     default_derived_pack_path(tokspur_base, pack_v3)
 }
 
-/// Runs `tokspur serve [options]` and returns the process exit code (`0` on `SIGINT`/`SIGTERM` drain, otherwise the child's exit code).
+fn adoption_matches_dirs(
+    existing: &Json,
+    assets_profile: &Json,
+    resolved_dir: &Path,
+    explicit_dflash2: Option<&Path>,
+) -> bool {
+    let Some(resolved_str) = resolved_dir.to_str() else {
+        return false;
+    };
+    let target_ok = existing
+        .find("target")
+        .ok()
+        .flatten()
+        .and_then(|g| json_str(g, "directory").ok())
+        == Some(resolved_str);
+    let draft_ok = existing
+        .find("draft")
+        .ok()
+        .flatten()
+        .and_then(|g| json_str(g, "directory").ok())
+        == Some(resolved_str);
+    if !target_ok || !draft_ok {
+        return false;
+    }
+    if let Some(raw_df) = explicit_dflash2 {
+        let Ok(canon_df) = fs::canonicalize(raw_df) else {
+            return false;
+        };
+        let Some(canon_df_str) = canon_df.to_str() else {
+            return false;
+        };
+        let df_ok = existing
+            .find("dflash2_draft")
+            .ok()
+            .flatten()
+            .and_then(|g| json_str(g, "directory").ok())
+            == Some(canon_df_str);
+        if !df_ok {
+            return false;
+        }
+    }
+    check_adoption(existing, assets_profile).is_ok()
+}
+
+fn resolve_serve_config_port(
+    layout: &RuntimeLayout,
+    configured_path: &Path,
+    explicit_port: Option<u32>,
+) -> Result<u32, CliError> {
+    if let Some(p) = explicit_port {
+        return Ok(p);
+    }
+    if configured_path.is_file()
+        && let Ok(existing) = read_json_file(configured_path)
+        && let Some(p) = existing
+            .find("port")
+            .ok()
+            .flatten()
+            .and_then(|v| v.unsigned_integer().ok())
+            .and_then(|n| u32::try_from(n).ok())
+        && (1024..=65535).contains(&p)
+    {
+        return Ok(p);
+    }
+    let profile = read_json_file(&layout.hardware_profile_path())?;
+    Ok(profile
+        .find("port")
+        .ok()
+        .flatten()
+        .and_then(|v| v.unsigned_integer().ok())
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(18081))
+}
+
+/// Runs `tokspur serve [dir] [options]` and returns the process exit code (`0` on `SIGINT`/`SIGTERM` drain, otherwise the child's exit code).
 pub fn serve_foreground(layout: &RuntimeLayout, opts: &ServeOptions) -> Result<i32, CliError> {
-    validate_serve_options(opts)?;
+    {
+        let mut flag_probe = opts.clone();
+        if flag_probe.drafter == "dflash2" && flag_probe.dflash2_dir.is_none() {
+            flag_probe.dflash2_dir = Some(PathBuf::from("/__deferred_dflash2__"));
+        }
+        validate_serve_options(&flag_probe)?;
+    }
+
     let tokspur_base = layout.tokspur_base()?;
     let state = private_dir(&tokspur_base, Path::new("state"))?;
     let _lock = StateLock::acquire(&tokspur_base)?;
 
-    let configured = read_json_file(&tokspur_base.join("configured.json"))?;
-    let adoption = read_json_file(&tokspur_base.join("adoption.json"))?;
     let assets_profile = read_json_file(&layout.assets_profile_path())?;
-    check_adoption(&adoption, &assets_profile)?;
+    let adoption_path = tokspur_base.join("adoption.json");
+    let mut auto_adopted = false;
+    let adoption = if let Some(raw_dir) = opts.model_dir.as_deref() {
+        let resolved_dir = fs::canonicalize(raw_dir).map_err(|source| CliError::Io {
+            context: "cannot resolve model directory".to_owned(),
+            source,
+        })?;
+        if adoption_path.is_file()
+            && let Ok(existing) = read_json_file(&adoption_path)
+            && adoption_matches_dirs(
+                &existing,
+                &assets_profile,
+                &resolved_dir,
+                opts.dflash2_dir.as_deref(),
+            )
+        {
+            existing
+        } else {
+            auto_adopted = true;
+            let mut stderr = std::io::stderr().lock();
+            adopt_weights_locked(
+                layout,
+                &tokspur_base,
+                &resolved_dir,
+                &resolved_dir,
+                opts.dflash2_dir.as_deref(),
+                &mut stderr,
+            )?
+        }
+    } else if adoption_path.is_file() {
+        let existing = read_json_file(&adoption_path)?;
+        check_adoption(&existing, &assets_profile)?;
+        existing
+    } else {
+        let managed_root = layout.managed_models_dir()?;
+        let target_repo = assets_profile
+            .find("target")
+            .ok()
+            .flatten()
+            .ok_or_else(|| CliError::Validation("flash-next-assets.json missing target".to_owned()))
+            .and_then(|g| json_str(g, "repo"))?;
+        let draft_repo = assets_profile
+            .find("draft")
+            .ok()
+            .flatten()
+            .ok_or_else(|| CliError::Validation("flash-next-assets.json missing draft".to_owned()))
+            .and_then(|g| json_str(g, "repo"))?;
+        let managed_target = managed_root.join(repo_leaf_name(target_repo)?);
+        let managed_draft = managed_root.join(repo_leaf_name(draft_repo)?);
+        if directory_has_candidate_assets(&assets_profile, "target", &managed_target)?
+            && directory_has_candidate_assets(&assets_profile, "draft", &managed_draft)?
+        {
+            let managed_df = if opts.dflash2_dir.is_some() {
+                opts.dflash2_dir.clone()
+            } else if let Some(df_key) = dflash2_profile_group_key(&assets_profile)
+                && let Some(df_obj) = assets_profile.find(df_key).ok().flatten()
+                && let Ok(df_repo) = json_str(df_obj, "repo")
+                && let Ok(df_leaf) = repo_leaf_name(df_repo)
+            {
+                let candidate = managed_root.join(df_leaf);
+                if directory_has_candidate_assets(&assets_profile, df_key, &candidate)? {
+                    Some(candidate)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            auto_adopted = true;
+            let mut stderr = std::io::stderr().lock();
+            adopt_weights_locked(
+                layout,
+                &tokspur_base,
+                &managed_target,
+                &managed_draft,
+                managed_df.as_deref(),
+                &mut stderr,
+            )?
+        } else {
+            return Err(CliError::Validation(
+                "No adopted model weights found. Run 'tokspur pull' or 'tokspur serve /path/to/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF'."
+                    .to_owned(),
+            ));
+        }
+    };
+
+    let configured_path = tokspur_base.join("configured.json");
+    let configured = if !configured_path.is_file()
+        || opts.port.is_some()
+        || opts.model_dir.is_some()
+        || auto_adopted
+    {
+        let cfg_port = resolve_serve_config_port(layout, &configured_path, opts.port)?;
+        let mut stderr = std::io::stderr().lock();
+        configure_runtime_locked(layout, &tokspur_base, cfg_port, true, &mut stderr)?;
+        read_json_file(&configured_path)?
+    } else {
+        read_json_file(&configured_path)?
+    };
+
+    let mut effective_opts = opts.clone();
+    if effective_opts.drafter == "dflash2" && effective_opts.dflash2_dir.is_none() {
+        if let Some(df_dir) = adoption
+            .find("dflash2_draft")
+            .ok()
+            .flatten()
+            .and_then(|g| json_str(g, "directory").ok())
+        {
+            effective_opts.dflash2_dir = Some(PathBuf::from(df_dir));
+        } else if let Some(df_key) = dflash2_profile_group_key(&assets_profile)
+            && let Some(df_obj) = assets_profile.find(df_key).ok().flatten()
+            && let Ok(df_repo) = json_str(df_obj, "repo")
+            && let Ok(df_leaf) = repo_leaf_name(df_repo)
+            && let Ok(managed_root) = layout.managed_models_dir()
+        {
+            let candidate_df = managed_root.join(df_leaf);
+            if directory_has_candidate_assets(&assets_profile, df_key, &candidate_df)? {
+                let mut stderr = std::io::stderr().lock();
+                let (_updated_adoption, resolved_df) = record_dflash2_in_adoption(
+                    &tokspur_base,
+                    &assets_profile,
+                    &adoption,
+                    &candidate_df,
+                    &mut stderr,
+                )?;
+                effective_opts.dflash2_dir = Some(resolved_df);
+            }
+        }
+    }
+    validate_serve_options(&effective_opts)?;
+    let opts = &effective_opts;
 
     let port = configured
         .find("port")
@@ -1494,7 +1719,10 @@ pub fn serve_foreground(layout: &RuntimeLayout, opts: &ServeOptions) -> Result<i
     let speculative_path: PathBuf;
     let speculative_asset = if opts.drafter == "dflash2" {
         let raw_dflash2 = opts.dflash2_dir.as_deref().ok_or_else(|| {
-            CliError::Validation("--drafter dflash2 requires --dflash2-dir".to_owned())
+            CliError::Validation(
+                "--drafter dflash2 requires --dflash2-dir (or run 'tokspur pull --dflash2')"
+                    .to_owned(),
+            )
         })?;
         speculative_path = fs::canonicalize(raw_dflash2).map_err(|source| CliError::Io {
             context: format!(

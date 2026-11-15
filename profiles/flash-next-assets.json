@@ -2,6 +2,7 @@
   "schema": 1,
   "target": {
     "repo": "san-digital/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF",
+    "revision": "7c236c2d3f55e04045c4729ed4c7bac207eab069",
     "source_repo": "Qwen/Qwen3.8-Flash-Next",
     "source_revision": "34567a4712bc9766c4449e2e98e4468bfa24d915",
     "variant": "Q4_K",
@@ -12,6 +13,7 @@
   },
   "draft": {
     "repo": "san-digital/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF",
+    "revision": "7c236c2d3f55e04045c4729ed4c7bac207eab069",
     "source_repo": "Qwen/Qwen3.8-Flash-Next",
     "source_revision": "34567a4712bc9766c4449e2e98e4468bfa24d915",
     "files": [
@@ -20,6 +22,7 @@
   },
   "dflash2_draft": {
     "repo": "san-digital/Qwen3.8-Flash-Next-DFlash2",
+    "revision": "dd826e37c887c4b6f360023d0ae855683f51068d",
     "source_repo": "Qwen/Qwen3.8-Flash-Next",
     "source_revision": "34567a4712bc9766c4449e2e98e4468bfa24d915",
     "warm_start_repo": "incoai/Qwen3.8-Flash-Next-DFlash2",

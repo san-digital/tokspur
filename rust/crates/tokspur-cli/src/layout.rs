@@ -238,6 +238,37 @@ impl RuntimeLayout {
         }
     }
 
+    /// Returns the managed model download directory (`<state_root>/models` for staged packages or `--state-root`, and `<root>/.tokspur/models` inside a checkout).
+    pub fn managed_models_dir(&self) -> Result<PathBuf, CliError> {
+        match self {
+            Self::Checkout(c) => {
+                let dir = if c.state_root_overridden {
+                    c.state_root.join("models")
+                } else {
+                    c.root.join(".tokspur/models")
+                };
+                ensure_no_symlink_components(&dir, "managed models directory")?;
+                Ok(dir)
+            }
+            Self::Staged(s) => {
+                let root = s.state_root.as_ref().ok_or_else(|| {
+                    CliError::Validation(
+                        "Staged tokspur package requires --state-root <abs-path> or TOKSPUR_STATE_ROOT outside the package directory".to_owned(),
+                    )
+                })?;
+                let dir = root.join("models");
+                ensure_no_symlink_components(&dir, "managed models directory")?;
+                if at_or_below_directory(&dir, &s.package_dir)? {
+                    return Err(CliError::Validation(
+                        "Managed models directory must be separate from the immutable package directory"
+                            .to_owned(),
+                    ));
+                }
+                Ok(dir)
+            }
+        }
+    }
+
     pub fn assets_profile_path(&self) -> PathBuf {
         match self {
             Self::Checkout(c) => c.root.join("profiles/flash-next-assets.json"),

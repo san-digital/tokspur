@@ -570,7 +570,7 @@
     "file": "third_party/model-licences/Qwen3.8-Flash-Next/LICENSE",
     "sha256": "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08",
     "source": "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/raw/34567a4712bc9766c4449e2e98e4468bfa24d915/LICENSE",
-    "asset_manifest_sha256": "c7bd896d358a260ce798e6e4bfff4677cc090200b6f28d019d54f91792e8c40c",
+    "asset_manifest_sha256": "feb36d211e50b10783aa7568d8ffa0f3b5ecbfbc0fbafbd3a3bd896134e0f623",
     "review_status": "runtime-only",
     "distribution_scope": {
       "weights": false,

@@ -2469,3 +2469,381 @@ fn pack_only_variant_adoption_seals_pack_and_refuses_raw_gguf_and_repack() {
         "pack_gguf must only appear once (after --derived-pack), not as a positional shard: {argv_lines:?}"
     );
 }
+
+#[test]
+fn pull_downloads_seals_pack_autoadopts_dflash2_and_serve_dir_autoconfigures() {
+    use std::sync::Arc;
+
+    let _serial = SERVE_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut fixture = SyntheticCheckout::create("pull-and-autoconfig");
+
+    let target_rev = "7c236c2d3f55e04045c4729ed4c7bac207eab069";
+    let dflash2_rev = "dd826e37c887c4b6f360023d0ae855683f51068d";
+    let base_bytes = b"synthetic-cpu-base-gguf-v031\n".to_vec();
+    let pack_bytes = b"synthetic-prebuilt-pack-v3-v031\n".to_vec();
+    let mtp_bytes = b"synthetic-mtp-sidecar-v031\n".to_vec();
+    let df_cfg_bytes = b"{\"architectures\":[\"DFlash2\"]}\n".to_vec();
+    let df_st_bytes = b"synthetic-dflash2-safetensors-v031\n".to_vec();
+
+    let assets_json = Json::new_object([
+        ("schema", Json::integer(1)),
+        (
+            "target",
+            Json::new_object([
+                (
+                    "repo",
+                    Json::from("san-digital/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF"),
+                ),
+                ("revision", Json::from(target_rev)),
+                ("variant", Json::from("Q4_K")),
+                (
+                    "files",
+                    Json::Array(vec![
+                        Json::new_object([
+                            ("name", Json::from("Qwen3.8-Flash-Next-base.gguf")),
+                            ("size", Json::integer(base_bytes.len() as u64)),
+                            ("sha256", Json::from(sha256_bytes(&base_bytes))),
+                        ]),
+                        Json::new_object([
+                            ("name", Json::from("Qwen3.8-Flash-Next-Q4_K.tokspur.gguf")),
+                            ("size", Json::integer(pack_bytes.len() as u64)),
+                            ("sha256", Json::from(sha256_bytes(&pack_bytes))),
+                            ("role", Json::from("derived_pack")),
+                        ]),
+                    ]),
+                ),
+            ]),
+        ),
+        (
+            "draft",
+            Json::new_object([
+                (
+                    "repo",
+                    Json::from("san-digital/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF"),
+                ),
+                ("revision", Json::from(target_rev)),
+                (
+                    "files",
+                    Json::Array(vec![Json::new_object([
+                        (
+                            "name",
+                            Json::from("MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"),
+                        ),
+                        ("size", Json::integer(mtp_bytes.len() as u64)),
+                        ("sha256", Json::from(sha256_bytes(&mtp_bytes))),
+                    ])]),
+                ),
+            ]),
+        ),
+        (
+            "dflash2_draft",
+            Json::new_object([
+                ("repo", Json::from("san-digital/Qwen3.8-Flash-Next-DFlash2")),
+                ("revision", Json::from(dflash2_rev)),
+                (
+                    "files",
+                    Json::Array(vec![
+                        Json::new_object([
+                            ("name", Json::from("config.json")),
+                            ("size", Json::integer(df_cfg_bytes.len() as u64)),
+                            ("sha256", Json::from(sha256_bytes(&df_cfg_bytes))),
+                        ]),
+                        Json::new_object([
+                            ("name", Json::from("model.safetensors")),
+                            ("size", Json::integer(df_st_bytes.len() as u64)),
+                            ("sha256", Json::from(sha256_bytes(&df_st_bytes))),
+                        ]),
+                    ]),
+                ),
+            ]),
+        ),
+    ]);
+    write_mode(
+        &fixture.root.join("profiles/flash-next-assets.json"),
+        &dump_json(&assets_json),
+        0o644,
+    );
+    fixture.refresh_build_manifest();
+
+    // Start a tiny deterministic loopback HTTP server serving the pinned paths.
+    let routes: Arc<Mutex<BTreeMap<String, Vec<u8>>>> = Arc::new(Mutex::new(BTreeMap::from([
+        (
+            format!(
+                "/san-digital/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF/resolve/{target_rev}/Qwen3.8-Flash-Next-base.gguf"
+            ),
+            base_bytes.clone(),
+        ),
+        (
+            format!(
+                "/san-digital/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF/resolve/{target_rev}/Qwen3.8-Flash-Next-Q4_K.tokspur.gguf"
+            ),
+            pack_bytes.clone(),
+        ),
+        (
+            format!(
+                "/san-digital/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF/resolve/{target_rev}/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
+            ),
+            mtp_bytes.clone(),
+        ),
+        (
+            format!("/san-digital/Qwen3.8-Flash-Next-DFlash2/resolve/{dflash2_rev}/config.json"),
+            df_cfg_bytes,
+        ),
+        (
+            format!(
+                "/san-digital/Qwen3.8-Flash-Next-DFlash2/resolve/{dflash2_rev}/model.safetensors"
+            ),
+            df_st_bytes,
+        ),
+    ])));
+    let hit_count = Arc::new(AtomicU64::new(0));
+    let stop_http = Arc::new(AtomicU64::new(0));
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let http_port = listener.local_addr().unwrap().port();
+    let base_url = format!("http://127.0.0.1:{http_port}");
+
+    let routes_bg = Arc::clone(&routes);
+    let hits_bg = Arc::clone(&hit_count);
+    let stop_bg = Arc::clone(&stop_http);
+    let server_thread = thread::spawn(move || {
+        while stop_bg.load(Ordering::Relaxed) == 0 {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut req_buf = [0u8; 4096];
+                    let n = stream.read(&mut req_buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&req_buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("");
+                    hits_bg.fetch_add(1, Ordering::Relaxed);
+                    let body_opt = routes_bg.lock().unwrap().get(path).cloned();
+                    if let Some(body) = body_opt {
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ignored = stream.write_all(hdr.as_bytes());
+                        let _ignored = stream.write_all(&body);
+                    } else {
+                        let _ignored = stream.write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // 1. Non-loopback TOKSPUR_HF_BASE_URL is refused before making any request.
+    let bad_url = Command::new(fixture.cli_bin())
+        .env("TOKSPUR_HF_BASE_URL", "https://example.com")
+        .arg("pull")
+        .output()
+        .unwrap();
+    assert!(!bad_url.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad_url.stderr)
+            .contains("TOKSPUR_HF_BASE_URL only permits loopback"),
+        "stderr={}",
+        String::from_utf8_lossy(&bad_url.stderr)
+    );
+    assert_eq!(hit_count.load(Ordering::Relaxed), 0);
+
+    // 2. Checksum mismatch from server is refused and leaves neither destination nor .part file.
+    {
+        let key = format!(
+            "/san-digital/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF/resolve/{target_rev}/Qwen3.8-Flash-Next-base.gguf"
+        );
+        let mut corrupt = base_bytes.clone();
+        corrupt[0] ^= 0xff;
+        routes.lock().unwrap().insert(key.clone(), corrupt);
+
+        let mismatch = Command::new(fixture.cli_bin())
+            .env("TOKSPUR_HF_BASE_URL", &base_url)
+            .arg("pull")
+            .output()
+            .unwrap();
+        assert!(!mismatch.status.success());
+        assert!(
+            String::from_utf8_lossy(&mismatch.stderr).contains("Checksum mismatch"),
+            "stderr={}",
+            String::from_utf8_lossy(&mismatch.stderr)
+        );
+        let managed_gguf = fixture
+            .root
+            .join(".tokspur/models/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF");
+        assert!(!managed_gguf.join("Qwen3.8-Flash-Next-base.gguf").exists());
+        assert!(
+            !managed_gguf
+                .join("Qwen3.8-Flash-Next-base.gguf.part")
+                .exists()
+        );
+        routes.lock().unwrap().insert(key, base_bytes.clone());
+    }
+
+    // 3. `tokspur pull --port <free>` downloads target + MTP draft, seals pack 0444, writes adoption + configured + api-key.
+    hit_count.store(0, Ordering::Relaxed);
+    let serve_port = free_loopback_port();
+    let pull_ok = Command::new(fixture.cli_bin())
+        .env("TOKSPUR_HF_BASE_URL", &base_url)
+        .args(["pull", "--port", &serve_port.to_string()])
+        .output()
+        .unwrap();
+    assert!(
+        pull_ok.status.success(),
+        "pull failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&pull_ok.stdout),
+        String::from_utf8_lossy(&pull_ok.stderr)
+    );
+    assert_eq!(hit_count.load(Ordering::Relaxed), 3);
+    let managed_gguf = fixture
+        .root
+        .join(".tokspur/models/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF");
+    let pulled_pack = managed_gguf.join("Qwen3.8-Flash-Next-Q4_K.tokspur.gguf");
+    assert_eq!(
+        fs::metadata(&pulled_pack).unwrap().permissions().mode() & 0o777,
+        0o444
+    );
+    assert!(fixture.root.join(".tokspur/adoption.json").is_file());
+    assert!(fixture.root.join(".tokspur/configured.json").is_file());
+    assert!(fixture.root.join(".tokspur/state/api-key").is_file());
+
+    // 4. Re-running `tokspur pull` skips already-verified files with zero network requests.
+    let pull_again = Command::new(fixture.cli_bin())
+        .env("TOKSPUR_HF_BASE_URL", &base_url)
+        .arg("pull")
+        .output()
+        .unwrap();
+    assert!(pull_again.status.success());
+    assert!(
+        String::from_utf8_lossy(&pull_again.stdout).contains("Already verified:"),
+        "stdout={}",
+        String::from_utf8_lossy(&pull_again.stdout)
+    );
+    assert_eq!(hit_count.load(Ordering::Relaxed), 3);
+
+    // 5. `tokspur pull --dflash2` downloads DFlash2 and `tokspur serve --drafter dflash2` auto-resolves `--native-dflash2-dir` without `--dflash2-dir`.
+    let pull_df = Command::new(fixture.cli_bin())
+        .env("TOKSPUR_HF_BASE_URL", &base_url)
+        .args(["pull", "--dflash2"])
+        .output()
+        .unwrap();
+    assert!(
+        pull_df.status.success(),
+        "pull --dflash2 stderr={}",
+        String::from_utf8_lossy(&pull_df.stderr)
+    );
+    assert_eq!(hit_count.load(Ordering::Relaxed), 5);
+
+    let df_pid_file = fixture._tmp.path().join("pull-df-srv.pid");
+    let df_argv_file = fixture._tmp.path().join("pull-df-srv.argv");
+    let serve_df = output_serve_retrying_transient_workers(
+        || {
+            let mut cmd = Command::new(fixture.cli_bin());
+            cmd.args([
+                "serve",
+                "--drafter",
+                "dflash2",
+                "--drain-timeouts-ms",
+                "300,300,300,300",
+            ])
+            .env("FAKE_SERVER_MODE", "exit_code")
+            .env("FAKE_EXIT_CODE", "0")
+            .env("FAKE_SERVER_PID_FILE", &df_pid_file)
+            .env("FAKE_SERVER_ARGV_FILE", &df_argv_file);
+            cmd
+        },
+        Duration::from_secs(15),
+    );
+    assert_eq!(
+        serve_df.status.code(),
+        Some(0),
+        "auto-resolved dflash2 serve failed: {}",
+        String::from_utf8_lossy(&serve_df.stderr)
+    );
+    let df_argv: Vec<String> = fs::read_to_string(&df_argv_file)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let expected_df_dir = fs::canonicalize(
+        fixture
+            .root
+            .join(".tokspur/models/Qwen3.8-Flash-Next-DFlash2"),
+    )
+    .unwrap();
+    assert!(
+        df_argv
+            .windows(2)
+            .any(|w| w[0] == "--native-dflash2-dir" && Path::new(&w[1]) == expected_df_dir),
+        "missing auto-resolved --native-dflash2-dir in {df_argv:?}"
+    );
+
+    stop_http.store(1, Ordering::Relaxed);
+    server_thread.join().unwrap();
+
+    // 6. Fresh `--state-root`: zero-ceremony `tokspur serve <dir> --port <free>` auto-adopts, auto-configures, and launches cleanly.
+    let fresh_state = fixture._tmp.path().join("fresh-state-root");
+    let dir_port = free_loopback_port();
+    let dir_pid_file = fixture._tmp.path().join("dir-srv.pid");
+    let dir_argv_file = fixture._tmp.path().join("dir-srv.argv");
+    let serve_dir = output_serve_retrying_transient_workers(
+        || {
+            let mut cmd = Command::new(fixture.cli_bin());
+            cmd.arg("--state-root")
+                .arg(&fresh_state)
+                .arg("serve")
+                .arg(&managed_gguf)
+                .args([
+                    "--port",
+                    &dir_port.to_string(),
+                    "--drain-timeouts-ms",
+                    "300,300,300,300",
+                ])
+                .env("FAKE_SERVER_MODE", "exit_code")
+                .env("FAKE_EXIT_CODE", "0")
+                .env("FAKE_SERVER_PID_FILE", &dir_pid_file)
+                .env("FAKE_SERVER_ARGV_FILE", &dir_argv_file);
+            cmd
+        },
+        Duration::from_secs(15),
+    );
+    assert_eq!(
+        serve_dir.status.code(),
+        Some(0),
+        "serve <dir> failed: {}",
+        String::from_utf8_lossy(&serve_dir.stderr)
+    );
+    assert!(fresh_state.join(".tokspur/adoption.json").is_file());
+    assert!(fresh_state.join(".tokspur/configured.json").is_file());
+    assert!(fresh_state.join(".tokspur/state/api-key").is_file());
+
+    // 7. Single-path `tokspur adopt <dir>` also works on another fresh `--state-root`.
+    let adopt_state = fixture._tmp.path().join("single-adopt-state");
+    let single_adopt = Command::new(fixture.cli_bin())
+        .arg("--state-root")
+        .arg(&adopt_state)
+        .arg("adopt")
+        .arg(&managed_gguf)
+        .output()
+        .unwrap();
+    assert!(
+        single_adopt.status.success(),
+        "single-path adopt failed: {}",
+        String::from_utf8_lossy(&single_adopt.stderr)
+    );
+    assert!(adopt_state.join(".tokspur/adoption.json").is_file());
+}

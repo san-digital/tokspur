@@ -1,4 +1,4 @@
-//! Standalone Rust CLI library (`tokspur-cli`) implementing `doctor`, `adopt`, `configure`, `plan`, `verify-build`, `serve`, and `pack {plan,build}`.
+//! Standalone Rust CLI library (`tokspur-cli`) implementing `pull`, `doctor`, `adopt`, `configure`, `plan`, `verify-build`, `serve`, and `pack {plan,build}`.
 
 #![forbid(unsafe_code)]
 
@@ -6,6 +6,7 @@ pub mod error;
 pub mod layout;
 mod model_config;
 mod pack_command;
+pub mod pull;
 pub mod serve;
 pub mod state;
 mod text_assets;
@@ -24,10 +25,11 @@ use tokspur_sys::net::port_available;
 
 use crate::error::CliError;
 use crate::layout::RuntimeLayout;
+use crate::pull::{PullOptions, pull_weights};
 use crate::serve::{DrainTimeouts, ServeOptions, serve_foreground};
 use crate::state::{
-    StateLock, adopt_weights, check_adopted_weights, configure_runtime, format_pretty_sorted_json,
-    inference_processes, private_dir, read_json_file,
+    StateLock, adopt_weights_with_dflash2, check_adopted_weights, configure_runtime,
+    format_pretty_sorted_json, inference_processes, private_dir, read_json_file,
 };
 use crate::verify::verify_build;
 
@@ -37,6 +39,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HelpTopic {
     General,
+    Pull,
     Doctor,
     CheckModelConfig,
     Adopt,
@@ -85,11 +88,13 @@ impl PackFormat {
 pub enum Command {
     PrintVersion,
     PrintHelp(HelpTopic),
+    Pull(PullOptions),
     Doctor,
     CheckModelConfig(PathBuf),
     Adopt {
         target: Option<PathBuf>,
         draft: Option<PathBuf>,
+        dflash2_dir: Option<PathBuf>,
         check_only: bool,
     },
     Configure {
@@ -119,16 +124,19 @@ impl fmt::Debug for Command {
         match self {
             Self::PrintVersion => formatter.write_str("PrintVersion"),
             Self::PrintHelp(topic) => formatter.debug_tuple("PrintHelp").field(topic).finish(),
+            Self::Pull(opts) => formatter.debug_tuple("Pull").field(opts).finish(),
             Self::Doctor => formatter.write_str("Doctor"),
             Self::CheckModelConfig(_) => formatter.write_str("CheckModelConfig([redacted])"),
             Self::Adopt {
                 target,
                 draft,
+                dflash2_dir,
                 check_only,
             } => formatter
                 .debug_struct("Adopt")
                 .field("target", &target.as_ref().map(|_| "[redacted]"))
                 .field("draft", &draft.as_ref().map(|_| "[redacted]"))
+                .field("dflash2_dir", &dflash2_dir.as_ref().map(|_| "[redacted]"))
                 .field("check_only", check_only)
                 .finish(),
             Self::Configure { port } => formatter
@@ -194,15 +202,29 @@ const HELP_TEXT: &str = "\
 usage: tokspur [--version] [--state-root <abs-path>] <command> [options]
 
 commands:
-  check-model-config  Compare a local config.json with the Flash-Next text profile
+  pull              Download and verify pinned weights; configures local state
+  serve             Foreground API; refuses other inference workers
   doctor            Read-only readiness summary; never loads a model
-  adopt             Fully hash existing weights without copying them
+  check-model-config  Compare a local config.json with the Flash-Next text profile
+  adopt             Verify existing weights in place without copying them
   configure         Write isolated settings; never starts inference
   plan              Show the selected native policy
   verify-build      Verify built or staged executables, metallib and provenance
-  serve             Foreground API; refuses other inference workers
   pack plan         Plan the selected lossless pack layout and check 50 GiB reserve
   pack build        Stream and seal a lossless pack with byte-exact inverse proof
+";
+
+const PULL_HELP_TEXT: &str = "\
+usage: tokspur [--state-root <abs-path>] pull [<dir>] [--dir <dir>] [--dflash2] [--dflash2-dir <dir>] [--port <port>]
+
+Download and verify pinned weights from Hugging Face over HTTPS without sending tokens, then configure local state.
+
+options:
+  --dir <dir>         Custom target and MTP weight destination directory
+  --dflash2, --all    Also download the pinned DFlash2 speculative drafter checkpoint
+  --dflash2-dir <dir> Custom DFlash2 checkpoint destination directory (implies --dflash2)
+  --port <port>       Unprivileged local TCP port to record in configured.json (1024..65535)
+  -h, --help          Show this help message and exit
 ";
 
 const DOCTOR_HELP_TEXT: &str = "\
@@ -212,13 +234,14 @@ Read-only readiness summary; never loads a model.
 ";
 
 const ADOPT_HELP_TEXT: &str = "\
-usage: tokspur [--state-root <abs-path>] adopt [--target <dir> --draft <dir> | --check-only]
+usage: tokspur [--state-root <abs-path>] adopt [<dir> | --target <dir> [--draft <dir>] [--dflash2-dir <dir>] | --check-only]
 
 options:
-  --target <dir>    Existing target GGUF directory to verify in place
-  --draft <dir>     Existing MTP draft sidecar directory to verify in place
-  --check-only      Verify existing adopted weights without rehashing
-  -h, --help        Show this help message and exit
+  --target <dir>      Existing target GGUF directory to verify in place
+  --draft <dir>       Existing MTP draft sidecar directory to verify in place (defaults to --target)
+  --dflash2-dir <dir> Optional DFlash2 checkpoint directory to verify in place
+  --check-only        Verify existing adopted weights without rehashing
+  -h, --help          Show this help message and exit
 ";
 
 const CONFIGURE_HELP_TEXT: &str = "\
@@ -242,9 +265,11 @@ Verify build-manifest.json or staged package provenance and launch artefacts.
 ";
 
 const SERVE_HELP_TEXT: &str = "\
-usage: tokspur [--state-root <abs-path>] serve [options]
+usage: tokspur [--state-root <abs-path>] serve [dir] [options]
 
 options:
+  --model-dir <dir>                           Verify and serve weights directly from <dir>
+  --port <port>                               Unprivileged local TCP port (1024..65535)
   --raw-gguf                                  Explicit opt-in to raw GGUF instead of derived pack
   --pack-v3                                   Require planar derived pack v3 (the default when installed; v2 is the fallback)
   --derived-pack <file>                       Explicit derived pack GGUF file path
@@ -347,6 +372,7 @@ impl HelpTopic {
     const fn text(self) -> &'static str {
         match self {
             Self::General => HELP_TEXT,
+            Self::Pull => PULL_HELP_TEXT,
             Self::Doctor => DOCTOR_HELP_TEXT,
             Self::CheckModelConfig => {
                 "usage: tokspur check-model-config <config.json>\n\nCompare the text architecture and dimensions offline before downloading weights. Exit 0 means the checked fields match; asset adoption is a separate check.\n"
@@ -455,33 +481,173 @@ where
             reject_extra_args("verify-build", rest)?;
             Command::VerifyBuild
         }
+        "pull" => {
+            let mut opts = PullOptions::default();
+            let mut i = 0;
+            while i < rest.len() {
+                let (flag, inline_val) = match rest[i].split_once('=') {
+                    Some((k, v)) if k.starts_with("--") => (k, Some(v)),
+                    _ => (rest[i].as_str(), None),
+                };
+                let take_val = |flag: &str,
+                                inline: Option<&str>,
+                                idx: &mut usize,
+                                hint: &str|
+                 -> Result<String, CliError> {
+                    if let Some(v) = inline {
+                        return Ok(v.to_owned());
+                    }
+                    *idx += 1;
+                    rest.get(*idx)
+                        .cloned()
+                        .ok_or_else(|| CliError::Usage(format!("{flag} {hint}")))
+                };
+                match flag {
+                    "--dir" => {
+                        let val = take_val(flag, inline_val, &mut i, "requires a directory path")?;
+                        if val.is_empty() {
+                            return Err(CliError::Usage("--dir cannot be empty".to_owned()));
+                        }
+                        if opts.dir.is_some() {
+                            return Err(CliError::Usage(
+                                "pull accepts a single model directory".to_owned(),
+                            ));
+                        }
+                        opts.dir = Some(PathBuf::from(val));
+                    }
+                    "--dflash2" | "--all" => {
+                        if inline_val.is_some() {
+                            return Err(CliError::Usage(format!("{flag} does not take a value")));
+                        }
+                        opts.dflash2 = true;
+                    }
+                    "--dflash2-dir" => {
+                        let val = take_val(flag, inline_val, &mut i, "requires a directory path")?;
+                        if val.is_empty() {
+                            return Err(CliError::Usage(
+                                "--dflash2-dir cannot be empty".to_owned(),
+                            ));
+                        }
+                        opts.dflash2 = true;
+                        opts.dflash2_dir = Some(PathBuf::from(val));
+                    }
+                    "--port" => {
+                        let val = take_val(flag, inline_val, &mut i, "requires an integer")?;
+                        let parsed = val.parse::<u32>().map_err(|_| {
+                            CliError::Usage(format!("invalid --port integer: {val}"))
+                        })?;
+                        opts.port = Some(parsed);
+                    }
+                    "--help" | "-h" => {
+                        if inline_val.is_some() {
+                            return Err(CliError::Usage(format!("{flag} does not take a value")));
+                        }
+                        return Ok(CliArgs {
+                            state_root,
+                            command: Command::PrintHelp(HelpTopic::Pull),
+                        });
+                    }
+                    other if !other.starts_with('-') => {
+                        if other.is_empty() {
+                            return Err(CliError::Usage(
+                                "model directory cannot be empty".to_owned(),
+                            ));
+                        }
+                        if opts.dir.is_some() {
+                            return Err(CliError::Usage(
+                                "pull accepts a single model directory".to_owned(),
+                            ));
+                        }
+                        opts.dir = Some(PathBuf::from(other));
+                    }
+                    other => {
+                        return Err(CliError::Usage(format!(
+                            "unrecognised pull argument: {other}"
+                        )));
+                    }
+                }
+                i += 1;
+            }
+            Command::Pull(opts)
+        }
         "adopt" => {
+            let mut positional: Option<PathBuf> = None;
             let mut target = None;
             let mut draft = None;
+            let mut dflash2_dir = None;
             let mut check_only = false;
             let mut i = 0;
             while i < rest.len() {
-                match rest[i].as_str() {
+                let (flag, inline_val) = match rest[i].split_once('=') {
+                    Some((k, v)) if k.starts_with("--") => (k, Some(v)),
+                    _ => (rest[i].as_str(), None),
+                };
+                let take_val = |flag: &str,
+                                inline: Option<&str>,
+                                idx: &mut usize,
+                                hint: &str|
+                 -> Result<String, CliError> {
+                    if let Some(v) = inline {
+                        return Ok(v.to_owned());
+                    }
+                    *idx += 1;
+                    rest.get(*idx)
+                        .cloned()
+                        .ok_or_else(|| CliError::Usage(format!("{flag} {hint}")))
+                };
+                match flag {
                     "--target" => {
-                        i += 1;
-                        let val = rest.get(i).ok_or_else(|| {
-                            CliError::Usage("--target requires a directory path".to_owned())
-                        })?;
+                        let val = take_val(flag, inline_val, &mut i, "requires a directory path")?;
+                        if val.is_empty() {
+                            return Err(CliError::Usage("--target cannot be empty".to_owned()));
+                        }
                         target = Some(PathBuf::from(val));
                     }
                     "--draft" => {
-                        i += 1;
-                        let val = rest.get(i).ok_or_else(|| {
-                            CliError::Usage("--draft requires a directory path".to_owned())
-                        })?;
+                        let val = take_val(flag, inline_val, &mut i, "requires a directory path")?;
+                        if val.is_empty() {
+                            return Err(CliError::Usage("--draft cannot be empty".to_owned()));
+                        }
                         draft = Some(PathBuf::from(val));
                     }
-                    "--check-only" => check_only = true,
+                    "--dflash2-dir" => {
+                        let val = take_val(flag, inline_val, &mut i, "requires a directory path")?;
+                        if val.is_empty() {
+                            return Err(CliError::Usage(
+                                "--dflash2-dir cannot be empty".to_owned(),
+                            ));
+                        }
+                        dflash2_dir = Some(PathBuf::from(val));
+                    }
+                    "--check-only" => {
+                        if inline_val.is_some() {
+                            return Err(CliError::Usage(
+                                "--check-only does not take a value".to_owned(),
+                            ));
+                        }
+                        check_only = true;
+                    }
                     "--help" | "-h" => {
+                        if inline_val.is_some() {
+                            return Err(CliError::Usage(format!("{flag} does not take a value")));
+                        }
                         return Ok(CliArgs {
                             state_root,
                             command: Command::PrintHelp(HelpTopic::Adopt),
                         });
+                    }
+                    other if !other.starts_with('-') => {
+                        if other.is_empty() {
+                            return Err(CliError::Usage(
+                                "adopt directory cannot be empty".to_owned(),
+                            ));
+                        }
+                        if positional.is_some() {
+                            return Err(CliError::Usage(
+                                "adopt accepts at most one positional directory".to_owned(),
+                            ));
+                        }
+                        positional = Some(PathBuf::from(other));
                     }
                     other => {
                         return Err(CliError::Usage(format!(
@@ -491,9 +657,27 @@ where
                 }
                 i += 1;
             }
+            if let Some(dir) = positional {
+                if target.is_some() || draft.is_some() || check_only {
+                    return Err(CliError::Usage(
+                        "adopt <dir> cannot be combined with --target, --draft or --check-only"
+                            .to_owned(),
+                    ));
+                }
+                target = Some(dir.clone());
+                draft = Some(dir);
+            } else if !check_only && target.is_some() && draft.is_none() {
+                draft = target.clone();
+            }
+            if check_only && (target.is_some() || draft.is_some() || dflash2_dir.is_some()) {
+                return Err(CliError::Usage(
+                    "--check-only cannot be combined with directory arguments".to_owned(),
+                ));
+            }
             Command::Adopt {
                 target,
                 draft,
+                dflash2_dir,
                 check_only,
             }
         }
@@ -565,6 +749,25 @@ where
                     Ok(())
                 };
                 match flag {
+                    "--model-dir" => {
+                        let val = take_val(flag, inline_val, &mut i, "requires a directory path")?;
+                        if val.is_empty() {
+                            return Err(CliError::Usage("--model-dir cannot be empty".to_owned()));
+                        }
+                        if opts.model_dir.is_some() {
+                            return Err(CliError::Usage(
+                                "serve accepts a single model directory".to_owned(),
+                            ));
+                        }
+                        opts.model_dir = Some(PathBuf::from(val));
+                    }
+                    "--port" => {
+                        let val = take_val(flag, inline_val, &mut i, "requires an integer")?;
+                        let parsed = val.parse::<u32>().map_err(|_| {
+                            CliError::Usage(format!("invalid --port integer: {val}"))
+                        })?;
+                        opts.port = Some(parsed);
+                    }
                     "--raw-gguf" => {
                         forbid_val(flag, inline_val)?;
                         opts.raw_gguf = true;
@@ -1142,6 +1345,19 @@ where
                             command: Command::PrintHelp(HelpTopic::Serve),
                         });
                     }
+                    other if !other.starts_with('-') => {
+                        if other.is_empty() {
+                            return Err(CliError::Usage(
+                                "model directory cannot be empty".to_owned(),
+                            ));
+                        }
+                        if opts.model_dir.is_some() {
+                            return Err(CliError::Usage(
+                                "serve accepts a single model directory".to_owned(),
+                            ));
+                        }
+                        opts.model_dir = Some(PathBuf::from(other));
+                    }
                     other => {
                         return Err(CliError::Usage(format!(
                             "unrecognised serve argument: {other}"
@@ -1497,9 +1713,14 @@ pub fn execute(cli: CliArgs, out: &mut dyn Write) -> Result<i32, CliError> {
             })?;
             Ok(0)
         }
+        Command::Pull(opts) => {
+            pull_weights(&layout, &opts, out)?;
+            Ok(0)
+        }
         Command::Adopt {
             target,
             draft,
+            dflash2_dir,
             check_only,
         } => {
             if check_only {
@@ -1507,11 +1728,11 @@ pub fn execute(cli: CliArgs, out: &mut dyn Write) -> Result<i32, CliError> {
             } else {
                 let (Some(t), Some(d)) = (target, draft) else {
                     return Err(CliError::Validation(
-                        "--target and --draft are required unless --check-only is specified"
+                        "Pass a model directory (tokspur adopt <dir>) or --target/--draft, or --check-only"
                             .to_owned(),
                     ));
                 };
-                adopt_weights(&layout, &t, &d, out)?;
+                adopt_weights_with_dflash2(&layout, &t, &d, dflash2_dir.as_deref(), out)?;
             }
             Ok(0)
         }
@@ -2947,6 +3168,95 @@ mod tests {
         assert_eq!(serve::resolve_derived_pack_path(&dir, false, false), v2_asa);
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn pull_single_path_adopt_and_serve_dir_parse_and_redact_paths() {
+        let pull_default = parse_args(["pull"]).unwrap();
+        assert_eq!(
+            pull_default.command,
+            Command::Pull(PullOptions {
+                dir: None,
+                dflash2: false,
+                dflash2_dir: None,
+                port: None,
+            })
+        );
+
+        let pull_full = parse_args([
+            "pull",
+            "/Users/secret/models-dir",
+            "--dflash2-dir",
+            "/Users/secret/dflash2-dir",
+            "--port",
+            "18999",
+        ])
+        .unwrap();
+        assert!(
+            !format!("{pull_full:?}").contains("secret"),
+            "leaked pull path in Debug: {pull_full:?}"
+        );
+        assert_eq!(
+            pull_full.command,
+            Command::Pull(PullOptions {
+                dir: Some(PathBuf::from("/Users/secret/models-dir")),
+                dflash2: true,
+                dflash2_dir: Some(PathBuf::from("/Users/secret/dflash2-dir")),
+                port: Some(18999),
+            })
+        );
+        assert!(parse_args(["pull", "/tmp/a", "--dir", "/tmp/b"]).is_err());
+
+        let pull_help = parse_args(["pull", "--help"]).unwrap();
+        assert_eq!(pull_help.command, Command::PrintHelp(HelpTopic::Pull));
+        let mut help_out = Vec::new();
+        assert_eq!(execute(pull_help, &mut help_out).unwrap(), 0);
+        assert!(String::from_utf8(help_out).unwrap().contains("--dflash2"));
+
+        let adopt_pos = parse_args([
+            "adopt",
+            "/Users/secret/unified-dir",
+            "--dflash2-dir",
+            "/Users/secret/df-dir",
+        ])
+        .unwrap();
+        assert!(!format!("{adopt_pos:?}").contains("secret"));
+        assert_eq!(
+            adopt_pos.command,
+            Command::Adopt {
+                target: Some(PathBuf::from("/Users/secret/unified-dir")),
+                draft: Some(PathBuf::from("/Users/secret/unified-dir")),
+                dflash2_dir: Some(PathBuf::from("/Users/secret/df-dir")),
+                check_only: false,
+            }
+        );
+
+        let adopt_target_only = parse_args(["adopt", "--target", "/tmp/only-target"]).unwrap();
+        assert_eq!(
+            adopt_target_only.command,
+            Command::Adopt {
+                target: Some(PathBuf::from("/tmp/only-target")),
+                draft: Some(PathBuf::from("/tmp/only-target")),
+                dflash2_dir: None,
+                check_only: false,
+            }
+        );
+        assert!(parse_args(["adopt", "/tmp/a", "--target", "/tmp/b"]).is_err());
+        assert!(parse_args(["adopt", "--check-only", "/tmp/a"]).is_err());
+
+        let serve_pos =
+            parse_args(["serve", "/Users/secret/serve-dir", "--port", "18123"]).unwrap();
+        assert!(!format!("{serve_pos:?}").contains("secret"));
+        let Command::Serve(serve_opts) = serve_pos.command else {
+            panic!("expected Serve");
+        };
+        assert_eq!(
+            serve_opts.model_dir,
+            Some(PathBuf::from("/Users/secret/serve-dir"))
+        );
+        assert_eq!(serve_opts.port, Some(18123));
+        assert!(parse_args(["serve", "/tmp/a", "--model-dir", "/tmp/b"]).is_err());
     }
 }
 

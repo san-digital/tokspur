@@ -426,7 +426,7 @@ fn recorded_volume_uuid(asset: &Json) -> Result<Option<String>, CliError> {
     Ok(Some(text.to_ascii_lowercase()))
 }
 
-fn json_str<'a>(obj: &'a Json, key: &str) -> Result<&'a str, CliError> {
+pub(crate) fn json_str<'a>(obj: &'a Json, key: &str) -> Result<&'a str, CliError> {
     let raw = obj
         .find(key)
         .map_err(|source| CliError::Json {
@@ -447,7 +447,7 @@ fn json_str<'a>(obj: &'a Json, key: &str) -> Result<&'a str, CliError> {
         .map_err(|_| CliError::Validation(format!("non-UTF-8 string in field '{key}'")))
 }
 
-fn json_u64(obj: &Json, key: &str) -> Result<u64, CliError> {
+pub(crate) fn json_u64(obj: &Json, key: &str) -> Result<u64, CliError> {
     obj.find(key)
         .map_err(|source| CliError::Json {
             context: "expected JSON object",
@@ -566,7 +566,109 @@ fn group_candidate_file_specs<'a>(
     Ok(out)
 }
 
-fn verify_asset(path: &Path, spec: &Json) -> Result<Json, CliError> {
+pub(crate) fn dflash2_profile_group_key(assets_profile: &Json) -> Option<&'static str> {
+    if assets_profile
+        .find("dflash2_draft")
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        Some("dflash2_draft")
+    } else if assets_profile
+        .find("legacy_dflash2_draft")
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        Some("legacy_dflash2_draft")
+    } else {
+        None
+    }
+}
+
+pub(crate) fn repo_leaf_name(repo: &str) -> Result<&str, CliError> {
+    let Some((owner, leaf)) = repo.split_once('/') else {
+        return Err(CliError::Validation(format!(
+            "invalid repository identifier '{repo}'"
+        )));
+    };
+    let valid_part = |part: &str| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && !part.contains('/')
+            && part
+                .bytes()
+                .all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
+    };
+    if !valid_part(owner) || !valid_part(leaf) {
+        return Err(CliError::Validation(format!(
+            "invalid repository identifier '{repo}'"
+        )));
+    }
+    Ok(leaf)
+}
+
+pub(crate) fn directory_has_candidate_assets(
+    assets_profile: &Json,
+    group: &str,
+    dir: &Path,
+) -> Result<bool, CliError> {
+    if !dir.is_dir() {
+        return Ok(false);
+    }
+    let candidates = group_candidate_file_specs(assets_profile, group, false)?;
+    for cand in candidates {
+        let mut all_exist = true;
+        for spec in cand {
+            let name = json_str(spec, "name")?;
+            if !dir.join(name).is_file() {
+                all_exist = false;
+                break;
+            }
+        }
+        if all_exist {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn asset_record_json(
+    resolved: &Path,
+    digest: String,
+    recorded_identity: FileIdentity,
+    role: Option<&str>,
+) -> Result<Json, CliError> {
+    let resolved_str = resolved
+        .to_str()
+        .ok_or_else(|| CliError::Validation("asset path is not valid UTF-8".to_owned()))?;
+    let device_u64 = u64::try_from(recorded_identity.device)
+        .map_err(|_| CliError::Validation("negative st_dev on asset".to_owned()))?;
+    let mtime_u64 = u64::try_from(recorded_identity.mtime_ns)
+        .map_err(|_| CliError::Validation("negative mtime_ns on asset".to_owned()))?;
+    let ctime_u64 = u64::try_from(recorded_identity.ctime_ns)
+        .map_err(|_| CliError::Validation("negative ctime_ns on asset".to_owned()))?;
+
+    let mut record = vec![
+        ("path", Json::from(resolved_str)),
+        ("sha256", Json::from(digest)),
+        ("device", Json::integer(device_u64)),
+        ("inode", Json::integer(recorded_identity.inode)),
+        ("size", Json::integer(recorded_identity.size)),
+        ("mtime_ns", Json::integer(mtime_u64)),
+        ("ctime_ns", Json::integer(ctime_u64)),
+    ];
+    if let Some(uuid) = recorded_identity.volume_uuid {
+        record.push(("volume_uuid", Json::from(uuid)));
+    }
+    if let Some(role_name) = role {
+        record.push(("role", Json::from(role_name)));
+    }
+    Ok(Json::new_object(record))
+}
+
+pub(crate) fn verify_asset(path: &Path, spec: &Json) -> Result<Json, CliError> {
     let spec_name = json_str(spec, "name")?;
     let expected_size = json_u64(spec, "size")?;
     let expected_sha256 = json_str(spec, "sha256")?;
@@ -699,32 +801,340 @@ fn verify_asset(path: &Path, spec: &Json) -> Result<Json, CliError> {
         drop(file);
     }
 
-    let resolved_str = resolved
-        .to_str()
-        .ok_or_else(|| CliError::Validation("asset path is not valid UTF-8".to_owned()))?;
-    let device_u64 = u64::try_from(recorded_identity.device)
-        .map_err(|_| CliError::Validation("negative st_dev on asset".to_owned()))?;
-    let mtime_u64 = u64::try_from(recorded_identity.mtime_ns)
-        .map_err(|_| CliError::Validation("negative mtime_ns on asset".to_owned()))?;
-    let ctime_u64 = u64::try_from(recorded_identity.ctime_ns)
-        .map_err(|_| CliError::Validation("negative ctime_ns on asset".to_owned()))?;
+    asset_record_json(&resolved, digest, recorded_identity, role)
+}
 
-    let mut record = vec![
-        ("path", Json::from(resolved_str)),
-        ("sha256", Json::from(digest)),
-        ("device", Json::integer(device_u64)),
-        ("inode", Json::integer(recorded_identity.inode)),
-        ("size", Json::integer(recorded_identity.size)),
-        ("mtime_ns", Json::integer(mtime_u64)),
-        ("ctime_ns", Json::integer(ctime_u64)),
-    ];
-    if let Some(uuid) = recorded_identity.volume_uuid {
-        record.push(("volume_uuid", Json::from(uuid)));
+/// Verifies a downloaded `.part` file in a single streaming SHA-256 pass, unlinking on checksum mismatch, and atomically publishes `dest_path`.
+pub(crate) fn publish_verified_part(
+    part_path: &Path,
+    dest_path: &Path,
+    spec: &Json,
+) -> Result<Json, CliError> {
+    let spec_name = json_str(spec, "name")?;
+    let expected_size = json_u64(spec, "size")?;
+    let expected_sha256 = json_str(spec, "sha256")?;
+    let role = optional_asset_role(spec)?;
+    let is_derived_pack = role == Some("derived_pack");
+
+    let parent = dest_path
+        .parent()
+        .ok_or_else(|| CliError::Validation("asset path has no parent".to_owned()))?;
+    if part_path.parent() != Some(parent) {
+        return Err(CliError::Validation(
+            "partial asset path must share parent directory with destination".to_owned(),
+        ));
     }
-    if let Some(role_name) = role {
-        record.push(("role", Json::from(role_name)));
+    let dest_name = dest_path
+        .file_name()
+        .ok_or_else(|| CliError::Validation("asset path has no filename".to_owned()))?;
+    let part_name = part_path
+        .file_name()
+        .ok_or_else(|| CliError::Validation("partial asset path has no filename".to_owned()))?;
+    let short = dest_name.to_str().unwrap_or(spec_name);
+
+    let dir_fd = open_nofollow_dir(parent, "asset parent directory")?;
+    let part_c = CString::new(part_name.as_bytes())
+        .map_err(|_| CliError::Validation("asset filename contains NUL".to_owned()))?;
+    let dest_c = CString::new(dest_name.as_bytes())
+        .map_err(|_| CliError::Validation("asset filename contains NUL".to_owned()))?;
+
+    let lstat_before = lstat_at(dir_fd.as_fd(), &part_c).map_err(|source| CliError::Io {
+        context: format!("cannot stat downloaded {spec_name}"),
+        source,
+    })?;
+    if !lstat_before.is_regular() {
+        return Err(CliError::Validation(
+            "Downloaded asset must be a regular file".to_owned(),
+        ));
     }
-    Ok(Json::new_object(record))
+    if lstat_before.nlink != 1 {
+        return Err(CliError::Validation(
+            "Downloaded asset must not have multiple hard links".to_owned(),
+        ));
+    }
+    if lstat_before.size != expected_size {
+        return Err(CliError::Validation(format!("Unexpected size: {short}")));
+    }
+
+    let file = openat(
+        dir_fd.as_fd(),
+        &part_c,
+        O_RDONLY | O_NOFOLLOW | O_CLOEXEC,
+        0,
+    )
+    .map_err(|source| CliError::Io {
+        context: format!("cannot open downloaded {spec_name}"),
+        source,
+    })?;
+    let opened = fstat(file.as_fd()).map_err(|source| CliError::Io {
+        context: "cannot stat opened downloaded asset".to_owned(),
+        source,
+    })?;
+    if !opened.is_regular()
+        || opened.nlink != 1
+        || (
+            opened.dev,
+            opened.ino,
+            opened.size,
+            opened.mtime_ns,
+            opened.ctime_ns,
+        ) != (
+            lstat_before.dev,
+            lstat_before.ino,
+            lstat_before.size,
+            lstat_before.mtime_ns,
+            lstat_before.ctime_ns,
+        )
+    {
+        return Err(CliError::Validation(
+            "Asset changed while opening".to_owned(),
+        ));
+    }
+    set_nocache(file.as_fd(), true).map_err(|source| CliError::Io {
+        context: "cannot set F_NOCACHE on downloaded asset".to_owned(),
+        source,
+    })?;
+
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; ASSET_STREAM_CHUNK];
+    let mut at = 0u64;
+    while at < opened.size {
+        let take = (opened.size - at).min(ASSET_STREAM_CHUNK as u64) as usize;
+        pread_exact(file.as_fd(), &mut buf[..take], at).map_err(|source| CliError::Io {
+            context: format!("failed reading downloaded {spec_name}"),
+            source,
+        })?;
+        hasher.update(&buf[..take]);
+        at += take as u64;
+    }
+
+    let after_hash = fstat(file.as_fd()).map_err(|source| CliError::Io {
+        context: "cannot re-stat downloaded asset".to_owned(),
+        source,
+    })?;
+    let lstat_after = lstat_at(dir_fd.as_fd(), &part_c).map_err(|source| CliError::Io {
+        context: "cannot re-inspect downloaded asset".to_owned(),
+        source,
+    })?;
+    if (
+        after_hash.dev,
+        after_hash.ino,
+        after_hash.size,
+        after_hash.mtime_ns,
+        after_hash.ctime_ns,
+    ) != (
+        opened.dev,
+        opened.ino,
+        opened.size,
+        opened.mtime_ns,
+        opened.ctime_ns,
+    ) || (
+        lstat_after.dev,
+        lstat_after.ino,
+        lstat_after.size,
+        lstat_after.mtime_ns,
+        lstat_after.ctime_ns,
+    ) != (
+        opened.dev,
+        opened.ino,
+        opened.size,
+        opened.mtime_ns,
+        opened.ctime_ns,
+    ) {
+        return Err(CliError::Validation(
+            "Asset changed during verification".to_owned(),
+        ));
+    }
+
+    let digest = hex(&hasher.finalize());
+    if digest != expected_sha256 {
+        drop(file);
+        let _ignored = unlink_at(dir_fd.as_fd(), &part_c, false);
+        return Err(CliError::Validation(format!("Checksum mismatch: {short}")));
+    }
+
+    match lstat_at(dir_fd.as_fd(), &dest_c) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(CliError::Validation(format!(
+                "Refusing to overwrite existing asset: {short}"
+            )));
+        }
+        Err(source) => {
+            return Err(CliError::Io {
+                context: "cannot inspect destination asset".to_owned(),
+                source,
+            });
+        }
+    }
+
+    let target_mode = if is_derived_pack { 0o444 } else { 0o644 };
+    fchmod(file.as_fd(), target_mode).map_err(|source| CliError::Io {
+        context: format!("cannot set permissions on {spec_name}"),
+        source,
+    })?;
+    fsync(file.as_fd()).map_err(|source| CliError::Io {
+        context: format!("cannot fsync {spec_name}"),
+        source,
+    })?;
+    fs::rename(part_path, dest_path).map_err(|source| CliError::Io {
+        context: format!("cannot publish verified asset {spec_name}"),
+        source,
+    })?;
+    fsync(dir_fd.as_fd()).map_err(|source| CliError::Io {
+        context: "cannot fsync asset parent directory".to_owned(),
+        source,
+    })?;
+
+    let sealed = fstat(file.as_fd()).map_err(|source| CliError::Io {
+        context: "cannot stat published asset".to_owned(),
+        source,
+    })?;
+    if is_derived_pack && ((sealed.mode & 0o222) != 0 || sealed.nlink != 1) {
+        return Err(CliError::Validation(
+            "Derived pack asset must be read-only with a single link".to_owned(),
+        ));
+    }
+    drop(file);
+
+    let resolved = fs::canonicalize(dest_path).map_err(|source| CliError::Io {
+        context: format!("cannot resolve asset {spec_name}"),
+        source,
+    })?;
+    let published_identity = FileIdentity::of_resolved_path(&resolved)?;
+    if (
+        published_identity.device,
+        published_identity.inode,
+        published_identity.size,
+        published_identity.mtime_ns,
+    ) != (opened.dev, opened.ino, opened.size, opened.mtime_ns)
+    {
+        return Err(CliError::Validation(
+            "Asset changed during verification".to_owned(),
+        ));
+    }
+    asset_record_json(&resolved, digest, published_identity, role)
+}
+
+pub(crate) fn check_adoption_group(
+    adoption: &Json,
+    assets_profile: &Json,
+    adoption_key: &str,
+    profile_key: &str,
+    include_legacy_draft: bool,
+) -> Result<(), CliError> {
+    let group_obj = adoption
+        .find(adoption_key)
+        .map_err(|source| CliError::Json {
+            context: "invalid adoption.json",
+            source,
+        })?
+        .ok_or_else(|| {
+            CliError::Validation(format!(
+                "missing configuration field '{adoption_key}'; re-run adopt/configure"
+            ))
+        })?;
+    let dir_str = json_str(group_obj, "directory")?;
+    let assets = group_obj
+        .find("assets")
+        .map_err(|source| CliError::Json {
+            context: "invalid adoption group",
+            source,
+        })?
+        .ok_or_else(|| {
+            CliError::Validation(
+                "missing configuration field 'assets'; re-run adopt/configure".to_owned(),
+            )
+        })?
+        .array()
+        .map_err(|source| CliError::Json {
+            context: "adoption assets must be an array",
+            source,
+        })?;
+
+    let candidate_specs =
+        group_candidate_file_specs(assets_profile, profile_key, include_legacy_draft)?;
+    let same_len: Vec<&Vec<Json>> = candidate_specs
+        .into_iter()
+        .filter(|spec_files| assets.len() == spec_files.len())
+        .collect();
+    if same_len.is_empty() {
+        return Err(CliError::Validation(
+            "Incomplete adopted asset set".to_owned(),
+        ));
+    }
+
+    let mut matched_spec: Option<&Vec<Json>> = None;
+    for spec_files in &same_len {
+        let mut all_match = true;
+        for (asset, spec) in assets.iter().zip(spec_files.iter()) {
+            let spec_sha = json_str(spec, "sha256")?;
+            let asset_sha = json_str(asset, "sha256")?;
+            let spec_role = optional_asset_role(spec)?;
+            let asset_role = optional_asset_role(asset)?;
+            if asset_sha != spec_sha || asset_role != spec_role {
+                all_match = false;
+                break;
+            }
+        }
+        if all_match {
+            matched_spec = Some(*spec_files);
+            break;
+        }
+    }
+    let matched_spec = matched_spec.ok_or_else(|| {
+        CliError::Validation("Asset manifest differs from the pinned profile".to_owned())
+    })?;
+
+    for (asset, spec) in assets.iter().zip(matched_spec.iter()) {
+        let spec_name = json_str(spec, "name")?;
+        let is_derived_pack = optional_asset_role(spec)? == Some("derived_pack");
+        let asset_path = PathBuf::from(json_str(asset, "path")?);
+        let actual = FileIdentity::of_resolved_path(&asset_path)
+            .map_err(|_| CliError::Validation(format!("Asset changed; re-adopt: {spec_name}")))?;
+        if is_derived_pack {
+            let f = File::open(&asset_path).map_err(|_| {
+                CliError::Validation(format!("Asset changed; re-adopt: {spec_name}"))
+            })?;
+            let st = fstat(f.as_fd()).map_err(|_| {
+                CliError::Validation(format!("Asset changed; re-adopt: {spec_name}"))
+            })?;
+            if (st.mode & 0o222) != 0 || st.nlink != 1 {
+                return Err(CliError::Validation(format!(
+                    "Asset changed; re-adopt: {spec_name}"
+                )));
+            }
+        }
+        let recorded = FileIdentity {
+            device: i32::try_from(json_i128(asset, "device")?)
+                .map_err(|_| CliError::Validation("invalid recorded asset device".to_owned()))?,
+            inode: json_u64(asset, "inode")?,
+            size: json_u64(asset, "size")?,
+            mtime_ns: json_i128(asset, "mtime_ns")?,
+            ctime_ns: json_i128(asset, "ctime_ns")?,
+            volume_uuid: recorded_volume_uuid(asset)?,
+        };
+        if recorded.device < 0 {
+            return Err(CliError::Validation(
+                "invalid recorded asset device".to_owned(),
+            ));
+        }
+        if !actual.matches_adopted(&recorded) {
+            return Err(CliError::Validation(format!(
+                "Asset changed; re-adopt: {spec_name}"
+            )));
+        }
+        let selected = Path::new(dir_str).join(spec_name);
+        let resolved_selected = fs::canonicalize(&selected).map_err(|_| {
+            CliError::Validation("Selected asset link changed; re-adopt".to_owned())
+        })?;
+        if resolved_selected != asset_path {
+            return Err(CliError::Validation(
+                "Selected asset link changed; re-adopt".to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Validates full adoption against the pinned asset profile, including legacy draft records and the Python reference in `src/tokspur/local.py`.
@@ -746,195 +1156,103 @@ pub fn check_adoption(adoption: &Json, assets_profile: &Json) -> Result<(), CliE
     }
 
     for group in ["target", "draft"] {
-        let group_obj = adoption
-            .find(group)
-            .map_err(|source| CliError::Json {
-                context: "invalid adoption.json",
-                source,
-            })?
-            .ok_or_else(|| {
-                CliError::Validation(format!(
-                    "missing configuration field '{group}'; re-run adopt/configure"
-                ))
-            })?;
-        let dir_str = json_str(group_obj, "directory")?;
-        let assets = group_obj
-            .find("assets")
-            .map_err(|source| CliError::Json {
-                context: "invalid adoption group",
-                source,
-            })?
-            .ok_or_else(|| {
-                CliError::Validation(
-                    "missing configuration field 'assets'; re-run adopt/configure".to_owned(),
-                )
-            })?
-            .array()
-            .map_err(|source| CliError::Json {
-                context: "adoption assets must be an array",
-                source,
-            })?;
-
-        let candidate_specs = group_candidate_file_specs(assets_profile, group, true)?;
-        let same_len: Vec<&Vec<Json>> = candidate_specs
-            .into_iter()
-            .filter(|spec_files| assets.len() == spec_files.len())
-            .collect();
-        if same_len.is_empty() {
-            return Err(CliError::Validation(
-                "Incomplete adopted asset set".to_owned(),
-            ));
-        }
-
-        let mut matched_spec: Option<&Vec<Json>> = None;
-        for spec_files in &same_len {
-            let mut all_match = true;
-            for (asset, spec) in assets.iter().zip(spec_files.iter()) {
-                let spec_sha = json_str(spec, "sha256")?;
-                let asset_sha = json_str(asset, "sha256")?;
-                let spec_role = optional_asset_role(spec)?;
-                let asset_role = optional_asset_role(asset)?;
-                if asset_sha != spec_sha || asset_role != spec_role {
-                    all_match = false;
-                    break;
-                }
-            }
-            if all_match {
-                matched_spec = Some(*spec_files);
-                break;
-            }
-        }
-        let matched_spec = matched_spec.ok_or_else(|| {
-            CliError::Validation("Asset manifest differs from the pinned profile".to_owned())
+        check_adoption_group(adoption, assets_profile, group, group, true)?;
+    }
+    if adoption
+        .find("dflash2_draft")
+        .map_err(|source| CliError::Json {
+            context: "invalid adoption.json",
+            source,
+        })?
+        .is_some()
+    {
+        let profile_key = dflash2_profile_group_key(assets_profile).ok_or_else(|| {
+            CliError::Validation("flash-next-assets.json missing dflash2_draft".to_owned())
         })?;
-
-        for (asset, spec) in assets.iter().zip(matched_spec.iter()) {
-            let spec_name = json_str(spec, "name")?;
-            let is_derived_pack = optional_asset_role(spec)? == Some("derived_pack");
-            let asset_path = PathBuf::from(json_str(asset, "path")?);
-            let actual = FileIdentity::of_resolved_path(&asset_path).map_err(|_| {
-                CliError::Validation(format!("Asset changed; re-adopt: {spec_name}"))
-            })?;
-            if is_derived_pack {
-                let f = File::open(&asset_path).map_err(|_| {
-                    CliError::Validation(format!("Asset changed; re-adopt: {spec_name}"))
-                })?;
-                let st = fstat(f.as_fd()).map_err(|_| {
-                    CliError::Validation(format!("Asset changed; re-adopt: {spec_name}"))
-                })?;
-                if (st.mode & 0o222) != 0 || st.nlink != 1 {
-                    return Err(CliError::Validation(format!(
-                        "Asset changed; re-adopt: {spec_name}"
-                    )));
-                }
-            }
-            let recorded = FileIdentity {
-                device: i32::try_from(json_i128(asset, "device")?).map_err(|_| {
-                    CliError::Validation("invalid recorded asset device".to_owned())
-                })?,
-                inode: json_u64(asset, "inode")?,
-                size: json_u64(asset, "size")?,
-                mtime_ns: json_i128(asset, "mtime_ns")?,
-                ctime_ns: json_i128(asset, "ctime_ns")?,
-                volume_uuid: recorded_volume_uuid(asset)?,
-            };
-            if recorded.device < 0 {
-                return Err(CliError::Validation(
-                    "invalid recorded asset device".to_owned(),
-                ));
-            }
-            if !actual.matches_adopted(&recorded) {
-                return Err(CliError::Validation(format!(
-                    "Asset changed; re-adopt: {spec_name}"
-                )));
-            }
-            let selected = Path::new(dir_str).join(spec_name);
-            let resolved_selected = fs::canonicalize(&selected).map_err(|_| {
-                CliError::Validation("Selected asset link changed; re-adopt".to_owned())
-            })?;
-            if resolved_selected != asset_path {
-                return Err(CliError::Validation(
-                    "Selected asset link changed; re-adopt".to_owned(),
-                ));
-            }
-        }
+        check_adoption_group(
+            adoption,
+            assets_profile,
+            "dflash2_draft",
+            profile_key,
+            false,
+        )?;
     }
     Ok(())
 }
 
-/// Runs `tokspur adopt --target <dir> --draft <dir>`.
-pub fn adopt_weights(
-    layout: &RuntimeLayout,
-    target_dir: &Path,
-    draft_dir: &Path,
+pub(crate) fn verify_group_directory(
+    specs: &Json,
+    profile_group: &str,
+    label: &str,
+    raw_dir: &Path,
     out: &mut dyn Write,
-) -> Result<(), CliError> {
-    let tokspur_base = layout.tokspur_base()?;
-    let _lock = StateLock::acquire(&tokspur_base)?;
-    let specs = read_json_file(&layout.assets_profile_path())?;
-
-    let mut fields: Vec<(&str, Json)> = vec![
-        ("schema", Json::integer(1)),
-        ("verification", Json::from("full-sha256")),
-    ];
-
-    for (group, raw_dir) in [("target", target_dir), ("draft", draft_dir)] {
-        let directory = fs::canonicalize(raw_dir).map_err(|source| CliError::Io {
-            context: format!("cannot resolve {group} directory"),
+) -> Result<Json, CliError> {
+    let directory = fs::canonicalize(raw_dir).map_err(|source| CliError::Io {
+        context: format!("cannot resolve {label} directory"),
+        source,
+    })?;
+    let dir_str = directory
+        .to_str()
+        .ok_or_else(|| CliError::Validation("directory path is not valid UTF-8".to_owned()))?;
+    let candidates = group_candidate_file_specs(specs, profile_group, false)?;
+    let spec_files = if candidates.len() == 1 {
+        candidates[0]
+    } else {
+        let mut present = Vec::new();
+        for cand in &candidates {
+            let mut all_exist = true;
+            for spec in *cand {
+                let name = json_str(spec, "name")?;
+                if !directory.join(name).exists() {
+                    all_exist = false;
+                    break;
+                }
+            }
+            if all_exist {
+                present.push(*cand);
+            }
+        }
+        if present.len() > 1 {
+            return Err(CliError::Validation(format!(
+                "Ambiguous {label} asset variants present in {}",
+                directory.display()
+            )));
+        }
+        present.first().copied().unwrap_or(candidates[0])
+    };
+    let mut verified = Vec::with_capacity(spec_files.len());
+    for spec in spec_files {
+        let name = json_str(spec, "name")?;
+        writeln!(out, "Verifying {label}: {name}").map_err(|source| CliError::Io {
+            context: "stdout write failed".to_owned(),
             source,
         })?;
-        let dir_str = directory
-            .to_str()
-            .ok_or_else(|| CliError::Validation("directory path is not valid UTF-8".to_owned()))?;
-        let candidates = group_candidate_file_specs(&specs, group, false)?;
-        let spec_files = if candidates.len() == 1 {
-            candidates[0]
-        } else {
-            let mut present = Vec::new();
-            for cand in &candidates {
-                let mut all_exist = true;
-                for spec in *cand {
-                    let name = json_str(spec, "name")?;
-                    if !directory.join(name).exists() {
-                        all_exist = false;
-                        break;
-                    }
-                }
-                if all_exist {
-                    present.push(*cand);
-                }
-            }
-            if present.len() > 1 {
-                return Err(CliError::Validation(format!(
-                    "Ambiguous {group} asset variants present in {}",
-                    directory.display()
-                )));
-            }
-            present.first().copied().unwrap_or(candidates[0])
-        };
-        let mut verified = Vec::with_capacity(spec_files.len());
-        for spec in spec_files {
-            let name = json_str(spec, "name")?;
-            writeln!(out, "Verifying {group}: {name}").map_err(|source| CliError::Io {
-                context: "stdout write failed".to_owned(),
-                source,
-            })?;
-            out.flush().map_err(|source| CliError::Io {
-                context: "stdout flush failed".to_owned(),
-                source,
-            })?;
-            verified.push(verify_asset(&directory.join(name), spec)?);
-        }
-        fields.push((
-            group,
-            Json::new_object([
-                ("directory", Json::from(dir_str)),
-                ("assets", Json::Array(verified)),
-            ]),
-        ));
+        out.flush().map_err(|source| CliError::Io {
+            context: "stdout flush failed".to_owned(),
+            source,
+        })?;
+        verified.push(verify_asset(&directory.join(name), spec)?);
     }
+    Ok(Json::new_object([
+        ("directory", Json::from(dir_str)),
+        ("assets", Json::Array(verified)),
+    ]))
+}
 
-    let adopted = Json::new_object(fields);
+pub(crate) fn preserved_dflash2_group(tokspur_base: &Path, specs: &Json) -> Option<Json> {
+    let profile_key = dflash2_profile_group_key(specs)?;
+    let existing = read_json_file(&tokspur_base.join("adoption.json")).ok()?;
+    let group_obj = existing.find("dflash2_draft").ok().flatten()?.clone();
+    check_adoption_group(&existing, specs, "dflash2_draft", profile_key, false).ok()?;
+    Some(group_obj)
+}
+
+pub(crate) fn finalize_and_write_adoption(
+    tokspur_base: &Path,
+    specs: &Json,
+    adopted: Json,
+    out: &mut dyn Write,
+) -> Result<Json, CliError> {
     let target = adopted
         .find("target")
         .map_err(|source| CliError::Json {
@@ -961,7 +1279,7 @@ pub fn adopt_weights(
     if json_str(first, "sha256")? == crate::text_assets::SHARD1_SHA256
         || crate::text_assets::has_flash_next_text_metadata(first_path)
     {
-        crate::text_assets::derive(&tokspur_base, first_path)?;
+        crate::text_assets::derive(tokspur_base, first_path)?;
         writeln!(
             out,
             "Pinned tokenizer and chat template derived from verified metadata."
@@ -971,7 +1289,43 @@ pub fn adopt_weights(
             source,
         })?;
     }
-    write_private_json(&tokspur_base, Path::new("adoption.json"), &adopted)?;
+    check_adoption(&adopted, specs)?;
+    write_private_json(tokspur_base, Path::new("adoption.json"), &adopted)?;
+    Ok(adopted)
+}
+
+pub(crate) fn adopt_weights_locked(
+    layout: &RuntimeLayout,
+    tokspur_base: &Path,
+    target_dir: &Path,
+    draft_dir: &Path,
+    dflash2_dir: Option<&Path>,
+    out: &mut dyn Write,
+) -> Result<Json, CliError> {
+    let specs = read_json_file(&layout.assets_profile_path())?;
+    let mut fields: Vec<(&str, Json)> = vec![
+        ("schema", Json::integer(1)),
+        ("verification", Json::from("full-sha256")),
+    ];
+    for (group, raw_dir) in [("target", target_dir), ("draft", draft_dir)] {
+        fields.push((
+            group,
+            verify_group_directory(&specs, group, group, raw_dir, out)?,
+        ));
+    }
+    if let Some(df_dir) = dflash2_dir {
+        let profile_key = dflash2_profile_group_key(&specs).ok_or_else(|| {
+            CliError::Validation("flash-next-assets.json missing dflash2_draft".to_owned())
+        })?;
+        fields.push((
+            "dflash2_draft",
+            verify_group_directory(&specs, profile_key, "dflash2", df_dir, out)?,
+        ));
+    } else if let Some(existing_df) = preserved_dflash2_group(tokspur_base, &specs) {
+        fields.push(("dflash2_draft", existing_df));
+    }
+
+    let adopted = finalize_and_write_adoption(tokspur_base, &specs, Json::new_object(fields), out)?;
     writeln!(
         out,
         "Existing weights verified in place. No model files copied or downloaded."
@@ -980,6 +1334,60 @@ pub fn adopt_weights(
         context: "stdout write failed".to_owned(),
         source,
     })?;
+    Ok(adopted)
+}
+
+/// Verifies `dflash2_dir` against the pinned asset profile and records `"dflash2_draft"` in `adoption.json` under an already-held `StateLock`.
+pub(crate) fn record_dflash2_in_adoption(
+    tokspur_base: &Path,
+    specs: &Json,
+    adoption: &Json,
+    dflash2_dir: &Path,
+    out: &mut dyn Write,
+) -> Result<(Json, PathBuf), CliError> {
+    let profile_key = dflash2_profile_group_key(specs).ok_or_else(|| {
+        CliError::Validation("flash-next-assets.json missing dflash2_draft".to_owned())
+    })?;
+    let df_group = verify_group_directory(specs, profile_key, "dflash2", dflash2_dir, out)?;
+    let resolved_dir = PathBuf::from(json_str(&df_group, "directory")?);
+    let mut updated = adoption.clone();
+    if let Json::Object(ref mut obj) = updated {
+        obj.retain(|(k, _)| k != b"dflash2_draft");
+        obj.push((b"dflash2_draft".to_vec(), df_group));
+    }
+    check_adoption(&updated, specs)?;
+    write_private_json(tokspur_base, Path::new("adoption.json"), &updated)?;
+    Ok((updated, resolved_dir))
+}
+
+/// Runs `tokspur adopt --target <dir> --draft <dir>`.
+pub fn adopt_weights(
+    layout: &RuntimeLayout,
+    target_dir: &Path,
+    draft_dir: &Path,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    adopt_weights_with_dflash2(layout, target_dir, draft_dir, None, out)
+}
+
+/// Runs `tokspur adopt` with optional `--dflash2-dir`.
+pub fn adopt_weights_with_dflash2(
+    layout: &RuntimeLayout,
+    target_dir: &Path,
+    draft_dir: &Path,
+    dflash2_dir: Option<&Path>,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    let tokspur_base = layout.tokspur_base()?;
+    let _lock = StateLock::acquire(&tokspur_base)?;
+    adopt_weights_locked(
+        layout,
+        &tokspur_base,
+        target_dir,
+        draft_dir,
+        dflash2_dir,
+        out,
+    )?;
     Ok(())
 }
 
@@ -1001,21 +1409,20 @@ pub fn check_adopted_weights(layout: &RuntimeLayout, out: &mut dyn Write) -> Res
     Ok(())
 }
 
-/// Runs `tokspur configure --port <port>` (`cli.py:48-100`).
-pub fn configure_runtime(
+pub(crate) fn configure_runtime_locked(
     layout: &RuntimeLayout,
+    tokspur_base: &Path,
     port: u32,
+    require_port_free: bool,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
-    let tokspur_base = layout.tokspur_base()?;
-    let _lock = StateLock::acquire(&tokspur_base)?;
     if !(1024..=65535).contains(&port) {
         return Err(CliError::Validation(
             "Use an unprivileged local port".to_owned(),
         ));
     }
     let port_u16 = port as u16;
-    if !port_available(port_u16) {
+    if require_port_free && !port_available(port_u16) {
         return Err(CliError::Validation(format!(
             "Port {port} is occupied; configuration left unchanged"
         )));
@@ -1027,7 +1434,7 @@ pub fn configure_runtime(
     let profile = read_json_file(&layout.hardware_profile_path())?;
     let public_model = json_str(&profile, "public_model")?.to_owned();
 
-    let state = private_dir(&tokspur_base, Path::new("state"))?;
+    let state = private_dir(tokspur_base, Path::new("state"))?;
     let owner_path = state.join("owner.json");
     let expected_owner = Json::new_object([
         ("project", Json::from("tokspur")),
@@ -1052,11 +1459,7 @@ pub fn configure_runtime(
             return Err(CliError::Validation("Unknown state owner".to_owned()));
         }
     }
-    write_private_json(
-        &tokspur_base,
-        Path::new("state/owner.json"),
-        &expected_owner,
-    )?;
+    write_private_json(tokspur_base, Path::new("state/owner.json"), &expected_owner)?;
 
     // Keep a key only if the server would admit it: a single-link 0600 file of 64 lowercase hex digits and a newline. Anything else, such as the empty file an interrupted write could leave, is replaced. The replacement is published atomically, so an interruption leaves the old state.
     let key_file = state.join("api-key");
@@ -1093,7 +1496,7 @@ pub fn configure_runtime(
         let mut secret = [0u8; 32];
         random_bytes(&mut secret);
         write_private_bytes(
-            &tokspur_base,
+            tokspur_base,
             Path::new("state/api-key"),
             format!("{}\n", hex(&secret)).as_bytes(),
         )?;
@@ -1108,9 +1511,8 @@ pub fn configure_runtime(
         "directory",
     )?);
     if target_dir.is_dir() {
-        let model_dir = private_dir(&tokspur_base, Path::new("state/models"))?;
+        let model_dir = private_dir(tokspur_base, Path::new("state/models"))?;
         let link = model_dir.join(&public_model);
-        let gguf_dir = state.join("gguf");
         if let Ok(meta) = fs::symlink_metadata(&link) {
             if meta.file_type().is_symlink() {
                 let resolved_link = fs::canonicalize(&link).unwrap_or_default();
@@ -1119,22 +1521,15 @@ pub fn configure_runtime(
                         context: "cannot resolve adopted target directory".to_owned(),
                         source,
                     })?;
-                if gguf_dir.exists()
-                    && let Ok(resolved_gguf) = fs::canonicalize(&gguf_dir)
-                    && resolved_link.starts_with(&resolved_gguf)
-                {
+                if resolved_link != resolved_target {
                     fs::remove_file(&link).map_err(|source| CliError::Io {
-                        context: "cannot replace legacy model symlink".to_owned(),
+                        context: "cannot update model symlink".to_owned(),
                         source,
                     })?;
                     symlink(&target_dir, &link).map_err(|source| CliError::Io {
                         context: "cannot create model symlink".to_owned(),
                         source,
                     })?;
-                } else if resolved_link != resolved_target {
-                    return Err(CliError::Validation(
-                        "Existing model link points elsewhere".to_owned(),
-                    ));
                 }
             } else {
                 return Err(CliError::Validation(
@@ -1150,7 +1545,7 @@ pub fn configure_runtime(
     }
 
     write_private_json(
-        &tokspur_base,
+        tokspur_base,
         Path::new("configured.json"),
         &Json::new_object([
             ("port", Json::integer(u64::from(port))),
@@ -1167,6 +1562,17 @@ pub fn configure_runtime(
         source,
     })?;
     Ok(())
+}
+
+/// Runs `tokspur configure --port <port>` (`cli.py:48-100`).
+pub fn configure_runtime(
+    layout: &RuntimeLayout,
+    port: u32,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    let tokspur_base = layout.tokspur_base()?;
+    let _lock = StateLock::acquire(&tokspur_base)?;
+    configure_runtime_locked(layout, &tokspur_base, port, true, out)
 }
 
 /// Pure process-matching predicate ported one to one from `local.py:172-201`.
