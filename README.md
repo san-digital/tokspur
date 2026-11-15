@@ -24,7 +24,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ## Add the model
 
-The `pull` and directory-based `serve` commands below require Tokspur 0.3.1 or later. For 0.3.0, follow the [setup guide](https://tokspur.com/get-started/) for download and adoption commands.
+The `pull` and directory-based `serve` commands below require Tokspur 0.3.1 or later.
 
 `tokspur pull` downloads the pinned base GGUF, pre-built Planar Pack v3 and shared Q8 MTP sidecar from [`san-digital/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF`](https://huggingface.co/san-digital/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF), verifies every file by SHA-256 and configures local state with no extra `adopt`, `configure` or `pack build` step (see the [model guide](https://tokspur.com/docs/models/)).
 
