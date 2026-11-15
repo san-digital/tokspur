@@ -21,6 +21,7 @@ from .local import (  # noqa: E402
     ROOT,
     candidate_file_specs,
     check_adoption,
+    dflash2_profile_group_key,
     inference_processes,
     isolated_environment,
     port_available,
@@ -32,33 +33,87 @@ from .local import (  # noqa: E402
     write_json,
 )
 
+DEFAULT_HF_BASE_URL = "https://huggingface.co"
+QWEN_LICENCE_URL = (
+    "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/"
+    "34567a4712bc9766c4449e2e98e4468bfa24d915/LICENSE"
+)
 
-def adopt(target: Path, draft: Path) -> None:
+
+def _repo_leaf_name(repo: str) -> str:
+    parts = repo.split("/")
+    if len(parts) != 2 or any(not part or part in (".", "..") for part in parts):
+        raise ValueError(f"invalid repository identifier '{repo}'")
+    return parts[1]
+
+
+def _directory_has_candidate_assets(specs: dict, group: str, directory: Path) -> bool:
+    if not directory.is_dir():
+        return False
+    return any(
+        all((directory / entry["name"]).is_file() for entry in cand)
+        for cand in candidate_file_specs(specs, group)
+    )
+
+
+def _verify_group_directory(
+    specs: dict, profile_group: str, label: str, directory: Path, *, out=None
+) -> dict:
+    stream = sys.stdout if out is None else out
+    directory = directory.resolve(strict=True)
+    candidates = candidate_file_specs(specs, profile_group)
+    if len(candidates) == 1:
+        selected_specs = candidates[0]
+    else:
+        present = [
+            cand
+            for cand in candidates
+            if all((directory / spec["name"]).exists() for spec in cand)
+        ]
+        if len(present) > 1:
+            raise ValueError(f"Ambiguous {label} asset variants present in {directory}")
+        selected_specs = present[0] if present else candidates[0]
+    assets = []
+    for spec in selected_specs:
+        print(f"Verifying {label}: {spec['name']}", file=stream, flush=True)
+        assets.append(verify_asset(directory / spec["name"], spec))
+    return {"directory": str(directory), "assets": assets}
+
+
+def adopt(
+    target: Path,
+    draft: Path | None = None,
+    dflash2_dir: Path | None = None,
+    *,
+    out=None,
+) -> None:
+    stream = sys.stdout if out is None else out
+    if draft is None:
+        draft = target
     specs = read_json(ROOT / "profiles/flash-next-assets.json")
-    result = {"schema": 1, "verification": "full-sha256"}
+    result: dict = {"schema": 1, "verification": "full-sha256"}
     for group, directory in (("target", target), ("draft", draft)):
-        directory = directory.resolve(strict=True)
-        candidates = candidate_file_specs(specs, group)
-        if len(candidates) == 1:
-            selected_specs = candidates[0]
-        else:
-            present = [
-                cand
-                for cand in candidates
-                if all((directory / spec["name"]).exists() for spec in cand)
-            ]
-            if len(present) > 1:
-                raise ValueError(
-                    f"Ambiguous {group} asset variants present in {directory}"
-                )
-            selected_specs = present[0] if present else candidates[0]
-        assets = []
-        for spec in selected_specs:
-            print(f"Verifying {group}: {spec['name']}", flush=True)
-            assets.append(verify_asset(directory / spec["name"], spec))
-        result[group] = {"directory": str(directory), "assets": assets}
+        result[group] = _verify_group_directory(
+            specs, group, group, directory, out=stream
+        )
+    if dflash2_dir is not None:
+        df_key = dflash2_profile_group_key(specs)
+        if df_key is None:
+            raise ValueError("flash-next-assets.json missing dflash2_draft")
+        result["dflash2_draft"] = _verify_group_directory(
+            specs, df_key, "dflash2", dflash2_dir, out=stream
+        )
+    else:
+        with contextlib.suppress(FileNotFoundError, KeyError, ValueError):
+            existing = read_json(ROOT / ".tokspur/adoption.json")
+            if "dflash2_draft" in existing:
+                check_adoption({**result, "dflash2_draft": existing["dflash2_draft"]})
+                result["dflash2_draft"] = existing["dflash2_draft"]
     write_json(ROOT / ".tokspur/adoption.json", result)
-    print("Existing weights verified in place. No model files copied or downloaded.")
+    print(
+        "Existing weights verified in place. No model files copied or downloaded.",
+        file=stream,
+    )
 
 
 def valid_api_key(path: Path) -> bool:
@@ -77,10 +132,11 @@ def valid_api_key(path: Path) -> bool:
     )
 
 
-def configure(port: int) -> None:
+def configure(port: int, *, require_port_free: bool = True, out=None) -> None:
+    stream = sys.stdout if out is None else out
     if type(port) is not int or not 1024 <= port <= 65535:
         raise ValueError("Use an unprivileged local port")
-    if not port_available(port):
+    if require_port_free and not port_available(port):
         raise ValueError(f"Port {port} is occupied; configuration left unchanged")
     data = read_json(ROOT / ".tokspur/adoption.json")
     check_adoption(data)
@@ -107,11 +163,11 @@ def configure(port: int) -> None:
             0o600,
         )
         try:
-            with os.fdopen(fd, "w") as stream:
-                stream.write(secrets.token_hex(32) + "\n")
-                stream.flush()
-                os.fchmod(stream.fileno(), 0o600)
-                os.fsync(stream.fileno())
+            with os.fdopen(fd, "w") as key_stream:
+                key_stream.write(secrets.token_hex(32) + "\n")
+                key_stream.flush()
+                os.fchmod(key_stream.fileno(), 0o600)
+                os.fsync(key_stream.fileno())
             os.replace(temporary, key_file)
         except BaseException:
             temporary.unlink(missing_ok=True)
@@ -122,13 +178,9 @@ def configure(port: int) -> None:
         model_dir = private_dir(state / "models")
         link = model_dir / p["public_model"]
         if link.is_symlink():
-            if (state / "gguf").exists() and link.resolve().is_relative_to(
-                state / "gguf"
-            ):
+            if link.resolve() != target_dir.resolve():
                 link.unlink()
                 link.symlink_to(target_dir, target_is_directory=True)
-            elif link.resolve() != target_dir.resolve():
-                raise ValueError("Existing model link points elsewhere")
         elif link.exists():
             raise ValueError("Refusing to replace an existing model directory")
         else:
@@ -142,7 +194,173 @@ def configure(port: int) -> None:
             "model": p["public_model"],
         },
     )
-    print(f"Configured tokspur at http://127.0.0.1:{port}; inference not started.")
+    print(
+        f"Configured tokspur at http://127.0.0.1:{port}; inference not started.",
+        file=stream,
+    )
+
+
+def _resolve_hf_base_url() -> tuple[str, bool]:
+    raw = os.environ.get("TOKSPUR_HF_BASE_URL", "").rstrip("/")
+    if not raw:
+        return DEFAULT_HF_BASE_URL, False
+    for prefix in ("http://127.0.0.1:", "http://[::1]:"):
+        if raw.startswith(prefix):
+            port_s = raw[len(prefix) :]
+            if port_s.isdigit() and 1 <= int(port_s) <= 65535:
+                return raw, True
+    raise ValueError(
+        "TOKSPUR_HF_BASE_URL only permits loopback http://127.0.0.1:<port> or http://[::1]:<port>"
+    )
+
+
+def pull(
+    directory: Path | None = None,
+    *,
+    dflash2: bool = False,
+    dflash2_dir: Path | None = None,
+    port: int | None = None,
+) -> None:
+    if port is not None and (type(port) is not int or not 1024 <= port <= 65535):
+        raise ValueError("Use an unprivileged local port")
+    base_url, allow_http = _resolve_hf_base_url()
+    blocked = ("HF_", "HUGGING_FACE_", "HUGGINGFACE_")
+    curl_env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(blocked)
+        and k not in ("PYTHONPATH", "PYTHONHOME", "TOKSPUR_HF_BASE_URL")
+    }
+    curl_env["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
+    curl_env["DO_NOT_TRACK"] = "1"
+
+    include_dflash2 = bool(dflash2 or dflash2_dir is not None)
+    with state_lock():
+        specs = read_json(ROOT / "profiles/flash-next-assets.json")
+        managed_root = private_dir(ROOT / ".tokspur/models")
+        target_repo = specs["target"]["repo"]
+        draft_repo = specs["draft"]["repo"]
+        target_dest = (
+            directory.resolve()
+            if directory is not None
+            else (managed_root / _repo_leaf_name(target_repo))
+        )
+        draft_dest = (
+            target_dest
+            if (directory is not None or target_repo == draft_repo)
+            else (managed_root / _repo_leaf_name(draft_repo))
+        )
+
+        print(
+            f"Model licence: Qwen Community License Agreement 1.0 ({QWEN_LICENCE_URL})",
+            flush=True,
+        )
+        if include_dflash2:
+            print(
+                "Drafter licence: Apache-2.0 checkpoint subject to Qwen Community License Agreement 1.0",
+                flush=True,
+            )
+
+        cache: dict[Path, dict] = {}
+
+        def _pull_group(group_key: str, dest: Path) -> dict:
+            group_obj = specs[group_key]
+            repo = group_obj["repo"]
+            revision = group_obj["revision"]
+            if len(revision) != 40 or any(
+                c not in "0123456789abcdef" for c in revision
+            ):
+                raise ValueError(
+                    f"asset profile requires a 40-character lowercase hex revision, found '{revision}'"
+                )
+            dest.mkdir(parents=True, exist_ok=True)
+            verified_assets = []
+            for spec in group_obj["files"]:
+                name = spec["name"]
+                dest_path = dest / name
+                if dest_path in cache:
+                    verified_assets.append(cache[dest_path])
+                    continue
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                part_path = dest_path.parent / f"{dest_path.name}.part"
+                if dest_path.is_symlink():
+                    raise ValueError(f"Refusing symlink asset path: {name}")
+                if dest_path.exists():
+                    rec = verify_asset(dest_path, spec)
+                    part_path.unlink(missing_ok=True)
+                    print(f"Already verified: {name}", flush=True)
+                    cache[dest_path] = rec
+                    verified_assets.append(rec)
+                    continue
+                expected_size = spec["size"]
+                part_len = part_path.stat().st_size if part_path.is_file() else 0
+                if part_len > expected_size:
+                    part_path.unlink()
+                    part_len = 0
+                if part_len < expected_size:
+                    url = f"{base_url}/{repo}/resolve/{revision}/{name}"
+                    print(f"Downloading {repo}/{name}...", flush=True)
+                    cmd = [
+                        "/usr/bin/curl",
+                        "--fail",
+                        "--location",
+                        "--proto",
+                        "=http,https" if allow_http else "=https",
+                        "--retry",
+                        "3",
+                        "--retry-delay",
+                        "2",
+                        "--silent",
+                        "--show-error",
+                    ]
+                    if part_len > 0:
+                        cmd.extend(["--continue-at", "-"])
+                    cmd.extend(["--output", str(part_path), "--", url])
+                    subprocess.run(cmd, check=True, env=curl_env)
+                print(f"Verifying: {name}", flush=True)
+                try:
+                    verify_asset(part_path, spec)
+                except BaseException:
+                    part_path.unlink(missing_ok=True)
+                    raise
+                os.replace(part_path, dest_path)
+                rec = verify_asset(dest_path, spec)
+                cache[dest_path] = rec
+                verified_assets.append(rec)
+            return {
+                "directory": str(dest.resolve(strict=True)),
+                "assets": verified_assets,
+            }
+
+        result: dict = {
+            "schema": 1,
+            "verification": "full-sha256",
+            "target": _pull_group("target", target_dest),
+            "draft": _pull_group("draft", draft_dest),
+        }
+        if include_dflash2:
+            df_key = dflash2_profile_group_key(specs)
+            if df_key is None:
+                raise ValueError("flash-next-assets.json missing dflash2_draft")
+            df_dest = (
+                dflash2_dir.resolve()
+                if dflash2_dir is not None
+                else (managed_root / _repo_leaf_name(specs[df_key]["repo"]))
+            )
+            result["dflash2_draft"] = _pull_group(df_key, df_dest)
+        write_json(ROOT / ".tokspur/adoption.json", result)
+
+        resolved_port = port
+        if resolved_port is None:
+            with contextlib.suppress(FileNotFoundError, KeyError):
+                existing_cfg = read_json(ROOT / ".tokspur/configured.json")
+                if isinstance(existing_cfg.get("port"), int):
+                    resolved_port = existing_cfg["port"]
+        if resolved_port is None:
+            resolved_port = profile()["port"]
+        configure(resolved_port, require_port_free=(port is not None))
+        suffix = " --drafter dflash2" if include_dflash2 else ""
+        print(f"Ready. Start serving with: tokspur serve --speed-preset{suffix}")
 
 
 def default_derived_pack_path(
@@ -269,7 +487,11 @@ def serve(
     checkpoint_ssd_floor_gib: float = 20.0,
     checkpoint_ssd_dir: str | Path | None = None,
     overlap_prefill: bool = False,
+    model_dir: Path | str | None = None,
+    port: int | None = None,
 ) -> None:
+    if port is not None and (type(port) is not int or not 1024 <= port <= 65535):
+        raise ValueError("Use an unprivileged local port")
     for flag, value in (
         ("native_host_logit_views", native_host_logit_views),
         ("native_logit_topk", native_logit_topk),
@@ -495,8 +717,6 @@ def serve(
     if checkpoint_policy not in ("recompute-cost", "lru"):
         raise ValueError(f"Unsupported checkpoint_policy: {checkpoint_policy}")
     if drafter == "dflash2":
-        if dflash2_dir is None:
-            raise ValueError("--drafter dflash2 requires --dflash2-dir")
         if mtp_depth is not None:
             raise ValueError("--mtp-depth is incompatible with --drafter dflash2")
         if mtp_draft_slice_enabled:
@@ -541,9 +761,115 @@ def serve(
 
     state = private_dir(ROOT / ".tokspur/state")
     with state_lock():
-        config = read_json(ROOT / ".tokspur/configured.json")
-        adoption = read_json(ROOT / ".tokspur/adoption.json")
+        auto_adopted = False
+        if model_dir is not None:
+            resolved_dir = Path(model_dir).resolve(strict=True)
+            reuse_existing = False
+            with contextlib.suppress(FileNotFoundError, KeyError, ValueError):
+                existing_adopt = read_json(ROOT / ".tokspur/adoption.json")
+                if (
+                    existing_adopt.get("target", {}).get("directory")
+                    == str(resolved_dir)
+                    and existing_adopt.get("draft", {}).get("directory")
+                    == str(resolved_dir)
+                    and (
+                        dflash2_dir is None
+                        or existing_adopt.get("dflash2_draft", {}).get("directory")
+                        == str(Path(dflash2_dir).resolve(strict=True))
+                    )
+                ):
+                    check_adoption(existing_adopt)
+                    adoption = existing_adopt
+                    reuse_existing = True
+            if not reuse_existing:
+                auto_adopted = True
+                adopt(
+                    resolved_dir,
+                    resolved_dir,
+                    Path(dflash2_dir) if dflash2_dir is not None else None,
+                    out=sys.stderr,
+                )
+                adoption = read_json(ROOT / ".tokspur/adoption.json")
+        else:
+            try:
+                adoption = read_json(ROOT / ".tokspur/adoption.json")
+            except FileNotFoundError:
+                specs = read_json(ROOT / "profiles/flash-next-assets.json")
+                managed_root = ROOT / ".tokspur/models"
+                managed_target = managed_root / _repo_leaf_name(specs["target"]["repo"])
+                managed_draft = managed_root / _repo_leaf_name(specs["draft"]["repo"])
+                if _directory_has_candidate_assets(
+                    specs, "target", managed_target
+                ) and _directory_has_candidate_assets(specs, "draft", managed_draft):
+                    auto_df: Path | None = (
+                        Path(dflash2_dir) if dflash2_dir is not None else None
+                    )
+                    if auto_df is None:
+                        df_key = dflash2_profile_group_key(specs)
+                        if df_key is not None and "repo" in specs[df_key]:
+                            cand_df = managed_root / _repo_leaf_name(
+                                specs[df_key]["repo"]
+                            )
+                            if _directory_has_candidate_assets(specs, df_key, cand_df):
+                                auto_df = cand_df
+                    auto_adopted = True
+                    adopt(
+                        managed_target,
+                        managed_draft,
+                        auto_df,
+                        out=sys.stderr,
+                    )
+                    adoption = read_json(ROOT / ".tokspur/adoption.json")
+                else:
+                    raise ValueError(
+                        "No adopted model weights found. Run 'tokspur pull' or 'tokspur serve /path/to/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF'."
+                    ) from None
         check_adoption(adoption)
+
+        if port is not None or model_dir is not None or auto_adopted:
+            cfg_port = port
+            if cfg_port is None:
+                with contextlib.suppress(FileNotFoundError, KeyError):
+                    prev_cfg = read_json(ROOT / ".tokspur/configured.json")
+                    if isinstance(prev_cfg.get("port"), int):
+                        cfg_port = prev_cfg["port"]
+            if cfg_port is None:
+                cfg_port = profile()["port"]
+            configure(cfg_port, out=sys.stderr)
+            config = read_json(ROOT / ".tokspur/configured.json")
+        else:
+            try:
+                config = read_json(ROOT / ".tokspur/configured.json")
+            except FileNotFoundError:
+                configure(profile()["port"], out=sys.stderr)
+                config = read_json(ROOT / ".tokspur/configured.json")
+
+        if drafter == "dflash2" and dflash2_dir is None:
+            adopted_df = adoption.get("dflash2_draft", {}).get("directory")
+            if adopted_df:
+                dflash2_dir = adopted_df
+            else:
+                with contextlib.suppress(FileNotFoundError, KeyError):
+                    specs = read_json(ROOT / "profiles/flash-next-assets.json")
+                    df_key = dflash2_profile_group_key(specs)
+                    if df_key is not None and "repo" in specs[df_key]:
+                        cand_df = (
+                            ROOT
+                            / ".tokspur/models"
+                            / _repo_leaf_name(specs[df_key]["repo"])
+                        )
+                        if _directory_has_candidate_assets(specs, df_key, cand_df):
+                            df_group = _verify_group_directory(
+                                specs, df_key, "dflash2", cand_df, out=sys.stderr
+                            )
+                            adoption = {**adoption, "dflash2_draft": df_group}
+                            check_adoption(adoption)
+                            write_json(ROOT / ".tokspur/adoption.json", adoption)
+                            dflash2_dir = df_group["directory"]
+            if dflash2_dir is None:
+                raise ValueError(
+                    "--drafter dflash2 requires --dflash2-dir (or run 'tokspur pull --dflash2')"
+                )
         if not port_available(config["port"]):
             raise ValueError("Requested port is occupied")
         workers = inference_processes()
@@ -1067,9 +1393,28 @@ def main() -> None:
         "check-model-config",
         help="Compare a local config.json with the Flash-Next text profile",
     )
-    a = sub.add_parser("adopt", help="Fully hash existing weights without copying them")
+    p_pull = sub.add_parser(
+        "pull",
+        help="Download and verify pinned weights; configures local state",
+    )
+    p_pull.add_argument("dir_pos", nargs="?", type=Path, default=None)
+    p_pull.add_argument("--dir", dest="dir_flag", type=Path, default=None)
+    p_pull.add_argument(
+        "--dflash2",
+        "--all",
+        dest="dflash2",
+        action="store_true",
+        default=False,
+    )
+    p_pull.add_argument("--dflash2-dir", type=Path, default=None)
+    p_pull.add_argument("--port", type=int, default=None)
+    a = sub.add_parser(
+        "adopt", help="Verify existing weights in place without copying them"
+    )
+    a.add_argument("dir_pos", nargs="?", type=Path, default=None)
     a.add_argument("--target", type=Path, required=False, default=None)
     a.add_argument("--draft", type=Path, required=False, default=None)
+    a.add_argument("--dflash2-dir", type=Path, required=False, default=None)
     a.add_argument(
         "--check-only",
         action="store_true",
@@ -1085,6 +1430,9 @@ def main() -> None:
         "verify-build", help="Verify build-manifest.json and launch artefacts"
     )
     s = sub.add_parser("serve", help="Foreground API; refuses other inference workers")
+    s.add_argument("model_dir_pos", nargs="?", type=Path, default=None)
+    s.add_argument("--model-dir", dest="model_dir_flag", type=Path, default=None)
+    s.add_argument("--port", type=int, default=None)
     s.add_argument(
         "--raw-gguf",
         action="store_true",
@@ -1457,24 +1805,54 @@ def main() -> None:
     )
     args = parser.parse_args()
     try:
-        if args.command == "adopt":
+        if args.command == "pull":
+            if args.dir_pos is not None and args.dir_flag is not None:
+                raise ValueError("pull accepts a single model directory")
+            pull(
+                args.dir_pos or args.dir_flag,
+                dflash2=args.dflash2,
+                dflash2_dir=args.dflash2_dir,
+                port=args.port,
+            )
+        elif args.command == "adopt":
             with state_lock():
                 if args.check_only:
+                    if (
+                        args.dir_pos is not None
+                        or args.target is not None
+                        or args.draft is not None
+                        or args.dflash2_dir is not None
+                    ):
+                        raise ValueError(
+                            "--check-only cannot be combined with directory arguments"
+                        )
                     data = read_json(ROOT / ".tokspur/adoption.json")
                     check_adoption(data)
                     print(
                         "Existing weights verified in place. No model files copied or downloaded."
                     )
-                else:
-                    if not args.target or not args.draft:
+                elif args.dir_pos is not None:
+                    if args.target is not None or args.draft is not None:
                         raise ValueError(
-                            "--target and --draft are required unless --check-only is specified"
+                            "adopt <dir> cannot be combined with --target or --draft"
                         )
-                    adopt(args.target, args.draft)
+                    adopt(args.dir_pos, args.dir_pos, args.dflash2_dir)
+                else:
+                    if not args.target:
+                        raise ValueError(
+                            "Pass a model directory (tokspur adopt <dir>) or --target/--draft, or --check-only"
+                        )
+                    adopt(
+                        args.target,
+                        args.draft or args.target,
+                        args.dflash2_dir,
+                    )
         elif args.command == "configure":
             with state_lock():
                 configure(args.port)
         elif args.command == "serve":
+            if args.model_dir_pos is not None and args.model_dir_flag is not None:
+                raise ValueError("serve accepts a single model directory")
             serve(
                 allow_raw_gguf=args.raw_gguf,
                 pack_v3=args.pack_v3,
@@ -1533,6 +1911,8 @@ def main() -> None:
                 checkpoint_floor_gib=args.checkpoint_floor_gib,
                 checkpoint_policy=args.checkpoint_policy,
                 overlap_prefill=args.overlap_prefill,
+                model_dir=args.model_dir_pos or args.model_dir_flag,
+                port=args.port,
             )
         elif args.command == "verify-build":
             subprocess.run(

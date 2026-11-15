@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Private local state and fail-closed adoption. No model downloader."""
+"""Private local state, pinned weight downloads and fail-closed adoption."""
 
 from __future__ import annotations
 
@@ -210,60 +210,90 @@ def verify_asset(path: Path, expected: dict) -> dict:
     return out
 
 
+def dflash2_profile_group_key(expected: dict) -> str | None:
+    if "dflash2_draft" in expected:
+        return "dflash2_draft"
+    if "legacy_dflash2_draft" in expected:
+        return "legacy_dflash2_draft"
+    return None
+
+
+def _check_adoption_group(
+    data: dict,
+    expected: dict,
+    adoption_key: str,
+    profile_key: str,
+    *,
+    include_legacy_draft: bool,
+) -> None:
+    assets = data[adoption_key]["assets"]
+    same_len = [
+        spec_files
+        for spec_files in candidate_file_specs(
+            expected, profile_key, include_legacy_draft=include_legacy_draft
+        )
+        if len(assets) == len(spec_files)
+    ]
+    if not same_len:
+        raise ValueError("Incomplete adopted asset set")
+    matched_spec = None
+    for spec_files in same_len:
+        if all(
+            asset["sha256"] == spec["sha256"]
+            and _optional_role(asset) == _optional_role(spec)
+            for asset, spec in zip(assets, spec_files, strict=True)
+        ):
+            matched_spec = spec_files
+            break
+    if matched_spec is None:
+        raise ValueError("Asset manifest differs from the pinned profile")
+    for asset, spec in zip(assets, matched_spec, strict=True):
+        asset_path = Path(asset["path"])
+        actual = identity(asset_path)
+        if _optional_role(spec) == "derived_pack":
+            st = os.stat(asset_path, follow_symlinks=False)
+            if (st.st_mode & 0o222) != 0 or st.st_nlink != 1:
+                raise ValueError(f"Asset changed; re-adopt: {spec['name']}")
+        device = asset["device"]
+        if type(device) is not int or not 0 <= device <= 0x7FFFFFFF:
+            raise ValueError("invalid recorded asset device")
+        if "volume_uuid" in asset:
+            volume_uuid = asset["volume_uuid"]
+            if (
+                not isinstance(volume_uuid, str)
+                or len(volume_uuid) != 32
+                or any(c not in "0123456789abcdefABCDEF" for c in volume_uuid)
+            ):
+                raise ValueError("invalid asset volume UUID")
+            same_volume = actual.get("volume_uuid") == volume_uuid.lower()
+        else:
+            same_volume = actual["device"] == device
+        if not same_volume or any(
+            actual[k] != asset[k] for k in ("inode", "size", "mtime_ns", "ctime_ns")
+        ):
+            raise ValueError(f"Asset changed; re-adopt: {spec['name']}")
+        selected = Path(data[adoption_key]["directory"]) / spec["name"]
+        if selected.resolve(strict=True) != asset_path:
+            raise ValueError("Selected asset link changed; re-adopt")
+
+
 def check_adoption(data: dict) -> None:
     if data.get("schema") != 1 or data.get("verification") != "full-sha256":
         raise ValueError("Full asset verification is required")
     expected = read_json(ROOT / "profiles/flash-next-assets.json")
     for group in ("target", "draft"):
-        assets = data[group]["assets"]
-        same_len = [
-            spec_files
-            for spec_files in candidate_file_specs(
-                expected, group, include_legacy_draft=True
-            )
-            if len(assets) == len(spec_files)
-        ]
-        if not same_len:
-            raise ValueError("Incomplete adopted asset set")
-        matched_spec = None
-        for spec_files in same_len:
-            if all(
-                asset["sha256"] == spec["sha256"]
-                and _optional_role(asset) == _optional_role(spec)
-                for asset, spec in zip(assets, spec_files, strict=True)
-            ):
-                matched_spec = spec_files
-                break
-        if matched_spec is None:
-            raise ValueError("Asset manifest differs from the pinned profile")
-        for asset, spec in zip(assets, matched_spec, strict=True):
-            asset_path = Path(asset["path"])
-            actual = identity(asset_path)
-            if _optional_role(spec) == "derived_pack":
-                st = os.stat(asset_path, follow_symlinks=False)
-                if (st.st_mode & 0o222) != 0 or st.st_nlink != 1:
-                    raise ValueError(f"Asset changed; re-adopt: {spec['name']}")
-            device = asset["device"]
-            if type(device) is not int or not 0 <= device <= 0x7FFFFFFF:
-                raise ValueError("invalid recorded asset device")
-            if "volume_uuid" in asset:
-                volume_uuid = asset["volume_uuid"]
-                if (
-                    not isinstance(volume_uuid, str)
-                    or len(volume_uuid) != 32
-                    or any(c not in "0123456789abcdefABCDEF" for c in volume_uuid)
-                ):
-                    raise ValueError("invalid asset volume UUID")
-                same_volume = actual.get("volume_uuid") == volume_uuid.lower()
-            else:
-                same_volume = actual["device"] == device
-            if not same_volume or any(
-                actual[k] != asset[k] for k in ("inode", "size", "mtime_ns", "ctime_ns")
-            ):
-                raise ValueError(f"Asset changed; re-adopt: {spec['name']}")
-            selected = Path(data[group]["directory"]) / spec["name"]
-            if selected.resolve(strict=True) != asset_path:
-                raise ValueError("Selected asset link changed; re-adopt")
+        _check_adoption_group(data, expected, group, group, include_legacy_draft=True)
+    if "dflash2_draft" in data:
+        profile_key = dflash2_profile_group_key(expected)
+        if profile_key is None:
+            raise ValueError("flash-next-assets.json missing dflash2_draft")
+        _check_adoption_group(
+            data,
+            expected,
+            "dflash2_draft",
+            profile_key,
+            include_legacy_draft=False,
+        )
 
 
 def port_available(port: int) -> bool:

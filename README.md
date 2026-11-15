@@ -24,22 +24,26 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ## Add the model
 
-Use the pinned base GGUF, pre-built Planar Pack v3 and shared Q8 MTP sidecar from [`san-digital/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF`](https://huggingface.co/san-digital/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF) (see the [model guide](https://tokspur.com/docs/models/)). Adoption verifies every file by SHA-256 and reuses the downloaded pack directly in place with no extra `tokspur pack build` step.
+`tokspur pull` downloads the pinned base GGUF, pre-built Planar Pack v3 and shared Q8 MTP sidecar from [`san-digital/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF`](https://huggingface.co/san-digital/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF), verifies every file by SHA-256 and configures local state with no extra `adopt`, `configure` or `pack build` step (see the [model guide](https://tokspur.com/docs/models/)).
 
 ```sh
-hf download san-digital/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF --local-dir /path/to/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF
-tokspur adopt --target /path/to/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF --draft /path/to/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF
-tokspur configure
+tokspur pull
 tokspur serve --speed-preset
+```
+
+If you already downloaded the repository folder separately with `hf download`, point `serve` directly at that directory:
+
+```sh
+tokspur serve /path/to/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF --speed-preset
 ```
 
 Connect to `http://127.0.0.1:18081/v1` with model `tokspur` and the generated API key.
 
-For faster block-8 speculative decoding across code, `<think>` reasoning and multilingual workloads, pair with the optional drafter [`san-digital/Qwen3.8-Flash-Next-DFlash2`](https://huggingface.co/san-digital/Qwen3.8-Flash-Next-DFlash2):
+For faster block-8 speculative decoding across code, `<think>` reasoning and multilingual workloads, pull the optional drafter [`san-digital/Qwen3.8-Flash-Next-DFlash2`](https://huggingface.co/san-digital/Qwen3.8-Flash-Next-DFlash2):
 
 ```sh
-hf download san-digital/Qwen3.8-Flash-Next-DFlash2 --local-dir /path/to/Qwen3.8-Flash-Next-DFlash2
-tokspur serve --speed-preset --drafter dflash2 --dflash2-dir /path/to/Qwen3.8-Flash-Next-DFlash2 --shared-prefix-cache
+tokspur pull --dflash2
+tokspur serve --speed-preset --drafter dflash2 --shared-prefix-cache
 ```
 
 Add `--dflash2-vocab-gather cjk64k --dflash2-lookup hybrid --ple-ram-resident` when serving multilingual or CJK prompts alongside `<think>` reasoning.

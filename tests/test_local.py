@@ -372,3 +372,32 @@ def test_adoption_variants_and_derived_pack_sealing(sandbox, tmp_path, monkeypat
         dst.write_bytes(src.read_bytes())
     with pytest.raises(ValueError, match="Ambiguous target asset variants"):
         cli.adopt(both_dir, draft_dir)
+
+    # Single-path adoption + optional dflash2_draft verification.
+    unified_dir = tmp_path / "unified"
+    dflash2_dir = tmp_path / "dflash2"
+    (unified_dir / "MTP").mkdir(parents=True)
+    dflash2_dir.mkdir()
+    for name, src in (
+        ("Qwen3.8-Flash-Next-base.gguf", base_gguf),
+        ("Qwen3.8-Flash-Next-Q4_K.tokspur.gguf", pack_gguf),
+    ):
+        dst = unified_dir / name
+        dst.write_bytes(src.read_bytes())
+    uni_mtp = unified_dir / "MTP/mtp.gguf"
+    uni_mtp.write_bytes(draft_file.read_bytes())
+    df_cfg = dflash2_dir / "config.json"
+    df_cfg.write_bytes(b'{"architectures":["DFlash2"]}')
+    profile["draft"]["files"] = [
+        {
+            "name": "MTP/mtp.gguf",
+            "size": uni_mtp.stat().st_size,
+            "sha256": hashlib.sha256(uni_mtp.read_bytes()).hexdigest(),
+        }
+    ]
+    profile["dflash2_draft"] = {"files": [make_spec(df_cfg)]}
+    (profiles_dir / "flash-next-assets.json").write_text(json.dumps(profile))
+    cli.adopt(unified_dir, dflash2_dir=dflash2_dir)
+    uni_receipt = local.read_json(sandbox / ".tokspur/adoption.json")
+    assert "dflash2_draft" in uni_receipt
+    local.check_adoption(uni_receipt)
