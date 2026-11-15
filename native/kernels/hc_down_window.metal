@@ -26,7 +26,7 @@ kernel void graph_hc_down_q8_window(device const uchar* weights [[buffer(0)]], d
     device float* output [[buffer(2)]], constant HcDownWindowArgs& p [[buffer(3)]], device atomic_uint* error [[buffer(7)]],
     uint2 group [[threadgroup_position_in_grid]], ushort subgroup [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]], ushort tid [[thread_index_in_threadgroup]]) {
-    if (p.columns != 10240 || p.rows != 320 || !p.tokens || p.tokens > 512 || p.reserved > 1 ||
+    if (p.columns != 10240 || p.rows != 320 || !p.tokens || p.tokens > 2048 || p.reserved > 1 ||
         p.input_stride_bytes < 40960 || p.output_stride_bytes < 1280 || p.input_stride_bytes % 4 || p.output_stride_bytes % 4) {
         if (!tid) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
         return;

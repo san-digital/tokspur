@@ -49,6 +49,14 @@ constexpr std::array immutable{"native_mtp_protocol", "native_mtp_depth", "nativ
     "checkpoint_host_bytes", "checkpoint_store_host_bytes", "checkpoint_gpu_bytes", "native_limit_bytes", "mapped_weight_region_limit_bytes",
     "capture_resource_bytes", "capture_binding_aliases", "capture_binding_alias_span_bytes", "capture_binding_alias_resource_bytes",
     "live_captures", "profile_counter_payload_bytes", "verification_max_tokens", "verification_head_many", "verification8_branch_reuse"};
+uint64_t ready_context_limit(const Json& ready) {
+    if (ready.kind() != Json::Kind::object) return 65536;
+    const auto* field = ready.find("context_length");
+    if (!field) return 65536;
+    const auto ctx = field->unsigned_integer();
+    need(ctx == 65536 || ctx == 131072, "MTP context length bound");
+    return ctx;
+}
 void final_logits_state(const Json& value, bool available) {
     need(get(value, "logits_available").boolean() == available, "MTP logits readiness differs");
     const auto& hash = get(value, "hc_exact_final_logit_sha256"); const auto& top = get(value, "final_logit_top8");
@@ -700,8 +708,9 @@ MtpWireReply::MtpWireReply(const Json& ready, const Json& previous, const Json& 
             "MTP reset sampling policy bound");
         static_cast<void>(integer(job_, "seed"));
     }
+    const auto context_limit = ready_context_limit(ready_);
     const auto before = event == "ready" ? 0 : integer(previous_, "committed_prefix");
-    need(before <= 65536, "MTP previous context bound"); base_ = position_ = reset_ ? 0 : uint32_t(before);
+    need(before <= context_limit, "MTP previous context bound"); base_ = position_ = reset_ ? 0 : uint32_t(before);
     const uint32_t pending_overflow = (generation_.v2 && !generation_.begin) ? generation_.pending : 0;
     if (pending_overflow) {
         need(pending_overflow <= (depth_ == 7 ? 7u : depth_) && pending_overflow <= position_, "invalid MTP pending overflow bound");
@@ -709,7 +718,7 @@ MtpWireReply::MtpWireReply(const Json& ready, const Json& previous, const Json& 
         pending_tokens_ = pending_overflow;
         round_end_ = base_;
     }
-    need(uint64_t(base_) + inputs_ + maximum_ <= 65536, "MTP packet exceeds context reservation");
+    need(uint64_t(base_) + inputs_ + maximum_ <= context_limit, "MTP packet exceeds context reservation");
     resync_ = resync; need(!resync_ || (reset_ && inputs_), "MTP counter resync must be a cold input reset");
     if (!reset_) {
         need(get(get(previous_, "sampling"), "valid").boolean() && integer(get(previous_, "sampling"), "entropy_prefix") == base_,
@@ -762,9 +771,16 @@ void MtpWireReply::event(const Json& value) {
                 "pending_anchor", "round_wall_ms", "timings_qualified"});
             need(proposals >= 1 && proposals <= depth_, "variable-depth round omitted actual proposal count");
         } else if (depth_ == 7) {
-            keys(value, {"event", "base", "committed_prefix", "count", "accepted", "proposed", "draft_wall_ms", "draft_gpu_ms", "verification_wall_ms",
-                "verification_gpu_ms", "recovery_wall_ms", "recovery_gpu_ms", "materialization_wall_ms", "lookahead_anchor", "used_carried_anchor",
-                "pending_anchor", "round_wall_ms", "timings_qualified"});
+            if (value.find("head_calls") != nullptr || value.find("prime_extra") != nullptr) {
+                keys(value, {"event", "base", "committed_prefix", "count", "accepted", "proposed", "head_calls", "prime_extra",
+                    "draft_wall_ms", "draft_gpu_ms", "verification_wall_ms",
+                    "verification_gpu_ms", "recovery_wall_ms", "recovery_gpu_ms", "materialization_wall_ms", "lookahead_anchor", "used_carried_anchor",
+                    "pending_anchor", "round_wall_ms", "timings_qualified"});
+            } else {
+                keys(value, {"event", "base", "committed_prefix", "count", "accepted", "proposed", "draft_wall_ms", "draft_gpu_ms", "verification_wall_ms",
+                    "verification_gpu_ms", "recovery_wall_ms", "recovery_gpu_ms", "materialization_wall_ms", "lookahead_anchor", "used_carried_anchor",
+                    "pending_anchor", "round_wall_ms", "timings_qualified"});
+            }
             need(proposals >= 1 && proposals <= depth_, "variable-depth round omitted actual proposal count");
         } else {
         keys(value, {"event", "base", "committed_prefix", "count", "accepted", "draft_wall_ms", "draft_gpu_ms", "verification_wall_ms",
@@ -773,10 +789,11 @@ void MtpWireReply::event(const Json& value) {
         }
         const bool has_head_calls = value.find("head_calls") != nullptr;
         const bool has_prime_extra = value.find("prime_extra") != nullptr;
-        need(has_head_calls == has_prime_extra && (!has_head_calls || depth_ == 2 || depth_ == 3), "MTP round lookup-bypass accounting incomplete");
+        need(has_head_calls == has_prime_extra && (!has_head_calls || depth_ == 2 || depth_ == 3 || depth_ == 7), "MTP round lookup-bypass accounting incomplete");
         const uint32_t round_head_calls = has_head_calls ? uint32_t(integer(value, "head_calls")) : proposals;
         const uint32_t round_prime_extra = has_prime_extra ? uint32_t(integer(value, "prime_extra")) : 0u;
-        need((round_head_calls == proposals && round_prime_extra == 0) || (round_head_calls == 0 && round_prime_extra == 1),
+        const uint32_t expected_bypass_prime_extra = depth_ == 7 ? 0u : 1u;
+        need((round_head_calls == proposals && round_prime_extra == 0) || (round_head_calls == 0 && round_prime_extra == expected_bypass_prime_extra),
             "MTP round head/prime bypass accounting invalid");
         const auto count = integer(value, "count"), accepted = integer(value, "accepted");
         const bool count_valid = generation_.v2 ? (count_ < maximum_) : (count <= maximum_ - count_);

@@ -647,7 +647,7 @@ bool verify_nax_qsa_batch_supported(QsaShape a) {
         a.head_width && a.head_width <= 256 && a.index_heads && a.index_heads <= 8 &&
         a.index_width && a.index_width <= 256 && a.rotary_width && a.rotary_width % 2 == 0 &&
         a.rotary_width <= std::min(a.head_width, a.index_width) &&
-        qsa_block_capacity(a) <= 16384 && qsa_block_budget(a) && qsa_block_budget(a) <= 512;
+        qsa_block_capacity(a) <= 32768 && qsa_block_budget(a) && qsa_block_budget(a) <= 512;
 #else
     (void)a;
     return false;

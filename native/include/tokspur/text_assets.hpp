@@ -3,5 +3,5 @@
 
 namespace tokspur::text_assets {
 inline constexpr char tokenizer_sha256[] = "8e852142d8ab38bb7678f650bd504ba28c29d9c6357e6ed762bebdbd474689eb";
-inline constexpr char template_sha256[] = "12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce";
+inline constexpr char template_sha256[] = "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041";
 }

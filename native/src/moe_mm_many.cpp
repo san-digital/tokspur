@@ -114,12 +114,23 @@ uint64_t moe_mm_many_dispatches(const MetalGraph& g,const MoeWeights& w,MoeShape
     }
 #endif
     uint64_t router=uint64_t(n)*g.gemv_dispatches(w.router.encoding,s.channels,s.experts);
-#ifdef TOKSPUR_PRIVATE_MOE_ROUTER_F32_BATCH
-    if(g.moe_router_f32_batch_enabled() && w.router.encoding==0 && s.channels==2560 && s.experts==512 && n>1)router=1;
-#endif
     const uint32_t max_batch_rows = grouped_nax ? 2048u : 512u;
+    bool router_batched = false;
+#ifdef TOKSPUR_PRIVATE_MOE_ROUTER_F32_BATCH
+    router_batched = g.moe_router_f32_batch_enabled() && w.router.encoding==0 && s.channels==2560 && s.experts==512 && n>1 && n<=512;
+    if(router_batched)router=1;
+#endif
+    if (!router_batched && g.prefill_batch_router_f32() && w.router.encoding == 0 &&
+        s.channels >= 32 && s.channels <= 65536 && (s.channels % 32 == 0) &&
+        s.experts > 64 && s.experts <= 4096 && n >= 2 && n <= max_batch_rows) {
+        router = 1;
+    }
     const uint64_t route_dispatches = (g.prefill_batch_top10() && s.experts <= 512 && n >= 2 && n <= max_batch_rows) ? 1ull : uint64_t(n);
-    const uint64_t shared_router_dispatches = uint64_t(n) * g.gemv_dispatches(w.shared_router.encoding, s.channels, 1);
+    const bool use_batch_shared_router = g.prefill_batch_shared_router_f32() && w.shared_router.encoding == 0 &&
+        s.channels >= 32 && s.channels <= 2560 && (s.channels % 32 == 0) && n >= 2 && n <= max_batch_rows;
+    const uint64_t shared_router_dispatches = use_batch_shared_router
+        ? 1ull
+        : uint64_t(n) * g.gemv_dispatches(w.shared_router.encoding, s.channels, 1);
     const uint64_t mixture_dispatches = (g.prefill_batch_mixture() && s.channels <= 2560 && n >= 2 && n <= max_batch_rows) ? 1ull : uint64_t(n);
     return fixed + router + route_dispatches + shared_router_dispatches + mixture_dispatches;
 }
@@ -174,7 +185,15 @@ void encode_moe_mm_many(MetalGraph& g,const MoeWeights& w,const MoeMmManyScratch
                 TOKSPUR_OPERATOR_CHECKPOINT(g,"moe","router_f32_batched",{n,shape.channels,shape.experts,shape.selected});}
 #endif
             // Rows are independent: every projection, then every top-k, so a concurrent batch needs one barrier here instead of one per row.
-            if(!router_batched)g.gemv_rows(0,w.router.view,input,rows(active(g,s.rows.logits,shape.experts,n),n,shape.experts));
+            const bool use_batch_router = !router_batched && g.prefill_batch_router_f32() && w.router.encoding == 0 &&
+                shape.channels >= 32 && shape.channels <= 65536 && (shape.channels % 32 == 0) &&
+                shape.experts > 64 && shape.experts <= 4096 && n >= 2 && n <= max_batch_rows;
+            if (use_batch_router) {
+                g.prefill_router_f32_batch(w.router.view, input, rows(active(g, s.rows.logits, shape.experts, n), n, shape.experts));
+                TOKSPUR_OPERATOR_CHECKPOINT(g, "moe", "router_f32_exact_batched", {n, shape.channels, shape.experts, shape.selected});
+            } else if (!router_batched) {
+                g.gemv_rows(0, w.router.view, input, rows(active(g, s.rows.logits, shape.experts, n), n, shape.experts));
+            }
             if (use_batch_top10) {
                 g.prefill_route_batch(active(g, s.rows.logits, shape.experts, n), active(g, s.rows.indices, shape.selected, n), active(g, s.rows.weights, shape.selected, n), shape.experts, shape.selected, n, mode, normalise);
                 TOKSPUR_OPERATOR_CHECKPOINT(g, "moe", "topk_batched_after_scalar_router", {n, shape.experts, shape.selected, 0});
@@ -270,7 +289,13 @@ void encode_moe_mm_many(MetalGraph& g,const MoeWeights& w,const MoeMmManyScratch
         {
             const uint32_t max_batch_rows = grouped_nax ? 2048u : 512u;
             const bool use_batch_mixture = g.prefill_batch_mixture() && shape.channels <= 2560 && n >= 2 && n <= max_batch_rows;
-            g.gemv_rows(0,w.shared_router.view,input,rows(active(g,s.rows.shared_logit,1,n),n,1));
+            const bool use_batch_shared_router = g.prefill_batch_shared_router_f32() && w.shared_router.encoding == 0 &&
+                shape.channels >= 32 && shape.channels <= 2560 && (shape.channels % 32 == 0) && n >= 2 && n <= max_batch_rows;
+            if (use_batch_shared_router) {
+                g.prefill_shared_router_f32_batch(w.shared_router.view, input, active(g, s.rows.shared_logit, 1, n));
+            } else {
+                g.gemv_rows(0, w.shared_router.view, input, rows(active(g, s.rows.shared_logit, 1, n), n, 1));
+            }
             if (use_batch_mixture) {
                 g.prefill_mixture_batch(active(g, s.rows.down, uint64_t(shape.selected) * shape.channels, n), active(g, s.rows.weights, shape.selected, n), active(g, s.rows.shared_down, shape.channels, n), active(g, s.rows.shared_logit, 1, n), output, shape.selected);
                 TOKSPUR_OPERATOR_CHECKPOINT(g, "moe", "shared_router_f32_and_mixture_batched", {n, shape.channels, shape.selected, 0});

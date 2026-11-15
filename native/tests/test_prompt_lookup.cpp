@@ -426,6 +426,7 @@ void invalid_configuration() {
     };
     admit([](LookupConfig& c) { c.match_tokens = 1; c.history_tokens = 2; });
     admit([](LookupConfig& c) { c.match_tokens = maximum_match_tokens; c.history_tokens = maximum_match_tokens + 1; });
+    admit([](LookupConfig& c) { c.history_tokens = maximum_history_tokens; });
     admit([](LookupConfig& c) { c.proposal_tokens = 1; });
     admit([](LookupConfig& c) { c.proposal_tokens = maximum_proposal_tokens; });
     admit([](LookupConfig& c) { c.token_limit = 2; });
@@ -573,7 +574,7 @@ void randomized(uint64_t seed, const LookupConfig& config, size_t operations) {
 void capacity_boundaries() {
     // Full-size history with the default widths: exact fill, first eviction,
     // thousands of evictions, truncation above and below the window start.
-    const LookupConfig config = configure(16, 7, maximum_history_tokens);
+    const LookupConfig config = configure(16, 7, 65536);
     Harness harness(config);
     std::mt19937_64 engine(0x6361706163697479ull);
     Tokens stream;
@@ -620,6 +621,20 @@ void capacity_boundaries() {
     static_cast<void>(harness.reset());
     static_cast<void>(harness.append(slice(0, 5000)));
     require(harness.lookup().charged_bytes() == prompt_lookup_bytes(config), "capacity exercise allocated memory");
+
+    // 128K opt-in maximum_history_tokens retains >64K tokens without eviction, then evicts past 131072.
+    const LookupConfig config128k = configure(16, 7, maximum_history_tokens);
+    PromptLookup lookup128k(config128k);
+    Tokens chunk128k(131072);
+    for (size_t i = 0; i < chunk128k.size(); ++i) chunk128k[i] = uint32_t(i % 977);
+    lookup128k.append(1, 0, chunk128k);
+    require(lookup128k.retained_tokens() == 131072 && lookup128k.retained_begin() == 0 &&
+                lookup128k.ledger().evicted_grams == 0,
+            "128K capacity without eviction");
+    lookup128k.append(1, 131072, Tokens{42});
+    require(lookup128k.retained_tokens() == 131072 && lookup128k.retained_begin() == 1 &&
+                lookup128k.ledger().evicted_grams == 1,
+            "128K first eviction");
 }
 } // namespace
 

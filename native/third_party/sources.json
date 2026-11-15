@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "reviewed_date": "2026-11-07",
+  "reviewed_date": "2026-11-12",
   "scope": "Source credits, licence notices and hashes for the distributed runtime.",
   "projects": [
     {
@@ -41,6 +41,36 @@
           "sha256": "757ffa2fabd995bebe2b916412a387949dcc71f1263577f9a8a88bfd20214189",
           "bytes": 23599,
           "lines": 603
+        },
+        {
+          "path": "conversion/base.py",
+          "sha256": "727d7889676e2d7ea0e7f86991f5cfb6e00530fe386bc84ebf34248f464dea4f",
+          "bytes": 163672,
+          "lines": 3162
+        },
+        {
+          "path": "conversion/qwen.py",
+          "sha256": "b1029af5e7b41a37f4b6f07aebb2ce207fed6a77e493c39ad35f524786a7422e",
+          "bytes": 49985,
+          "lines": 1046
+        },
+        {
+          "path": "conversion/qwen4exp.py",
+          "sha256": "6ca34bef01b546facde449633303283c9febff0151bf8dda575e86d9e3af82ed",
+          "bytes": 12439,
+          "lines": 266
+        },
+        {
+          "path": "ggml/src/ggml-common.h",
+          "sha256": "0061131b615c5721fc88a78feeb22c1f8c450f1c2646a317d80796a653bf595c",
+          "bytes": 135161,
+          "lines": 1911
+        },
+        {
+          "path": "ggml/src/ggml-quants.c",
+          "sha256": "5574a2dccf7c07e75b143733e04a5412d3d8c819e7945f5217a7b83a2b2ff8ab",
+          "bytes": 226847,
+          "lines": 5639
         }
       ]
     },
@@ -294,7 +324,7 @@
     },
     {
       "path": "native/kernels/nax_prefill.metal",
-      "sha256": "ba77dc37fc0e1635212513308f4bc15fc5ee3f4c406ae11be394f2819f310957",
+      "sha256": "af8551d80a68cd78293b7016aea248cccd61c475ac2f0e83b843b6836d3a4681",
       "sources": [
         "llama.cpp",
         "Splash"
@@ -305,7 +335,7 @@
         "shared/gguf_float.metal three-part BF16 weight split and plane matmul"
       ],
       "status": "recorded-adaptation",
-      "lines": 7649
+      "lines": 7699
     },
     {
       "path": "native/kernels/raw_decode.metal",
@@ -369,7 +399,7 @@
     },
     {
       "path": "native/kernels/dflash2.metal",
-      "sha256": "a59637856c5a82c97486779382cbc675ca28ef396bfc9bbabd5bf790fdf1f367",
+      "sha256": "ed65730587c439a3403f80879c8e51ff61a257aaf7c161b28121e5105e6b4590",
       "sources": [
         "Splash"
       ],
@@ -377,11 +407,11 @@
         "draft convolution, ring attention, candidate selection"
       ],
       "status": "recorded-adaptation",
-      "lines": 1467
+      "lines": 1518
     },
     {
       "path": "native/src/dflash2_drafter.cpp",
-      "sha256": "8eb7ca64d73c1bfde36b4e4dd638b2b5f700198d626e934f462dc2f8f12091a7",
+      "sha256": "55379ed49b0e55a2cb00059ac1146f721d8e4e9424d048ac44908abe5e206e3c",
       "sources": [
         "Splash"
       ],
@@ -389,11 +419,11 @@
         "DFlash2VerifyBudget"
       ],
       "status": "recorded-adaptation",
-      "lines": 1184
+      "lines": 1230
     },
     {
       "path": "native/include/tokspur/dflash2_drafter.hpp",
-      "sha256": "5b19fe4a88008797b334cf6e9058b0202900a31bb3ec2a43169b38ed4973fdf6",
+      "sha256": "6b2bf4beccc47c3c23a08d94978c12b153b1323b316362d6129a2ba72c2de596",
       "sources": [
         "Splash"
       ],
@@ -401,7 +431,7 @@
         "DFlash2VerifyBudget"
       ],
       "status": "recorded-adaptation",
-      "lines": 256
+      "lines": 272
     },
     {
       "path": "native/kernels/gemv.metal",
@@ -446,12 +476,101 @@
       "lines": 365
     }
   ],
+  "rust_files": [
+    {
+      "path": "rust/crates/tokspur-quant/src/blocks.rs",
+      "sha256": "66308879c520329be17c880fc42af7ab7e29f80bd638fe78b214254eba9bce49",
+      "sources": [
+        "llama.cpp"
+      ],
+      "routines": [
+        "quantize_row_q8_0_ref, quantize_row_q5_1_ref and their dequantisers",
+        "quantize_row_q5_1_impl with make_qkx3_quants, used without an importance matrix"
+      ],
+      "status": "recorded-adaptation",
+      "lines": 379
+    },
+    {
+      "path": "rust/crates/tokspur-quant/src/iq4nl.rs",
+      "sha256": "0ff6dd987324eeade9aa01191fbdbad8d381d9730ad6460bc66f6451c92c5c27",
+      "sources": [
+        "llama.cpp"
+      ],
+      "routines": [
+        "best_index_int8, quantize_row_iq4_nl_impl without an importance matrix, dequantize_row_iq4_nl",
+        "kvalues_iq4nl table"
+      ],
+      "status": "recorded-adaptation",
+      "lines": 176
+    },
+    {
+      "path": "rust/crates/tokspur-quant/src/kquant.rs",
+      "sha256": "8afe0621b630b70da0ef399852e0ca2a32e5b9486dc7f7a68d3891bbfb8e585f",
+      "sources": [
+        "llama.cpp"
+      ],
+      "routines": [
+        "nearest_int, make_qkx2_quants, get_scale_min_k4",
+        "quantize_row_q4_K_ref, quantize_row_q5_K_ref and their dequantisers"
+      ],
+      "status": "recorded-adaptation",
+      "lines": 769
+    },
+    {
+      "path": "rust/crates/tokspur-quant/src/layout.rs",
+      "sha256": "77d997e53521570cfd68ac079e1a2893c56ca7927de66716a087de7fb2efeb13",
+      "sources": [
+        "llama.cpp"
+      ],
+      "routines": [
+        "Flash-Next tensor mapping, value-head reordering and norm conventions from conversion/qwen4exp.py and conversion/qwen.py"
+      ],
+      "status": "recorded-adaptation",
+      "lines": 859
+    },
+    {
+      "path": "rust/crates/tokspur-quant/src/lib.rs",
+      "sha256": "6407c8139b553b7eedfbd405da2a9e63e53104fb02aa92a235144a6cf8970c4a",
+      "sources": [
+        "llama.cpp"
+      ],
+      "routines": [
+        "Dispatch to the adapted block encodings"
+      ],
+      "status": "recorded-adaptation",
+      "lines": 339
+    },
+    {
+      "path": "rust/crates/tokspur-quant/src/model.rs",
+      "sha256": "0fef08388903cd4bdff6866637236c895c3b12234c0788327e2bf7633409fe09",
+      "sources": [
+        "llama.cpp"
+      ],
+      "routines": [
+        "GGUF metadata records and their order as the converter writes them"
+      ],
+      "status": "recorded-adaptation",
+      "lines": 490
+    },
+    {
+      "path": "rust/crates/tokspur-quant/src/tokenizer.rs",
+      "sha256": "1f484ff24af67c3ff835f62f694e93ddcb86dc18a6088973470f9915a980dc35",
+      "sources": [
+        "llama.cpp"
+      ],
+      "routines": [
+        "Token kinds for byte-pair vocabularies from get_vocab_base and does_token_look_special"
+      ],
+      "status": "recorded-adaptation",
+      "lines": 200
+    }
+  ],
   "unresolved": [],
   "model_licence": {
     "file": "third_party/model-licences/Qwen3.8-Flash-Next/LICENSE",
     "sha256": "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08",
     "source": "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/raw/34567a4712bc9766c4449e2e98e4468bfa24d915/LICENSE",
-    "asset_manifest_sha256": "c1d1163ddf50f667e73054d34314acd073c5062f1461e59f5f71a7cef8aa65d8",
+    "asset_manifest_sha256": "c7bd896d358a260ce798e6e4bfff4677cc090200b6f28d019d54f91792e8c40c",
     "review_status": "runtime-only",
     "distribution_scope": {
       "weights": false,

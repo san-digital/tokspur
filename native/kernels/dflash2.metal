@@ -228,33 +228,46 @@ kernel void dflash2_conv_f32(device const float* input [[buffer(0)]], device con
         if (!idx) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
         return;
     }
-    const uint total = a.rows * a.hidden;
-    if (idx >= total) return;
-    const uint row = idx / a.hidden, ch = idx % a.hidden;
-    const uint conv_groups = a.hidden / a.group_size;
+    const uint quads_per_row = a.hidden >> 2u;
+    const uint total_quads = a.rows * quads_per_row;
+    if (idx >= total_quads) return;
+    const uint row = idx / quads_per_row;
+    const uint q_in_row = idx % quads_per_row;
+    const uint ch = q_in_row << 2u;
+    const uint conv_groups = a.hidden >> 4u;
     const uint dyn_width = 4u * conv_groups;
-    const uint cg = ch / a.group_size;
+    const uint cg = q_in_row >> 2u;
     const uint kind = a.finish ? 1u : 0u;
-    uint bad = 0u;
-    const float x0 = input[idx];
-    const float b0 = base[(kind * 2u) * a.hidden + ch];
+
+    const float4 x0 = float4(reinterpret_cast<device const packed_float4*>(input)[idx]);
+    const float4 b0 = float4(*reinterpret_cast<device const packed_float4*>(base + (kind * 2u) * a.hidden + ch));
     const float d0 = dynamic[row * dyn_width + (kind * 2u) * conv_groups + cg];
-    bad |= dflash2_detail::nonfinite_bit(x0) | dflash2_detail::nonfinite_bit(b0) | dflash2_detail::nonfinite_bit(d0);
-    float val = x0 * (b0 + d0);
+    uint bad = dflash2_detail::nonfinite_bit(d0) |
+               dflash2_detail::nonfinite_bit(x0.x) | dflash2_detail::nonfinite_bit(x0.y) |
+               dflash2_detail::nonfinite_bit(x0.z) | dflash2_detail::nonfinite_bit(x0.w) |
+               dflash2_detail::nonfinite_bit(b0.x) | dflash2_detail::nonfinite_bit(b0.y) |
+               dflash2_detail::nonfinite_bit(b0.z) | dflash2_detail::nonfinite_bit(b0.w);
+    float4 val = x0 * (b0 + d0);
     if (row > 0u) {
-        const float x1 = input[(row - 1u) * a.hidden + ch];
-        const float b1 = base[(kind * 2u + 1u) * a.hidden + ch];
+        const float4 x1 = float4(*reinterpret_cast<device const packed_float4*>(input + ulong(row - 1u) * a.hidden + ch));
+        const float4 b1 = float4(*reinterpret_cast<device const packed_float4*>(base + (kind * 2u + 1u) * a.hidden + ch));
         const float d1 = dynamic[row * dyn_width + (kind * 2u + 1u) * conv_groups + cg];
-        bad |= dflash2_detail::nonfinite_bit(x1) | dflash2_detail::nonfinite_bit(b1) | dflash2_detail::nonfinite_bit(d1);
+        bad |= dflash2_detail::nonfinite_bit(d1) |
+               dflash2_detail::nonfinite_bit(x1.x) | dflash2_detail::nonfinite_bit(x1.y) |
+               dflash2_detail::nonfinite_bit(x1.z) | dflash2_detail::nonfinite_bit(x1.w) |
+               dflash2_detail::nonfinite_bit(b1.x) | dflash2_detail::nonfinite_bit(b1.y) |
+               dflash2_detail::nonfinite_bit(b1.z) | dflash2_detail::nonfinite_bit(b1.w);
         val += x1 * (b1 + d1);
     }
     if (a.finish) {
-        const float res = residual[idx];
-        bad |= dflash2_detail::nonfinite_bit(res);
+        const float4 res = float4(reinterpret_cast<device const packed_float4*>(residual)[idx]);
+        bad |= dflash2_detail::nonfinite_bit(res.x) | dflash2_detail::nonfinite_bit(res.y) |
+               dflash2_detail::nonfinite_bit(res.z) | dflash2_detail::nonfinite_bit(res.w);
         val += res;
     }
-    bad |= dflash2_detail::nonfinite_bit(val);
-    output[idx] = val;
+    bad |= dflash2_detail::nonfinite_bit(val.x) | dflash2_detail::nonfinite_bit(val.y) |
+           dflash2_detail::nonfinite_bit(val.z) | dflash2_detail::nonfinite_bit(val.w);
+    reinterpret_cast<device packed_float4*>(output)[idx] = val;
     if (bad) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
 }
 
@@ -560,9 +573,7 @@ kernel void dflash2_attention_reduce(device const float* partials_all [[buffer(0
     for (uint s = 0u; s < Splits; ++s) maximum = max(maximum, partials[ulong(s) * Stride + M * D + m_row]);
 
     float total = 0.0f;
-    float acc[Chunk];
-    #pragma unroll
-    for (uint i = 0u; i < Chunk; ++i) acc[i] = 0.0f;
+    float4 acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
 
     if (maximum != -INFINITY) {
         for (uint s = 0u; s < Splits; ++s) {
@@ -571,23 +582,35 @@ kernel void dflash2_attention_reduce(device const float* partials_all [[buffer(0
             if (split_max == -INFINITY) continue;
             const float scale = exp(split_max - maximum);
             total += scale * p[M * D + M + m_row];
-            #pragma unroll
-            for (uint i = 0u; i < Chunk; ++i) acc[i] += scale * p[m_row * D + dim + i];
+            device const packed_float4* pv4 = reinterpret_cast<device const packed_float4*>(p + m_row * D + dim);
+            acc0 += scale * float4(pv4[0]);
+            acc1 += scale * float4(pv4[1]);
+            acc2 += scale * float4(pv4[2]);
+            acc3 += scale * float4(pv4[3]);
         }
     }
 
     const uint local_q = m_row / Rows;
     const uint prop_row = m_row % Rows;
     const uint global_q = kv_head * 4u + local_q;
-    device float* dst = output + (ulong(prop_row) * QHeads + global_q) * D + dim;
-    uint bad = 0u;
+    device packed_float4* dst4 = reinterpret_cast<device packed_float4*>(output + (ulong(prop_row) * QHeads + global_q) * D + dim);
     const float inv_total = total > 0.0f ? (1.0f / total) : 0.0f;
-    #pragma unroll
-    for (uint i = 0u; i < Chunk; ++i) {
-        const float val = acc[i] * inv_total;
-        bad |= dflash2_detail::nonfinite_bit(val);
-        dst[i] = val;
-    }
+    const float4 y0 = acc0 * inv_total;
+    const float4 y1 = acc1 * inv_total;
+    const float4 y2 = acc2 * inv_total;
+    const float4 y3 = acc3 * inv_total;
+    uint bad = dflash2_detail::nonfinite_bit(y0.x) | dflash2_detail::nonfinite_bit(y0.y) |
+               dflash2_detail::nonfinite_bit(y0.z) | dflash2_detail::nonfinite_bit(y0.w) |
+               dflash2_detail::nonfinite_bit(y1.x) | dflash2_detail::nonfinite_bit(y1.y) |
+               dflash2_detail::nonfinite_bit(y1.z) | dflash2_detail::nonfinite_bit(y1.w) |
+               dflash2_detail::nonfinite_bit(y2.x) | dflash2_detail::nonfinite_bit(y2.y) |
+               dflash2_detail::nonfinite_bit(y2.z) | dflash2_detail::nonfinite_bit(y2.w) |
+               dflash2_detail::nonfinite_bit(y3.x) | dflash2_detail::nonfinite_bit(y3.y) |
+               dflash2_detail::nonfinite_bit(y3.z) | dflash2_detail::nonfinite_bit(y3.w);
+    dst4[0] = y0;
+    dst4[1] = y1;
+    dst4[2] = y2;
+    dst4[3] = y3;
     if (bad) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
 }
 
@@ -704,6 +727,25 @@ kernel void dflash2_top16_sharded(device const float* logits [[buffer(0)]],
         }
     }
     if (bad) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
+}
+
+// Gathered draft vocabulary only: rewrites each shard's top-16 slice row indices as token IDs before the selector reads them. reserved carries the full vocabulary. The table is strictly ascending, so equal logits keep their order; empty entries stay 0xffffffff.
+kernel void dflash2_remap_top16(device uint* partial_ids [[buffer(0)]], device const uint* row_token_ids [[buffer(1)]],
+    constant dflash2_detail::DFlash2SelectArgs& a [[buffer(2)]], device atomic_uint* error [[buffer(7)]],
+    uint index [[thread_position_in_grid]]) {
+    if (!a.positions || a.positions > 7u || !a.vocabulary || a.reserved < a.vocabulary) {
+        if (!index) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
+        return;
+    }
+    if (index >= a.positions * 8u * 16u) return;
+    const uint row = partial_ids[index];
+    if (row == 0xffffffffu) return;
+    const uint token = row < a.vocabulary ? row_token_ids[row] : 0xffffffffu;
+    if (token >= a.reserved) {
+        atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
+        return;
+    }
+    partial_ids[index] = token;
 }
 
 // Writes packed selector_out layout: uint candidates[7*16], float unary[7*16], float edges[7*16*16].
@@ -1408,32 +1450,54 @@ kernel void dflash2_conv_finish_rms_f32(
     }
     if (row >= a.rows) return;
     constexpr uint Hidden = 2560u, GroupSize = 16u, ConvGroups = Hidden / GroupSize, DynWidth = 4u * ConvGroups;
-    threadgroup float row_buf[Hidden];
+    alignas(16) threadgroup float row_buf[Hidden];
     threadgroup float s_inv;
     threadgroup uint s_bad;
     if (!tid) s_bad = 0u;
     uint bad = 0u;
     const ulong row_off = ulong(row) * Hidden;
-    for (uint ch = tid; ch < Hidden; ch += 128u) {
-        const uint cg = ch / GroupSize;
-        const float x0 = input[row_off + ch];
-        const float b0 = base[2u * Hidden + ch];
+    device const packed_float4* in4_cur = reinterpret_cast<device const packed_float4*>(input + row_off);
+    device const packed_float4* in4_prev = row > 0u ? reinterpret_cast<device const packed_float4*>(input + ulong(row - 1u) * Hidden) : nullptr;
+    device const packed_float4* base4_0 = reinterpret_cast<device const packed_float4*>(base + 2u * Hidden);
+    device const packed_float4* base4_1 = reinterpret_cast<device const packed_float4*>(base + 3u * Hidden);
+    device const packed_float4* res4 = reinterpret_cast<device const packed_float4*>(residual + row_off);
+    device packed_float4* rout4 = reinterpret_cast<device packed_float4*>(residual_out + row_off);
+    threadgroup packed_float4* rbuf4 = reinterpret_cast<threadgroup packed_float4*>(row_buf);
+
+    float4 rv[5];
+    #pragma unroll
+    for (uint step = 0u; step < 5u; ++step) {
+        const uint q = step * 128u + uint(tid);
+        const uint cg = q >> 2u;
+        const float4 x0 = float4(in4_cur[q]);
+        const float4 b0 = float4(base4_0[q]);
         const float d0 = dynamic[row * DynWidth + 2u * ConvGroups + cg];
-        bad |= dflash2_detail::nonfinite_bit(x0) | dflash2_detail::nonfinite_bit(b0) | dflash2_detail::nonfinite_bit(d0);
-        float val = x0 * (b0 + d0);
+        bad |= dflash2_detail::nonfinite_bit(d0) |
+               dflash2_detail::nonfinite_bit(x0.x) | dflash2_detail::nonfinite_bit(x0.y) |
+               dflash2_detail::nonfinite_bit(x0.z) | dflash2_detail::nonfinite_bit(x0.w) |
+               dflash2_detail::nonfinite_bit(b0.x) | dflash2_detail::nonfinite_bit(b0.y) |
+               dflash2_detail::nonfinite_bit(b0.z) | dflash2_detail::nonfinite_bit(b0.w);
+        float4 val = x0 * (b0 + d0);
         if (row > 0u) {
-            const float x1 = input[(row - 1u) * Hidden + ch];
-            const float b1 = base[3u * Hidden + ch];
+            const float4 x1 = float4(in4_prev[q]);
+            const float4 b1 = float4(base4_1[q]);
             const float d1 = dynamic[row * DynWidth + 3u * ConvGroups + cg];
-            bad |= dflash2_detail::nonfinite_bit(x1) | dflash2_detail::nonfinite_bit(b1) | dflash2_detail::nonfinite_bit(d1);
+            bad |= dflash2_detail::nonfinite_bit(d1) |
+                   dflash2_detail::nonfinite_bit(x1.x) | dflash2_detail::nonfinite_bit(x1.y) |
+                   dflash2_detail::nonfinite_bit(x1.z) | dflash2_detail::nonfinite_bit(x1.w) |
+                   dflash2_detail::nonfinite_bit(b1.x) | dflash2_detail::nonfinite_bit(b1.y) |
+                   dflash2_detail::nonfinite_bit(b1.z) | dflash2_detail::nonfinite_bit(b1.w);
             val += x1 * (b1 + d1);
         }
-        const float res = residual[row_off + ch];
-        bad |= dflash2_detail::nonfinite_bit(res);
+        const float4 res = float4(res4[q]);
+        bad |= dflash2_detail::nonfinite_bit(res.x) | dflash2_detail::nonfinite_bit(res.y) |
+               dflash2_detail::nonfinite_bit(res.z) | dflash2_detail::nonfinite_bit(res.w);
         val += res;
-        bad |= dflash2_detail::nonfinite_bit(val);
-        residual_out[row_off + ch] = val;
-        row_buf[ch] = val;
+        bad |= dflash2_detail::nonfinite_bit(val.x) | dflash2_detail::nonfinite_bit(val.y) |
+               dflash2_detail::nonfinite_bit(val.z) | dflash2_detail::nonfinite_bit(val.w);
+        rout4[q] = val;
+        rbuf4[q] = val;
+        rv[step] = val;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sg == 0u) {
@@ -1455,12 +1519,18 @@ kernel void dflash2_conv_finish_rms_f32(
         bad |= 1u;
     } else {
         const float inv = s_inv;
-        for (uint ch = tid; ch < Hidden; ch += 128u) {
-            const float g = gains[ch];
-            bad |= dflash2_detail::nonfinite_bit(g);
-            const float out_v = (row_buf[ch] * inv) * g;
-            bad |= dflash2_detail::nonfinite_bit(out_v);
-            norm_out[row_off + ch] = out_v;
+        device const packed_float4* gains4 = reinterpret_cast<device const packed_float4*>(gains);
+        device packed_float4* nout4 = reinterpret_cast<device packed_float4*>(norm_out + row_off);
+        #pragma unroll
+        for (uint step = 0u; step < 5u; ++step) {
+            const uint q = step * 128u + uint(tid);
+            const float4 g = float4(gains4[q]);
+            bad |= dflash2_detail::nonfinite_bit(g.x) | dflash2_detail::nonfinite_bit(g.y) |
+                   dflash2_detail::nonfinite_bit(g.z) | dflash2_detail::nonfinite_bit(g.w);
+            const float4 out_v = (rv[step] * inv) * g;
+            bad |= dflash2_detail::nonfinite_bit(out_v.x) | dflash2_detail::nonfinite_bit(out_v.y) |
+                   dflash2_detail::nonfinite_bit(out_v.z) | dflash2_detail::nonfinite_bit(out_v.w);
+            nout4[q] = out_v;
         }
     }
     if (bad) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);

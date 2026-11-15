@@ -22,8 +22,8 @@ struct MtpAnchorPublication {
     std::optional<SampledPathToken> pending;
 };
 
-inline MtpAnchorPublication prepare_mtp_anchor_publication(uint32_t base, const SampledPathDecision& decision) {
-    if (base >= 65536 || decision.identity.prefix != base + 1 || decision.accepted > 1 || !decision.count ||
+inline MtpAnchorPublication prepare_mtp_anchor_publication(uint32_t base, const SampledPathDecision& decision, uint32_t context_limit = 65536) {
+    if ((context_limit != 65536 && context_limit != 131072) || base >= context_limit || decision.identity.prefix != base + 1 || decision.accepted > 1 || !decision.count ||
         decision.count > 2)
         throw FormatError("invalid MTP anchor publication decision");
     const auto& terminal = decision.tokens[decision.count - 1];
@@ -40,14 +40,14 @@ inline MtpAnchorPublication prepare_mtp_anchor_publication(uint32_t base, const 
     if (!std::isfinite(terminal.source_logit) || (!accepted_stop && terminal.accepted_proposal))
         throw FormatError("MTP anchor terminal is not a correction or bonus");
     const uint32_t count = 1 + decision.accepted;
-    if (count > 65536 - base) throw FormatError("MTP anchor consumed prefix exceeds context");
+    if (count > context_limit - base) throw FormatError("MTP anchor consumed prefix exceeds context");
     return {base + count, count, accepted_stop,
         accepted_stop ? std::optional<SampledPathToken>{} : std::optional<SampledPathToken>{terminal}};
 }
 
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP_DEPTH2
-inline MtpAnchorPublication prepare_mtp_anchor_publication2(uint32_t base, const SampledPathDecision& decision) {
-    if (base >= 65536 || decision.identity.prefix != base + 1 ||
+inline MtpAnchorPublication prepare_mtp_anchor_publication2(uint32_t base, const SampledPathDecision& decision, uint32_t context_limit = 65536) {
+    if ((context_limit != 65536 && context_limit != 131072) || base >= context_limit || decision.identity.prefix != base + 1 ||
         decision.active_proposals < 1 || decision.active_proposals > 3 ||
         decision.accepted > decision.active_proposals || !decision.count ||
         decision.count > 1 + decision.active_proposals)
@@ -62,15 +62,15 @@ inline MtpAnchorPublication prepare_mtp_anchor_publication2(uint32_t base, const
             !std::isfinite(token.source_logit)) throw FormatError("depth-two MTP token identity differs");
     }
     const auto count = 1 + decision.accepted;
-    if (count > 65536 - base) throw FormatError("depth-two MTP consumed prefix exceeds context");
+    if (count > context_limit - base) throw FormatError("depth-two MTP consumed prefix exceeds context");
     return {base + count, count, accepted_stop, accepted_stop ? std::optional<SampledPathToken>{} :
         std::optional<SampledPathToken>{decision.tokens[decision.count - 1]}};
 }
 #endif
 
 #ifdef TOKSPUR_PRIVATE_VERIFY_EIGHT
-inline MtpAnchorPublication prepare_mtp_anchor_publication8(uint32_t base, const SampledPathDecision& decision) {
-    if (base >= 65536 || decision.identity.prefix != base + 1 ||
+inline MtpAnchorPublication prepare_mtp_anchor_publication8(uint32_t base, const SampledPathDecision& decision, uint32_t context_limit = 65536) {
+    if ((context_limit != 65536 && context_limit != 131072) || base >= context_limit || decision.identity.prefix != base + 1 ||
         decision.active_proposals < 1 || decision.active_proposals > 7 ||
         decision.accepted > decision.active_proposals || !decision.count ||
         decision.count > 1 + decision.active_proposals)
@@ -85,7 +85,7 @@ inline MtpAnchorPublication prepare_mtp_anchor_publication8(uint32_t base, const
             !std::isfinite(token.source_logit)) throw FormatError("bounded-eight token identity differs");
     }
     const auto count = 1 + decision.accepted;
-    if (count > 65536 - base) throw FormatError("bounded-eight consumed prefix exceeds context");
+    if (count > context_limit - base) throw FormatError("bounded-eight consumed prefix exceeds context");
     return {base + count, count, accepted_stop, accepted_stop ? std::optional<SampledPathToken>{} :
         std::optional<SampledPathToken>{decision.tokens[decision.count - 1]}};
 }

@@ -40,6 +40,7 @@ struct AdmittedChat {
     std::vector<Json> schemas;
     std::vector<std::string> names;
     std::optional<uint64_t> seed;
+    std::optional<uint32_t> thinking_budget;
     std::string tool_choice;
     bool stream = false, thinking = true, include_usage = false, named_tool_choice = false, single_tool_call = false;
     uint32_t maximum_tokens = 8192;
@@ -47,7 +48,8 @@ struct AdmittedChat {
 
 AdmittedChat admit_chat(const Json& request, std::string_view alias,
                         ToolEnumValidation = ToolEnumValidation::strict,
-                        ToolArgValidation = ToolArgValidation::strict);
+                        ToolArgValidation = ToolArgValidation::strict,
+                        uint32_t context_length = 65536);
 // CPU-only startup admission for the fixed owned target policy. Every field is
 // mandatory and type-checked; absent metadata never implies the direct path.
 void validate_worker_ready(const Json& ready, std::string_view stack_execution = "direct",
@@ -82,6 +84,7 @@ public:
                           , std::optional<uint32_t> mtp_first_output_packet = std::nullopt
 #endif
                           , ToolArgValidation tool_args = ToolArgValidation::strict
+                          , uint32_t context_length = 65536
                           );
     Json complete(const Json& request, std::string_view response_id,
                   const ServeTarget& target, const ServeSink& sink);
@@ -93,6 +96,7 @@ private:
     std::string stack_execution_; // Immutable startup choice, never a request field.
     const ToolEnumValidation tool_enums_; // Enum membership only; executor owns allowlist.
     const ToolArgValidation tool_args_; // Schema property/type/required enforcement or executor deferral.
+    const uint32_t context_length_;
 #ifdef TOKSPUR_PRIVATE_LANE_LAYOUT
     Json weight_lanes_identity_; // Five identity fields plus optional worker pair; no paths or raw READY.
 #endif

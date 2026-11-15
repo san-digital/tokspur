@@ -9,7 +9,7 @@ namespace tokspur {
 // This is a closed catalogue/ownership component, not a learned draft graph.
 // Asset digests identify the prospective assets; no function here computes or
 // verifies a full-weight digest, and none provides a runnable capability.
-inline constexpr std::string_view mtp_shared_q8_revision = "766911a6b7369840a91dbcd95f9f997acaab6cd6";
+inline constexpr std::string_view mtp_shared_q8_revision = "34567a4712bc9766c4449e2e98e4468bfa24d915";
 inline constexpr std::string_view mtp_shared_q8_sha256 = "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6";
 inline constexpr uint64_t mtp_shared_q8_file_bytes = 2'786'568'256;
 inline constexpr uint64_t mtp_shared_q8_header_bytes = 10'946'624;

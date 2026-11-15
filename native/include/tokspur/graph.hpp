@@ -452,6 +452,8 @@ public:
                                                  );
     [[nodiscard]] GpuView slice(GpuView buffer, uint64_t offset, uint64_t bytes) const;
     [[nodiscard]] GpuView suballocate_draft_output_slice(GpuView output_weight_view, uint32_t entries = 32768, uint32_t channels = 2560);
+    // Gathered draft vocabulary: copies the listed rows of a Q8_0 output projection into a new immutable matrix in the parent's layout, so result row r is parent row token_ids[r]. The IDs must be strictly ascending. The caller owns the result and releases it before choosing another draft slice; the parent is not referenced afterwards.
+    [[nodiscard]] GpuView gather_draft_output_slice(GpuView output_weight_view, std::span<const uint32_t> token_ids, uint32_t channels = 2560);
     [[nodiscard]] GpuView allocate_draft_embedding_slice(uint32_t entries = 32768, uint32_t channels = 2560);
     [[nodiscard]] GpuView draft_output_slice() const noexcept;
     [[nodiscard]] GpuView draft_embedding_slice() const noexcept;
@@ -848,9 +850,15 @@ public:
 #endif
     [[nodiscard]] bool prefill_batch_top10() const;
     [[nodiscard]] bool prefill_batch_mixture() const;
+    [[nodiscard]] bool prefill_batch_router_f32() const;
+    [[nodiscard]] bool prefill_batch_shared_router_f32() const;
+    [[nodiscard]] bool prefill_batch_hc_down() const;
     void prepare_prefill_top10_mixture();
     void prefill_route_batch(GpuView logits, GpuView indices, GpuView weights, uint32_t experts, uint32_t selected, uint32_t tokens, RouterMode mode, bool normalize_selected);
     void prefill_mixture_batch(GpuView experts, GpuView weights, GpuView shared, GpuView shared_logit, GpuRowsF32 output, uint32_t selected);
+    void prefill_router_f32_batch(GpuView matrix, GpuRowsF32 input, GpuRowsF32 output);
+    void prefill_shared_router_f32_batch(GpuView weights, GpuRowsF32 input, GpuView output);
+    void prefill_hc_down_batch(GpuView weights, GpuRowsF32 input, GpuRowsF32 output);
     void record_prefill_moe_chunk(uint32_t rows, bool used_batch_top10, bool top10_fallback, bool used_batch_mixture, bool mixture_fallback);
     [[nodiscard]] PrefillTop10MixtureTelemetry prefill_top10_mixture_telemetry() const;
     void reset_prefill_top10_mixture_telemetry();
@@ -1153,7 +1161,7 @@ public:
     void dflash2_select(GpuView logits, GpuView partial_ids, GpuView partial_values, GpuView selector_out,
                         GpuView selector_hidden, GpuView predecessor_codebook, GpuView successor_codebook,
                         uint32_t positions, uint32_t vocabulary, uint32_t anchor,
-                        uint32_t codebook_vocabulary = 0);
+                        uint32_t codebook_vocabulary = 0, GpuView row_token_ids = {});
     void dflash2_dense_bf16(GpuView matrix, GpuRowsF32 input, GpuRowsF32 output, bool swiglu = false);
     void dflash2_dense_q8(GpuView matrix, GpuRowsF32 input, GpuRowsF32 output, bool swiglu = false);
     void dflash2_gate_up_swiglu(GpuView gate_matrix, GpuView up_matrix, GpuRowsF32 input, GpuRowsF32 output, bool bf16 = false);

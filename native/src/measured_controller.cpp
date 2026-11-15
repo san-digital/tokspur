@@ -99,7 +99,7 @@ MeasuredCostProfile MeasuredCostProfile::parse(const Json& v) {
         for (const auto& anchor : anchors) {
             keys(anchor, {"context", "ordinary_ms", "draft_ms", "remaining_ms", "conditional_acceptance"});
             MeasuredCostAnchor a; const auto context = field(anchor, "context").unsigned_integer();
-            need(context && context <= 65536 && (next.anchors.empty() || context > next.anchors.back().context), "measured context anchors must increase");
+            need(context && context <= 131072 && (next.anchors.empty() || context > next.anchors.back().context), "measured context anchors must increase");
             a.context = uint32_t(context); a.costs.calibrated = true; a.costs.ordinary_ms = real(field(anchor, "ordinary_ms"));
             const auto& draft = field(anchor, "draft_ms").array();
             const auto& remaining = field(anchor, "remaining_ms").array();
@@ -242,7 +242,7 @@ bool MeasuredCostProfile::supports_sampling(MeasuredSampling sampling) const noe
     return std::any_of(modes_.begin(), modes_.end(), [sampling](const auto& mode) { return mode.sampling == sampling; });
 }
 MeasuredCosts MeasuredCostProfile::costs(uint32_t context, MeasuredSampling sampling) const {
-    need(context && context <= 65536, "measured context outside supported model");
+    need(context && context <= 131072, "measured context outside supported model");
     const auto mode = std::find_if(modes_.begin(), modes_.end(), [sampling](const auto& m) { return m.sampling == sampling; });
     need(mode != modes_.end(), "sampling mode is not calibrated by measured profile");
     const auto& anchors = mode->anchors;

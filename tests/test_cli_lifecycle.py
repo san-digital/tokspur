@@ -404,6 +404,8 @@ def test_serve_default_uses_f32_and_keeps_speed_lead_paths_opt_in(harness):
         "--native-drafter",
         "--native-mtp-lookup",
         "--native-mtp-lookup-match",
+        "--native-dflash2-lookup",
+        "--native-dflash2-lookup-match",
         "--private-prefix-trace",
         "--telemetry-stdout",
         "--overlap-prefill",
@@ -509,16 +511,22 @@ def test_serve_opt_in_speed_lead_flags_are_forwarded(harness, tmp_path):
             dflash2_dir=dflash2_dir,
             shared_prefix_cache=True,
             checkpoint_cap_gib=4.0,
+            dflash2_lookup="hybrid",
+            dflash2_lookup_match=4,
         )
     cached = harness.last_command
     assert cached[cached.index("--shared-prefix-cache") + 1] == "on"
     assert cached[cached.index("--checkpoint-ssd") + 1] == "on"
+    assert cached[cached.index("--native-dflash2-lookup") + 1] == "hybrid"
+    assert cached[cached.index("--native-dflash2-lookup-match") + 1] == "4"
 
     for bad_kwargs in (
         {"drafter": "dflash2"},
         {"dflash2_dir": dflash2_dir},
         {"drafter": "dflash2", "dflash2_dir": dflash2_dir, "mtp_draft_slice": True},
         {"drafter": "dflash2", "dflash2_dir": dflash2_dir, "mtp_lookup": "bypass"},
+        {"dflash2_lookup": "hybrid"},
+        {"dflash2_lookup_match": 4},
         {"prefill_grouped": "serial"},
         {"prefill_dense": "f32", "prefill_grouped": "nax"},
     ):
@@ -707,13 +715,21 @@ def test_dflash2_verify_rows_refuses_invalid_mode_before_launch(harness):
 
 
 @pytest.mark.parametrize("speed_preset", [False, True])
-def test_m8_and_adaptive_verify_rows_remain_opt_in_for_mtp_and_non_preset(
+def test_m8_and_adaptive_verify_rows_preset_and_opt_in_behaviour(
     harness, tmp_path, speed_preset
 ):
     harness.stop_during_wait = False
     with pytest.raises(SystemExit):
         cli.serve(speed_preset=speed_preset)
-    assert "--native-verify-nax-m8" not in harness.last_command
+    if speed_preset:
+        assert (
+            harness.last_command[
+                harness.last_command.index("--native-verify-nax-m8") + 1
+            ]
+            == "on"
+        )
+    else:
+        assert "--native-verify-nax-m8" not in harness.last_command
     assert "--native-dflash2-verify-rows" not in harness.last_command
 
     if not speed_preset:
@@ -726,7 +742,9 @@ def test_m8_and_adaptive_verify_rows_remain_opt_in_for_mtp_and_non_preset(
         assert "--native-prepared-validation" not in harness.last_command
 
 
-def test_mtp_depth_speed_preset_and_dflash2_precision_forwarding(harness, tmp_path):
+def test_mtp_depth_speed_preset_and_dflash2_precision_forwarding(
+    harness, tmp_path, monkeypatch
+):
     harness.stop_during_wait = False
     with pytest.raises(SystemExit):
         cli.serve(speed_preset=True)
@@ -744,6 +762,7 @@ def test_mtp_depth_speed_preset_and_dflash2_precision_forwarding(harness, tmp_pa
     assert "--native-gdn-prefill-ported" not in command
     assert command[command.index("--native-mtp-draft-slice") + 1] == "on"
     assert command[command.index("--native-verify-nax") + 1] == "on"
+    assert command[command.index("--native-verify-nax-m8") + 1] == "on"
     assert command[command.index("--native-verify-hc-gdn-fused") + 1] == "on"
     assert command[command.index("--native-host-logit-views") + 1] == "on"
     assert command[command.index("--native-logit-topk") + 1] == "on"
@@ -751,7 +770,7 @@ def test_mtp_depth_speed_preset_and_dflash2_precision_forwarding(harness, tmp_pa
     assert command[command.index("--native-prepared-validation") + 1] == "on"
     assert command[command.index("--tool-enum-validation") + 1] == "executor"
     assert command[command.index("--tool-arg-validation") + 1] == "executor"
-    assert "--native-mtp-fast-round" not in command
+    assert command[command.index("--native-mtp-fast-round") + 1] == "on"
 
     v3_pack = tmp_path / ".tokspur/derived/tokspur-pack-v3.asa.gguf"
     v3_pack.touch()
@@ -767,26 +786,68 @@ def test_mtp_depth_speed_preset_and_dflash2_precision_forwarding(harness, tmp_pa
     ].endswith("tokspur-pack-v3.asa.gguf")
 
     with pytest.raises(SystemExit):
-        cli.serve(speed_preset=True, native_mtp_fast_round="on")
+        cli.serve(speed_preset=True, verify_nax_m8=False, native_mtp_fast_round="off")
+    assert (
+        harness.last_command[harness.last_command.index("--native-verify-nax-m8") + 1]
+        == "off"
+    )
     assert (
         harness.last_command[harness.last_command.index("--native-mtp-fast-round") + 1]
-        == "on"
+        == "off"
     )
 
     with pytest.raises(SystemExit):
         cli.serve(
             speed_preset=True,
             mtp_depth=2,
+            mtp_draft_slice=False,
             verify_nax=False,
             tool_enum_validation="strict",
             tool_arg_validation="strict",
         )
     override_cmd = harness.last_command
     assert override_cmd[override_cmd.index("--native-mtp-depth") + 1] == "2"
+    assert "--native-mtp-draft-slice" not in override_cmd
     assert "--native-verify-nax" not in override_cmd
+    assert "--native-verify-nax-m8" not in override_cmd
     assert "--native-verify-hc-gdn-fused" not in override_cmd
     assert override_cmd[override_cmd.index("--tool-enum-validation") + 1] == "strict"
     assert "--tool-arg-validation" not in override_cmd
+
+    monkeypatch.setenv("TOKSPUR_CLI_IMPL", "python")
+    monkeypatch.setattr(
+        sys, "argv", ["tokspur", "serve", "--speed-preset", "--no-mtp-draft-slice"]
+    )
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert "--native-mtp-draft-slice" not in harness.last_command
+    assert (
+        harness.last_command[harness.last_command.index("--native-mtp-depth") + 1]
+        == "3"
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["tokspur", "serve", "--speed-preset", "--native-mtp-draft-slice", "off"],
+    )
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert "--native-mtp-draft-slice" not in harness.last_command
+    for selection in (
+        {"mtp_draft_slice": True},
+        {"native_mtp_draft_slice": "on"},
+    ):
+        with pytest.raises(ValueError, match="^--mtp-draft-slice is incompatible"):
+            cli.serve(drafter="dflash2", dflash2_dir=tmp_path, **selection)
+    for selection in (
+        {"mtp_draft_slice": False},
+        {"native_mtp_draft_slice": "off"},
+    ):
+        with pytest.raises(
+            ValueError,
+            match="do not apply to --drafter dflash2; use --dflash2-vocab-slice 0",
+        ):
+            cli.serve(drafter="dflash2", dflash2_dir=tmp_path, **selection)
 
     dflash2_dir = tmp_path / "dflash2"
     dflash2_dir.mkdir()
@@ -868,11 +929,71 @@ def test_mtp_depth_speed_preset_and_dflash2_precision_forwarding(harness, tmp_pa
     with pytest.raises(ValueError, match="Unsupported tool_arg_validation"):
         cli.serve(tool_arg_validation="permissive")
 
+    assert "--context-length" not in arg_cmd
+
+    with pytest.raises(SystemExit):
+        cli.serve(context_length=65536)
+    assert "--context-length" not in harness.last_command
+
+    with pytest.raises(SystemExit):
+        cli.serve(context_length=131072)
+    ctx128_cmd = harness.last_command
+    assert ctx128_cmd[ctx128_cmd.index("--context-length") + 1] == "131072"
+
+    for bad_ctx in (32768, 100000, 262144, True):
+        with pytest.raises(ValueError, match="Unsupported context_length"):
+            cli.serve(context_length=bad_ctx)
+
     with pytest.raises(ValueError, match="removed router-window"):
         cli.serve(native_prefill_router_fast="on")
 
     with pytest.raises(ValueError, match="removed router-window"):
         cli.serve(speed_preset=True, native_prefill_router_fast="on")
+
+    with pytest.raises(SystemExit):
+        cli.serve(ple_ram_resident=True)
+    ple_on_cmd = harness.last_command
+    assert ple_on_cmd[ple_on_cmd.index("--native-ple-ram-resident") + 1] == "on"
+
+    with pytest.raises(SystemExit):
+        cli.serve(ple_ram_resident=False)
+    ple_off_cmd = harness.last_command
+    assert ple_off_cmd[ple_off_cmd.index("--native-ple-ram-resident") + 1] == "off"
+
+    with pytest.raises(SystemExit):
+        cli.serve(ple_ram_resident=True, native_ple_ram_resident="off")
+    ple_override_cmd = harness.last_command
+    assert (
+        ple_override_cmd[ple_override_cmd.index("--native-ple-ram-resident") + 1]
+        == "off"
+    )
+
+    with pytest.raises(SystemExit):
+        cli.serve(
+            speed_preset=True,
+            drafter="dflash2",
+            dflash2_dir=str(dflash2_dir),
+            dflash2_vocab_gather="cjk64k",
+        )
+    gather_cmd = harness.last_command
+    assert "--native-dflash2-vocab-slice" not in gather_cmd
+    assert gather_cmd[gather_cmd.index("--native-dflash2-vocab-gather") + 1] == "cjk64k"
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        cli.serve(
+            drafter="dflash2",
+            dflash2_dir=str(dflash2_dir),
+            dflash2_vocab_slice=32768,
+            dflash2_vocab_gather="control32k",
+        )
+    with pytest.raises(ValueError, match="requires --drafter dflash2"):
+        cli.serve(dflash2_vocab_gather="control32k")
+    with pytest.raises(ValueError, match="Unsupported dflash2_vocab_gather"):
+        cli.serve(
+            drafter="dflash2",
+            dflash2_dir=str(dflash2_dir),
+            dflash2_vocab_gather="bad",
+        )
 
 
 def test_retired_gdn_prefill_refuses_before_launch(harness):

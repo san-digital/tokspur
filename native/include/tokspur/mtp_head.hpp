@@ -26,7 +26,7 @@ struct MtpHeadWeights {
 struct MtpHeadShape {
     ResidualShape residual;
     MoeShape experts;
-    uint32_t query_heads, kv_heads, head_width, rotary_width, vocabulary, capacity;
+    uint32_t query_heads, kv_heads, head_width, rotary_width, vocabulary, capacity, max_positions = 0;
 };
 // Auxiliary proposal arithmetic only. These kernels never evaluate target P.
 // Serial remains the default; tiles change FP32 association in draft Q.
@@ -176,6 +176,7 @@ public:
     [[nodiscard]] BatchResult flush_deferred_prime();
     [[nodiscard]] uint32_t deferred_prime_rows() const noexcept;
     [[nodiscard]] uint32_t first_absolute_position() const noexcept;
+    [[nodiscard]] uint32_t max_positions() const noexcept;
     [[nodiscard]] uint64_t ssd_cache_bytes(uint32_t cache_rows) const;
     [[nodiscard]] uint64_t ssd_cache_bytes() const;
     [[nodiscard]] bool read_ssd_cache_span(uint64_t offset, std::span<std::byte> target) const;

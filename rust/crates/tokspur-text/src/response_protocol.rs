@@ -228,12 +228,18 @@ pub fn parse_native_response_with_controls<E>(
             b"finish_reason",
             b"stop_id",
             b"executor_parameters",
+            b"forced_thinking_close_index",
         ],
     )?;
     let executor_parameters = match data.find("executor_parameters").map_err(access)? {
         Some(value) => value.boolean().map_err(access)?,
         None => false,
     };
+    let forced_thinking_close_index =
+        match data.find("forced_thinking_close_index").map_err(access)? {
+            Some(value) => Some(value.unsigned_integer().map_err(access)?),
+            None => None,
+        };
     require(
         maximum_ids != 0 && maximum_ids <= RESPONSE_MAXIMUM_ACCUMULATED_IDS,
         "invalid response ID admission bound",
@@ -325,18 +331,48 @@ pub fn parse_native_response_with_controls<E>(
         )?;
         bytes.truncate(bytes.len() - marker.len());
     }
+    let body = if stopped {
+        &ids[..ids.len() - 1]
+    } else {
+        &ids[..]
+    };
+    let forced_close_at = match forced_thinking_close_index {
+        Some(idx) => {
+            require(
+                idx <= body.len() as u64,
+                "forced thinking close index out of bounds",
+            )?;
+            Some(idx as usize)
+        }
+        None => None,
+    };
     if control_ids.is_empty() {
-        require(
-            parser.feed(&bytes) != ResponseStatus::Error,
-            "invalid response bytes or frames",
-        )?;
+        if let Some(split) = forced_close_at {
+            let prefix = decode(&body[..split]).map_err(ResponseProtocolError::Decode)?;
+            let suffix = decode(&body[split..]).map_err(ResponseProtocolError::Decode)?;
+            require(
+                prefix.len() + suffix.len() == bytes.len()
+                    && bytes.starts_with(&prefix)
+                    && bytes[prefix.len()..] == suffix[..],
+                "response decoder/terminal identity mismatch",
+            )?;
+            require(
+                parser.feed(&prefix) != ResponseStatus::Error,
+                "invalid response bytes or frames",
+            )?;
+            parser.prepare_forced_thinking_close();
+            require(
+                parser.feed(&suffix) != ResponseStatus::Error,
+                "invalid response bytes or frames",
+            )?;
+        } else {
+            require(
+                parser.feed(&bytes) != ResponseStatus::Error,
+                "invalid response bytes or frames",
+            )?;
+        }
     } else {
         // Control markers are known only per ID, so decode and feed each body ID; together they must be exactly the bytes admitted above.
-        let body = if stopped {
-            &ids[..ids.len() - 1]
-        } else {
-            &ids[..]
-        };
         let mut pieces = Vec::with_capacity(body.len());
         let mut joined = Vec::with_capacity(bytes.len());
         for &id in body {
@@ -348,7 +384,10 @@ pub fn parse_native_response_with_controls<E>(
             joined == bytes,
             "response decoder/terminal identity mismatch",
         )?;
-        for (id, piece) in &pieces {
+        for (i, (id, piece)) in pieces.iter().enumerate() {
+            if forced_close_at == Some(i) {
+                parser.prepare_forced_thinking_close();
+            }
             let status = if control_ids.contains(id) {
                 parser.feed_control(piece)
             } else {
@@ -358,6 +397,9 @@ pub fn parse_native_response_with_controls<E>(
                 status != ResponseStatus::Error,
                 "invalid response bytes or frames",
             )?;
+        }
+        if forced_close_at == Some(pieces.len()) {
+            parser.prepare_forced_thinking_close();
         }
     }
     if stopped {

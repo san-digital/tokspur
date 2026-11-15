@@ -77,6 +77,7 @@ pub enum Variant {
 pub struct Options {
     pub checkpoint_slots: u32,
     pub checkpoint_budget_bytes: u64,
+    pub context_length: u32,
     #[cfg(feature = "verify8")]
     pub verify8: bool,
     #[cfg(feature = "branch8")]
@@ -552,7 +553,7 @@ impl Wire {
                 )?;
                 let prompt = worker_field(body, "prompt_ids")?.array()?;
                 require(
-                    !prompt.is_empty() && prompt.len() <= 65536,
+                    !prompt.is_empty() && prompt.len() <= self.options.context_length as usize,
                     "owned broker future prompt bound",
                 )?;
                 for token in prompt {
@@ -837,7 +838,7 @@ impl Wire {
                         self.broker_identity(&value, command, lease)?;
                         self.broker_storage(&value)?;
                         require(
-                            position <= 65536
+                            position <= u64::from(self.options.context_length)
                                 && worker_integer(&value, "checkpoint_retained")?
                                     <= u64::from(self.options.checkpoint_slots),
                             "owned broker prefix/retention bound",

@@ -14,7 +14,7 @@ QsaPrefillPlan qsa_prefill_plan(uint32_t base, uint32_t rows, uint32_t capacity,
         s.index_heads * s.index_width <= 512 &&
         s.rotary_width && s.rotary_width % 2 == 0 && s.rotary_width <= std::min(s.head_width,s.index_width) &&
         s.compression == 4 && s.token_budget && s.token_budget % 4 == 0 && s.token_budget / 4 <= 512 &&
-        s.capacity && s.capacity <= 65536, "unsupported batched QSA geometry");
+        s.capacity && s.capacity <= 131072, "unsupported batched QSA geometry");
     const uint32_t max_cap = allow_nax_2k ? 2048u : qsa_prefill_capacity;
     need(capacity && capacity <= max_cap && rows && rows <= capacity && base < s.capacity &&
         rows <= s.capacity - base, "batched QSA rows exceed the accepted cache frontier");

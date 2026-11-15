@@ -19,6 +19,7 @@ from . import __version__
 DEFAULT_CLI_IMPL = "rust"
 from .local import (  # noqa: E402
     ROOT,
+    candidate_file_specs,
     check_adoption,
     inference_processes,
     isolated_environment,
@@ -37,8 +38,22 @@ def adopt(target: Path, draft: Path) -> None:
     result = {"schema": 1, "verification": "full-sha256"}
     for group, directory in (("target", target), ("draft", draft)):
         directory = directory.resolve(strict=True)
+        candidates = candidate_file_specs(specs, group)
+        if len(candidates) == 1:
+            selected_specs = candidates[0]
+        else:
+            present = [
+                cand
+                for cand in candidates
+                if all((directory / spec["name"]).exists() for spec in cand)
+            ]
+            if len(present) > 1:
+                raise ValueError(
+                    f"Ambiguous {group} asset variants present in {directory}"
+                )
+            selected_specs = present[0] if present else candidates[0]
         assets = []
-        for spec in specs[group]["files"]:
+        for spec in selected_specs:
             print(f"Verifying {group}: {spec['name']}", flush=True)
             assets.append(verify_asset(directory / spec["name"], spec))
         result[group] = {"directory": str(directory), "assets": assets}
@@ -157,6 +172,40 @@ def default_derived_pack_path(
     return asa_path.resolve()
 
 
+def _is_valid_dflash2_vocab_gather(value: str, vocabulary: int = 248320) -> bool:
+    if value in ("control32k", "cjk48k", "cjk64k", "cjk80k"):
+        return vocabulary > 248076
+    if not value or len(value) > 65536 or vocabulary <= 0:
+        return False
+    prev_last = -1
+    count = 0
+    for part in value.split(","):
+        if not part:
+            return False
+        if "-" in part:
+            pieces = part.split("-")
+            if len(pieces) != 2:
+                return False
+            first_s, last_s = pieces
+        else:
+            first_s = last_s = part
+        for s in (first_s, last_s):
+            if (
+                not s
+                or not s.isascii()
+                or not s.isdigit()
+                or (s[0] == "0" and len(s) > 1)
+            ):
+                return False
+        first = int(first_s)
+        last = int(last_s)
+        if last < first or first <= prev_last or last >= vocabulary:
+            return False
+        count += last - first + 1
+        prev_last = last
+    return 256 <= count < vocabulary and count % 32 == 0
+
+
 def serve(
     allow_raw_gguf: bool = False,
     pack_v3: bool = False,
@@ -168,24 +217,30 @@ def serve(
     prefill_dense: str | None = None,
     prefill_grouped: str | None = None,
     known_token_capacity: int | None = 2048,
-    mtp_draft_slice: bool = False,
+    context_length: int = 65536,
+    mtp_draft_slice: bool | None = None,
     verify_nax: bool | None = None,
-    verify_nax_m8: bool = False,
+    verify_nax_m8: bool | None = None,
     speed_preset: bool = False,
     mtp_depth: int | None = None,
     dflash2_precision: str | None = None,
     dflash2_max_drafts: int | None = None,
     dflash2_vocab_slice: int | None = None,
+    dflash2_vocab_gather: str | None = None,
     native_host_logit_views: str | None = None,
     native_logit_topk: str | None = None,
     native_ple_async_gather: str | None = None,
+    ple_ram_resident: bool | None = None,
+    native_ple_ram_resident: str | None = None,
     native_mtp_fast_round: str | None = None,
     native_prefill_router_fast: str | None = None,
     native_verify_hc_gdn_fused: str | None = None,
     native_dflash2_defer_context: str | None = None,
     native_dflash2_verify_rows: str | None = None,
     native_prepared_validation: str | None = None,
+    native_mtp_draft_slice: str | None = None,
     native_verify_nax: str | None = None,
+    native_verify_nax_m8: str | None = None,
     drafter: str = "mtp",
     dflash2_dir: Path | str | None = None,
     concurrent_dispatch: bool = True,
@@ -199,6 +254,8 @@ def serve(
     shared_prefix_cache: bool | None = None,
     mtp_lookup: str = "off",
     mtp_lookup_match: int | None = None,
+    dflash2_lookup: str = "off",
+    dflash2_lookup_match: int | None = None,
     tool_enum_validation: str | None = None,
     tool_arg_validation: str | None = None,
     private_prefix_trace: bool = False,
@@ -217,12 +274,15 @@ def serve(
         ("native_host_logit_views", native_host_logit_views),
         ("native_logit_topk", native_logit_topk),
         ("native_ple_async_gather", native_ple_async_gather),
+        ("native_ple_ram_resident", native_ple_ram_resident),
         ("native_mtp_fast_round", native_mtp_fast_round),
         ("native_prefill_router_fast", native_prefill_router_fast),
         ("native_verify_hc_gdn_fused", native_verify_hc_gdn_fused),
         ("native_dflash2_defer_context", native_dflash2_defer_context),
         ("native_prepared_validation", native_prepared_validation),
+        ("native_mtp_draft_slice", native_mtp_draft_slice),
         ("native_verify_nax", native_verify_nax),
+        ("native_verify_nax_m8", native_verify_nax_m8),
     ):
         if value not in (None, "off", "on"):
             raise ValueError(f"Unsupported {flag} mode: {value}")
@@ -240,13 +300,34 @@ def serve(
         prefill_dense = "nax" if speed_preset else "f32-staged"
     if prefill_grouped is None:
         prefill_grouped = "nax" if speed_preset else "f32"
+    if native_mtp_draft_slice is not None:
+        mtp_draft_slice_enabled = native_mtp_draft_slice == "on"
+    elif mtp_draft_slice is not None:
+        mtp_draft_slice_enabled = bool(mtp_draft_slice)
+    else:
+        mtp_draft_slice_enabled = bool(speed_preset and drafter == "mtp")
+    if native_ple_ram_resident is not None:
+        ple_ram_resident_flag: str | None = native_ple_ram_resident
+    elif ple_ram_resident is not None:
+        ple_ram_resident_flag = "on" if ple_ram_resident else "off"
+    else:
+        ple_ram_resident_flag = None
     if native_verify_nax is not None:
         verify_nax_enabled = native_verify_nax == "on"
     elif verify_nax is not None:
         verify_nax_enabled = bool(verify_nax)
     else:
         verify_nax_enabled = bool(speed_preset)
-    verify_nax_enabled = verify_nax_enabled or verify_nax_m8
+    if native_verify_nax_m8 is not None:
+        verify_nax_m8_enabled = native_verify_nax_m8 == "on"
+        verify_nax_m8_explicit = True
+    elif verify_nax_m8 is not None:
+        verify_nax_m8_enabled = bool(verify_nax_m8)
+        verify_nax_m8_explicit = True
+    else:
+        verify_nax_m8_enabled = False
+        verify_nax_m8_explicit = False
+    verify_nax_enabled = verify_nax_enabled or verify_nax_m8_enabled
     if speed_preset:
         if native_verify_hc_gdn_fused is None and verify_nax_enabled:
             native_verify_hc_gdn_fused = "on"
@@ -259,19 +340,22 @@ def serve(
         if native_prepared_validation is None:
             native_prepared_validation = "on"
         if drafter == "mtp":
+            if verify_nax_enabled and not verify_nax_m8_explicit:
+                verify_nax_m8_enabled = True
+            if native_mtp_fast_round is None:
+                native_mtp_fast_round = "on"
             if mtp_depth is None:
                 mtp_depth = 3
-            mtp_draft_slice = True
         elif drafter == "dflash2":
-            if verify_nax_enabled:
-                verify_nax_m8 = True
+            if verify_nax_enabled and not verify_nax_m8_explicit:
+                verify_nax_m8_enabled = True
             if dflash2_precision is None:
                 dflash2_precision = "q8_0"
             if native_dflash2_defer_context is None:
                 native_dflash2_defer_context = "on"
             if dflash2_max_drafts is None:
                 dflash2_max_drafts = 7
-            if dflash2_vocab_slice is None:
+            if dflash2_vocab_slice is None and dflash2_vocab_gather is None:
                 dflash2_vocab_slice = 32768
             if native_dflash2_verify_rows is None:
                 native_dflash2_verify_rows = "auto"
@@ -324,6 +408,19 @@ def serve(
             raise ValueError(
                 f"Unsupported dflash2_vocab_slice: {dflash2_vocab_slice} (expected 0 or a multiple of 32 in 256..248319)"
             )
+    if dflash2_vocab_gather is not None:
+        if drafter != "dflash2":
+            raise ValueError("--dflash2-vocab-gather requires --drafter dflash2")
+        if dflash2_vocab_slice is not None:
+            raise ValueError(
+                "--dflash2-vocab-gather and --dflash2-vocab-slice are mutually exclusive"
+            )
+        if not isinstance(
+            dflash2_vocab_gather, str
+        ) or not _is_valid_dflash2_vocab_gather(dflash2_vocab_gather):
+            raise ValueError(
+                f"Unsupported dflash2_vocab_gather: {dflash2_vocab_gather} (expected control32k, cjk48k, cjk64k, cjk80k, or ascending IDs/ranges multiple of 32 in 256..248319)"
+            )
     if mtp_depth not in (None, 2, 3):
         raise ValueError(f"Unsupported mtp_depth: {mtp_depth} (expected 2 or 3)")
     if dflash2_precision not in (None, "q8_0", "bf16"):
@@ -367,6 +464,10 @@ def serve(
         raise ValueError(
             f"Unsupported known_token_capacity: {resolved_known_capacity} (expected 512, 1024 or 2048)"
         )
+    if type(context_length) is not int or context_length not in (65536, 131072):
+        raise ValueError(
+            f"Unsupported context_length: {context_length} (expected 65536 or 131072)"
+        )
     if drafter not in ("mtp", "dflash2"):
         raise ValueError(f"Unsupported drafter mode: {drafter}")
     if q8_gemv_rg4 not in ("off", "on", "wide"):
@@ -378,6 +479,12 @@ def serve(
     if mtp_lookup_match is not None and not (2 <= mtp_lookup_match <= 16):
         raise ValueError(
             f"Unsupported mtp_lookup_match: {mtp_lookup_match} (expected 2..16)"
+        )
+    if dflash2_lookup not in ("off", "bypass", "hybrid"):
+        raise ValueError(f"Unsupported dflash2_lookup mode: {dflash2_lookup}")
+    if dflash2_lookup_match is not None and not (2 <= dflash2_lookup_match <= 16):
+        raise ValueError(
+            f"Unsupported dflash2_lookup_match: {dflash2_lookup_match} (expected 2..16)"
         )
     if tool_enum_validation not in ("strict", "executor"):
         raise ValueError(
@@ -392,14 +499,21 @@ def serve(
             raise ValueError("--drafter dflash2 requires --dflash2-dir")
         if mtp_depth is not None:
             raise ValueError("--mtp-depth is incompatible with --drafter dflash2")
-        if mtp_draft_slice:
+        if mtp_draft_slice_enabled:
             raise ValueError("--mtp-draft-slice is incompatible with --drafter dflash2")
+        # An explicit OFF is refused too, so it cannot be mistaken for a full DFlash2 draft vocabulary: that is a separate setting.
+        if mtp_draft_slice is not None or native_mtp_draft_slice is not None:
+            raise ValueError(
+                "--no-mtp-draft-slice and --native-mtp-draft-slice do not apply to --drafter dflash2; use --dflash2-vocab-slice 0 for the full draft vocabulary"
+            )
         if mtp_lookup != "off" or mtp_lookup_match is not None:
             raise ValueError("--mtp-lookup is incompatible with --drafter dflash2")
     elif dflash2_dir is not None:
         raise ValueError("--dflash2-dir requires --drafter dflash2")
     elif dflash2_precision is not None:
         raise ValueError("--dflash2-precision requires --drafter dflash2")
+    elif dflash2_lookup != "off" or dflash2_lookup_match is not None:
+        raise ValueError("--dflash2-lookup requires --drafter dflash2")
 
     if checkpoint_cap_gib is not None:
         effective_checkpoint_cap_gib = float(checkpoint_cap_gib)
@@ -505,12 +619,27 @@ def serve(
                 if tokenizer.is_file() and template.is_file():
                     break
 
+        shards = []
+        adopted_pack: Path | None = None
+        for asset in target_info.get("assets", []):
+            if asset.get("role") == "derived_pack":
+                if adopted_pack is not None:
+                    raise ValueError("multiple derived packs in adopted target assets")
+                adopted_pack = Path(asset["path"])
+            else:
+                shards.append(asset["path"])
+        if adopted_pack is not None and allow_raw_gguf:
+            raise ValueError(
+                "--raw-gguf is unavailable for pack-only adopted weights (no raw GPU GGUF shards)"
+            )
+
         if derived_pack is not None:
             dp = Path(derived_pack)
             pack_file = dp if dp.is_absolute() else (Path.cwd() / dp).resolve()
+        elif adopted_pack is not None:
+            pack_file = adopted_pack
         else:
             pack_file = default_derived_pack_path(ROOT, pack_v3=pack_v3, prefer_v3=True)
-        shards = [asset["path"] for asset in target_info.get("assets", [])]
 
         if not allow_raw_gguf:
             if not pack_file.is_file():
@@ -563,6 +692,11 @@ def serve(
                 *(
                     ["--native-dflash2-vocab-slice", str(dflash2_vocab_slice)]
                     if dflash2_vocab_slice is not None
+                    else []
+                ),
+                *(
+                    ["--native-dflash2-vocab-gather", dflash2_vocab_gather]
+                    if dflash2_vocab_gather is not None
                     else []
                 ),
             ]
@@ -636,10 +770,21 @@ def serve(
             "on",
             "--native-known-token-capacity",
             str(resolved_known_capacity),
+            *(
+                ["--context-length", str(context_length)]
+                if context_length != 65536
+                else []
+            ),
             *(["--native-raw-decode", "on"] if allow_raw_gguf else []),
-            *(["--native-mtp-draft-slice", "on"] if mtp_draft_slice else []),
+            *(["--native-mtp-draft-slice", "on"] if mtp_draft_slice_enabled else []),
             *(["--native-verify-nax", "on"] if verify_nax_enabled else []),
-            *(["--native-verify-nax-m8", "on"] if verify_nax_m8 else []),
+            *(
+                ["--native-verify-nax-m8", "on"]
+                if verify_nax_m8_enabled
+                else (
+                    ["--native-verify-nax-m8", "off"] if verify_nax_m8_explicit else []
+                )
+            ),
             *(
                 ["--native-dflash2-verify-rows", native_dflash2_verify_rows]
                 if native_dflash2_verify_rows is not None
@@ -663,6 +808,11 @@ def serve(
             *(
                 ["--native-ple-async-gather", native_ple_async_gather]
                 if native_ple_async_gather is not None
+                else []
+            ),
+            *(
+                ["--native-ple-ram-resident", ple_ram_resident_flag]
+                if ple_ram_resident_flag is not None
                 else []
             ),
             *(
@@ -714,6 +864,16 @@ def serve(
             *(
                 ["--native-mtp-lookup-match", str(mtp_lookup_match)]
                 if mtp_lookup_match is not None
+                else []
+            ),
+            *(
+                ["--native-dflash2-lookup", dflash2_lookup]
+                if dflash2_lookup != "off"
+                else []
+            ),
+            *(
+                ["--native-dflash2-lookup-match", str(dflash2_lookup_match)]
+                if dflash2_lookup_match is not None
                 else []
             ),
             "--tool-enum-validation",
@@ -990,10 +1150,25 @@ def main() -> None:
         help="Known-token IPC packet capacity (default: 2048)",
     )
     s.add_argument(
+        "--context-length",
+        "--native-context-length",
+        dest="context_length",
+        type=int,
+        choices=[65536, 131072],
+        default=65536,
+        help="Active prompt and generation context length (default: 65536)",
+    )
+    s.add_argument(
         "--mtp-draft-slice",
-        action="store_true",
-        default=False,
-        help="Opt-in top-32K MTP draft vocabulary slice",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Opt-in top-32K MTP draft vocabulary slice (default: off)",
+    )
+    s.add_argument(
+        "--native-mtp-draft-slice",
+        choices=["off", "on"],
+        default=None,
+        help="Explicit native top-32K MTP draft vocabulary slice (default: off)",
     )
     s.add_argument(
         "--verify-nax",
@@ -1009,9 +1184,15 @@ def main() -> None:
     )
     s.add_argument(
         "--verify-nax-m8",
-        action="store_true",
-        default=False,
-        help="Opt-in Metal 4 NAX m=8 dense tensor-ops speculative verification",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Opt-in Metal 4 NAX m=8 dense tensor-ops speculative verification (default: off)",
+    )
+    s.add_argument(
+        "--native-verify-nax-m8",
+        choices=["off", "on"],
+        default=None,
+        help="Explicit native m=8 dense tensor-ops verification mode (default: off)",
     )
     s.add_argument(
         "--speed-preset",
@@ -1050,6 +1231,13 @@ def main() -> None:
         help="Opt-in DFlash2 draft vocabulary slice (0 or multiple of 32)",
     )
     s.add_argument(
+        "--dflash2-vocab-gather",
+        "--native-dflash2-vocab-gather",
+        dest="dflash2_vocab_gather",
+        default=None,
+        help="Opt-in DFlash2 gathered draft vocabulary (control32k, cjk48k, cjk64k, cjk80k, or ID ranges)",
+    )
+    s.add_argument(
         "--native-host-logit-views",
         choices=["off", "on"],
         default=None,
@@ -1066,6 +1254,18 @@ def main() -> None:
         choices=["off", "on"],
         default=None,
         help="Opt-in asynchronous 16-bucket PLE gather overlap (default: off)",
+    )
+    s.add_argument(
+        "--ple-ram-resident",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Opt-in clean read-only mmap PLE RAM residency (default: off)",
+    )
+    s.add_argument(
+        "--native-ple-ram-resident",
+        choices=["off", "on"],
+        default=None,
+        help="Explicit native PLE RAM residency mode (default: off)",
     )
     s.add_argument(
         "--native-mtp-fast-round",
@@ -1182,6 +1382,20 @@ def main() -> None:
         help="Opt-in MTP prompt-lookup match length (2..16)",
     )
     s.add_argument(
+        "--dflash2-lookup",
+        choices=["off", "bypass", "hybrid"],
+        default="off",
+        help="Opt-in DFlash2 prompt-lookup mode (default: off)",
+    )
+    s.add_argument(
+        "--dflash2-lookup-match",
+        type=int,
+        choices=range(2, 17),
+        metavar="2..16",
+        default=None,
+        help="Opt-in DFlash2 prompt-lookup match length (2..16)",
+    )
+    s.add_argument(
         "--tool-enum-validation",
         choices=["strict", "executor"],
         default=None,
@@ -1272,6 +1486,7 @@ def main() -> None:
                 prefill_dense=args.prefill_dense,
                 prefill_grouped=args.prefill_grouped,
                 known_token_capacity=args.known_token_capacity,
+                context_length=args.context_length,
                 mtp_draft_slice=args.mtp_draft_slice,
                 verify_nax=args.verify_nax,
                 verify_nax_m8=args.verify_nax_m8,
@@ -1280,15 +1495,20 @@ def main() -> None:
                 dflash2_precision=args.dflash2_precision,
                 dflash2_max_drafts=args.dflash2_max_drafts,
                 dflash2_vocab_slice=args.dflash2_vocab_slice,
+                dflash2_vocab_gather=args.dflash2_vocab_gather,
                 native_host_logit_views=args.native_host_logit_views,
                 native_logit_topk=args.native_logit_topk,
                 native_ple_async_gather=args.native_ple_async_gather,
+                ple_ram_resident=args.ple_ram_resident,
+                native_ple_ram_resident=args.native_ple_ram_resident,
                 native_mtp_fast_round=args.native_mtp_fast_round,
                 native_prefill_router_fast=args.native_prefill_router_fast,
                 native_verify_hc_gdn_fused=args.native_verify_hc_gdn_fused,
                 native_dflash2_defer_context=args.native_dflash2_defer_context,
                 native_dflash2_verify_rows=args.native_dflash2_verify_rows,
+                native_mtp_draft_slice=args.native_mtp_draft_slice,
                 native_verify_nax=args.native_verify_nax,
+                native_verify_nax_m8=args.native_verify_nax_m8,
                 drafter=args.drafter,
                 dflash2_dir=args.dflash2_dir,
                 concurrent_dispatch=args.concurrent_dispatch,
@@ -1302,6 +1522,8 @@ def main() -> None:
                 shared_prefix_cache=args.shared_prefix_cache,
                 mtp_lookup=args.mtp_lookup,
                 mtp_lookup_match=args.mtp_lookup_match,
+                dflash2_lookup=args.dflash2_lookup,
+                dflash2_lookup_match=args.dflash2_lookup_match,
                 tool_enum_validation=args.tool_enum_validation,
                 tool_arg_validation=args.tool_arg_validation,
                 private_prefix_trace=args.private_prefix_trace,

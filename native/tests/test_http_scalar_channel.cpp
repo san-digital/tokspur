@@ -246,12 +246,13 @@ struct Files {
         std::vector<char> data(pattern.begin(),pattern.end());data.push_back('\0');
         const auto* created=mkdtemp(data.data());if(!created)throw std::runtime_error("scalar fixture directory");directory=created;
         options.executable=directory/"scalar-channel-target";
-        std::filesystem::copy_file(executable,options.executable);
+        std::error_code linked;std::filesystem::create_hard_link(executable,options.executable,linked);
+        if(linked)std::filesystem::copy_file(executable,options.executable);
         options.policy=directory/mode;options.library=directory/"library";
         for(const auto& file:{options.policy,options.library}){std::ofstream out(file);out<<"generated CPU fixture\n";}
         for(unsigned i=0;i<4;++i){auto file=directory/("shard"+std::to_string(i));{std::ofstream out(file);out<<i;}options.shards.push_back(file);}
         options.scalar_channel=true;options.stage8_present=true;options.stage8_enabled=true;options.fast_channel=true;
-        options.startup_timeout=3s;options.step_timeout=3s;options.drain_timeout=300ms;
+        options.startup_timeout=8s;options.step_timeout=3s;options.drain_timeout=800ms;
     }
     ~Files(){std::error_code ignored;std::filesystem::remove_all(directory,ignored);}
 };

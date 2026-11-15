@@ -58,6 +58,13 @@ bool batch_hc_down_window(const MetalGraph& g, const ResidualWeights& w, Residua
     static_cast<void>(g); static_cast<void>(w); static_cast<void>(s); static_cast<void>(n); return false;
 #endif
 }
+bool batch_hc_down_exact(const MetalGraph& g, const ResidualWeights& w, ResidualShape s, uint32_t n) {
+    const auto layout = g.prefill_weight_layout(w.down.view);
+    return !batch_hc_down_window(g, w, s, n) && !batch_hc_down(g, w, s, n) &&
+        g.prefill_batch_hc_down() && n >= 2 && n <= max_hc_rows(g) &&
+        s.branches == 4 && s.channels == 2560 && s.rank == 320 && w.down.encoding == 8 &&
+        (layout == PrefillWeightLayout::gguf || layout == PrefillWeightLayout::q8_lanes_v1);
+}
 void abort(MetalGraph& g) { try { g.abort(); } catch (const FormatError&) {} }
 bool batch_rows(const MetalGraph& g, ResidualShape s, uint32_t n) {
 #ifdef TOKSPUR_PRIVATE_HC_ROWS
@@ -82,6 +89,8 @@ void encode_prefill_residual_after_rms(MetalGraph& g, const ResidualWeights& w, 
     if (batch_hc_down(g, w, shape, n)) g.dense_hc_down_f32(w.down.view, normalized, bottleneck);
     else
 #endif
+    if (batch_hc_down_exact(g, w, shape, n)) g.prefill_hc_down_batch(w.down.view, normalized, bottleneck);
+    else
     for (uint32_t t = 0; t < n; ++t) g.gemv(w.down.encoding, w.down.view, row(g, normalized, t), row(g, bottleneck, t), width, shape.rank);
     TOKSPUR_OPERATOR_CHECKPOINT(g,"hc","down",{n,width,shape.rank,w.down.encoding});
     const auto active = g.slice(s.rows.bottleneck, 0, uint64_t(n) * shape.rank * 4);
@@ -162,7 +171,8 @@ uint64_t prefill_residual_dispatches(const MetalGraph& g, const ResidualWeights&
         return total;
     }
     const auto down = batch_hc_down_window(g, w, s, n) ? g.dense_mm_q8_dispatches(s.branches * s.channels)
-        : (batch_hc_down(g, w, s, n) ? 1 : uint64_t(n) * g.gemv_dispatches(w.down.encoding, s.branches * s.channels, s.rank));
+        : ((batch_hc_down(g, w, s, n) || batch_hc_down_exact(g, w, s, n)) ? 1
+            : uint64_t(n) * g.gemv_dispatches(w.down.encoding, s.branches * s.channels, s.rank));
     const auto inject = (batch_rows(g, s, n) && w.inject.encoding == 0) ? 2
         : (batch_q8_inject(g, w, s, n) ? g.dense_mm_q8_dispatches(s.branches * s.channels)
             : uint64_t(n) * g.gemv_dispatches(w.inject.encoding, s.branches * s.channels, s.branches));

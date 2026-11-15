@@ -47,10 +47,11 @@ struct DFlash2ContextCommitPlan {
 
 // Store valid ring rows in chronological order. Each layer contributes keys followed by values; unused and overwritten physical rows are never checkpoint state.
 struct DFlash2CheckpointLayout {
-    uint32_t first = 0, rows = 0, window = 2048, layers = 5, heads = 8, width = 128;
+    uint32_t first = 0, rows = 0, window = 2048, layers = 5, heads = 8, width = 128, max_context = 65536;
 
     [[nodiscard]] bool valid() const noexcept {
-        return window && layers && heads && width && first <= 65536 && rows <= 65536 - first &&
+        return (max_context == 65536 || max_context == 131072) &&
+            window && layers && heads && width && first <= max_context && rows <= max_context - first &&
             rows == std::min(first + rows, window) && layers <= 64 && heads <= 128 && width <= 1024;
     }
     [[nodiscard]] uint64_t bytes() const noexcept { return uint64_t(rows) * heads * width * 2 * 2 * layers; }

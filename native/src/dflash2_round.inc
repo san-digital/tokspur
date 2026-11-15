@@ -62,29 +62,89 @@ if (dflash2 && mtp_depth == 7) {
     const uint32_t max_k = std::min({7u, dflash2->max_drafts(), compute_remaining - 1u, max_context_steps - 1u});
     dequantize(token_table.type, files.tensor_bytes(token_table.name).subspan(uint64_t(anchor) * row_bytes, row_bytes),
         std::span(mtp_candidate_rows).first(2560));
+
+    uint32_t lookup_bypass_k = 0;
+    std::array<uint32_t, 7> lookup_proposed{};
+    if (mtp_lookup && mtp_lookup_valid) {
+        require(mtp_lookup->committed_length() == base, "DFlash2 lookup prefix differs from target frontier");
+        mtp_lookup->append(mtp_lookup->epoch(), base, std::span(&anchor, 1));
+        if (mtp_lookup_mode != MtpLookupMode::off && max_k >= 1) {
+            const auto prop = mtp_lookup->propose(mtp_lookup->epoch(), base + 1);
+            if (prop.outcome == LookupOutcome::proposed && prop.count >= 1) {
+                const uint32_t limit = std::min(prop.count, max_k);
+                uint32_t usable = 0;
+                for (uint32_t t = 0; t < limit; ++t) {
+                    lookup_proposed[t] = prop.tokens[t];
+                    usable = t + 1;
+                    if (std::find(job.stops.begin(), job.stops.end(), prop.tokens[t]) != job.stops.end()) {
+                        break;
+                    }
+                }
+                if (mtp_lookup_mode == MtpLookupMode::hybrid || usable >= 2 || (usable == 1 && max_k == 1)) {
+                    lookup_bypass_k = usable;
+                }
+            }
+        }
+    }
+
+    const bool lookup_round = lookup_bypass_k > 0;
     PleAsyncScopeGuard ple_guard;
     NgramHistory ple_hist{};
-    if (ple_async) {
-        ple_hist = stack.committed_history();
-        ple_guard.start(*ple_async, ple_hist, std::span(&anchor, 1), std::span(mtp_candidate_memory).first(2560));
-    }
-    const auto head_started = Clock::now();
-    measured_observer.drafted_rows = max_k + 1;
-    const auto draft = dflash2->draft_block8(max_k, base, anchor, std::span(mtp_candidate_rows).first(2560),
-        sampler.options().policy, random, dflash2->adaptive_budget());
-    if (measured_controller) measured_observer.probabilities = dflash_measured_probabilities(*dflash2, draft.confidences);
-    const double draft_wall = milliseconds(head_started);
-    const double draft_gpu = draft.batch.gpu_ms;
-    if (ple_async) {
-        ple_hist = ple_guard.finish();
+    DFlash2DraftResult draft{};
+    double draft_wall = 0.0;
+    double draft_gpu = 0.0;
+    if (lookup_round) {
+        if (dflash2->deferred_context()) {
+            const auto flush_started = Clock::now();
+            mtp_prime_gpu_ms += dflash2->flush_context().gpu_ms;
+            mtp_prime_wall_ms += milliseconds(flush_started);
+        }
+        const auto head_started = Clock::now();
+        measured_observer.drafted_rows = lookup_bypass_k + 1;
+        draft.count = lookup_bypass_k;
+        draft.evaluated_proposals = lookup_bypass_k;
+        draft.proposal_begin_words = random.words_consumed();
+        draft.random_after = random;
+        for (uint32_t t = 0; t < lookup_bypass_k; ++t) {
+            const uint32_t tok = lookup_proposed[t];
+            draft.proposals[t] = SampledProposalRow{
+                base + 1u + t,
+                t == 0u ? anchor : lookup_proposed[t - 1u],
+                tok,
+                SampledSparseLaw::from_grid_units(
+                    shape.vocabulary, std::span(&tok, 1), std::span(&sampled_path_grid_size, 1)),
+            };
+            draft.confidences[t] = 1.0f;
+        }
+        draft_wall = milliseconds(head_started);
+    } else {
+        if (ple_async) {
+            ple_hist = stack.committed_history();
+            ple_guard.start(*ple_async, ple_hist, std::span(&anchor, 1), std::span(mtp_candidate_memory).first(2560));
+        }
+        const auto head_started = Clock::now();
+        measured_observer.drafted_rows = max_k + 1;
+        draft = dflash2->draft_block8(max_k, base, anchor, std::span(mtp_candidate_rows).first(2560),
+            sampler.options().policy, random, dflash2->adaptive_budget());
+        if (measured_controller) measured_observer.probabilities = dflash_measured_probabilities(*dflash2, draft.confidences);
+        draft_wall = milliseconds(head_started);
+        draft_gpu = draft.batch.gpu_ms;
+        if (ple_async) {
+            ple_hist = ple_guard.finish();
+        }
     }
     const uint32_t k = draft.count;
-    mtp_head_calls += k;
+    if (!lookup_round) {
+        mtp_head_calls += k;
+        mtp_head_gpu_ms += draft_gpu;
+        mtp_head_wall_ms += draft_wall;
+    }
     mtp_proposed += k;
-    mtp_head_gpu_ms += draft_gpu;
-    mtp_head_wall_ms += draft_wall;
 
     if (k == 0u) {
+        if (mtp_lookup && mtp_lookup_valid) {
+            static_cast<void>(mtp_lookup->truncate(mtp_lookup->epoch(), base));
+        }
         advance(anchor);
         sampler.publish(std::move(random));
         if (pending) ++mtp_carried_anchors;
@@ -117,8 +177,13 @@ if (dflash2 && mtp_depth == 7) {
     for (uint32_t t = 0; t < k; ++t) candidates[1 + t] = draft.proposals[t].selected;
     const auto cand_span = std::span<const uint32_t>(candidates).first(1 + k);
     if (ple_async) {
-        ple_guard.start(*ple_async, ple_hist, cand_span.subspan(1),
-            std::span(mtp_candidate_memory).subspan(2560, uint64_t(k) * 2560));
+        if (lookup_round) {
+            ple_guard.start(*ple_async, stack.committed_history(), cand_span,
+                std::span(mtp_candidate_memory).first(uint64_t(1 + k) * 2560));
+        } else {
+            ple_guard.start(*ple_async, ple_hist, cand_span.subspan(1),
+                std::span(mtp_candidate_memory).subspan(2560, uint64_t(k) * 2560));
+        }
         for (uint32_t t = 1; t <= k; ++t) {
             dequantize(token_table.type, files.tensor_bytes(token_table.name).subspan(uint64_t(candidates[t]) * row_bytes, row_bytes),
                 std::span(mtp_candidate_rows).subspan(uint64_t(t) * 2560, 2560));
@@ -138,7 +203,7 @@ if (dflash2 && mtp_depth == 7) {
                      std::span(mtp_candidate_memory).first(uint64_t(1 + k) * 2560));
     }
 
-    TargetDFlash2Selection selector{base, anchor, draft, sampler.options().policy, job.stops, {}, {}};
+    TargetDFlash2Selection selector{base, anchor, draft, sampler.options().policy, job.stops, {}, {}, shape.attention.capacity};
     const auto verified = stack.verify_sampled8(cand_span,
         std::span(mtp_candidate_rows).first(uint64_t(1 + k) * 2560),
         std::span(mtp_candidate_memory).first(uint64_t(1 + k) * 2560),
@@ -148,6 +213,9 @@ if (dflash2 && mtp_depth == 7) {
         selector.publication->prefix == stack.position(), "DFlash2 target/decision publication differs");
     auto& decision = *selector.decision;
     measured_observer.stopped = decision.stopped;
+    if (mtp_lookup && mtp_lookup_valid && decision.accepted > 0) {
+        mtp_lookup->append(mtp_lookup->epoch(), base + 1, cand_span.subspan(1, decision.accepted));
+    }
     materialize_verified_logits_if_needed(verified, verified.committed,
         selector.publication->stopped, selector.publication->pending.has_value());
     mtp_spare->position = base;
@@ -161,6 +229,10 @@ if (dflash2 && mtp_depth == 7) {
 
     const auto cap = stack.last_dflash_capture();
     require(cap.rows.owner && cap.count == verified.committed, "DFlash2 verification tap capture mismatch");
+#ifdef TOKSPUR_DFLASH2_TAP_DUMP_ENABLED
+    // The committed rows are the anchor and the accepted drafts, in order from the round's base position.
+    dump_dflash2_taps(DFlash2TapDump::Source::verification, cap, base, cand_span.first(verified.committed));
+#endif
     const auto prime_started = Clock::now();
     if (dflash2->deferred_context()) dflash2->stage_context_commit(cap.rows, verified.committed, base);
     else mtp_prime_gpu_ms += dflash2->commit_context(cap.rows, verified.committed, base).gpu_ms;
@@ -171,37 +243,50 @@ if (dflash2 && mtp_depth == 7) {
     if (pending) ++mtp_carried_anchors;
     mtp_anchor.publish(*selector.publication);
     ++mtp_rounds;
+    if (lookup_round) {
+        ++mtp_lookup_rounds;
+        mtp_lookup_accepted += decision.accepted;
+    }
     mtp_accepted += decision.accepted;
     mtp_recoveries += decision.accepted < k;
     const uint32_t count = verified.committed;
     require(stack.position() == base + count && sampler.matches(stack.position()) && dflash2->context_len() == stack.position(),
         "DFlash2 visible/physical/drafter frontier differs");
     const double round_wall = milliseconds(round_started);
+    if (!lookup_round) {
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
-    if (carrier_mode == CarrierDiagnosticMode::off) {
+        if (carrier_mode == CarrierDiagnosticMode::off) {
 #endif
-    dflash2->observe_verify_round(draft.confidences, 1u + k, decision.accepted, measured_controller ? 0 : controller_observed_decode_ms(round_wall), !decision.stopped);
+        dflash2->observe_verify_round(draft.confidences, 1u + k, decision.accepted, measured_controller ? 0 : controller_observed_decode_ms(round_wall), !decision.stopped);
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
+        }
+#endif
     }
-#endif
     batch_wall += round_wall;
     batch_gpu += verified.verification.gpu_ms + verified.recovery.gpu_ms + draft_gpu + mtp_prime_gpu_ms - prime_before;
-    std::cout << decorate(Json(Json::Object{{"event", Json("mtp_round")}, {"base", Json::integer(base)},
+    Json::Object round_obj{{"event", Json("mtp_round")}, {"base", Json::integer(base)},
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
         {"gpu_counters_before", Json(Json::Object{{"dispatches", Json::integer(round_dispatches_before)}, {"command_buffers", Json::integer(round_commands_before)}, {"barriers", Json::integer(round_barriers_before)}})},
 #endif
         {"committed_prefix", Json::integer(stack.position())}, {"count", Json::integer(count)},
-        {"accepted", Json::integer(decision.accepted)}, {"proposed", Json::integer(k)},
-        {"draft_wall_ms", number(draft_wall)}, {"draft_gpu_ms", number(draft_gpu)},
-        {"verification_wall_ms", number(verified.verification.wall_ms)},
-        {"verification_gpu_ms", number(verified.verification.gpu_ms)},
-        {"recovery_wall_ms", number(verified.recovery.wall_ms)},
-        {"recovery_gpu_ms", number(verified.recovery.gpu_ms)},
-        {"materialization_wall_ms", number(0)}, {"lookahead_anchor", Json(true)},
-        {"used_carried_anchor", Json(bool(pending))},
-        {"pending_anchor", Json(bool(mtp_anchor.peek(stack.position())))},
-        {"round_wall_ms", number(round_wall)},
-        {"timings_qualified", Json(false)}})).dump() << '\n';
+        {"accepted", Json::integer(decision.accepted)}, {"proposed", Json::integer(k)}};
+    if (mtp_lookup) {
+        round_obj.emplace_back("head_calls", Json::integer(lookup_round ? 0u : k));
+        round_obj.emplace_back("prime_extra", Json::integer(0));
+    }
+    round_obj.emplace_back("draft_wall_ms", number(draft_wall));
+    round_obj.emplace_back("draft_gpu_ms", number(draft_gpu));
+    round_obj.emplace_back("verification_wall_ms", number(verified.verification.wall_ms));
+    round_obj.emplace_back("verification_gpu_ms", number(verified.verification.gpu_ms));
+    round_obj.emplace_back("recovery_wall_ms", number(verified.recovery.wall_ms));
+    round_obj.emplace_back("recovery_gpu_ms", number(verified.recovery.gpu_ms));
+    round_obj.emplace_back("materialization_wall_ms", number(0));
+    round_obj.emplace_back("lookahead_anchor", Json(true));
+    round_obj.emplace_back("used_carried_anchor", Json(bool(pending)));
+    round_obj.emplace_back("pending_anchor", Json(bool(mtp_anchor.peek(stack.position()))));
+    round_obj.emplace_back("round_wall_ms", number(round_wall));
+    round_obj.emplace_back("timings_qualified", Json(false));
+    std::cout << decorate(Json(std::move(round_obj))).dump() << '\n';
 
     std::array<uint32_t, 8> round_ids{};
     std::array<float, 8> round_scores{};

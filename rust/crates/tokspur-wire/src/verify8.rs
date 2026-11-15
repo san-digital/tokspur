@@ -477,8 +477,13 @@ fn fixed(v: &Json, branch8: bool) -> Result<()> {
 }
 
 /// This private endpoint binds the adopted fixed 48-layer architecture: 12 QSA layers, compression 4 and a 2048-token selection budget. 2222 includes 18 ordinary QSA dispatches per layer. Selection begins at token 2052 and adds sort/merge work; never bless an observed count.
-fn ordinary(prefix: u32, stage8_enabled: bool, channel_enabled: bool) -> Result<u64> {
-    const SHAPE: QsaShape = QsaShape {
+fn ordinary(
+    prefix: u32,
+    stage8_enabled: bool,
+    channel_enabled: bool,
+    capacity: u32,
+) -> Result<u64> {
+    let shape = QsaShape {
         channels: 2560,
         query_heads: 24,
         kv_heads: 2,
@@ -488,12 +493,35 @@ fn ordinary(prefix: u32, stage8_enabled: bool, channel_enabled: bool) -> Result<
         rotary_width: 64,
         compression: 4,
         token_budget: 2048,
-        capacity: 65536,
+        capacity,
     };
     Ok(2222u64
-        .wrapping_add(12u64.wrapping_mul(qsa_dispatches(SHAPE, prefix)?.wrapping_sub(18)))
+        .wrapping_add(12u64.wrapping_mul(qsa_dispatches(shape, prefix)?.wrapping_sub(18)))
         .wrapping_add(12 * u64::from(stage8_enabled))
         .wrapping_add(12 * u64::from(channel_enabled)))
+}
+
+fn ready_context_limit(v: &Json) -> Result<u32> {
+    if !matches!(v, Json::Object(_)) {
+        return Ok(65536);
+    }
+    if let Some(field) = v.find("context_length")? {
+        let ctx = field.unsigned_integer()?;
+        need(ctx == 65536 || ctx == 131072, "private V8 capability")?;
+        if let Some(hist) = v.find("lookup_history_tokens")? {
+            let h = hist.unsigned_integer()?;
+            need(h == 0 || h == ctx, "private V8 capability")?;
+        }
+        return Ok(ctx as u32);
+    }
+    if let Some(hist) = v.find("lookup_history_tokens")? {
+        let h = hist.unsigned_integer()?;
+        if h != 0 {
+            need(h == 65536 || h == 131072, "private V8 capability")?;
+            return Ok(h as u32);
+        }
+    }
+    Ok(65536)
 }
 
 fn sampling(v: &Json, policy: &Json, seed: u64, prefix: u32) -> Result<()> {
@@ -560,9 +588,12 @@ fn ready(v: &Json, branch8: bool) -> Result<()> {
             "private V8 request-time experiment",
         )?;
     }
+    let history_tokens = integer(v, "lookup_history_tokens")?;
+    let context_limit = u64::from(ready_context_limit(v)?);
     need(
         integer(v, "lookup_match_tokens")? == 16
-            && integer(v, "lookup_history_tokens")? == 65536
+            && (history_tokens == 65536 || history_tokens == 131072)
+            && history_tokens == context_limit
             && integer(v, "lookup_proposal_tokens")? == 7
             && integer(v, "lookup_verification_budget_bytes")? == (128 << 20),
         "private V8 capability",
@@ -775,7 +806,7 @@ mod branch {
         fast_metadata(state)?;
         let prefix = integer(state, "committed_prefix")?;
         need(
-            prefix <= 65536 && integer(state, "lookup_history_epoch")? != 0,
+            prefix <= 131072 && integer(state, "lookup_history_epoch")? != 0,
             "private branch8 state prefix/epoch",
         )?;
         for name in COST_FIELDS {
@@ -961,11 +992,12 @@ mod branch {
                 "seed",
             ],
         )?;
+        let context_limit = u64::from(ready_context_limit(prepared)?);
         let count = get(job, "prompt_ids")?.array()?.len() as u64;
         let allow = get(job, "allow_restore")?.boolean()?;
         need(
             count != 0
-                && count <= 65536
+                && count <= context_limit
                 && (!cold_resync || !allow)
                 && (allow || common == 0)
                 && common <= before.min(count)
@@ -1091,6 +1123,7 @@ pub struct Verify8Reply<'a> {
     position: u32,
     inputs: u32,
     maximum: u32,
+    context_limit: u32,
     events: Vec<Json>,
     ids: [u32; 8],
     routes: [u64; 5],
@@ -1242,6 +1275,7 @@ impl<'a> Verify8Reply<'a> {
             position: before,
             inputs,
             maximum,
+            context_limit: 65536,
             events: Vec::with_capacity(16),
             ids: [0; 8],
             routes: [0; 5],
@@ -1343,11 +1377,12 @@ impl<'a> Verify8Reply<'a> {
                 "prompt_lookup",
             ],
         )?;
+        self.context_limit = ready_context_limit(self.ready)?;
         need(
             get(job, "tokens")?.array()?.len() <= 8
                 && integer(job, "generate")? <= 8
                 && (self.inputs != 0) != (self.maximum != 0)
-                && before <= 65536,
+                && before <= self.context_limit,
             "private V8 one bounded input OR generation batch required",
         )?;
         plain_keys(policy, &["temperature", "top_k", "top_p", "min_p"])?;
@@ -1386,7 +1421,7 @@ impl<'a> Verify8Reply<'a> {
             self.base
                 .wrapping_add(self.inputs)
                 .wrapping_add(self.maximum)
-                <= 65536
+                <= self.context_limit
                 && (self.inputs != 0 || self.base != 0),
             "private V8 context bound",
         )?;
@@ -1472,9 +1507,9 @@ impl<'a> Verify8Reply<'a> {
         let o = integer(v, "ordinary_tokens")?;
         let p = integer(v, "proposed_tokens")?;
         let count = integer(v, "useful_tokens")?;
-        // `maximum_ - count_` is size_t; `65536 - position_` is unsigned int.
+        // `maximum_ - count_` is size_t; `context_limit_ - position_` is unsigned int.
         let left = (self.maximum as u64).wrapping_sub(self.count as u64);
-        let room = u64::from(65536u32.wrapping_sub(self.position));
+        let room = u64::from(self.context_limit.wrapping_sub(self.position));
         need(
             p <= 7
                 && (n == 0 || (2..=7).contains(&n))
@@ -1538,6 +1573,7 @@ impl<'a> Verify8Reply<'a> {
                 self.position.wrapping_add(t),
                 stage_enabled,
                 channel_enabled,
+                self.context_limit,
             )?);
         }
         let verified = if n != 0 {
@@ -1553,6 +1589,7 @@ impl<'a> Verify8Reply<'a> {
                 self.position.wrapping_add(k as u32),
                 stage_enabled,
                 channel_enabled,
+                self.context_limit,
             )?
         } else {
             0

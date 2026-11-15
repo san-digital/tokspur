@@ -10,7 +10,7 @@ use crate::error::CliError;
 use crate::state::{private_dir, write_private_bytes};
 
 pub(crate) const SHARD1_SHA256: &str =
-    "4448186216b3af4cc558bbce2c3213f01608f8f8b2e5267a9767971dd3ec8082";
+    "6e27f395dc7527953671f79f03b9554c6136062dbdc6128116f82e02d3cee36a";
 pub(crate) const DERIVED_DIR: &str = "derived-text";
 const TOKENIZER_PIN: &str = tokspur_text::assets::TOKENIZER_SHA256;
 const TEMPLATE_PIN: &str = tokspur_text::assets::TEMPLATE_SHA256;
@@ -118,6 +118,18 @@ fn tokenizer_json(gguf: &Gguf<'_>) -> Result<Vec<u8>, CliError> {
     ])
     .dump()
     .map_err(refuse)
+}
+
+/// Returns true when `shard` is a valid GGUF header carrying Flash-Next vocabulary and chat template metadata.
+pub(crate) fn has_flash_next_text_metadata(shard: &Path) -> bool {
+    let Ok(gguf) = Gguf::from_path(shard) else {
+        return false;
+    };
+    gguf.find("tokenizer.ggml.tokens")
+        .is_some_and(|m| m.r#type == 9 && m.element_type == 8 && m.elements == 248_320)
+        && gguf
+            .find("tokenizer.chat_template")
+            .is_some_and(|m| m.r#type == 8)
 }
 
 /// Writes both assets under `state/gguf/derived-text`, refusing anything that does not match its pin.

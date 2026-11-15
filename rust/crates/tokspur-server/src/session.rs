@@ -16,7 +16,7 @@ use tokspur_text::response_protocol::{
 };
 
 use crate::admission::{
-    AdmissionError, AdmittedChat, ToolArgValidation, ToolEnumValidation, admit_chat_with_policies,
+    AdmissionError, AdmittedChat, ToolArgValidation, ToolEnumValidation, admit_chat_with_context,
     broker_storage, chunk, field, number, parser_manifest, real, require,
     validate_executor_tool_arguments, validate_tool_value_with_policy, validate_worker_ready,
     worker_execution,
@@ -180,6 +180,7 @@ pub struct SessionOptions {
     pub mtp_ready: Json,
     pub mtp_first_output_packet: Option<u32>,
     pub overlap_prefill: bool,
+    pub context_length: u32,
 }
 
 impl Default for SessionOptions {
@@ -199,6 +200,7 @@ impl Default for SessionOptions {
             mtp_ready: Json::Null,
             mtp_first_output_packet: None,
             overlap_prefill: false,
+            context_length: 65_536,
         }
     }
 }
@@ -210,6 +212,7 @@ pub struct ServeSession {
     stack_execution: String,
     tool_enums: ToolEnumValidation,
     tool_args: ToolArgValidation,
+    context_length: u32,
     committed: Vec<u32>,
     sampling: Vec<u8>,
     seed: u64,
@@ -272,6 +275,7 @@ impl ServeSession {
             stack_execution: options.stack_execution,
             tool_enums: options.tool_enums,
             tool_args: options.tool_args,
+            context_length: options.context_length,
             committed: Vec::new(),
             sampling: Vec::new(),
             seed: 0,
@@ -308,15 +312,20 @@ impl ServeSession {
         };
         require(!session.alias.is_empty(), "invalid serving codec")?;
         require(
+            session.context_length == 65_536 || session.context_length == 131_072,
+            "unsupported serving context length",
+        )?;
+        require(
             session.stack_execution == "direct" || session.stack_execution == "recurrent-replay",
             "unsupported serving startup execution mode",
         )?;
+        let context_cap = session.context_length as usize;
         if session.mtp {
             let draft = tokspur_wire::mtp_wire::mtp_draft_attention(&session.mtp_ready)?;
             let carry = tokspur_wire::mtp_wire::mtp_request_carry(&session.mtp_ready)?;
             let depth = tokspur_wire::mtp_wire::mtp_depth(&session.mtp_ready)?;
             tokspur_wire::mtp_wire::validate_mtp_ready(&session.mtp_ready, draft, carry, depth)?;
-            session.committed.reserve(65536);
+            session.committed.reserve(context_cap);
         }
         if let Some(first_pkt) = session.mtp_first_output_packet {
             require(
@@ -353,7 +362,7 @@ impl ServeSession {
                 )?;
                 tokspur_wire::verify8::validate_verify8_ready(&session.verify_ready)?;
             }
-            session.committed.reserve(65536);
+            session.committed.reserve(context_cap);
         } else {
             require(
                 session.verify_ready.is_null(),
@@ -378,7 +387,7 @@ impl ServeSession {
             )?;
             session.broker_epoch =
                 field(&session.broker_ready, "broker_epoch")?.unsigned_integer()?;
-            session.committed.reserve(65536); // Before any restore publication.
+            session.committed.reserve(context_cap); // Before any restore publication.
         }
         Ok(session)
     }
@@ -498,8 +507,13 @@ impl ServeSession {
                 ..PhaseStamps::default()
             };
         }
-        let request =
-            admit_chat_with_policies(input, &self.alias, self.tool_enums, self.tool_args)?;
+        let request = admit_chat_with_context(
+            input,
+            &self.alias,
+            self.tool_enums,
+            self.tool_args,
+            self.context_length,
+        )?;
         crate::admission::validate_calibrated_sampling(&request.sampling, &self.mtp_ready)?;
         if !self.mtp && self.verify8_mode() {
             require(
@@ -507,6 +521,7 @@ impl ServeSession {
                 "private HTTP V8 is greedy-only; nonzero temperature is explicitly refused",
             )?;
         }
+        let context_cap = self.context_length as usize;
         let rendered = (self.codec.render)(&request.render)?;
         let mut prompt = (self.codec.encode)(&rendered)?;
         if self.reusable
@@ -514,15 +529,20 @@ impl ServeSession {
             && let Some(filled) = self.with_saved_reasoning(&request.render)?
         {
             let candidate = (self.codec.encode)(&(self.codec.render)(&filled)?)?;
-            if candidate.len() < 65536 && candidate.starts_with(&self.committed) {
+            if candidate.len() < context_cap && candidate.starts_with(&self.committed) {
                 prompt = candidate;
             }
         }
         require(
-            !prompt.is_empty() && prompt.len() < 65536,
-            "request leaves no generation space in the 64K context",
+            !prompt.is_empty() && prompt.len() < context_cap,
+            if self.context_length == 131_072 {
+                "request leaves no generation space in the 128K context"
+            } else {
+                "request leaves no generation space in the 64K context"
+            },
         )?;
-        let maximum_tokens = (request.maximum_tokens as usize).min(65536 - prompt.len()) as u32;
+        let maximum_tokens =
+            (request.maximum_tokens as usize).min(context_cap - prompt.len()) as u32;
         for &id in &prompt {
             require(
                 id < self.codec.admission.vocabulary,
@@ -1176,6 +1196,331 @@ impl Completion<'_> {
         primary
     }
 
+    fn encode_forced_tokens(session: &ServeSession, text: &[u8]) -> Result<Vec<u32>> {
+        let rendered = RenderedChat {
+            prompt: text.to_vec(),
+            ..RenderedChat::default()
+        };
+        let ids = (session.codec.encode)(&rendered)?;
+        require(!ids.is_empty(), "forced thinking close encoded no tokens")?;
+        let admission = session.codec.admission;
+        for &id in &ids {
+            require(
+                id < admission.vocabulary && id != admission.im_start && !admission.is_stop(id),
+                "forced thinking close token outside vocabulary or terminal",
+            )?;
+        }
+        Ok(ids)
+    }
+
+    fn build_mtp_generation_field(
+        session: &ServeSession,
+        begin: bool,
+        remaining: u64,
+        total_budget: u64,
+    ) -> Result<Json> {
+        let is_v2 = if let Some(scope) = session.mtp_ready.find("native_mtp_carry_scope")? {
+            scope.string()? == b"http-generation-v2"
+        } else {
+            false
+        };
+        if is_v2 {
+            let committed = session.mtp_committed;
+            let emitted = session.mtp_emitted;
+            let pending = session.mtp_pending;
+            let remaining_compute = total_budget.saturating_sub(committed);
+            let mut fields: Vec<(&str, Json)> = vec![
+                ("id", Json::integer(session.mtp_generation_id)),
+                ("begin", Json::Bool(begin)),
+                ("remaining", Json::integer(remaining)),
+                ("committed", Json::integer(committed)),
+                ("emitted", Json::integer(emitted)),
+                ("pending", Json::integer(pending)),
+                ("remaining_compute", Json::integer(remaining_compute)),
+                ("total_budget", Json::integer(total_budget)),
+            ];
+            if let Some(ref ctrl) = session.mtp_stage_a_controller {
+                let digest_arr: Vec<Json> = ctrl
+                    .controller_policy_digest
+                    .iter()
+                    .map(|&b| Json::integer(b as u64))
+                    .collect();
+                let ctrl_obj = Json::new_object([
+                    ("ewma_alpha1", real(ctrl.ewma_alpha1)?),
+                    ("current_mode", Json::integer(ctrl.current_mode as u64)),
+                    (
+                        "consecutive_ordinary_steps",
+                        Json::integer(ctrl.consecutive_ordinary_steps as u64),
+                    ),
+                    ("controller_policy_digest", Json::Array(digest_arr)),
+                ]);
+                let ctrl_obj = if let Some(measured) = ctrl.measured {
+                    let mut object = ctrl_obj.object()?.to_vec();
+                    object.push((b"measured".to_vec(), measured.json()?));
+                    Json::Object(object)
+                } else {
+                    ctrl_obj
+                };
+                fields.push(("stage_a_controller", ctrl_obj));
+            }
+            Ok(Json::new_object(fields))
+        } else {
+            Ok(Json::new_object([
+                ("id", Json::integer(session.mtp_generation_id)),
+                ("begin", Json::Bool(begin)),
+                ("remaining", Json::integer(remaining)),
+            ]))
+        }
+    }
+
+    fn run_generation_phase(
+        &mut self,
+        session: &mut ServeSession,
+        target: &mut ServeTarget<'_>,
+        sink: &mut ServeSink<'_>,
+        phase_limit: usize,
+        stopped: &mut bool,
+    ) -> Result<()> {
+        if *stopped || self.generated.len() >= phase_limit {
+            return Ok(());
+        }
+        let phase_budget = phase_limit - self.generated.len();
+        let admission = session.codec.admission;
+        let stop_ids = || {
+            Json::Array(vec![
+                Json::integer(u64::from(admission.im_end)),
+                Json::integer(u64::from(admission.end_of_text)),
+            ])
+        };
+        if session.mtp {
+            session.mtp_committed = 0;
+            session.mtp_emitted = 0;
+            session.mtp_pending = 0;
+            session.mtp_stage_a_controller = None;
+            let scoped_carry = tokspur_wire::mtp_wire::mtp_request_carry(&session.mtp_ready)?;
+            if scoped_carry {
+                require(
+                    session.mtp_generation_id < u64::MAX,
+                    "MTP generation ID exhausted",
+                )?;
+                session.mtp_generation_id += 1;
+            }
+            let output_packet =
+                tokspur_wire::mtp_wire::mtp_output_packet(&session.mtp_ready)? as usize;
+            let mut phase_emitted = 0usize;
+            while phase_emitted < phase_budget {
+                let packet_cap = match session.mtp_first_output_packet {
+                    Some(first_pkt) if self.generated.is_empty() => {
+                        (first_pkt as usize).min(output_packet)
+                    }
+                    _ => output_packet,
+                };
+                let n = packet_cap.min(phase_budget - phase_emitted);
+                let mut job = vec![
+                    (b"tokens".to_vec(), Json::Array(Vec::new())),
+                    (b"generate".to_vec(), Json::integer(n as u64)),
+                    (b"reset".to_vec(), Json::Bool(false)),
+                    (b"stop_ids".to_vec(), stop_ids()),
+                ];
+                if scoped_carry {
+                    let gen_obj = Self::build_mtp_generation_field(
+                        session,
+                        phase_emitted == 0,
+                        (phase_budget - phase_emitted) as u64,
+                        phase_budget as u64,
+                    )?;
+                    job.push((b"mtp_generation".to_vec(), gen_obj));
+                }
+                let done = self.run_mtp(session, target, sink, Json::Object(job))?;
+                for token in field(&done, "generated_ids")?.array()? {
+                    let id = token.unsigned_integer()? as u32;
+                    require(
+                        id != admission.im_start && !*stopped,
+                        "MTP unexpected generated role/terminal",
+                    )?;
+                    *stopped = admission.is_stop(id);
+                    self.generated.push(id);
+                    phase_emitted += 1;
+                    self.feed(session, sink, id)?;
+                }
+                if *stopped {
+                    break;
+                }
+            }
+        } else if session.verify8_mode() {
+            #[cfg(feature = "verify8")]
+            while self.generated.len() < phase_limit {
+                let n = 8.min(phase_limit - self.generated.len());
+                let job = Json::new_object([
+                    ("tokens", Json::Array(Vec::new())),
+                    ("generate", Json::integer(n as u64)),
+                    ("reset", Json::Bool(false)),
+                    ("stop_ids", stop_ids()),
+                ]);
+                let done = self.run_many(session, target, sink, job)?;
+                for token in field(&done, "generated_ids")?.array()? {
+                    let id = token.unsigned_integer()? as u32;
+                    require(
+                        id != admission.im_start && !*stopped,
+                        "private V8 unexpected generated role/terminal",
+                    )?;
+                    *stopped = admission.is_stop(id);
+                    self.generated.push(id);
+                    self.feed(session, sink, id)?;
+                }
+                if *stopped {
+                    break;
+                }
+            }
+        } else {
+            while self.generated.len() < phase_limit {
+                let job = Json::new_object([
+                    ("tokens", Json::Array(Vec::new())),
+                    ("generate", Json::integer(1)),
+                    ("reset", Json::Bool(false)),
+                    ("stop_ids", stop_ids()),
+                ]);
+                let done = self.step(session, target, sink, job, None, true)?;
+                let id = session.committed.last().copied().unwrap_or(0);
+                require(
+                    id != admission.im_start,
+                    "unexpected generated role/terminal token",
+                )?;
+                *stopped = admission.is_stop(id);
+                require(
+                    is(
+                        field(&done, "finish_reason")?,
+                        if *stopped { "stop" } else { "length" },
+                    )? && is(
+                        field(&done, "status")?,
+                        if *stopped { "stopped" } else { "length" },
+                    )?,
+                    "worker termination mismatch",
+                )?;
+                if *stopped {
+                    require(
+                        field(&done, "stop_id")?.unsigned_integer()? == u64::from(id)
+                            && !field(&done, "continuation_allowed")?.boolean()?,
+                        "invalid terminal admission",
+                    )?;
+                } else {
+                    require(
+                        field(&done, "stop_id")?.is_null()
+                            && field(&done, "continuation_allowed")?.boolean()?,
+                        "invalid continuation admission",
+                    )?;
+                }
+                self.generated.push(id);
+                self.feed(session, sink, id)?;
+                if *stopped {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn inject_forced_thinking_close(
+        &mut self,
+        session: &mut ServeSession,
+        target: &mut ServeTarget<'_>,
+        sink: &mut ServeSink<'_>,
+    ) -> Result<Option<usize>> {
+        let nl_ids = if self.parser.thinking_ends_with_newline() {
+            Vec::new()
+        } else {
+            Self::encode_forced_tokens(session, b"\n")?
+        };
+        let close_ids = Self::encode_forced_tokens(session, b"</think>")?;
+        let nl2_ids = Self::encode_forced_tokens(session, b"\n\n")?;
+        let mut inject = Vec::with_capacity(nl_ids.len() + close_ids.len() + nl2_ids.len());
+        inject.extend_from_slice(&nl_ids);
+        let close_offset = inject.len();
+        inject.extend_from_slice(&close_ids);
+        inject.extend_from_slice(&nl2_ids);
+        let rem = self.maximum_tokens as usize - self.generated.len();
+        if inject.len() > rem {
+            inject.truncate(rem);
+        }
+        if inject.is_empty() {
+            return Ok(None);
+        }
+        let forced_close_index = if inject.len() > close_offset {
+            Some(self.generated.len() + close_offset)
+        } else {
+            None
+        };
+        if session.mtp {
+            let input_packet =
+                tokspur_wire::mtp_wire::mtp_input_packet(&session.mtp_ready)? as usize;
+            let final_logits = tokspur_wire::mtp_wire::mtp_final_input_logits(&session.mtp_ready)?;
+            let mut at = 0usize;
+            while at < inject.len() {
+                cancelled(sink)?;
+                let n = input_packet.min(inject.len() - at);
+                let ids = inject[at..at + n]
+                    .iter()
+                    .map(|&id| Json::integer(u64::from(id)))
+                    .collect();
+                let mut job = vec![
+                    (b"tokens".to_vec(), Json::Array(ids)),
+                    (b"generate".to_vec(), Json::integer(0)),
+                    (b"reset".to_vec(), Json::Bool(false)),
+                ];
+                if final_logits {
+                    job.push((
+                        b"prefill_final".to_vec(),
+                        Json::Bool(at + n == inject.len()),
+                    ));
+                }
+                self.run_mtp(session, target, sink, Json::Object(job))?;
+                at += n;
+            }
+        } else if session.verify8_mode() {
+            #[cfg(feature = "verify8")]
+            {
+                let mut at = 0usize;
+                while at < inject.len() {
+                    let n = 8.min(inject.len() - at);
+                    let ids = inject[at..at + n]
+                        .iter()
+                        .map(|&id| Json::integer(u64::from(id)))
+                        .collect();
+                    let job = Json::new_object([
+                        ("tokens", Json::Array(ids)),
+                        ("generate", Json::integer(0)),
+                        ("reset", Json::Bool(false)),
+                    ]);
+                    self.run_many(session, target, sink, job)?;
+                    at += n;
+                }
+            }
+        } else {
+            for &token in &inject {
+                let job = Json::new_object([
+                    ("tokens", Json::Array(vec![Json::integer(u64::from(token))])),
+                    ("generate", Json::integer(0)),
+                    ("reset", Json::Bool(false)),
+                ]);
+                let done = self.step(session, target, sink, job, Some(token), false)?;
+                require(
+                    is(field(&done, "status")?, "prefilled")?
+                        && field(&done, "finish_reason")?.is_null()
+                        && field(&done, "stop_id")?.is_null(),
+                    "invalid prefill termination",
+                )?;
+            }
+        }
+        for (i, &id) in inject.iter().enumerate() {
+            if i == close_offset {
+                self.parser.prepare_forced_thinking_close();
+            }
+            self.generated.push(id);
+            self.feed(session, sink, id)?;
+        }
+        Ok(forced_close_index)
+    }
+
     /// Feeds one generated ID's bytes to the parser and streams new deltas.
     fn feed(&mut self, session: &ServeSession, sink: &mut ServeSink<'_>, id: u32) -> Result<()> {
         if session.codec.admission.is_stop(id) {
@@ -1437,189 +1782,35 @@ impl Completion<'_> {
         )?;
         cached_prefix += self.counters.restored_input_tokens as usize;
         let admission = session.codec.admission;
-        let stop_ids = || {
-            Json::Array(vec![
-                Json::integer(u64::from(admission.im_end)),
-                Json::integer(u64::from(admission.end_of_text)),
-            ])
-        };
         let generation_start = std::time::Instant::now();
         if session.phase_stamps_enabled {
             session.phase_stamps.generation_start = Some(generation_start);
         }
         let mut stopped = false;
-        if session.mtp {
-            session.mtp_committed = 0;
-            session.mtp_emitted = 0;
-            session.mtp_pending = 0;
-            session.mtp_stage_a_controller = None;
-            let scoped_carry = tokspur_wire::mtp_wire::mtp_request_carry(&session.mtp_ready)?;
-            if scoped_carry {
-                require(
-                    session.mtp_generation_id < u64::MAX,
-                    "MTP generation ID exhausted",
-                )?;
-                session.mtp_generation_id += 1;
+        let mut forced_thinking_close_index = None;
+        let max_total = self.maximum_tokens as usize;
+        if let Some(budget) = request.thinking_budget
+            && request.thinking
+            && (budget as usize) < max_total
+        {
+            self.run_generation_phase(session, target, sink, budget as usize, &mut stopped)?;
+            while !stopped
+                && self.parser.in_thinking()
+                && self.parser.has_incomplete_utf8()
+                && self.generated.len() < max_total
+            {
+                let next_limit = self.generated.len() + 1;
+                self.run_generation_phase(session, target, sink, next_limit, &mut stopped)?;
             }
-            let output_packet =
-                tokspur_wire::mtp_wire::mtp_output_packet(&session.mtp_ready)? as usize;
-            while self.generated.len() < self.maximum_tokens as usize {
-                let packet_cap = match session.mtp_first_output_packet {
-                    Some(first_pkt) if self.generated.is_empty() => {
-                        (first_pkt as usize).min(output_packet)
-                    }
-                    _ => output_packet,
-                };
-                let n = packet_cap.min(self.maximum_tokens as usize - self.generated.len());
-                let mut job = vec![
-                    (b"tokens".to_vec(), Json::Array(Vec::new())),
-                    (b"generate".to_vec(), Json::integer(n as u64)),
-                    (b"reset".to_vec(), Json::Bool(false)),
-                    (b"stop_ids".to_vec(), stop_ids()),
-                ];
-                if scoped_carry {
-                    let is_v2 =
-                        if let Some(scope) = session.mtp_ready.find("native_mtp_carry_scope")? {
-                            scope.string()? == b"http-generation-v2"
-                        } else {
-                            false
-                        };
-                    let remaining = (self.maximum_tokens as usize - self.generated.len()) as u64;
-                    let gen_obj = if is_v2 {
-                        let total_budget = self.maximum_tokens as u64;
-                        let committed = session.mtp_committed;
-                        let emitted = session.mtp_emitted;
-                        let pending = session.mtp_pending;
-                        let remaining_compute = total_budget.saturating_sub(committed);
-                        let mut fields: Vec<(&str, Json)> = vec![
-                            ("id", Json::integer(session.mtp_generation_id)),
-                            ("begin", Json::Bool(self.generated.is_empty())),
-                            ("remaining", Json::integer(remaining)),
-                            ("committed", Json::integer(committed)),
-                            ("emitted", Json::integer(emitted)),
-                            ("pending", Json::integer(pending)),
-                            ("remaining_compute", Json::integer(remaining_compute)),
-                            ("total_budget", Json::integer(total_budget)),
-                        ];
-                        let ctrl_obj;
-                        if let Some(ref ctrl) = session.mtp_stage_a_controller {
-                            let digest_arr: Vec<Json> = ctrl
-                                .controller_policy_digest
-                                .iter()
-                                .map(|&b| Json::integer(b as u64))
-                                .collect();
-                            ctrl_obj = Json::new_object([
-                                ("ewma_alpha1", real(ctrl.ewma_alpha1)?),
-                                ("current_mode", Json::integer(ctrl.current_mode as u64)),
-                                (
-                                    "consecutive_ordinary_steps",
-                                    Json::integer(ctrl.consecutive_ordinary_steps as u64),
-                                ),
-                                ("controller_policy_digest", Json::Array(digest_arr)),
-                            ]);
-                            let ctrl_obj = if let Some(measured) = ctrl.measured {
-                                let mut object = ctrl_obj.object()?.to_vec();
-                                object.push((b"measured".to_vec(), measured.json()?));
-                                Json::Object(object)
-                            } else {
-                                ctrl_obj
-                            };
-                            fields.push(("stage_a_controller", ctrl_obj));
-                        }
-                        Json::new_object(fields)
-                    } else {
-                        Json::new_object([
-                            ("id", Json::integer(session.mtp_generation_id)),
-                            ("begin", Json::Bool(self.generated.is_empty())),
-                            ("remaining", Json::integer(remaining)),
-                        ])
-                    };
-                    job.push((b"mtp_generation".to_vec(), gen_obj));
-                }
-                let done = self.run_mtp(session, target, sink, Json::Object(job))?;
-                for token in field(&done, "generated_ids")?.array()? {
-                    let id = token.unsigned_integer()? as u32;
-                    require(
-                        id != admission.im_start && !stopped,
-                        "MTP unexpected generated role/terminal",
-                    )?;
-                    stopped = admission.is_stop(id);
-                    self.generated.push(id);
-                    self.feed(session, sink, id)?;
-                }
-                if stopped {
-                    break;
-                }
+            if !stopped && self.parser.in_thinking() && self.generated.len() < max_total {
+                forced_thinking_close_index =
+                    self.inject_forced_thinking_close(session, target, sink)?;
             }
-        } else if session.verify8_mode() {
-            #[cfg(feature = "verify8")]
-            while self.generated.len() < self.maximum_tokens as usize {
-                let n = 8.min(self.maximum_tokens as usize - self.generated.len());
-                let job = Json::new_object([
-                    ("tokens", Json::Array(Vec::new())),
-                    ("generate", Json::integer(n as u64)),
-                    ("reset", Json::Bool(false)),
-                    ("stop_ids", stop_ids()),
-                ]);
-                let done = self.run_many(session, target, sink, job)?;
-                for token in field(&done, "generated_ids")?.array()? {
-                    let id = token.unsigned_integer()? as u32;
-                    require(
-                        id != admission.im_start && !stopped,
-                        "private V8 unexpected generated role/terminal",
-                    )?;
-                    stopped = admission.is_stop(id);
-                    self.generated.push(id);
-                    self.feed(session, sink, id)?;
-                }
-                if stopped {
-                    break;
-                }
+            if !stopped && self.generated.len() < max_total {
+                self.run_generation_phase(session, target, sink, max_total, &mut stopped)?;
             }
         } else {
-            for _ in 0..self.maximum_tokens {
-                let job = Json::new_object([
-                    ("tokens", Json::Array(Vec::new())),
-                    ("generate", Json::integer(1)),
-                    ("reset", Json::Bool(false)),
-                    ("stop_ids", stop_ids()),
-                ]);
-                let done = self.step(session, target, sink, job, None, true)?;
-                let id = session.committed.last().copied().unwrap_or(0);
-                require(
-                    id != admission.im_start,
-                    "unexpected generated role/terminal token",
-                )?;
-                stopped = admission.is_stop(id);
-                require(
-                    is(
-                        field(&done, "finish_reason")?,
-                        if stopped { "stop" } else { "length" },
-                    )? && is(
-                        field(&done, "status")?,
-                        if stopped { "stopped" } else { "length" },
-                    )?,
-                    "worker termination mismatch",
-                )?;
-                if stopped {
-                    require(
-                        field(&done, "stop_id")?.unsigned_integer()? == u64::from(id)
-                            && !field(&done, "continuation_allowed")?.boolean()?,
-                        "invalid terminal admission",
-                    )?;
-                } else {
-                    require(
-                        field(&done, "stop_id")?.is_null()
-                            && field(&done, "continuation_allowed")?.boolean()?,
-                        "invalid continuation admission",
-                    )?;
-                }
-                self.generated.push(id);
-                self.feed(session, sink, id)?;
-                if stopped {
-                    break;
-                }
-            }
+            self.run_generation_phase(session, target, sink, max_total, &mut stopped)?;
         }
         // Nonstreaming still validates each token above. Assemble its parser
         // records once for the same final prefix check used by streaming.
@@ -1653,6 +1844,12 @@ impl Completion<'_> {
         ];
         if session.tool_args == ToolArgValidation::Executor {
             final_fields.push((b"executor_parameters".to_vec(), Json::Bool(true)));
+        }
+        if let Some(idx) = forced_thinking_close_index {
+            final_fields.push((
+                b"forced_thinking_close_index".to_vec(),
+                Json::integer(idx as u64),
+            ));
         }
         let final_request = Json::Object(final_fields);
         let decode = |ids: &[u32]| (session.codec.decode)(ids);
@@ -2075,6 +2272,7 @@ impl Completion<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admission::admit_chat_with_policies;
 
     fn codec() -> ServeCodec {
         ServeCodec {

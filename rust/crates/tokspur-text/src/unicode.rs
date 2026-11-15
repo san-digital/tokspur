@@ -136,6 +136,15 @@ fn compose(first_point: u32, second_point: u32) -> u32 {
 ///
 /// Composition follows the C++ rule exactly: a scalar composes with the last starter when `previous < current || previous == 0`, where `previous` is the class of the last scalar appended (not of one composed away).
 pub fn normalize_nfc9(utf8: &[u8]) -> Result<Vec<u8>, NormalizeError> {
+    // ASCII is its own NFC: no ASCII scalar decomposes, has a nonzero class or composes with an ASCII successor (`ascii_is_nfc_stable` checks this against the tables). Within the input limit no work limit can trip either, so the full pass below would return the input unchanged.
+    if utf8.len() <= WORK_LIMIT && utf8.is_ascii() {
+        return Ok(utf8.to_vec());
+    }
+    normalize_full(utf8)
+}
+
+/// The full `normalize_nfc9` pass, without the ASCII shortcut.
+fn normalize_full(utf8: &[u8]) -> Result<Vec<u8>, NormalizeError> {
     let points = unicode_scalars(utf8)?;
     let mut decomposed = Vec::with_capacity(points.len());
     for point in points {
@@ -382,6 +391,32 @@ mod tests {
             Err(NormalizeError::Scalar(UnicodeError::Decode(
                 "Unicode input exceeds limit"
             )))
+        );
+    }
+
+    #[test]
+    fn ascii_is_nfc_stable() {
+        // The ASCII shortcut in `normalize_nfc9` rests on these table facts.
+        for point in 0..0x80u32 {
+            assert_eq!(combining(point), 0, "U+{point:04X} has a class");
+            let mut decomposed = Vec::new();
+            decompose(point, &mut decomposed, 0).unwrap();
+            assert_eq!(decomposed, [point], "U+{point:04X} decomposes");
+            for next in 0..0x80u32 {
+                assert_eq!(
+                    compose(point, next),
+                    0,
+                    "U+{point:04X} U+{next:04X} composes"
+                );
+            }
+        }
+        let every: Vec<u8> = (0..0x80u8).cycle().take(4096).collect();
+        assert_eq!(normalize_full(&every).unwrap(), every);
+        assert_eq!(normalize_nfc9(&every).unwrap(), every);
+        // Past the input limit the shortcut is not taken, so the scalar codec's refusal stands.
+        assert_eq!(
+            normalize_nfc9(&vec![b'a'; WORK_LIMIT + 1]),
+            normalize_full(&vec![b'a'; WORK_LIMIT + 1])
         );
     }
 

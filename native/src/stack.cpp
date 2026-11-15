@@ -53,6 +53,23 @@ struct RecurrentRun {
     std::array<GraphCapture, 2> captures{};
 };
 void require(bool ok, const char* message) { if (!ok) throw FormatError(message); }
+void require_all_finite(std::span<const float> vals, const char* message) {
+    size_t idx = 0;
+#if defined(__aarch64__)
+    const uint32x4_t exp_mask = vdupq_n_u32(0x7f800000u);
+    uint32x4_t bad = vdupq_n_u32(0u);
+    for (; idx + 16 <= vals.size(); idx += 16) {
+        const float* fp = vals.data() + idx;
+        const uint32x4_t c0 = vceqq_u32(vandq_u32(vreinterpretq_u32_f32(vld1q_f32(fp)), exp_mask), exp_mask);
+        const uint32x4_t c1 = vceqq_u32(vandq_u32(vreinterpretq_u32_f32(vld1q_f32(fp + 4)), exp_mask), exp_mask);
+        const uint32x4_t c2 = vceqq_u32(vandq_u32(vreinterpretq_u32_f32(vld1q_f32(fp + 8)), exp_mask), exp_mask);
+        const uint32x4_t c3 = vceqq_u32(vandq_u32(vreinterpretq_u32_f32(vld1q_f32(fp + 12)), exp_mask), exp_mask);
+        bad = vorrq_u32(bad, vorrq_u32(vorrq_u32(c0, c1), vorrq_u32(c2, c3)));
+    }
+    require(vmaxvq_u32(bad) == 0u, message);
+#endif
+    for (; idx < vals.size(); ++idx) require(std::isfinite(vals[idx]), message);
+}
 #ifdef TOKSPUR_PRIVATE_CHUNKED_PREFILL
 struct ChunkedPrefillStore {
     MetalGraph& g;
@@ -2041,8 +2058,8 @@ StackResult TextStack::step_with_logits(uint32_t token, std::span<const float> r
     auto& p = *impl_; p.check_thread(); const auto candidate = lookup(token);
     const auto kernel_policy = p.g.kernel_policy();
     require(row.size() == p.shape.residual.channels && memory.size() == p.shape.memory.embedding, "stack embedding input shape mismatch");
-    for (auto value : row) require(std::isfinite(value), "nonfinite token embedding");
-    for (auto value : memory) require(std::isfinite(value), "nonfinite lookup embedding");
+    require_all_finite(row, "nonfinite token embedding");
+    require_all_finite(memory, "nonfinite lookup embedding");
     for (uint32_t b = 0; b < p.shape.residual.branches; ++b) std::copy(row.begin(), row.end(), p.host_streams.begin() + uint64_t(b) * row.size());
     p.g.write(p.token_streams, std::as_bytes(std::span(p.host_streams))); p.g.write(p.embedding, std::as_bytes(memory));
     const auto allocations = p.g.memory().allocations; const auto expected = p.expected_dispatches() - (emit_logits ? 0 : p.final_dispatches()) + p.dflash_tap_dispatches();
@@ -2093,7 +2110,7 @@ StackResult TextStack::step_with_logits(uint32_t token, std::span<const float> r
         std::vector<float> logits;
         if (emit_logits) {
             const auto bytes = p.g.read(p.logits); logits.resize(p.shape.vocabulary); std::memcpy(logits.data(), bytes.data(), bytes.size());
-            for (auto value : logits) require(std::isfinite(value), "nonfinite target logits");
+            require_all_finite(logits, "nonfinite target logits");
         }
         p.capture_final_hc(streams, 1);
         // No fallible work after publication. Returning/moving the prepared
@@ -2149,30 +2166,8 @@ StackResult TextStack::step_known(std::span<const uint32_t> tokens, std::span<co
     const auto width = uint64_t(p.shape.residual.branches) * channels;
     require(rows.size() == checked_mul(steps, channels) && memory.size() == checked_mul(steps, p.shape.memory.embedding),
         "known-token flattened embedding input shape mismatch");
-#ifdef TOKSPUR_PRIVATE_M5_CPU_CANDIDATES
-    const auto require_all_finite = [](std::span<const float> vals, const char* msg) {
-        size_t idx = 0;
-#if defined(__aarch64__)
-        uint32x4_t bad = vdupq_n_u32(0u);
-        const uint32x4_t exp_mask = vdupq_n_u32(0x7f800000u);
-        for (; idx + 16 <= vals.size(); idx += 16) {
-            const float* fp = vals.data() + idx;
-            const uint32x4_t c0 = vceqq_u32(vandq_u32(vreinterpretq_u32_f32(vld1q_f32(fp)), exp_mask), exp_mask);
-            const uint32x4_t c1 = vceqq_u32(vandq_u32(vreinterpretq_u32_f32(vld1q_f32(fp + 4)), exp_mask), exp_mask);
-            const uint32x4_t c2 = vceqq_u32(vandq_u32(vreinterpretq_u32_f32(vld1q_f32(fp + 8)), exp_mask), exp_mask);
-            const uint32x4_t c3 = vceqq_u32(vandq_u32(vreinterpretq_u32_f32(vld1q_f32(fp + 12)), exp_mask), exp_mask);
-            bad = vorrq_u32(bad, vorrq_u32(vorrq_u32(c0, c1), vorrq_u32(c2, c3)));
-        }
-        require(vmaxvq_u32(bad) == 0u, msg);
-#endif
-        for (; idx < vals.size(); ++idx) require(std::isfinite(vals[idx]), msg);
-    };
     require_all_finite(rows, "nonfinite known-token embedding");
     require_all_finite(memory, "nonfinite known-token lookup embedding");
-#else
-    for (auto value : rows) require(std::isfinite(value), "nonfinite known-token embedding");
-    for (auto value : memory) require(std::isfinite(value), "nonfinite known-token lookup embedding");
-#endif
     for (uint32_t t = 0; t < steps; ++t) for (uint32_t b = 0; b < p.shape.residual.branches; ++b) {
         const auto row = rows.subspan(uint64_t(t) * channels, channels);
         std::copy(row.begin(), row.end(), p.known_host_streams.begin() + uint64_t(t) * width + uint64_t(b) * channels);
@@ -2257,7 +2252,7 @@ StackResult TextStack::step_known(std::span<const uint32_t> tokens, std::span<co
             "known-token full stack dispatch/allocation/capture invariant failed");
         if (emit_logits) {
             const auto bytes = p.g.read(p.logits); std::memcpy(logits.data(), bytes.data(), bytes.size());
-            for (auto value : logits) require(std::isfinite(value), "nonfinite known-token target logits");
+            require_all_finite(logits, "nonfinite known-token target logits");
         }
         if (p.final_hc_gpu_mode) {
             p.capture_final_hc_gpu_only(last_streams, steps);
@@ -2418,8 +2413,8 @@ StackVerificationResult TextStack::verify_greedy2(std::span<const uint32_t> toke
     const auto width = uint64_t(p.shape.residual.branches) * channels;
     require(rows.size() == 2ull * channels && memory.size() == 2ull * p.shape.memory.embedding,
         "verification flattened input shape mismatch");
-    for (auto value : rows) require(std::isfinite(value), "nonfinite verification token embedding");
-    for (auto value : memory) require(std::isfinite(value), "nonfinite verification lookup embedding");
+    require_all_finite(rows, "nonfinite verification token embedding");
+    require_all_finite(memory, "nonfinite verification lookup embedding");
     auto& v = *p.verification;
     std::copy(committed_logits.begin(), committed_logits.end(), v.host_logits[0].begin());
     StackVerificationResult result{0, p.prefix, v.host_logits[0]};
@@ -2628,8 +2623,8 @@ StackSampledVerificationResult TextStack::verify_sampled_bounded(std::span<const
         "sampled verification requires matching committed prefix and selector");
     require(rows.size() == uint64_t(steps) * channels && memory.size() == uint64_t(steps) * p.shape.memory.embedding,
         "sampled verification flattened input shape mismatch");
-    for (auto value : rows) require(std::isfinite(value), "nonfinite sampled token embedding");
-    for (auto value : memory) require(std::isfinite(value), "nonfinite sampled lookup embedding");
+    require_all_finite(rows, "nonfinite sampled token embedding");
+    require_all_finite(memory, "nonfinite sampled lookup embedding");
     auto& v = *p.verification8;
     const auto logits = [&](uint32_t row) { return std::span(v.host_logits).subspan(uint64_t(row) * vocabulary, vocabulary); };
     StackSampledVerificationResult result;
@@ -2665,17 +2660,23 @@ StackSampledVerificationResult TextStack::verify_sampled_bounded(std::span<const
         for (uint32_t t = 0; t < steps; ++t) for (uint32_t b = 0; b < p.shape.residual.branches; ++b)
             std::copy_n(rows.begin() + uint64_t(t) * channels, channels,
                 v.host_streams.begin() + uint64_t(t) * width + uint64_t(b) * channels);
-        p.g.write(v.streams, std::as_bytes(std::span(v.host_streams)));
-        p.g.write(p.g.slice(v.embeddings, 0, uint64_t(memory.size()) * sizeof(float)), std::as_bytes(memory));
-        const auto allocations = p.g.memory().allocations;
-        // The head and layer estimates use the same selected physical row widths.
-        const uint32_t chunks = p.g.q8_many_chunks(steps);
         const bool use_verify_nax =
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
             p.g.verify_nax() && steps >= 2;
 #else
             false;
 #endif
+        if (use_verify_nax) {
+            const uint64_t stream_floats = uint64_t(steps) * width;
+            p.g.write(p.g.slice(v.streams, 0, stream_floats * sizeof(float)),
+                std::as_bytes(std::span(v.host_streams).first(stream_floats)));
+        } else {
+            p.g.write(v.streams, std::as_bytes(std::span(v.host_streams)));
+        }
+        p.g.write(p.g.slice(v.embeddings, 0, uint64_t(memory.size()) * sizeof(float)), std::as_bytes(memory));
+        const auto allocations = p.g.memory().allocations;
+        // The head and layer estimates use the same selected physical row widths.
+        const uint32_t chunks = p.g.q8_many_chunks(steps);
         const bool use_topk = p.sampled_logit_topk && selector.allow_topk;
         const auto expected = (
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
@@ -2804,22 +2805,11 @@ StackSampledVerificationResult TextStack::verify_sampled_bounded(std::span<const
                 const auto row_logits = shared_logits ? std::span<const float>(shared_logits + uint64_t(t) * vocabulary, vocabulary) : logits(t + 1);
                 if (!gpu_checked_final) {
                     TOKSPUR_CARRIER_PHASE(numerical);
-#ifdef TOKSPUR_PRIVATE_M5_CPU_CANDIDATES
                     for (size_t base = 0; base < row_logits.size(); base += 4096) {
                         poll();
-                        const size_t end = std::min(base + 4096, row_logits.size());
-                        uint32_t bad = 0;
-                        for (size_t i = base; i < end; ++i) {
-                            bad |= uint32_t((std::bit_cast<uint32_t>(row_logits[i]) & 0x7f800000u) == 0x7f800000u);
-                        }
-                        require(!bad, "nonfinite sampled target logits");
+                        const size_t count = std::min<size_t>(4096, row_logits.size() - base);
+                        require_all_finite(row_logits.subspan(base, count), "nonfinite sampled target logits");
                     }
-#else
-                    for (size_t i = 0; i < row_logits.size(); ++i) {
-                        if (!(i & 4095)) poll();
-                        require(std::isfinite(row_logits[i]), "nonfinite sampled target logits");
-                    }
-#endif
                 }
                 result.evaluated.logits[t] = row_logits;
             }

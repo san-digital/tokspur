@@ -11,7 +11,9 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 pub use numbers::{from_chars_f64, from_chars_i64, from_chars_u32, to_chars_shortest};
-pub use utf8::{UnicodeError, WORK_LIMIT, push_scalar_utf8, scalar_utf8, unicode_scalars};
+pub use utf8::{
+    UnicodeError, WORK_LIMIT, push_scalar_utf8, scalar_str, scalar_utf8, unicode_scalars,
+};
 
 /// Default `dump` bound (`Json::dump(size_t byte_limit = 64 MiB)`).
 pub const DEFAULT_DUMP_LIMIT: usize = 64 * 1024 * 1024;
@@ -306,12 +308,19 @@ impl Writer {
     }
 
     fn quoted(&mut self, text: &[u8]) -> Result<(), JsonError> {
-        unicode_scalars(text)?;
+        scalar_str(text)?;
         self.append(b"\"")?;
-        for &c in text {
+        // Bytes that need no escape go out a run at a time: the output and the byte-limit verdict are those of appending them one by one.
+        let mut rest = text;
+        while let Some(at) = rest
+            .iter()
+            .position(|&c| c == b'"' || c == b'\\' || c < 0x20)
+        {
+            self.append(&rest[..at])?;
+            let c = rest[at];
             if c == b'"' || c == b'\\' {
                 self.append(&[b'\\', c])?;
-            } else if c < 0x20 {
+            } else {
                 const HEX: &[u8; 16] = b"0123456789abcdef";
                 let escaped = [
                     b'\\',
@@ -322,10 +331,10 @@ impl Writer {
                     HEX[usize::from(c & 15)],
                 ];
                 self.append(&escaped)?;
-            } else {
-                self.append(&[c])?;
             }
+            rest = &rest[at + 1..];
         }
+        self.append(rest)?;
         self.append(b"\"")
     }
 
@@ -450,17 +459,22 @@ impl Parser<'_> {
     fn text(&mut self) -> Result<Vec<u8>, JsonError> {
         let mut output = Vec::new();
         loop {
+            // Bytes other than a quote, backslash or control character are copied a run at a time; the byte that ends the run is handled as before.
+            let input = self.input;
+            let rest = &input[self.position..];
+            let run = rest
+                .iter()
+                .position(|&c| c == b'"' || c == b'\\' || c < 0x20)
+                .unwrap_or(rest.len());
+            output.extend_from_slice(&rest[..run]);
+            self.position += run;
             let c = self.take()?;
             if c == b'"' {
-                unicode_scalars(&output)?;
+                scalar_str(&output)?;
                 return Ok(output);
             }
             if c < 0x20 {
                 return Err(JsonError::Parse("unescaped JSON control character"));
-            }
-            if c != b'\\' {
-                output.push(c);
-                continue;
             }
             match self.take()? {
                 b'"' => output.push(b'"'),
@@ -614,6 +628,158 @@ impl Parser<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The byte-at-a-time `Parser::text` that run copying replaced, kept to pin the new one to it.
+    fn reference_text(parser: &mut Parser<'_>) -> Result<Vec<u8>, JsonError> {
+        let mut output = Vec::new();
+        loop {
+            let c = parser.take()?;
+            if c == b'"' {
+                unicode_scalars(&output)?;
+                return Ok(output);
+            }
+            if c < 0x20 {
+                return Err(JsonError::Parse("unescaped JSON control character"));
+            }
+            if c != b'\\' {
+                output.push(c);
+                continue;
+            }
+            match parser.take()? {
+                b'"' => output.push(b'"'),
+                b'\\' => output.push(b'\\'),
+                b'/' => output.push(b'/'),
+                b'b' => output.push(0x08),
+                b'f' => output.push(0x0c),
+                b'n' => output.push(b'\n'),
+                b'r' => output.push(b'\r'),
+                b't' => output.push(b'\t'),
+                b'u' => {
+                    let mut point = parser.hex4()?;
+                    if (0xd800..=0xdbff).contains(&point) {
+                        if parser.take()? != b'\\' || parser.take()? != b'u' {
+                            return Err(JsonError::Parse("missing JSON low surrogate"));
+                        }
+                        let low = parser.hex4()?;
+                        if !(0xdc00..=0xdfff).contains(&low) {
+                            return Err(JsonError::Parse("invalid JSON low surrogate"));
+                        }
+                        point = 0x10000 + ((point - 0xd800) << 10) + low - 0xdc00;
+                    } else if (0xdc00..=0xdfff).contains(&point) {
+                        return Err(JsonError::Parse("unpaired JSON low surrogate"));
+                    }
+                    push_scalar_utf8(&mut output, point)?;
+                }
+                _ => return Err(JsonError::Parse("invalid JSON escape")),
+            }
+        }
+    }
+
+    /// The byte-at-a-time `Writer::quoted` that run copying replaced.
+    fn reference_quoted(writer: &mut Writer, text: &[u8]) -> Result<(), JsonError> {
+        unicode_scalars(text)?;
+        writer.append(b"\"")?;
+        for &c in text {
+            if c == b'"' || c == b'\\' {
+                writer.append(&[b'\\', c])?;
+            } else if c < 0x20 {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let escaped = [
+                    b'\\',
+                    b'u',
+                    b'0',
+                    b'0',
+                    HEX[usize::from(c >> 4)],
+                    HEX[usize::from(c & 15)],
+                ];
+                writer.append(&escaped)?;
+            } else {
+                writer.append(&[c])?;
+            }
+        }
+        writer.append(b"\"")
+    }
+
+    /// Random string bodies built from the pieces each branch of the string code handles, including refusals.
+    fn string_body(random: &mut tokspur_testkit::Mt19937) -> Vec<u8> {
+        const PIECES: &[&[u8]] = &[
+            b"plain words ",
+            b"x",
+            b"\"",
+            b"\\",
+            b"\\\"",
+            b"\\\\",
+            b"\\/",
+            b"\\b\\f\\n\\r\\t",
+            b"\\u00e9",
+            b"\\u20AC",
+            b"\\ud83d\\ude00",
+            b"\\ud83d",
+            b"\\ud83dx",
+            b"\\ud83d\\u0041",
+            b"\\ude00",
+            b"\\u12G4",
+            b"\\q",
+            b"\n",
+            b"\x01",
+            b"\x1f",
+            b"\x7f",
+            "é€😀".as_bytes(),
+            b"\x80",
+            b"\xc3",
+            b"\xed\xa0\x80",
+            b"\xf5\x80\x80\x80",
+        ];
+        let count = random.next_u32() % 12;
+        let mut body = Vec::new();
+        for _ in 0..count {
+            body.extend_from_slice(PIECES[random.next_u32() as usize % PIECES.len()]);
+        }
+        body
+    }
+
+    #[test]
+    fn run_copying_parses_and_quotes_exactly_as_byte_at_a_time() {
+        let mut random = tokspur_testkit::Mt19937::new(5);
+        for _ in 0..40_000 {
+            let mut input = string_body(&mut random);
+            if !random.next_u32().is_multiple_of(4) {
+                input.extend_from_slice(b"\",1]");
+            }
+            let limits = JsonLimits::default();
+            let mut fast = Parser {
+                input: &input,
+                limits,
+                position: 0,
+                nodes: 0,
+            };
+            let mut slow = Parser {
+                input: &input,
+                limits,
+                position: 0,
+                nodes: 0,
+            };
+            assert_eq!(fast.text(), reference_text(&mut slow), "{input:02x?}");
+            assert_eq!(fast.position, slow.position, "{input:02x?}");
+
+            let text = string_body(&mut random);
+            let prefix = (random.next_u32() % 4) as usize;
+            let byte_limit = prefix + (random.next_u32() as usize % (text.len() * 6 + 4));
+            let mut fast = Writer {
+                output: vec![b'['; prefix],
+                byte_limit,
+            };
+            let mut slow = Writer {
+                output: vec![b'['; prefix],
+                byte_limit,
+            };
+            let verdict = fast.quoted(&text);
+            assert_eq!(verdict, reference_quoted(&mut slow, &text), "{text:02x?}");
+            if verdict.is_ok() {
+                assert_eq!(fast.output, slow.output, "{text:02x?}");
+            }
+        }
+    }
 
     #[test]
     fn debug_redacts_every_payload() {

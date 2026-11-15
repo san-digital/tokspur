@@ -89,7 +89,8 @@ std::vector<TensorRequirement> flash_next_requirements(uint64_t ple_rows) {
     return result;
 }
 
-FlashLayout inspect_flash_next(const ModelFiles& files, const ModelFiles* pack) {
+FlashLayout inspect_flash_next(const ModelFiles& files, const ModelFiles* pack, uint32_t context_length) {
+    require(context_length == 65536 || context_length == 131072, "unsupported model context length");
     require(files.architecture() == "qwen4exp", "model does not match the Flash-Next architecture profile");
     const Gguf* metadata = nullptr;
     for (const auto& shard : files.shards()) if (shard.find("qwen4exp.block_count")) {
@@ -108,7 +109,8 @@ FlashLayout inspect_flash_next(const ModelFiles& files, const ModelFiles* pack) 
         {"ple.eos_token_id", 248044}, {"ple.image_token_id", 248056}}) {
         require(metadata->unsigned_value(std::string("qwen4exp.") + key) == value, "unsupported Flash-Next architecture parameter");
     }
-    require(metadata->unsigned_value("qwen4exp.context_length") >= 65536, "model context cannot cover the initial profile");
+    require(metadata->unsigned_value("qwen4exp.context_length") >= context_length,
+        context_length == 65536 ? "model context cannot cover the initial profile" : "model context cannot cover the requested 131072-token context");
     require(metadata->unsigned_array("qwen4exp.rope.dimension_sections") == std::vector<uint64_t>({11, 11, 10, 0}), "unsupported RoPE sections");
     require(metadata->unsigned_array("qwen4exp.ple.layers") == std::vector<uint64_t>({1}), "unsupported PLE placement");
     const auto ratios = metadata->unsigned_array("qwen4exp.attention.compress_ratios");
@@ -133,10 +135,16 @@ FlashLayout inspect_flash_next(const ModelFiles& files, const ModelFiles* pack) 
     result.ple_addressable_rows = ple_rows;
     result.ple_storage_rows = checked_add(ple_rows, 255) & ~uint64_t(255);
     const auto requirements = flash_next_requirements(result.ple_storage_rows);
-    require(requirements.size() == files.tensors().size(), "unaccounted or missing tensors in Flash-Next variant");
     const bool pack_is_v3 = pack && pack->shards().size() == 1 &&
         pack->shards()[0].find("tokspur_pack.version") &&
         pack->shards()[0].unsigned_value("tokspur_pack.version") == planar_v3::pack_version_v3;
+    const bool cpu_base_only = pack_is_v3 &&
+        files.shards().size() == 1 &&
+        !files.shards()[0].find("split.no") &&
+        files.tensors().size() == 2 &&
+        files.tensors().contains("token_embd.weight") &&
+        files.tensors().contains("per_layer_token_embd.weight");
+    require(cpu_base_only || requirements.size() == files.tensors().size(), "unaccounted or missing tensors in Flash-Next variant");
     std::set<std::string> consumed;
     for (const auto& item : requirements) {
         const bool is_cpu = derived_pack::is_cpu_pinned_embedding(item.name);
@@ -146,16 +154,30 @@ FlashLayout inspect_flash_next(const ModelFiles& files, const ModelFiles* pack) 
         }
         const auto& tensor = use_pack ? pack->tensor(item.name) : files.tensor(item.name);
         if (use_pack && pack_is_v3 && tensor.type == 24) {
-            const auto& raw_tensor = files.tensor(item.name);
-            if (raw_tensor.dimensions != item.shape) throw FormatError("Flash-Next tensor shape mismatch: " + item.name);
-            if (std::find(item.encodings.begin(), item.encodings.end(), raw_tensor.type) == item.encodings.end())
-                throw FormatError("unsupported tensor encoding for this model profile: " + item.name);
-            require((raw_tensor.type == 12 || raw_tensor.type == 13) && item.shape.size() == 3,
-                "unexpected byte-container tensor in Pack v3");
-            const auto spec = planar_v3::make_expert_spec(raw_tensor.type, uint32_t(item.shape[0]), uint32_t(item.shape[1]));
-            const std::vector<uint64_t> expected_dims{spec.planar_row_bytes, item.shape[1], item.shape[2]};
-            if (tensor.dimensions != expected_dims || tensor.bytes != checked_mul(spec.planar_expert_bytes, item.shape[2]))
-                throw FormatError("Pack v3 planar tensor geometry mismatch: " + item.name);
+            require(item.shape.size() == 3, "unexpected byte-container tensor in Pack v3");
+            if (cpu_base_only) {
+                bool matched = false;
+                for (uint32_t candidate_type : item.encodings) {
+                    if (candidate_type != 12 && candidate_type != 13) continue;
+                    const auto spec = planar_v3::make_expert_spec(candidate_type, uint32_t(item.shape[0]), uint32_t(item.shape[1]));
+                    const std::vector<uint64_t> expected_dims{spec.planar_row_bytes, item.shape[1], item.shape[2]};
+                    if (tensor.dimensions == expected_dims && tensor.bytes == checked_mul(spec.planar_expert_bytes, item.shape[2])) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) throw FormatError("Pack v3 planar tensor geometry mismatch: " + item.name);
+            } else {
+                const auto& raw_tensor = files.tensor(item.name);
+                if (raw_tensor.dimensions != item.shape) throw FormatError("Flash-Next tensor shape mismatch: " + item.name);
+                if (std::find(item.encodings.begin(), item.encodings.end(), raw_tensor.type) == item.encodings.end())
+                    throw FormatError("unsupported tensor encoding for this model profile: " + item.name);
+                require(raw_tensor.type == 12 || raw_tensor.type == 13, "unexpected byte-container tensor in Pack v3");
+                const auto spec = planar_v3::make_expert_spec(raw_tensor.type, uint32_t(item.shape[0]), uint32_t(item.shape[1]));
+                const std::vector<uint64_t> expected_dims{spec.planar_row_bytes, item.shape[1], item.shape[2]};
+                if (tensor.dimensions != expected_dims || tensor.bytes != checked_mul(spec.planar_expert_bytes, item.shape[2]))
+                    throw FormatError("Pack v3 planar tensor geometry mismatch: " + item.name);
+            }
         } else {
             if (tensor.dimensions != item.shape) throw FormatError("Flash-Next tensor shape mismatch: " + item.name);
             if (std::find(item.encodings.begin(), item.encodings.end(), tensor.type) == item.encodings.end()) throw FormatError("unsupported tensor encoding for this model profile: " + item.name);
@@ -174,15 +196,16 @@ FlashLayout inspect_flash_next(const ModelFiles& files, const ModelFiles* pack) 
     return result;
 }
 
-Json FlashLayout::describe() const {
-    constexpr uint64_t context = 65536;
-    constexpr uint64_t kv = 12 * context * 2 * 256 * 2 * 2;
+Json FlashLayout::describe(uint32_t context_length) const {
+    require(context_length == 65536 || context_length == 131072, "unsupported model context length");
+    const uint64_t context = context_length;
+    const uint64_t kv = 12 * context * 2 * 256 * 2 * 2;
     constexpr uint64_t gdn = 36 * 48 * 128 * 128 * 4;
     constexpr uint64_t gdn_conv = 36 * 3 * 10240 * 4;
     // Published maximum-order dilation=3 requires nine historical vectors.
     // Still storage arithmetic, not checkpoint semantics or measured fit.
     constexpr uint64_t ple_conv = 9 * 10240 * 4;
-    constexpr uint64_t index_keys = 12 * (context / 4) * 128 * 2;
+    const uint64_t index_keys = 12 * (context / 4) * 128 * 2;
     constexpr uint64_t index_partial = 12 * 128 * 4;
     constexpr uint64_t ple_cache = 512 * 1024 * 1024;
     const auto subtotal = checked_add(resident_matrix_bytes, kv + gdn + gdn_conv + ple_conv + index_keys + index_partial + ple_cache);

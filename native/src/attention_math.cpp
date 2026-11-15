@@ -17,7 +17,7 @@ void validate_qsa_shape(QsaShape s) {
         s.query_heads % s.kv_heads || !s.head_width || s.head_width > 256 || s.head_width % 2 || !s.index_heads || s.index_heads > 8 ||
         !s.index_width || s.index_width > 256 || s.index_width % 2 || !s.rotary_width || s.rotary_width % 2 ||
         s.rotary_width > s.head_width || s.rotary_width > s.index_width || !s.compression || s.compression > 16 ||
-        !s.token_budget || s.token_budget % s.compression || s.token_budget / s.compression > 512 || !s.capacity || s.capacity > 65536) throw FormatError("unsupported sparse-attention shape");
+        !s.token_budget || s.token_budget % s.compression || s.token_budget / s.compression > 512 || !s.capacity || s.capacity > 131072) throw FormatError("unsupported sparse-attention shape");
 }
 void validate_qsa_policy(QsaPolicy p) {
     if (uint32_t(p.packing) > 1 || uint32_t(p.rotary_pairs) > 1 || !std::isfinite(p.rms_epsilon) || p.rms_epsilon <= 0) throw FormatError("invalid sparse-attention policy");
@@ -51,7 +51,7 @@ std::vector<float> rotary_frequencies(uint32_t width, double base) {
 std::vector<double> rotary_reference(std::span<const double> input, uint32_t heads, uint32_t width,
                                       uint32_t position, std::span<const float> freq, RotaryPairs pairs) {
     if (!heads || heads > 64 || !width || width > 256 || input.size() != uint64_t(heads) * width || freq.empty() ||
-        freq.size() * 2 > width || uint32_t(pairs) > 1 || position >= 65536) throw FormatError("rotary reference shape mismatch");
+        freq.size() * 2 > width || uint32_t(pairs) > 1 || position >= 131072) throw FormatError("rotary reference shape mismatch");
     finite(input);
     std::vector<double> out(input.begin(), input.end());
     for (uint32_t h = 0; h < heads; ++h) for (size_t i = 0; i < freq.size(); ++i) {
@@ -76,7 +76,7 @@ QueryGate split_query_reference(std::span<const double> input, uint32_t heads, u
     return out;
 }
 IndexStep index_accumulate_reference(std::span<const double> sum, std::span<const double> key, uint32_t position, uint32_t compression) {
-    if (sum.empty() || sum.size() > 256 || sum.size() != key.size() || !compression || compression > 16 || position >= 65536) throw FormatError("index pooling reference shape mismatch");
+    if (sum.empty() || sum.size() > 256 || sum.size() != key.size() || !compression || compression > 16 || position >= 131072) throw FormatError("index pooling reference shape mismatch");
     finite(sum); finite(key);
     IndexStep out{std::vector<double>(sum.size()), std::vector<double>(sum.size()), (position + 1) % compression == 0};
     for (size_t i = 0; i < sum.size(); ++i) {

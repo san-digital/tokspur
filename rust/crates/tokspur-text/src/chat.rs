@@ -4,9 +4,7 @@
 
 use std::fmt;
 
-use tokspur_json::{
-    Json, JsonError, Kind, UnicodeError, parse_json, push_scalar_utf8, unicode_scalars,
-};
+use tokspur_json::{Json, JsonError, Kind, UnicodeError, parse_json, scalar_str};
 
 use crate::cxx::{FromChars, find, from_chars_f64, to_chars_scientific};
 
@@ -510,10 +508,13 @@ pub fn template_json(value: &Json) -> Result<Vec<u8>, ChatError> {
 
 fn template_quoted(output: &mut Builder, text: &[u8]) -> Result<(), ChatError> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    unicode_scalars(text)?;
+    scalar_str(text)?;
     output.add(b"\"")?;
-    for &c in text {
-        match c {
+    // Bytes that need no escape go out a run at a time: the output and the byte-limit verdict are those of adding them one by one.
+    let mut rest = text;
+    while let Some(at) = rest.iter().position(|&c| c == b'"' || c == b'\\' || c < 32) {
+        output.add(&rest[..at])?;
+        match rest[at] {
             b'"' => output.add(b"\\\"")?,
             b'\\' => output.add(b"\\\\")?,
             0x08 => output.add(b"\\b")?,
@@ -521,7 +522,7 @@ fn template_quoted(output: &mut Builder, text: &[u8]) -> Result<(), ChatError> {
             b'\n' => output.add(b"\\n")?,
             b'\r' => output.add(b"\\r")?,
             b'\t' => output.add(b"\\t")?,
-            c if c < 32 => {
+            c => {
                 let escaped = [
                     b'\\',
                     b'u',
@@ -532,9 +533,10 @@ fn template_quoted(output: &mut Builder, text: &[u8]) -> Result<(), ChatError> {
                 ];
                 output.add(&escaped)?;
             }
-            c => output.add(&[c])?,
         }
+        rest = &rest[at + 1..];
     }
+    output.add(rest)?;
     output.add(b"\"")
 }
 
@@ -584,20 +586,18 @@ fn template_visit(output: &mut Builder, item: &Json, depth: usize) -> Result<(),
 
 /// Python `str.strip()`: drops leading and trailing Unicode whitespace.
 pub fn chat_trim(value: &[u8]) -> Result<Vec<u8>, UnicodeError> {
-    let points = unicode_scalars(value)?;
-    let mut start = 0;
-    let mut end = points.len();
-    while start < end && whitespace(points[start]) {
-        start += 1;
-    }
-    while end > start && whitespace(points[end - 1]) {
-        end -= 1;
-    }
-    let mut output = Vec::new();
-    for &point in &points[start..end] {
-        push_scalar_utf8(&mut output, point)?;
-    }
-    Ok(output)
+    // The refusals are those of decoding to scalars, and kept scalars re-encode to the bytes they came from, so the result is a slice of the input.
+    let text = scalar_str(value)?;
+    let start = text
+        .char_indices()
+        .find(|&(_, c)| !whitespace(u32::from(c)))
+        .map_or(text.len(), |(at, _)| at);
+    let end = text[start..]
+        .char_indices()
+        .rev()
+        .find(|&(_, c)| !whitespace(u32::from(c)))
+        .map_or(start, |(at, c)| start + at + c.len_utf8());
+    Ok(value[start..end].to_vec())
 }
 
 /// A rendered prompt. `Debug` prints only sizes and counters: the prompt and messages are conversation text.
@@ -907,9 +907,112 @@ impl ChatRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokspur_json::{push_scalar_utf8, unicode_scalars};
 
     fn parse(text: &str) -> Json {
         parse_json(text.as_bytes()).unwrap()
+    }
+
+    /// The scalar-at-a-time `chat_trim` that slicing replaced, kept to pin the new one to it.
+    fn reference_trim(value: &[u8]) -> Result<Vec<u8>, UnicodeError> {
+        let points = unicode_scalars(value)?;
+        let mut start = 0;
+        let mut end = points.len();
+        while start < end && whitespace(points[start]) {
+            start += 1;
+        }
+        while end > start && whitespace(points[end - 1]) {
+            end -= 1;
+        }
+        let mut output = Vec::new();
+        for &point in &points[start..end] {
+            push_scalar_utf8(&mut output, point)?;
+        }
+        Ok(output)
+    }
+
+    /// The byte-at-a-time `template_quoted` that run copying replaced.
+    fn reference_quoted(output: &mut Builder, text: &[u8]) -> Result<(), ChatError> {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        unicode_scalars(text)?;
+        output.add(b"\"")?;
+        for &c in text {
+            match c {
+                b'"' => output.add(b"\\\"")?,
+                b'\\' => output.add(b"\\\\")?,
+                0x08 => output.add(b"\\b")?,
+                0x0c => output.add(b"\\f")?,
+                b'\n' => output.add(b"\\n")?,
+                b'\r' => output.add(b"\\r")?,
+                b'\t' => output.add(b"\\t")?,
+                c if c < 32 => {
+                    let escaped = [
+                        b'\\',
+                        b'u',
+                        b'0',
+                        b'0',
+                        HEX[usize::from(c >> 4)],
+                        HEX[usize::from(c & 15)],
+                    ];
+                    output.add(&escaped)?;
+                }
+                c => output.add(&[c])?,
+            }
+        }
+        output.add(b"\"")
+    }
+
+    /// Random text from every whitespace scalar `whitespace` accepts, near misses, escapes, multi-byte text and malformed UTF-8.
+    fn text(random: &mut tokspur_testkit::Mt19937) -> Vec<u8> {
+        const PIECES: &[&[u8]] = &[
+            b" ", b"\t", b"\n", b"\x0b", b"\x0c", b"\r", b"\x1c", b"\x1f", b"\x00", b"\x08",
+            b"\x1b", b"\"", b"\\", b"word", b"x", b"\x7f",
+        ];
+        const SCALARS: &[u32] = &[
+            0x85, 0xa0, 0x1680, 0x2000, 0x200a, 0x200b, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000,
+            0xe9, 0x20ac, 0x1f600, 0xfeff, 0x180e,
+        ];
+        const BROKEN: &[&[u8]] = &[b"\x80", b"\xc3", b"\xed\xa0\x80", b"\xf4\x90\x80\x80"];
+        let count = random.next_u32() % 10;
+        let mut output = Vec::new();
+        for _ in 0..count {
+            match random.next_u32() % 16 {
+                0 => output.extend_from_slice(BROKEN[random.next_u32() as usize % BROKEN.len()]),
+                1..=6 => push_scalar_utf8(
+                    &mut output,
+                    SCALARS[random.next_u32() as usize % SCALARS.len()],
+                )
+                .unwrap(),
+                _ => output.extend_from_slice(PIECES[random.next_u32() as usize % PIECES.len()]),
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn slicing_trims_and_quotes_exactly_as_scalar_at_a_time() {
+        let mut random = tokspur_testkit::Mt19937::new(17);
+        // A builder this close to the output bound refuses part way through some strings.
+        let mut near_full = Builder::new();
+        near_full.value = vec![b'.'; OUTPUT_LIMIT - 48];
+        let base = near_full.value.len();
+        for _ in 0..40_000 {
+            let value = text(&mut random);
+            assert_eq!(chat_trim(&value), reference_trim(&value), "{value:02x?}");
+            let mut fast = Builder::new();
+            let mut slow = Builder::new();
+            let verdict = template_quoted(&mut fast, &value);
+            assert_eq!(verdict, reference_quoted(&mut slow, &value), "{value:02x?}");
+            assert_eq!(fast.value, slow.value, "{value:02x?}");
+            let verdict = template_quoted(&mut near_full, &value);
+            let fast_tail = near_full.value.split_off(base);
+            let slow_verdict = reference_quoted(&mut near_full, &value);
+            let slow_tail = near_full.value.split_off(base);
+            assert_eq!(verdict, slow_verdict, "{value:02x?}");
+            if verdict.is_ok() {
+                assert_eq!(fast_tail, slow_tail, "{value:02x?}");
+            }
+        }
     }
 
     fn renderer() -> ChatRenderer {

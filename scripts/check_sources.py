@@ -105,31 +105,40 @@ def validate(root: Path, *, fetch: bool = False, opener=None) -> dict:
                 fetched += 1
 
     listed = {}
-    for entry in manifest["native_files"]:
-        name = entry["path"]
-        need(name.startswith("native/"), "native source path required")
-        need(name not in listed, "duplicate native source")
-        listed[name] = entry
-        need(
-            digest(local_bytes(root, name)) == entry["sha256"],
-            "native source review has drifted",
-        )
-        need(set(entry["sources"]) <= projects.keys(), "unknown source project")
-        need(
-            entry["status"]
-            in {"recorded-adaptation", "reviewed-baseline", "unresolved"},
-            "invalid source status",
-        )
+    for key, prefix, kind in (
+        ("native_files", "native/", "native"),
+        ("rust_files", "rust/", "Rust"),
+    ):
+        for entry in manifest.get(key, []):
+            name = entry["path"]
+            need(name.startswith(prefix), f"{kind} source path required")
+            need(name not in listed, f"duplicate {kind} source")
+            listed[name] = entry
+            need(
+                digest(local_bytes(root, name)) == entry["sha256"],
+                f"{kind} source review has drifted",
+            )
+            need(set(entry["sources"]) <= projects.keys(), "unknown source project")
+            need(
+                entry["status"]
+                in {"recorded-adaptation", "reviewed-baseline", "unresolved"},
+                "invalid source status",
+            )
 
-    for directory in ("native/kernels", "native/src", "native/include"):
+    for directory, suffixes, kind in (
+        ("native/kernels", SOURCE_SUFFIXES, "native"),
+        ("native/src", SOURCE_SUFFIXES, "native"),
+        ("native/include", SOURCE_SUFFIXES, "native"),
+        ("rust/crates", {".rs"}, "Rust"),
+    ):
         for path in (root / directory).rglob("*"):
-            if path.suffix not in SOURCE_SUFFIXES or not path.is_file():
+            if path.suffix not in suffixes or not path.is_file():
                 continue
             text = local_bytes(root, path.relative_to(root).as_posix()).decode("utf-8")
             if any(PROJECT.search(comment) for comment in COMMENTS.findall(text)):
                 need(
                     path.relative_to(root).as_posix() in listed,
-                    "credited native source is unrecorded",
+                    f"credited {kind} source is unrecorded",
                 )
 
     gaps = manifest["unresolved"]
@@ -236,7 +245,8 @@ def validate(root: Path, *, fetch: bool = False, opener=None) -> dict:
     )
     return {
         "projects": len(projects),
-        "native_files": len(listed),
+        "native_files": len(manifest["native_files"]),
+        "rust_files": len(manifest.get("rust_files", [])),
         "upstream_files_fetched": fetched,
         "unresolved": [gap["id"] for gap in gaps],
         "retired_source_claims": [

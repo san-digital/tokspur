@@ -5,7 +5,7 @@ use std::fmt;
 
 use tokspur_testkit::Mt19937;
 use tokspur_text::tokenizer::{
-    AddedToken, BpeData, ByteBpe, TextProcessor, TokenizerError, byte_level_decode,
+    AddedToken, BpeData, ByteBpe, SegmentMemo, TextProcessor, TokenizerError, byte_level_decode,
     byte_level_encode, replace_invalid_utf8,
 };
 
@@ -670,4 +670,137 @@ fn added_token_may_repeat_an_ordinary_token() {
     let model = ByteBpe::new(data).unwrap();
     assert_eq!(model.encode(b"abab", &Identity).unwrap(), [266, 266]);
     assert_eq!(model.encode_piece(b"abab").unwrap(), [259]);
+}
+
+/// Splits at spaces, keeping each space with the word after it, so segments reach BPE as several pieces.
+struct Words;
+
+impl TextProcessor for Words {
+    type Error = Infallible;
+
+    fn pieces(&self, segment: &[u8]) -> Result<Vec<Vec<u8>>, Infallible> {
+        let mut pieces = Vec::new();
+        let mut start = 0;
+        for i in 1..segment.len() {
+            if segment[i] == b' ' {
+                pieces.push(segment[start..i].to_vec());
+                start = i;
+            }
+        }
+        pieces.push(segment[start..].to_vec());
+        Ok(pieces)
+    }
+}
+
+#[test]
+fn segment_memo_reuses_exactly_the_plain_encoding() {
+    let model = model().unwrap();
+    let mut memo = SegmentMemo::new(1 << 20, 4);
+    let mut random = Mt19937::new(0x6d65_6d6f);
+    let words: [&[u8]; 9] = [
+        b"ab", b" a", b"aaaa", b"abab", b" ", b"zz", b"<X>", b"<X>!", b"<Y>",
+    ];
+    let mut prompt = Vec::new();
+    for turn in 0..400 {
+        // A growing conversation, sometimes restarted, with markers that split it into segments.
+        if turn % 97 == 0 {
+            prompt.clear();
+        }
+        for _ in 0..random.next_u32() % 40 {
+            prompt.extend_from_slice(words[(random.next_u32() % 9) as usize]);
+        }
+        // Literal spans switch marker recognition off inside them, which moves the segment boundaries.
+        let literals: Vec<std::ops::Range<usize>> = if turn % 3 == 0 && prompt.len() > 8 {
+            let start = (random.next_u32() as usize) % (prompt.len() - 4);
+            std::iter::once(start..start + 4).collect()
+        } else {
+            Vec::new()
+        };
+        let plain = model.encode_with_literals(&prompt, &Words, &literals);
+        let reused = model.encode_with_literals_memo(&prompt, &Words, &literals, &mut memo);
+        assert_eq!(plain, reused, "turn {turn}");
+    }
+    assert!(memo.hits() > 1000 && memo.misses() > 100, "{memo:?}");
+}
+
+#[test]
+fn segment_memo_stays_within_its_budget_and_evicts_the_least_recent() {
+    let model = model().unwrap();
+    // Each 64-byte segment stays 64 single-byte IDs and costs 64 + 4 * 64 + 96 = 416 bytes, so five fit in 2080.
+    let mut memo = SegmentMemo::new(2080, 1);
+    let segments: Vec<Vec<u8>> = (0..8u8)
+        .map(|i| [vec![b'z'; 63], vec![b'a' + i]].concat())
+        .collect();
+    for segment in &segments[..5] {
+        model
+            .encode_with_literals_memo(segment, &Identity, &[], &mut memo)
+            .unwrap();
+    }
+    assert_eq!((memo.entries(), memo.held_bytes()), (5, 2080));
+    // Touch the first, then insert a sixth: the eviction keeps the most recent entries within three quarters of the budget.
+    model
+        .encode_with_literals_memo(&segments[0], &Identity, &[], &mut memo)
+        .unwrap();
+    model
+        .encode_with_literals_memo(&segments[5], &Identity, &[], &mut memo)
+        .unwrap();
+    assert!(memo.held_bytes() <= 2080, "{memo:?}");
+    let hits = memo.hits();
+    model
+        .encode_with_literals_memo(&segments[0], &Identity, &[], &mut memo)
+        .unwrap();
+    model
+        .encode_with_literals_memo(&segments[5], &Identity, &[], &mut memo)
+        .unwrap();
+    assert_eq!(memo.hits(), hits + 2, "{memo:?}");
+    model
+        .encode_with_literals_memo(&segments[1], &Identity, &[], &mut memo)
+        .unwrap();
+    assert_eq!(
+        memo.hits(),
+        hits + 2,
+        "the least recently used entry was kept: {memo:?}"
+    );
+    // A segment that alone exceeds the budget is encoded and never kept.
+    let large = vec![b'z'; 1000];
+    let before = memo.entries();
+    assert_eq!(
+        model.encode_with_literals_memo(&large, &Identity, &[], &mut memo),
+        model.encode(&large, &Identity)
+    );
+    assert!(
+        memo.entries() <= before && memo.held_bytes() <= 2080,
+        "{memo:?}"
+    );
+    memo.clear();
+    assert_eq!((memo.entries(), memo.held_bytes()), (0, 0));
+}
+
+#[test]
+fn segment_memo_keeps_refusals_and_the_output_bound_exact() {
+    let model = model().unwrap();
+    let mut memo = SegmentMemo::new(64 << 20, 1);
+    // A refused segment is never kept: it is refused again with the processor's own error.
+    for _ in 0..2 {
+        assert_eq!(
+            model.encode_with_literals_memo(b"<X>abc", &Refusing, &[], &mut memo),
+            Err(TokenizerError::Pieces(Refusal))
+        );
+    }
+    assert_eq!(memo.entries(), 0);
+    // A kept segment of 600,000 single-byte IDs fits once; a second copy passes the 1,000,000-ID bound partway through, and the reused IDs are refused with the same message.
+    let segment = vec![b'z'; 600_000];
+    let twice = [segment.as_slice(), b"<Y>", segment.as_slice()].concat();
+    assert_eq!(
+        model.encode_with_literals_memo(&segment, &Identity, &[], &mut memo),
+        model.encode(&segment, &Identity)
+    );
+    assert_eq!(memo.entries(), 1);
+    let expected = Err(TokenizerError::Encode("tokenizer output limit exceeded"));
+    assert_eq!(model.encode(&twice, &Identity), expected);
+    assert_eq!(
+        model.encode_with_literals_memo(&twice, &Identity, &[], &mut memo),
+        expected
+    );
+    assert!(memo.hits() >= 1, "{memo:?}");
 }

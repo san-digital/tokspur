@@ -317,20 +317,28 @@ def shards() -> list[Path]:
     for directory in (ASSETS / "split", ASSETS / "UD-Q4_K_XL", ASSETS):
         if not directory.is_dir():
             continue
-        found = sorted(path for path in directory.iterdir() if path.is_file() and path.suffix == ".gguf")
+        found = sorted(
+            path
+            for path in directory.iterdir()
+            if path.is_file() and path.suffix == ".gguf" and not path.name.endswith(".tokspur.gguf")
+        )
         if found:
-            if len(found) != 4:
-                raise SystemExit(f"expected four GGUF shards under {directory}")
+            if len(found) not in (1, 4):
+                raise SystemExit(f"expected one base GGUF or four GGUF shards under {directory}")
             return found
     adoption = ROOT / ".tokspur/adoption.json"
     if not ASSET_OVERRIDE and adoption.is_file():
         raw = adoption.read_bytes()
         if len(raw) > 4 * 1024 * 1024:
             raise SystemExit("adoption receipt exceeds the fixture byte bound")
-        paths = sorted(Path(item["path"]) for item in json.loads(raw)["target"]["assets"])
-        if len(paths) == len(set(paths)) == 4 and all(path.is_absolute() and path.is_file() for path in paths):
+        paths = sorted(
+            Path(item["path"])
+            for item in json.loads(raw)["target"]["assets"]
+            if item.get("role") != "derived_pack"
+        )
+        if len(paths) == len(set(paths)) and len(paths) in (1, 4) and all(path.is_absolute() and path.is_file() for path in paths):
             return paths
-    raise SystemExit("prepare four pinned GGUF metadata fixtures and both text assets, then set TOKSPUR_DIFF_ASSETS, or run tokspur adopt first")
+    raise SystemExit("prepare pinned GGUF metadata fixture(s) and both text assets, then set TOKSPUR_DIFF_ASSETS, or run tokspur adopt first")
 
 
 def requests(key: str) -> list[tuple[str, bytes]]:
@@ -458,8 +466,36 @@ def prepare(fake: Path, directory: Path, cohort: Cohort | None = None) -> None:
         (directory / "target").write_text(str(cohort.target) + "\n")
 
 
+def derived_pack() -> Path | None:
+    for directory in (ASSETS / "split", ASSETS / "UD-Q4_K_XL", ASSETS):
+        if not directory.is_dir():
+            continue
+        found = sorted(path for path in directory.iterdir() if path.is_file() and path.name.endswith(".tokspur.gguf"))
+        if len(found) == 1:
+            return found[0]
+    adoption = ROOT / ".tokspur/adoption.json"
+    if not ASSET_OVERRIDE and adoption.is_file():
+        raw = adoption.read_bytes()
+        if len(raw) <= 4 * 1024 * 1024:
+            packs = [
+                Path(item["path"])
+                for item in json.loads(raw)["target"]["assets"]
+                if item.get("role") == "derived_pack"
+            ]
+            if len(packs) == 1 and packs[0].is_absolute() and packs[0].is_file():
+                return packs[0]
+    return None
+
+
 def server_args(directory: Path, channel: str, cohort: Cohort | None = None) -> list[str]:
     """The fast-math startup argv after argv[0]."""
+    shard_list = shards()
+    pack_args: list[str] = []
+    if len(shard_list) == 1:
+        pack = derived_pack()
+        if pack is None:
+            raise SystemExit("single-shard base GGUF requires an adopted or staged .tokspur.gguf derived pack")
+        pack_args = ["--derived-pack", str(pack)]
     return [
         "--worker", str(directory / "branch8-target"),
         "--policy", str(cohort.policy if cohort else directory / "normal"),
@@ -475,7 +511,8 @@ def server_args(directory: Path, channel: str, cohort: Cohort | None = None) -> 
         "--native-fast-math", channel,
         "--checkpoint-slots", "4",
         "--checkpoint-budget-bytes", "536870912",
-        *map(str, shards()),
+        *pack_args,
+        *map(str, shard_list),
     ]
 
 
@@ -541,7 +578,8 @@ def startup_cases(directory: Path) -> list[tuple[str, list[str]]]:
         "--worker": [str(directory / "absent")],
     }.items():
         cases += [(f"{option}={value!r}", replaced(option, value)) for value in values]
-    shard_at = len(base) - 4
+    shard_list = shards()
+    shard_at = len(base) - len(shard_list)
     for option, values in {
         "--model-alias": ["", "a" * 65, "bad alias", "alias.ok-1"],
         "--request-timeout-seconds": ["0", "3601"],
@@ -554,11 +592,21 @@ def startup_cases(directory: Path) -> list[tuple[str, list[str]]]:
         cases += [(f"add {option}={value!r}", base[:shard_at] + [option, value] + base[shard_at:]) for value in values]
     cases += [
         ("trailing option without value", base[:shard_at] + base[shard_at:] + ["--port"]),
-        ("three shards", base[:-1]),
-        ("duplicate shard", base[:-1] + [base[-2]]),
-        ("five shards", base + [base[-1]]),
-        ("absent shard", base[:-1] + [str(directory / "absent.gguf")]),
     ]
+    if len(shard_list) == 1:
+        cases += [
+            ("no shards", base[:shard_at]),
+            ("duplicate shard", base + [base[-1]]),
+            ("two shards", base + [str(directory / "extra.gguf")]),
+            ("absent shard", base[:-1] + [str(directory / "absent.gguf")]),
+        ]
+    else:
+        cases += [
+            ("three shards", base[:-1]),
+            ("duplicate shard", base[:-1] + [base[-2]]),
+            ("five shards", base + [base[-1]]),
+            ("absent shard", base[:-1] + [str(directory / "absent.gguf")]),
+        ]
     return cases
 
 

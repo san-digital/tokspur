@@ -366,6 +366,8 @@ fn schema_admit(schema: &Json, depth: usize, nodes: &mut usize) -> Result<()> {
             "required",
             "additionalProperties",
             "items",
+            "minItems",
+            "maxItems",
             "enum",
             "minimum",
             "exclusiveMinimum",
@@ -455,9 +457,26 @@ fn schema_admit(schema: &Json, depth: usize, nodes: &mut usize) -> Result<()> {
     }
     if kind == b"array" {
         schema_admit(field(schema, "items")?, depth + 1, nodes)?;
+        let low = match schema.find("minItems")? {
+            Some(low) => Some(low.unsigned_integer()?),
+            None => None,
+        };
+        let high = match schema.find("maxItems")? {
+            Some(high) => Some(high.unsigned_integer()?),
+            None => None,
+        };
+        // Validation refuses any array above 4096 items, so a larger minimum could never be met. A larger maximum stays admitted: the same cap still applies at validation.
+        if let Some(low) = low {
+            require(low <= 4096, "minItems exceeds the tool array bound")?;
+        }
+        if let (Some(low), Some(high)) = (low, high) {
+            require(low <= high, "inverted schema bounds")?;
+        }
     } else {
         require(
-            schema.find("items")?.is_none(),
+            schema.find("items")?.is_none()
+                && schema.find("minItems")?.is_none()
+                && schema.find("maxItems")?.is_none(),
             "array schema keyword on other type",
         )?;
     }
@@ -583,7 +602,7 @@ pub fn validate_executor_tool_arguments(value: &Json) -> Result<()> {
     validate_executor_node(value, 0, &mut nodes)
 }
 
-fn thinking_history(message: &Json, role: &[u8]) -> Result<()> {
+fn thinking_history(message: &Json, role: &[u8], max_request_bytes: usize) -> Result<()> {
     let Some(blocks) = message.find("thinking_blocks")? else {
         return Ok(());
     };
@@ -607,7 +626,7 @@ fn thinking_history(message: &Json, role: &[u8]) -> Result<()> {
         }
         let part = field(block, "thinking")?.string()?;
         require(
-            part.len() <= 1024 * 1024 - text.len(),
+            part.len() <= max_request_bytes - text.len(),
             "thinking history bound",
         )?;
         text.extend_from_slice(part);
@@ -628,6 +647,7 @@ fn history(
     schemas: &[Json],
     tool_enums: ToolEnumValidation,
     tool_args: ToolArgValidation,
+    max_request_bytes: usize,
 ) -> Result<()> {
     require(
         !messages.array()?.is_empty() && messages.array()?.len() <= 4096,
@@ -656,7 +676,7 @@ fn history(
             ),
             "unsupported API message role",
         )?;
-        thinking_history(message, role)?;
+        thinking_history(message, role, max_request_bytes)?;
         if let Some(content) = message.find("content")? {
             if content.kind() == Kind::Array {
                 require(content.array()?.len() <= 4096, "text content part bound")?;
@@ -984,8 +1004,21 @@ pub fn validate_tool_value_with_policy(
             }
         }
         b"array" => {
-            require(value.array()?.len() <= 4096, "tool array bound")?;
-            for item in value.array()? {
+            let items = value.array()?;
+            require(items.len() <= 4096, "tool array bound")?;
+            if let Some(minimum) = schema.find("minItems")? {
+                require(
+                    (items.len() as u64) >= minimum.unsigned_integer()?,
+                    "tool array below minItems",
+                )?;
+            }
+            if let Some(maximum) = schema.find("maxItems")? {
+                require(
+                    (items.len() as u64) <= maximum.unsigned_integer()?,
+                    "tool array above maxItems",
+                )?;
+            }
+            for item in items {
                 validate_tool_value_with_policy(field(schema, "items")?, item, tool_enums)?;
             }
         }
@@ -1082,6 +1115,7 @@ pub struct AdmittedChat {
     pub stream: bool,
     pub include_usage: bool,
     pub thinking: bool,
+    pub thinking_budget: Option<u32>,
     pub maximum_tokens: u32,
 }
 
@@ -1119,7 +1153,27 @@ pub fn admit_chat_with_policies(
     tool_enums: ToolEnumValidation,
     tool_args: ToolArgValidation,
 ) -> Result<AdmittedChat> {
-    request.dump_limited(1024 * 1024)?;
+    admit_chat_with_context(request, alias, tool_enums, tool_args, 65_536)
+}
+
+/// `admit_chat`: validates one OpenAI-style request without side effects under the selected policies and configured context length.
+pub fn admit_chat_with_context(
+    request: &Json,
+    alias: &[u8],
+    tool_enums: ToolEnumValidation,
+    tool_args: ToolArgValidation,
+    context_length: u32,
+) -> Result<AdmittedChat> {
+    require(
+        context_length == 65_536 || context_length == 131_072,
+        "unsupported serving context length",
+    )?;
+    let max_request_bytes = if context_length > 65_536 {
+        4 * 1024 * 1024
+    } else {
+        1024 * 1024
+    };
+    request.dump_limited(max_request_bytes)?;
     keys(
         request,
         &[
@@ -1142,6 +1196,7 @@ pub fn admit_chat_with_policies(
             "enable_thinking",
             "preserve_thinking",
             "reasoning_effort",
+            "thinking_budget",
             "chat_template_kwargs",
             "presence_penalty",
             "repetition_penalty",
@@ -1164,6 +1219,7 @@ pub fn admit_chat_with_policies(
         stream: false,
         include_usage: false,
         thinking: true,
+        thinking_budget: None,
         maximum_tokens: 8192,
     };
     if let Some(n) = request.find("n")? {
@@ -1210,7 +1266,12 @@ pub fn admit_chat_with_policies(
     if let Some(template) = template_options {
         keys(
             template,
-            &["enable_thinking", "preserve_thinking", "reasoning_effort"],
+            &[
+                "enable_thinking",
+                "preserve_thinking",
+                "reasoning_effort",
+                "thinking_budget",
+            ],
         )?;
     }
     let mut canonical_options = Vec::new();
@@ -1242,9 +1303,43 @@ pub fn admit_chat_with_policies(
             canonical_options.push((name.as_bytes().to_vec(), selected.clone()));
         }
     }
+    let outer_budget = request.find("thinking_budget")?;
+    let inner_budget = match template_options {
+        Some(template) => template.find("thinking_budget")?,
+        None => None,
+    };
+    let mut raw_thinking_budget = None;
+    if let Some(p) = outer_budget {
+        let n = p.unsigned_integer()?;
+        require(n <= 32768, "thinking budget must be 0..32768")?;
+        raw_thinking_budget = Some(n as u32);
+    }
+    if let Some(p) = inner_budget {
+        let n = p.unsigned_integer()?;
+        require(n <= 32768, "thinking budget must be 0..32768")?;
+        if let Some(outer_val) = raw_thinking_budget {
+            require(outer_val == n as u32, "conflicting chat template options")?;
+        }
+        raw_thinking_budget = Some(n as u32);
+    }
     let options = Json::Object(canonical_options);
+    let mut explicit_thinking = None;
     if let Some(p) = options.find("enable_thinking")? {
-        out.thinking = p.boolean()?;
+        let val = p.boolean()?;
+        explicit_thinking = Some(val);
+        out.thinking = val;
+    }
+    if let Some(budget) = raw_thinking_budget {
+        if budget == 0 {
+            require(
+                explicit_thinking != Some(true),
+                "conflicting thinking options",
+            )?;
+            out.thinking = false;
+        } else if explicit_thinking != Some(false) {
+            // A positive budget only caps thinking. With thinking explicitly off there is nothing to cap, so the budget is ignored and not refused: clients keep a fixed budget and toggle thinking.
+            out.thinking_budget = Some(budget);
+        }
     }
     if let Some(p) = options.find("reasoning_effort")? {
         let effort = p.string()?;
@@ -1402,7 +1497,14 @@ pub fn admit_chat_with_policies(
         "tool choice requires tools",
     )?;
     let messages = field(request, "messages")?;
-    history(messages, &out.names, &out.schemas, tool_enums, tool_args)?;
+    history(
+        messages,
+        &out.names,
+        &out.schemas,
+        tool_enums,
+        tool_args,
+        max_request_bytes,
+    )?;
     let mut rendered_messages = messages.array()?.clone();
     if out.named_tool_choice || choice == b"required" {
         let instruction = if !out.named_tool_choice {
@@ -1527,6 +1629,75 @@ mod tests {
             assert!(schema_admit(&lexeme(text), 0, &mut 0).is_err());
         }
         assert!(schema_admit(&schema, 1, &mut 0).is_err());
+    }
+
+    #[test]
+    fn array_schema_min_items_and_max_items_are_checked() {
+        let schema = lexeme(
+            r#"{"type":"object","properties":{"tags":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":3}},"required":["tags"]}"#,
+        );
+        schema_admit(&schema, 0, &mut 0).unwrap();
+        for value in [r#"["a"]"#, r#"["a","b"]"#, r#"["a","b","c"]"#] {
+            let value = lexeme(&format!(r#"{{"tags":{value}}}"#));
+            validate_tool_value(&schema, &value).unwrap();
+        }
+        for value in [r#"[]"#, r#"["a","b","c","d"]"#] {
+            let value = lexeme(&format!(r#"{{"tags":{value}}}"#));
+            assert!(validate_tool_value(&schema, &value).is_err());
+        }
+        let exact_zero =
+            lexeme(r#"{"type":"array","items":{"type":"integer"},"minItems":0,"maxItems":0}"#);
+        schema_admit(&exact_zero, 0, &mut 0).unwrap();
+        validate_tool_value(&exact_zero, &lexeme("[]")).unwrap();
+        assert!(validate_tool_value(&exact_zero, &lexeme("[1]")).is_err());
+
+        // The minimum is bounded by the 4096-item validation cap; the maximum is not, because the cap still holds.
+        for text in [
+            r#"{"type":"array","items":{"type":"string"},"minItems":4096}"#,
+            r#"{"type":"array","items":{"type":"string"},"maxItems":4097}"#,
+            r#"{"type":"array","items":{"type":"string"},"minItems":4096,"maxItems":18446744073709551615}"#,
+        ] {
+            schema_admit(&lexeme(text), 0, &mut 0).unwrap();
+        }
+        assert_eq!(
+            schema_admit(
+                &lexeme(r#"{"type":"array","items":{"type":"string"},"minItems":4097}"#),
+                0,
+                &mut 0
+            ),
+            Err(AdmissionError::Refused(
+                "minItems exceeds the tool array bound"
+            ))
+        );
+        assert_eq!(
+            schema_admit(
+                &lexeme(
+                    r#"{"type":"array","items":{"type":"string"},"minItems":4097,"maxItems":2}"#
+                ),
+                0,
+                &mut 0
+            ),
+            Err(AdmissionError::Refused(
+                "minItems exceeds the tool array bound"
+            ))
+        );
+
+        for text in [
+            r#"{"type":"array","items":{"type":"string"},"minItems":4097}"#,
+            r#"{"type":"array","items":{"type":"string"},"minItems":18446744073709551616}"#,
+            r#"{"type":"array","items":{"type":"string"},"minItems":-1}"#,
+            r#"{"type":"array","items":{"type":"string"},"minItems":1.0}"#,
+            r#"{"type":"array","items":{"type":"string"},"maxItems":"2"}"#,
+            r#"{"type":"array","items":{"type":"string"},"minItems":3,"maxItems":2}"#,
+            r#"{"type":"string","minItems":1}"#,
+            r#"{"type":"object","properties":{},"maxItems":2}"#,
+            r#"{"anyOf":[{"type":"array","items":{"type":"string"}}],"minItems":1}"#,
+        ] {
+            assert!(
+                schema_admit(&lexeme(text), 0, &mut 0).is_err(),
+                "expected refusal for {text}"
+            );
+        }
     }
 
     #[test]

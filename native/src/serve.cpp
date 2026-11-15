@@ -7,6 +7,7 @@
 #endif
 #include "tokspur/text.hpp"
 #include "tokspur/gguf.hpp"
+#include "tokspur/speculative_controls.hpp"
 
 #include <CommonCrypto/CommonDigest.h>
 #include <sys/file.h>
@@ -154,7 +155,7 @@ public:
     void prefix_trace(const Json& record) {
         require(prefix_trace_.value >= 0 && !prefix_trace_failed_, "private prefix trace is unavailable");
         try {
-            const auto bytes = record.dump(1024 * 1024) + '\n';
+            const auto bytes = record.dump(4 * 1024 * 1024) + '\n';
             require(bytes.size() <= (16ull << 20) - prefix_trace_bytes_, "private prefix trace exceeds16MiB bound");
             size_t offset = 0;
             while (offset < bytes.size()) {
@@ -327,9 +328,15 @@ Options options(int argc, char** argv) {
             out.worker.dflash2_max_drafts = integer(value, 1, 7);
         }
         else if (option == "--dflash2-vocab-slice" || option == "--native-dflash2-vocab-slice") {
+            require(!out.worker.dflash2_vocab_gather.has_value(), "cannot combine --dflash2-vocab-slice and --dflash2-vocab-gather");
             const auto slice = integer(value, 0, 248319);
             require(slice == 0 || (slice >= 256 && slice % 32 == 0), "DFlash2 vocab slice must be 0 or a multiple of 32 in [256, 248319]");
             out.worker.dflash2_vocab_slice = slice;
+        }
+        else if (option == "--dflash2-vocab-gather" || option == "--native-dflash2-vocab-gather") {
+            require(!out.worker.dflash2_vocab_slice.has_value(), "cannot combine --dflash2-vocab-slice and --dflash2-vocab-gather");
+            admit_dflash2_vocab_gather(value, 248320);
+            out.worker.dflash2_vocab_gather = std::string(value);
         }
         else if (option == "--native-prepared-validation") {
             require(value == "off" || value == "on", "native prepared validation must be off or on"); out.worker.prepared_validation = value == "on";
@@ -354,6 +361,10 @@ Options options(int argc, char** argv) {
         else if (option == "--ple-async-gather" || option == "--native-ple-async-gather") {
             require(value == "on" || value == "off", "native PLE async gather must be off or on");
             out.worker.ple_async_gather = value == "on";
+        }
+        else if (option == "--ple-ram-resident" || option == "--native-ple-ram-resident") {
+            require(value == "on" || value == "off", "native PLE RAM residency must be off or on");
+            out.worker.ple_ram_resident = value == "on";
         }
         else if (option == "--mtp-fast-round" || option == "--native-mtp-fast-round") {
             require(value == "on" || value == "off", "native MTP fast round must be off or on");
@@ -460,6 +471,13 @@ Options options(int argc, char** argv) {
         else if (option == "--native-mtp-lookup-match" || option == "--mtp-lookup-match") {
             out.worker.mtp_lookup_match = integer(value, 2, 16);
         }
+        else if (option == "--native-dflash2-lookup" || option == "--dflash2-lookup") {
+            require(value == "off" || value == "bypass" || value == "hybrid", "native DFlash2 lookup must be off, bypass or hybrid");
+            out.worker.dflash2_lookup = std::string(value);
+        }
+        else if (option == "--native-dflash2-lookup-match" || option == "--dflash2-lookup-match") {
+            out.worker.dflash2_lookup_match = integer(value, 2, 16);
+        }
         else if (option == "--native-prefill-m64" || option == "--prefill-m64") {
             require(value == "off" || value == "on" || value == "short", "native prefill M64 must be off, on or short");
             out.worker.prefill_m64 = std::string(value);
@@ -491,6 +509,11 @@ Options options(int argc, char** argv) {
         else if (option == "--shared-prefix-cache" || option == "--native-shared-prefix-cache") {
             require(value == "off" || value == "on", "shared prefix cache must be off or on");
             out.worker.shared_prefix_cache = (value == "on");
+        }
+        else if (option == "--context-length" || option == "--native-context-length") {
+            const auto ctx = integer(value, 65536, 131072);
+            require(ctx == 65536 || ctx == 131072, "context-length must be 65536 or 131072");
+            out.worker.context_length = ctx;
         }
         else if (option == "--tokenizer") out.tokenizer = value;
         else if (option == "--template") out.model_template = value;
@@ -712,6 +735,7 @@ int server_cli(int argc, char** argv) {
         , config.mtp_first_output_packet
 #endif
         , config.tool_args
+        , config.worker.context_length
         );
     std::atomic<bool> shutdown{false}, available{true}; std::mutex mutex; std::condition_variable condition;
     std::optional<Job> pending;
@@ -899,10 +923,15 @@ int server_cli(int argc, char** argv) {
             ready.emplace_back("tool_arg_validation", Json(std::string(tool_arg_validation_name(config.tool_args))));
             ready.emplace_back("tool_arg_validation_policy", Json(std::string(tool_arg_validation_policy(config.tool_args))));
         }
+        if (config.worker.context_length != 65536) {
+            ready.emplace_back("context_length", Json::integer(config.worker.context_length));
+        }
         std::cout << Json(std::move(ready)).dump() << std::endl;
+        const size_t max_body_bytes = config.worker.context_length > 65536 ? 4 * 1024 * 1024 : 1024 * 1024;
+        const size_t max_json_values = config.worker.context_length > 65536 ? 300000 : 150000;
         while (!stopping) {
             try {
-                http::Limits limits; limits.body_bytes = 1024 * 1024;
+                http::Limits limits; limits.body_bytes = max_body_bytes;
                 auto connection = listener.accept(Clock::now() + std::chrono::milliseconds(100), limits);
                 const auto arrival = Clock::now();
                 try {
@@ -920,8 +949,8 @@ int server_cli(int argc, char** argv) {
                     const auto content_type = request.header("content-type");
                     if (!json_content_type(content_type)) { answer(415, error_json("application/json required", "unsupported_media_type")); continue; }
                     if (!available.load()) { answer(503, error_json("owned worker is unavailable; no automatic restart or generation retry", "worker_unavailable")); continue; }
-                    auto input = parse_json(request.body, {1024 * 1024, 150000, 32});
-                    static_cast<void>(admit_chat(input, config.alias, config.tool_enums, config.tool_args)); // No mutation on invalid admission.
+                    auto input = parse_json(request.body, {max_body_bytes, max_json_values, 32});
+                    static_cast<void>(admit_chat(input, config.alias, config.tool_enums, config.tool_args, config.worker.context_length)); // No mutation on invalid admission.
                     std::lock_guard lock(mutex);
                     if (pending) { answer(429, error_json("one waiting request already admitted", "queue_full")); continue; }
                     pending.emplace(Job{std::move(connection), std::move(input), arrival + std::chrono::seconds(config.request_seconds)}); condition.notify_one();

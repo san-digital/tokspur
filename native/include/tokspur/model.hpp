@@ -24,11 +24,11 @@ struct FlashLayout {
     std::vector<uint64_t> ple_multipliers;
     std::vector<uint64_t> ple_offsets;
     std::vector<uint64_t> ple_vocabularies;
-    [[nodiscard]] Json describe() const;
+    [[nodiscard]] Json describe(uint32_t context_length = 65536) const;
 };
 
 // Closed geometry contract for the current adopted variant. No allocation,
 // quantization/repack, GPU inference or claim of graph numerical equivalence.
-FlashLayout inspect_flash_next(const ModelFiles& files, const ModelFiles* pack = nullptr);
+FlashLayout inspect_flash_next(const ModelFiles& files, const ModelFiles* pack = nullptr, uint32_t context_length = 65536);
 
 } // namespace tokspur

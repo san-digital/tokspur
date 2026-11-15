@@ -17,7 +17,7 @@ void validate(const LookupConfig& c) {
     require(c.proposal_tokens >= 1 && c.proposal_tokens <= maximum_proposal_tokens,
             "prompt lookup proposal width outside [1, 16]");
     require(c.history_tokens > c.match_tokens && c.history_tokens <= maximum_history_tokens,
-            "prompt lookup history must exceed the match width and fit 65,536 tokens");
+            "prompt lookup history must exceed the match width and fit 131,072 tokens");
     require(c.token_limit >= 2, "prompt lookup token limit must admit at least two token IDs");
     require(c.work_limit >= 1 && c.work_limit <= maximum_lookup_work,
             "prompt lookup work limit outside [1, 2^20]");

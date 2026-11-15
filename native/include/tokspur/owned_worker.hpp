@@ -37,6 +37,7 @@ struct OwnedWorkerOptions {
     std::string stack_execution = "direct"; // Startup only: direct or recurrent-replay.
     uint32_t checkpoint_slots = 0;
     uint64_t checkpoint_budget_bytes = 0; // Paired opt-in; enables zero-step broker controls.
+    uint32_t context_length = 65536;
 #ifdef TOKSPUR_PRIVATE_HTTP_MTP_CONCURRENT
     std::optional<bool> concurrent_dispatch; // Presence is explicit startup consent, including OFF.
 #endif
@@ -55,8 +56,10 @@ struct OwnedWorkerOptions {
     std::optional<std::string> dflash2_precision; // Optional explicit "q8_0" or "bf16" DFlash2 dense precision.
     std::optional<uint32_t> dflash2_max_drafts;
     std::optional<uint32_t> dflash2_vocab_slice;
+    std::optional<std::string> dflash2_vocab_gather;
     std::optional<bool> logit_topk;
     std::optional<bool> ple_async_gather;
+    std::optional<bool> ple_ram_resident;
     std::optional<bool> mtp_fast_round;
     bool prepared_validation = false;
     std::optional<std::filesystem::path> verify_cost_profile, verify_m8_splits;
@@ -130,6 +133,8 @@ struct OwnedWorkerOptions {
     std::optional<bool> moe_three_union;
     std::optional<std::string> mtp_lookup;
     std::optional<uint32_t> mtp_lookup_match;
+    std::optional<std::string> dflash2_lookup;
+    std::optional<uint32_t> dflash2_lookup_match;
     std::optional<std::string> prefill_m64;
     std::optional<bool> prefill_multiseg;
     std::optional<bool> prefill_swizzle;

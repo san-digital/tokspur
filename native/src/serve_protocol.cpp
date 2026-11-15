@@ -64,7 +64,7 @@ struct PrivateMtpRequestTrace {
         double sum = 0;
         uint32_t expected = 0, observed = 0;
         void add(const Json& source, std::string_view name) {
-            require(expected < 65536, "private native trace sample bound"); ++expected;
+            require(expected < 131072, "private native trace sample bound"); ++expected;
             if (const auto* value = source.find(name)) {
                 const auto sample = number(*value, 0, std::numeric_limits<double>::max());
                 require(sample <= std::numeric_limits<double>::max() - sum, "private native trace clock overflow");
@@ -109,8 +109,8 @@ struct PrivateMtpRequestTrace {
         }
         const auto outputs = field(done, "generated_ids").array().size();
         require(packet_tokens == outputs && round_tokens <= outputs && packet_ordinary == outputs - round_tokens &&
-            round_committed_tokens <= 65536 - round_tokens && ordinary_tokens <= 65536 - packet_ordinary &&
-            ordinary_tail_tokens <= 65536 - packet_tails, "private native trace ordinary-token bound");
+            round_committed_tokens <= 131072 - round_tokens && ordinary_tokens <= 131072 - packet_ordinary &&
+            ordinary_tail_tokens <= 131072 - packet_tails, "private native trace ordinary-token bound");
         round_committed_tokens += round_tokens; ordinary_tokens += packet_ordinary; ordinary_tail_tokens += packet_tails;
     }
     Json report() const {
@@ -190,7 +190,7 @@ std::string_view schema_type(const Json& schema) {
 }
 void schema_admit(const Json& schema, size_t depth, size_t& nodes) {
     require(depth <= 16 && ++nodes <= 4096, "tool schema complexity bound");
-    keys(schema, {"type", "anyOf", "title", "default", "examples", "format", "$schema", "description", "properties", "required", "additionalProperties", "items", "enum", "minimum", "exclusiveMinimum", "maximum"});
+    keys(schema, {"type", "anyOf", "title", "default", "examples", "format", "$schema", "description", "properties", "required", "additionalProperties", "items", "minItems", "maxItems", "enum", "minimum", "exclusiveMinimum", "maximum"});
     const auto type = schema_type(schema);
     if (const auto* dialect = schema.find("$schema")) require(depth == 0 && dialect->string() == "https://json-schema.org/draft/2020-12/schema", "unsupported tool schema dialect");
     if (const auto* p = schema.find("description")) require(p->string().size() <= 16384, "schema description bound");
@@ -217,8 +217,16 @@ void schema_admit(const Json& schema, size_t depth, size_t& nodes) {
             }
         }
     } else require(!schema.find("properties") && !schema.find("required") && !schema.find("additionalProperties"), "object schema keyword on other type");
-    if (type == "array") schema_admit(field(schema, "items"), depth + 1, nodes);
-    else require(!schema.find("items"), "array schema keyword on other type");
+    if (type == "array") {
+        schema_admit(field(schema, "items"), depth + 1, nodes);
+        const auto* low = schema.find("minItems");
+        const auto* high = schema.find("maxItems");
+        if (low) static_cast<void>(low->unsigned_integer());
+        if (high) static_cast<void>(high->unsigned_integer());
+        // Validation refuses any array above 4096 items, so a larger minimum could never be met. A larger maximum stays admitted: the same cap still applies at validation.
+        if (low) require(low->unsigned_integer() <= 4096, "minItems exceeds the tool array bound");
+        if (low && high) require(low->unsigned_integer() <= high->unsigned_integer(), "inverted schema bounds");
+    } else require(!schema.find("items") && !schema.find("minItems") && !schema.find("maxItems"), "array schema keyword on other type");
     if (const auto* values = schema.find("enum")) {
         require(type != "object" && type != "array" && !values->array().empty() && values->array().size() <= 128, "unsupported enum");
         // Admission checks enum members against the same type, without enum.
@@ -268,7 +276,7 @@ void validate_executor_node(const Json& value, size_t depth, size_t& nodes) {
         }
     }
 }
-void thinking_history(const Json& message, std::string_view role) {
+void thinking_history(const Json& message, std::string_view role, size_t max_request_bytes) {
     const auto* blocks = message.find("thinking_blocks");
     if (!blocks) return;
     require(role == "assistant", "thinking blocks require assistant history");
@@ -279,13 +287,13 @@ void thinking_history(const Json& message, std::string_view role) {
         require(field(block, "type").string() == "thinking", "unsupported thinking block type");
         if (const auto* signature = block.find("signature")) require(signature->string().empty(), "signed thinking blocks are unsupported");
         const auto part = field(block, "thinking").string();
-        require(part.size() <= 1024 * 1024 - text.size(), "thinking history bound");
+        require(part.size() <= max_request_bytes - text.size(), "thinking history bound");
         text += part;
     }
     const auto* reasoning = message.find("reasoning_content");
     require(text == (reasoning && !reasoning->is_null() ? reasoning->string() : std::string_view{}), "thinking history differs from reasoning content");
 }
-void history(const Json& messages, const std::vector<std::string>& tools, const std::vector<Json>& schemas, ToolEnumValidation tool_enums, ToolArgValidation tool_args) {
+void history(const Json& messages, const std::vector<std::string>& tools, const std::vector<Json>& schemas, ToolEnumValidation tool_enums, ToolArgValidation tool_args, size_t max_request_bytes) {
     require(!messages.array().empty() && messages.array().size() <= 4096, "API history bound");
     std::map<std::string, std::string, std::less<>> pending;
     std::set<std::string, std::less<>> used;
@@ -293,7 +301,7 @@ void history(const Json& messages, const std::vector<std::string>& tools, const 
         keys(message, {"role", "content", "reasoning_content", "thinking_blocks", "tool_calls", "tool_call_id", "name"});
         const auto role = field(message, "role").string();
         require(role == "system" || role == "developer" || role == "user" || role == "assistant" || role == "tool", "unsupported API message role");
-        thinking_history(message, role);
+        thinking_history(message, role, max_request_bytes);
         if (const auto* content = message.find("content")) {
             if (content->kind() == Json::Kind::array) {
                 require(content->array().size() <= 4096, "text content part bound");
@@ -450,8 +458,11 @@ void validate_tool_value(const Json& schema, const Json& value, ToolEnumValidati
         if (const auto* maximum = schema.find("maximum")) require(compare(n, decimal(*maximum)) <= 0, "tool value above maximum");
         if (const auto* minimum = schema.find("exclusiveMinimum")) require(compare(n, decimal(*minimum)) > 0, "tool value at or below exclusive minimum");
     } else if (type == "array") {
-        require(value.array().size() <= 4096, "tool array bound");
-        for (const auto& item : value.array()) validate_tool_value(field(schema, "items"), item, tool_enums);
+        const auto& items = value.array();
+        require(items.size() <= 4096, "tool array bound");
+        if (const auto* minimum = schema.find("minItems")) require(uint64_t(items.size()) >= minimum->unsigned_integer(), "tool array below minItems");
+        if (const auto* maximum = schema.find("maxItems")) require(uint64_t(items.size()) <= maximum->unsigned_integer(), "tool array above maxItems");
+        for (const auto& item : items) validate_tool_value(field(schema, "items"), item, tool_enums);
     } else {
         const auto* properties = schema.find("properties");
         for (const auto& [name, item] : value.object()) {
@@ -469,11 +480,13 @@ void validate_tool_value(const Json& schema, const Json& value, ToolEnumValidati
     }
 }
 
-AdmittedChat admit_chat(const Json& request, std::string_view alias, ToolEnumValidation tool_enums, ToolArgValidation tool_args) {
+AdmittedChat admit_chat(const Json& request, std::string_view alias, ToolEnumValidation tool_enums, ToolArgValidation tool_args, uint32_t context_length) {
     static_cast<void>(tool_enum_validation_name(tool_enums));
     static_cast<void>(tool_arg_validation_name(tool_args));
-    static_cast<void>(request.dump(1024 * 1024));
-    keys(request, {"model", "messages", "n", "parallel_tool_calls", "stream", "stream_options", "keep_alive", "max_tokens", "max_completion_tokens", "temperature", "top_p", "top_k", "min_p", "seed", "tools", "tool_choice", "enable_thinking", "preserve_thinking", "reasoning_effort", "chat_template_kwargs", "presence_penalty", "repetition_penalty"});
+    require(context_length == 65536 || context_length == 131072, "unsupported serving context length");
+    const size_t max_request_bytes = context_length > 65536 ? 4 * 1024 * 1024 : 1024 * 1024;
+    static_cast<void>(request.dump(max_request_bytes));
+    keys(request, {"model", "messages", "n", "parallel_tool_calls", "stream", "stream_options", "keep_alive", "max_tokens", "max_completion_tokens", "temperature", "top_p", "top_k", "min_p", "seed", "tools", "tool_choice", "enable_thinking", "preserve_thinking", "reasoning_effort", "thinking_budget", "chat_template_kwargs", "presence_penalty", "repetition_penalty"});
     require(field(request, "model").string() == alias, "unknown model alias");
     AdmittedChat out;
     if (const auto* n = request.find("n")) require(n->unsigned_integer() == 1, "only n=1 is supported");
@@ -492,7 +505,7 @@ AdmittedChat admit_chat(const Json& request, std::string_view alias, ToolEnumVal
         } else static_cast<void>(number(*keep, -1, 1e12));
     }
     const auto* template_options = request.find("chat_template_kwargs");
-    if (template_options) keys(*template_options, {"enable_thinking", "preserve_thinking", "reasoning_effort"});
+    if (template_options) keys(*template_options, {"enable_thinking", "preserve_thinking", "reasoning_effort", "thinking_budget"});
     Json::Object canonical_options;
     for (const auto name : {"enable_thinking", "preserve_thinking", "reasoning_effort"}) {
         const auto* outer = request.find(name);
@@ -507,8 +520,37 @@ AdmittedChat admit_chat(const Json& request, std::string_view alias, ToolEnumVal
         require(!outer || !inner || outer->dump() == inner->dump(), "conflicting chat template options");
         if (const auto* selected = outer ? outer : inner) canonical_options.emplace_back(name, *selected);
     }
+    std::optional<uint32_t> raw_thinking_budget;
+    {
+        const auto* outer = request.find("thinking_budget");
+        const auto* inner = template_options ? template_options->find("thinking_budget") : nullptr;
+        if (outer) {
+            const auto n = outer->unsigned_integer();
+            require(n <= 32768, "thinking budget must be 0..32768");
+            raw_thinking_budget = uint32_t(n);
+        }
+        if (inner) {
+            const auto n = inner->unsigned_integer();
+            require(n <= 32768, "thinking budget must be 0..32768");
+            require(!outer || *raw_thinking_budget == uint32_t(n), "conflicting chat template options");
+            raw_thinking_budget = uint32_t(n);
+        }
+    }
     const Json options(std::move(canonical_options));
-    if (const auto* p = options.find("enable_thinking")) out.thinking = p->boolean();
+    std::optional<bool> explicit_thinking;
+    if (const auto* p = options.find("enable_thinking")) {
+        explicit_thinking = p->boolean();
+        out.thinking = *explicit_thinking;
+    }
+    if (raw_thinking_budget) {
+        if (*raw_thinking_budget == 0) {
+            require(explicit_thinking != std::optional<bool>(true), "conflicting thinking options");
+            out.thinking = false;
+        } else if (explicit_thinking != std::optional<bool>(false)) {
+            // A positive budget only caps thinking. With thinking explicitly off there is nothing to cap, so the budget is ignored and not refused: clients keep a fixed budget and toggle thinking.
+            out.thinking_budget = *raw_thinking_budget;
+        }
+    }
     if (const auto* p = options.find("reasoning_effort")) {
         const auto effort = p->string();
         require(effort == "xhigh" || effort == "high" || effort == "medium" || effort == "low" ||
@@ -553,7 +595,7 @@ AdmittedChat admit_chat(const Json& request, std::string_view alias, ToolEnumVal
         else { out.named_tool_choice = true; keys(*choice, {"type", "function"}); require(field(*choice, "type").string() == "function", "unsupported named tool_choice"); const auto& function = field(*choice, "function"); keys(function, {"name"}); out.tool_choice = field(function, "name").string(); require(names.contains(out.tool_choice), "unknown named tool_choice"); }
     }
     require(out.tool_choice == "auto" || out.tool_choice == "none" || !declarations.empty(), "tool choice requires tools");
-    const auto& messages = field(request, "messages"); history(messages, out.names, out.schemas, tool_enums, tool_args);
+    const auto& messages = field(request, "messages"); history(messages, out.names, out.schemas, tool_enums, tool_args, max_request_bytes);
     Json::Array rendered_messages = messages.array();
     if (out.named_tool_choice || out.tool_choice == "required") {
         const std::string instruction = !out.named_tool_choice ? "For this response, call at least one of the declared tools. Do not answer without a tool call." : "For this response, call only the declared function named " + out.tool_choice + ". Do not answer without that tool call.";
@@ -590,8 +632,9 @@ ServeSession::ServeSession(ServeCodec codec, std::string alias, std::string stac
     , std::optional<uint32_t> mtp_first_output_packet
 #endif
     , ToolArgValidation tool_args
+    , uint32_t context_length
     )
-    : codec_(std::move(codec)), alias_(std::move(alias)), stack_execution_(std::move(stack_execution)), tool_enums_(tool_enums), tool_args_(tool_args)
+    : codec_(std::move(codec)), alias_(std::move(alias)), stack_execution_(std::move(stack_execution)), tool_enums_(tool_enums), tool_args_(tool_args), context_length_(context_length)
 #ifdef TOKSPUR_PRIVATE_HTTP_SAMPLED_PREFILL
     , sampled_prefill_(sampled_prefill)
 #endif
@@ -609,6 +652,7 @@ ServeSession::ServeSession(ServeCodec codec, std::string alias, std::string stac
     static_cast<void>(tool_enum_validation_name(tool_enums_));
     static_cast<void>(tool_arg_validation_name(tool_args_));
     require(bool(codec_.render) && bool(codec_.encode) && bool(codec_.decode) && !alias_.empty(), "invalid serving codec");
+    require(context_length_ == 65536 || context_length_ == 131072, "unsupported serving context length");
     require(stack_execution_ == "direct" || stack_execution_ == "recurrent-replay", "unsupported serving startup execution mode");
 #ifdef TOKSPUR_PRIVATE_LANE_LAYOUT
     if (!weight_lanes_ready.is_null()) {
@@ -630,12 +674,12 @@ ServeSession::ServeSession(ServeCodec codec, std::string alias, std::string stac
 #ifdef TOKSPUR_PRIVATE_HTTP_SAMPLED_PREFILL
     require(!sampled_prefill_ || (stack_execution_ == "direct" && !verify8_ && !branch8_ && broker_ready_.is_null()),
         "sampled input8 refuses greedy verification, replay and checkpoint brokers");
-    if (sampled_prefill_) committed_.reserve(65536); // Before all-N publication.
+    if (sampled_prefill_) committed_.reserve(context_length_); // Before all-N publication.
 #endif
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
     require(!mtp_ || (stack_execution_ == "direct" && !verify8_ && !branch8_ && !sampled_prefill_ && broker_ready_.is_null()),
         "sampled MTP refuses another transport, replay and checkpoint brokers");
-    if (mtp_) { validate_mtp_ready(mtp_ready_, mtp_draft_attention(mtp_ready_), mtp_request_carry(mtp_ready_), mtp_depth(mtp_ready_)); committed_.reserve(65536); }
+    if (mtp_) { validate_mtp_ready(mtp_ready_, mtp_draft_attention(mtp_ready_), mtp_request_carry(mtp_ready_), mtp_depth(mtp_ready_)); committed_.reserve(context_length_); }
     if (mtp_first_output_packet_) {
         require(mtp_, "MTP first-output-packet requires native MTP readiness");
         const auto cap = mtp_output_packet(mtp_ready_);
@@ -652,7 +696,7 @@ ServeSession::ServeSession(ServeCodec codec, std::string alias, std::string stac
         } else
 #endif
         { require(broker_ready_.is_null(), "private HTTP V8 cannot use checkpoints without explicit branch8 consent"); validate_verify8_ready(verify_ready_); }
-        committed_.reserve(65536);
+        committed_.reserve(context_length_);
     } else require(verify_ready_.is_null(), "unexpected private V8 readiness");
 #endif
 #ifdef TOKSPUR_PRIVATE_HTTP_BRANCH8
@@ -663,7 +707,7 @@ ServeSession::ServeSession(ServeCodec codec, std::string alias, std::string stac
         require(slots && slots <= 4, "serving broker slot bound");
         validate_worker_ready(broker_ready_, stack_execution_, uint32_t(slots), field(broker_ready_, "checkpoint_combined_budget_bytes").unsigned_integer());
         broker_epoch_ = field(broker_ready_, "broker_epoch").unsigned_integer();
-        committed_.reserve(65536); // Before any restore publication.
+        committed_.reserve(context_length_); // Before any restore publication.
     }
 }
 void ServeSession::invalidate() noexcept { saved_reasoning_.clear(); committed_.clear(); sampling_.clear(); reusable_ = false; seed_ = 0; broker_resync_ = true;
@@ -677,7 +721,7 @@ void ServeSession::invalidate() noexcept { saved_reasoning_.clear(); committed_.
 
 Json ServeSession::complete(const Json& input, std::string_view response_id, const ServeTarget& target, const ServeSink& sink) {
     const auto request_start = std::chrono::steady_clock::now();
-    const auto request = admit_chat(input, alias_, tool_enums_, tool_args_);
+    const auto request = admit_chat(input, alias_, tool_enums_, tool_args_, context_length_);
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
     uint64_t gdn_old_order_admitted_calls = 0;
     uint64_t hc_down_f32_admitted_calls = 0;
@@ -737,10 +781,11 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
             value = Json(std::move(messages));
         }
         auto candidate = codec_.encode(codec_.render(Json(std::move(fields))));
-        if (candidate.size() < 65536 && matches_committed(candidate)) prompt = std::move(candidate);
+        if (candidate.size() < context_length_ && matches_committed(candidate)) prompt = std::move(candidate);
     }
-    require(!prompt.empty() && prompt.size() < 65536, "request leaves no generation space in the 64K context");
-    const auto maximum_tokens = std::min(request.maximum_tokens, 65536u - uint32_t(prompt.size()));
+    require(!prompt.empty() && prompt.size() < context_length_,
+        context_length_ == 131072 ? "request leaves no generation space in the 128K context" : "request leaves no generation space in the 64K context");
+    const auto maximum_tokens = std::min(request.maximum_tokens, context_length_ - uint32_t(prompt.size()));
     for (const auto id : prompt) require(id < codec_.admission.vocabulary, "rendered token outside vocabulary");
     const auto policy = request.sampling.dump();
     const auto created_signed = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
@@ -1063,76 +1108,183 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
         const size_t prefill_committed_end = position;
         const auto generation_start = std::chrono::steady_clock::now();
         bool stopped = false;
+        std::optional<size_t> forced_thinking_close_index;
+        const auto encode_forced_tokens = [&](std::string_view text) {
+            auto ids = codec_.encode(RenderedChat{std::string(text), Json(Json::Array{})});
+            require(!ids.empty(), "forced thinking close encoded no tokens");
+            for (const auto id : ids) {
+                require(id < codec_.admission.vocabulary && id != codec_.admission.im_start && !codec_.admission.is_stop(id),
+                    "forced thinking close token outside vocabulary or terminal");
+            }
+            return ids;
+        };
+        const auto run_generation_phase = [&](size_t phase_limit) {
+            if (stopped || generated.size() >= phase_limit) return;
+            const size_t phase_budget = phase_limit - generated.size();
+            static_cast<void>(phase_budget);
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
-        if (mtp_) {
-            controller_committed = controller_emitted = controller_pending = 0; controller_feedback = Json();
-            const bool scoped_carry = mtp_request_carry(mtp_ready_);
-            if (scoped_carry) { require(mtp_generation_id_ < std::numeric_limits<uint64_t>::max(), "MTP generation ID exhausted"); ++mtp_generation_id_; }
-            const size_t output_cap = mtp_output_packet(mtp_ready_);
-            while (generated.size() < maximum_tokens) {
-                const size_t packet_cap = (generated.empty() && mtp_first_output_packet_)
-                    ? std::min<size_t>(*mtp_first_output_packet_, output_cap)
-                    : output_cap;
-                const auto n = std::min<size_t>(packet_cap, maximum_tokens - generated.size());
-                Json::Object job{{"tokens", Json(Json::Array{})}, {"generate", Json::integer(n)}, {"reset", Json(false)},
-                    {"stop_ids", Json(Json::Array{Json::integer(codec_.admission.im_end), Json::integer(codec_.admission.end_of_text)})}};
-                if (scoped_carry) {
+            if (mtp_) {
+                controller_committed = controller_emitted = controller_pending = 0; controller_feedback = Json();
+                const bool scoped_carry = mtp_request_carry(mtp_ready_);
+                if (scoped_carry) { require(mtp_generation_id_ < std::numeric_limits<uint64_t>::max(), "MTP generation ID exhausted"); ++mtp_generation_id_; }
+                const size_t output_cap = mtp_output_packet(mtp_ready_);
+                const auto build_mtp_generation = [&](bool begin, size_t rem) {
                     Json::Object generation{{"id", Json::integer(mtp_generation_id_)},
-                        {"begin", Json(generated.empty())}, {"remaining", Json::integer(maximum_tokens - generated.size())}};
+                        {"begin", Json(begin)}, {"remaining", Json::integer(rem)}};
                     if (field(mtp_ready_, "native_mtp_carry_scope").string() == "http-generation-v2") {
                         generation.emplace_back("committed", Json::integer(controller_committed));
                         generation.emplace_back("emitted", Json::integer(controller_emitted));
                         generation.emplace_back("pending", Json::integer(controller_pending));
-                        generation.emplace_back("remaining_compute", Json::integer(maximum_tokens - std::min<uint64_t>(maximum_tokens, controller_committed)));
-                        generation.emplace_back("total_budget", Json::integer(maximum_tokens));
+                        generation.emplace_back("remaining_compute", Json::integer(phase_budget - std::min<uint64_t>(phase_budget, controller_committed)));
+                        generation.emplace_back("total_budget", Json::integer(phase_budget));
                         if (!controller_feedback.is_null()) generation.emplace_back("stage_a_controller", controller_feedback);
                     }
-                    job.emplace_back("mtp_generation", Json(std::move(generation)));
+                    return Json(std::move(generation));
+                };
+                size_t phase_emitted = 0;
+                while (phase_emitted < phase_budget) {
+                    const size_t packet_cap = (generated.empty() && mtp_first_output_packet_)
+                        ? std::min<size_t>(*mtp_first_output_packet_, output_cap)
+                        : output_cap;
+                    const auto n = std::min<size_t>(packet_cap, phase_budget - phase_emitted);
+                    Json::Object job{{"tokens", Json(Json::Array{})}, {"generate", Json::integer(n)}, {"reset", Json(false)},
+                        {"stop_ids", Json(Json::Array{Json::integer(codec_.admission.im_end), Json::integer(codec_.admission.end_of_text)})}};
+                    if (scoped_carry) job.emplace_back("mtp_generation", build_mtp_generation(phase_emitted == 0, phase_budget - phase_emitted));
+                    const auto done = run_mtp(Json(std::move(job)));
+                    for (const auto& token : field(done, "generated_ids").array()) {
+                        const auto id = uint32_t(token.unsigned_integer());
+                        require(id != codec_.admission.im_start && !stopped, "MTP unexpected generated role/terminal");
+                        stopped = codec_.admission.is_stop(id); generated.push_back(id); ++phase_emitted;
+                        require(stopped || parser.feed(codec_.decode(std::span<const uint32_t>(&generated.back(), 1))) != ResponseStatus::error,
+                            "MTP response bytes/frame validation failed"); flush();
+                    }
+                    if (stopped) break;
                 }
-                const auto done = run_mtp(Json(std::move(job)));
-                for (const auto& token : field(done, "generated_ids").array()) {
-                    const auto id = uint32_t(token.unsigned_integer());
-                    require(id != codec_.admission.im_start && !stopped, "MTP unexpected generated role/terminal");
-                    stopped = codec_.admission.is_stop(id); generated.push_back(id);
-                    require(stopped || parser.feed(codec_.decode(std::span<const uint32_t>(&generated.back(), 1))) != ResponseStatus::error,
-                        "MTP response bytes/frame validation failed"); flush();
-                }
-                if (stopped) break;
-            }
-        } else
+            } else
 #endif
 #ifdef TOKSPUR_PRIVATE_HTTP_VERIFY8
-        if (verify8_) {
-            while (generated.size() < maximum_tokens) {
-                const auto n = std::min<size_t>(8, maximum_tokens - generated.size());
-                const auto done = run_many(Json(Json::Object{{"tokens", Json(Json::Array{})}, {"generate", Json::integer(n)}, {"reset", Json(false)},
-                    {"stop_ids", Json(Json::Array{Json::integer(codec_.admission.im_end), Json::integer(codec_.admission.end_of_text)})}}));
-                for (const auto& token : field(done, "generated_ids").array()) {
-                    const auto id = uint32_t(token.unsigned_integer());
-                    require(id != codec_.admission.im_start && !stopped, "private V8 unexpected generated role/terminal");
-                    stopped = codec_.admission.is_stop(id); generated.push_back(id);
-                    require(stopped || parser.feed(codec_.decode(std::span<const uint32_t>(&generated.back(), 1))) != ResponseStatus::error, "response bytes/frame validation failed"); flush();
+            if (verify8_) {
+                while (generated.size() < phase_limit) {
+                    const auto n = std::min<size_t>(8, phase_limit - generated.size());
+                    const auto done = run_many(Json(Json::Object{{"tokens", Json(Json::Array{})}, {"generate", Json::integer(n)}, {"reset", Json(false)},
+                        {"stop_ids", Json(Json::Array{Json::integer(codec_.admission.im_end), Json::integer(codec_.admission.end_of_text)})}}));
+                    for (const auto& token : field(done, "generated_ids").array()) {
+                        const auto id = uint32_t(token.unsigned_integer());
+                        require(id != codec_.admission.im_start && !stopped, "private V8 unexpected generated role/terminal");
+                        stopped = codec_.admission.is_stop(id); generated.push_back(id);
+                        require(stopped || parser.feed(codec_.decode(std::span<const uint32_t>(&generated.back(), 1))) != ResponseStatus::error, "response bytes/frame validation failed"); flush();
+                    }
+                    if (stopped) break;
                 }
+            } else
+#endif
+            while (generated.size() < phase_limit) {
+                const auto done = run(Json(Json::Object{{"tokens", Json(Json::Array{})}, {"generate", Json::integer(1)}, {"reset", Json(false)},
+                    {"stop_ids", Json(Json::Array{Json::integer(codec_.admission.im_end), Json::integer(codec_.admission.end_of_text)})}}), {}, true);
+                const auto id = committed_.back();
+                require(id != codec_.admission.im_start, "unexpected generated role/terminal token");
+                stopped = codec_.admission.is_stop(id);
+                require(field(done, "finish_reason").string() == (stopped ? "stop" : "length") && field(done, "status").string() == (stopped ? "stopped" : "length"), "worker termination mismatch");
+                if (stopped) require(field(done, "stop_id").unsigned_integer() == id && !field(done, "continuation_allowed").boolean(), "invalid terminal admission");
+                else require(field(done, "stop_id").is_null() && field(done, "continuation_allowed").boolean(), "invalid continuation admission");
+                generated.push_back(id); require(stopped || parser.feed(codec_.decode(std::span<const uint32_t>(&generated.back(), 1))) != ResponseStatus::error, "response bytes/frame validation failed"); flush();
                 if (stopped) break;
             }
-        } else
+        };
+        const auto inject_forced_thinking_close = [&] {
+            const auto nl_ids = parser.thinking_ends_with_newline() ? std::vector<uint32_t>{} : encode_forced_tokens("\n");
+            const auto close_ids = encode_forced_tokens("</think>");
+            const auto nl2_ids = encode_forced_tokens("\n\n");
+            std::vector<uint32_t> inject;
+            inject.reserve(nl_ids.size() + close_ids.size() + nl2_ids.size());
+            inject.insert(inject.end(), nl_ids.begin(), nl_ids.end());
+            const size_t close_offset = inject.size();
+            inject.insert(inject.end(), close_ids.begin(), close_ids.end());
+            inject.insert(inject.end(), nl2_ids.begin(), nl2_ids.end());
+            const size_t rem = size_t(maximum_tokens) - generated.size();
+            if (inject.size() > rem) inject.resize(rem);
+            if (inject.empty()) return;
+            if (inject.size() > close_offset) forced_thinking_close_index = generated.size() + close_offset;
+#ifdef TOKSPUR_PRIVATE_HTTP_VERIFY8
+            if (verify8_) {
+                for (size_t at = 0; at < inject.size();) {
+                    const size_t n = std::min<size_t>(8, inject.size() - at);
+                    Json::Array ids; ids.reserve(n);
+                    for (size_t t = 0; t < n; ++t) ids.push_back(Json::integer(inject[at + t]));
+                    static_cast<void>(run_many(Json(Json::Object{{"tokens", Json(std::move(ids))}, {"generate", Json::integer(0)}, {"reset", Json(false)}})));
+                    at += n;
+                }
+            } else
 #endif
-        for (uint32_t i = 0; i < maximum_tokens; ++i) {
-            const auto done = run(Json(Json::Object{{"tokens", Json(Json::Array{})}, {"generate", Json::integer(1)}, {"reset", Json(false)},
-                {"stop_ids", Json(Json::Array{Json::integer(codec_.admission.im_end), Json::integer(codec_.admission.end_of_text)})}}), {}, true);
-            const auto id = committed_.back();
-            require(id != codec_.admission.im_start, "unexpected generated role/terminal token");
-            stopped = codec_.admission.is_stop(id);
-            require(field(done, "finish_reason").string() == (stopped ? "stop" : "length") && field(done, "status").string() == (stopped ? "stopped" : "length"), "worker termination mismatch");
-            if (stopped) require(field(done, "stop_id").unsigned_integer() == id && !field(done, "continuation_allowed").boolean(), "invalid terminal admission");
-            else require(field(done, "stop_id").is_null() && field(done, "continuation_allowed").boolean(), "invalid continuation admission");
-            generated.push_back(id); require(stopped || parser.feed(codec_.decode(std::span<const uint32_t>(&generated.back(), 1))) != ResponseStatus::error, "response bytes/frame validation failed"); flush();
-            if (stopped) break;
+#ifdef TOKSPUR_PRIVATE_HTTP_SAMPLED_PREFILL
+            if (sampled_prefill_
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+                || mtp_
+#endif
+                ) {
+                for (size_t at = 0; at < inject.size();) {
+                    cancelled();
+                    size_t input_packet = 8;
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+                    if (mtp_) input_packet = mtp_input_packet(mtp_ready_);
+#endif
+                    const auto n = std::min<size_t>(input_packet, inject.size() - at);
+                    Json::Array ids; ids.reserve(n);
+                    for (size_t t = 0; t < n; ++t) ids.push_back(Json::integer(inject[at + t]));
+                    Json::Object job{{"tokens", Json(std::move(ids))}, {"generate", Json::integer(0)}, {"reset", Json(false)}};
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+                    if (mtp_) {
+                        if (mtp_final_input_logits(mtp_ready_)) job.emplace_back("prefill_final", Json(at + n == inject.size()));
+                        static_cast<void>(run_mtp(Json(std::move(job))));
+                        at += n;
+                        continue;
+                    }
+#endif
+                    const auto done = target(Json(std::move(job)), [](const Json&) { throw FormatError("known input emitted a generated token"); });
+                    cancelled();
+                    require(field(done, "event").string() == "done" &&
+                        field(done, "sampled_prefill_protocol").string() == "sampled-prefill-input8-v1" &&
+                        field(done, "committed_prefix").unsigned_integer() == position + n &&
+                        field(done, "generated_ids").array().empty() && field(done, "status").string() == "prefilled" &&
+                        field(done, "finish_reason").is_null() && field(done, "stop_id").is_null(), "invalid sampled input8 completion");
+                    worker_execution(done, stack_execution_); sampling_matches(done, position + n);
+                    for (size_t t = 0; t < n; ++t) committed_.push_back(inject[at + t]);
+                    position += n;
+                    at += n;
+                }
+            } else
+#endif
+            for (const auto token : inject) {
+                Json::Object job{{"tokens", Json(Json::Array{Json::integer(token)})}, {"generate", Json::integer(0)}, {"reset", Json(false)}};
+                const auto done = run(Json(std::move(job)), token, false);
+                require(field(done, "status").string() == "prefilled" && field(done, "finish_reason").is_null() && field(done, "stop_id").is_null(), "invalid prefill termination");
+            }
+            for (size_t i = 0; i < inject.size(); ++i) {
+                if (i == close_offset) parser.prepare_forced_thinking_close();
+                generated.push_back(inject[i]);
+                require(parser.feed(codec_.decode(std::span<const uint32_t>(&generated.back(), 1))) != ResponseStatus::error, "response bytes/frame validation failed");
+                flush();
+            }
+        };
+        if (request.thinking && request.thinking_budget && *request.thinking_budget < maximum_tokens) {
+            run_generation_phase(*request.thinking_budget);
+            while (!stopped && parser.in_thinking() && parser.has_incomplete_utf8() && generated.size() < maximum_tokens) {
+                run_generation_phase(generated.size() + 1);
+            }
+            if (!stopped && parser.in_thinking() && generated.size() < maximum_tokens) {
+                inject_forced_thinking_close();
+            }
+            if (!stopped && generated.size() < maximum_tokens) {
+                run_generation_phase(maximum_tokens);
+            }
+        } else {
+            run_generation_phase(maximum_tokens);
         }
         Json::Array ids; for (const auto id : generated) ids.push_back(Json::integer(id));
         Json::Object final_req{{"ids", Json(std::move(ids))}, {"tools", parser_manifest(request.manifest)}, {"initial_thinking", Json(request.thinking)},
             {"finish_reason", Json(stopped ? "stop" : "length")}, {"stop_id", stopped ? Json::integer(generated.back()) : Json()}};
         if (tool_args_ == ToolArgValidation::executor) final_req.emplace_back("executor_parameters", Json(true));
+        if (forced_thinking_close_index) final_req.emplace_back("forced_thinking_close_index", Json::integer(*forced_thinking_close_index));
         const auto final = parse_native_response(Json(std::move(final_req)), codec_.admission, codec_.decode, response_maximum_accumulated_ids);
         require(!request.single_tool_call || field(final, "tool_calls").array().size() <= 1, "parallel tool calls are disabled for this request");
         Json::Array calls;

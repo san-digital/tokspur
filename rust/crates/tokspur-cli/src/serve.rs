@@ -87,10 +87,13 @@ pub struct ServeOptions {
     pub prefill_dense: String,
     pub prefill_grouped: String,
     pub known_token_capacity: u32,
+    pub context_length: u32,
     pub mtp_draft_slice: bool,
+    pub mtp_draft_slice_selection: Option<bool>,
     pub host_logit_views: Option<bool>,
     pub logit_topk: Option<bool>,
     pub ple_async_gather: Option<bool>,
+    pub ple_ram_resident: Option<bool>,
     pub mtp_fast_round: Option<bool>,
     pub dflash2_defer_context: Option<bool>,
     pub dflash2_verify_rows: Option<String>,
@@ -99,9 +102,11 @@ pub struct ServeOptions {
     pub dflash2_draft_policy: String,
     pub dflash2_max_drafts: Option<u32>,
     pub dflash2_vocab_slice: Option<u32>,
+    pub dflash2_vocab_gather: Option<String>,
     pub verify_nax: bool,
     pub verify_nax_selection: Option<bool>,
     pub verify_nax_m8: bool,
+    pub verify_nax_m8_selection: Option<bool>,
     pub verify_m8_splits: Option<PathBuf>,
     pub verify_hc_gdn_fused: Option<bool>,
     pub speed_preset: bool,
@@ -121,6 +126,8 @@ pub struct ServeOptions {
     pub shared_prefix_cache: Option<bool>,
     pub mtp_lookup: String,
     pub mtp_lookup_match: Option<u32>,
+    pub dflash2_lookup: String,
+    pub dflash2_lookup_match: Option<u32>,
     pub tool_enum_validation: String,
     pub tool_arg_validation: String,
     pub private_prefix_trace: bool,
@@ -148,10 +155,13 @@ impl Default for ServeOptions {
             prefill_dense: "f32-staged".to_owned(),
             prefill_grouped: "f32".to_owned(),
             known_token_capacity: 2048,
+            context_length: 65_536,
             mtp_draft_slice: false,
+            mtp_draft_slice_selection: None,
             host_logit_views: None,
             logit_topk: None,
             ple_async_gather: None,
+            ple_ram_resident: None,
             mtp_fast_round: None,
             dflash2_defer_context: None,
             dflash2_verify_rows: None,
@@ -160,9 +170,11 @@ impl Default for ServeOptions {
             dflash2_draft_policy: "always".to_owned(),
             dflash2_max_drafts: None,
             dflash2_vocab_slice: None,
+            dflash2_vocab_gather: None,
             verify_nax: false,
             verify_nax_selection: None,
             verify_nax_m8: false,
+            verify_nax_m8_selection: None,
             verify_m8_splits: None,
             verify_hc_gdn_fused: None,
             speed_preset: false,
@@ -182,6 +194,8 @@ impl Default for ServeOptions {
             shared_prefix_cache: None,
             mtp_lookup: "off".to_owned(),
             mtp_lookup_match: None,
+            dflash2_lookup: "off".to_owned(),
+            dflash2_lookup_match: None,
             tool_enum_validation: "strict".to_owned(),
             tool_arg_validation: "strict".to_owned(),
             private_prefix_trace: false,
@@ -215,10 +229,13 @@ impl fmt::Debug for ServeOptions {
             .field("prefill_dense", &self.prefill_dense)
             .field("prefill_grouped", &self.prefill_grouped)
             .field("known_token_capacity", &self.known_token_capacity)
+            .field("context_length", &self.context_length)
             .field("mtp_draft_slice", &self.mtp_draft_slice)
+            .field("mtp_draft_slice_selection", &self.mtp_draft_slice_selection)
             .field("host_logit_views", &self.host_logit_views)
             .field("logit_topk", &self.logit_topk)
             .field("ple_async_gather", &self.ple_async_gather)
+            .field("ple_ram_resident", &self.ple_ram_resident)
             .field("mtp_fast_round", &self.mtp_fast_round)
             .field("dflash2_defer_context", &self.dflash2_defer_context)
             .field("dflash2_verify_rows", &self.dflash2_verify_rows)
@@ -230,9 +247,11 @@ impl fmt::Debug for ServeOptions {
             .field("dflash2_draft_policy", &self.dflash2_draft_policy)
             .field("dflash2_max_drafts", &self.dflash2_max_drafts)
             .field("dflash2_vocab_slice", &self.dflash2_vocab_slice)
+            .field("dflash2_vocab_gather", &self.dflash2_vocab_gather)
             .field("verify_nax", &self.verify_nax)
             .field("verify_nax_selection", &self.verify_nax_selection)
             .field("verify_nax_m8", &self.verify_nax_m8)
+            .field("verify_nax_m8_selection", &self.verify_nax_m8_selection)
             .field(
                 "verify_m8_splits",
                 &self.verify_m8_splits.as_ref().map(|_| "[redacted]"),
@@ -258,6 +277,8 @@ impl fmt::Debug for ServeOptions {
             .field("shared_prefix_cache", &self.shared_prefix_cache)
             .field("mtp_lookup", &self.mtp_lookup)
             .field("mtp_lookup_match", &self.mtp_lookup_match)
+            .field("dflash2_lookup", &self.dflash2_lookup)
+            .field("dflash2_lookup_match", &self.dflash2_lookup_match)
             .field("tool_enum_validation", &self.tool_enum_validation)
             .field("tool_arg_validation", &self.tool_arg_validation)
             .field("private_prefix_trace", &self.private_prefix_trace)
@@ -289,6 +310,60 @@ impl fmt::Debug for SpeculativeAsset<'_> {
             Self::DFlash2Dir(_) => formatter.write_str("DFlash2Dir([redacted])"),
         }
     }
+}
+
+pub fn is_valid_dflash2_vocab_gather(value: &str, vocabulary: u32) -> bool {
+    if matches!(value, "control32k" | "cjk48k" | "cjk64k" | "cjk80k") {
+        return vocabulary > 248_076;
+    }
+    if value.is_empty() || value.len() > 65_536 || vocabulary == 0 {
+        return false;
+    }
+    let bytes = value.as_bytes();
+    let mut at = 0usize;
+    let mut prev_last: Option<u32> = None;
+    let mut count: u64 = 0;
+    let parse_num = |pos: &mut usize| -> Option<u32> {
+        let begin = *pos;
+        let mut parsed = 0u64;
+        while *pos < bytes.len() && bytes[*pos].is_ascii_digit() {
+            parsed = parsed * 10 + u64::from(bytes[*pos] - b'0');
+            if parsed >= u64::from(vocabulary) {
+                return None;
+            }
+            *pos += 1;
+        }
+        if *pos == begin || (bytes[begin] == b'0' && *pos - begin > 1) {
+            return None;
+        }
+        Some(parsed as u32)
+    };
+    loop {
+        let Some(first) = parse_num(&mut at) else {
+            return false;
+        };
+        let mut last = first;
+        if at < bytes.len() && bytes[at] == b'-' {
+            at += 1;
+            let Some(end) = parse_num(&mut at) else {
+                return false;
+            };
+            last = end;
+        }
+        if last < first || prev_last.is_some_and(|p| first <= p) {
+            return false;
+        }
+        count += u64::from(last - first) + 1;
+        prev_last = Some(last);
+        if at == bytes.len() {
+            break;
+        }
+        if bytes[at] != b',' {
+            return false;
+        }
+        at += 1;
+    }
+    count >= 256 && count < u64::from(vocabulary) && count.is_multiple_of(32)
 }
 
 /// Validates individual option bounds and cross-flag compatibility before launching `tokspur-server`.
@@ -374,6 +449,12 @@ pub fn validate_serve_options(opts: &ServeOptions) -> Result<(), CliError> {
             opts.known_token_capacity
         )));
     }
+    if !matches!(opts.context_length, 65_536 | 131_072) {
+        return Err(CliError::Validation(format!(
+            "Unsupported context_length: {} (expected 65536 or 131072)",
+            opts.context_length
+        )));
+    }
     if !matches!(opts.drafter.as_str(), "mtp" | "dflash2") {
         return Err(CliError::Validation(format!(
             "Unsupported drafter mode: {}",
@@ -403,6 +484,19 @@ pub fn validate_serve_options(opts: &ServeOptions) -> Result<(), CliError> {
     {
         return Err(CliError::Validation(format!(
             "Unsupported mtp_lookup_match: {match_len} (expected 2..16)"
+        )));
+    }
+    if !matches!(opts.dflash2_lookup.as_str(), "off" | "bypass" | "hybrid") {
+        return Err(CliError::Validation(format!(
+            "Unsupported dflash2_lookup mode: {}",
+            opts.dflash2_lookup
+        )));
+    }
+    if let Some(match_len) = opts.dflash2_lookup_match
+        && !(2..=16).contains(&match_len)
+    {
+        return Err(CliError::Validation(format!(
+            "Unsupported dflash2_lookup_match: {match_len} (expected 2..16)"
         )));
     }
     if !matches!(opts.tool_enum_validation.as_str(), "strict" | "executor") {
@@ -465,6 +559,19 @@ pub fn validate_serve_options(opts: &ServeOptions) -> Result<(), CliError> {
             "Unsupported dflash2_vocab_slice: {vs} (expected 0 or a multiple of 32 in 256..248319)"
         )));
     }
+    if let Some(ref vg) = opts.dflash2_vocab_gather {
+        if !is_valid_dflash2_vocab_gather(vg, 248_320) {
+            return Err(CliError::Validation(format!(
+                "Unsupported dflash2_vocab_gather: {vg} (expected control32k, cjk48k, cjk64k, cjk80k, or ascending IDs/ranges multiple of 32 in 256..248319)"
+            )));
+        }
+        if opts.dflash2_vocab_slice.is_some() {
+            return Err(CliError::Validation(
+                "--dflash2-vocab-gather and --dflash2-vocab-slice are mutually exclusive"
+                    .to_owned(),
+            ));
+        }
+    }
     if opts.verify_hc_gdn_fused == Some(true)
         && !opts.verify_nax
         && !opts.verify_nax_m8
@@ -489,6 +596,12 @@ pub fn validate_serve_options(opts: &ServeOptions) -> Result<(), CliError> {
         if opts.mtp_draft_slice {
             return Err(CliError::Validation(
                 "--mtp-draft-slice is incompatible with --drafter dflash2".to_owned(),
+            ));
+        }
+        // An explicit OFF is refused too, so it cannot be mistaken for a full DFlash2 draft vocabulary: that is a separate setting.
+        if opts.mtp_draft_slice_selection.is_some() {
+            return Err(CliError::Validation(
+                "--no-mtp-draft-slice and --native-mtp-draft-slice do not apply to --drafter dflash2; use --dflash2-vocab-slice 0 for the full draft vocabulary".to_owned(),
             ));
         }
         if opts.mtp_fast_round == Some(true) {
@@ -517,6 +630,14 @@ pub fn validate_serve_options(opts: &ServeOptions) -> Result<(), CliError> {
         return Err(CliError::Validation(
             "--dflash2-vocab-slice requires --drafter dflash2".to_owned(),
         ));
+    } else if opts.dflash2_lookup != "off" || opts.dflash2_lookup_match.is_some() {
+        return Err(CliError::Validation(
+            "--dflash2-lookup requires --drafter dflash2".to_owned(),
+        ));
+    } else if opts.dflash2_vocab_gather.is_some() {
+        return Err(CliError::Validation(
+            "--dflash2-vocab-gather requires --drafter dflash2".to_owned(),
+        ));
     }
     if opts.verify_m8_splits.is_some() && !opts.verify_nax_m8 {
         return Err(CliError::Validation(
@@ -527,10 +648,14 @@ pub fn validate_serve_options(opts: &ServeOptions) -> Result<(), CliError> {
         && (opts.verify_nax
             || opts.verify_nax_m8
             || opts.verify_hc_gdn_fused == Some(true)
-            || opts.mtp_fast_round == Some(true))
+            || opts.mtp_fast_round == Some(true)
+            || opts.mtp_lookup != "off"
+            || opts.dflash2_lookup != "off"
+            || opts.dflash2_lookup_match.is_some())
     {
         return Err(CliError::Validation(
-            "measured controllers require exact target verification and fast round off".to_owned(),
+            "measured controllers require exact target verification, fast round off and lookup off"
+                .to_owned(),
         ));
     }
     if opts.verify_cost_profile.is_some()
@@ -651,6 +776,10 @@ pub fn build_carrier_flags(
                 flags.push("--native-dflash2-vocab-slice".to_owned());
                 flags.push(vs.to_string());
             }
+            if let Some(ref vg) = opts.dflash2_vocab_gather {
+                flags.push("--native-dflash2-vocab-gather".to_owned());
+                flags.push(vg.clone());
+            }
             flags
         }
         _ => {
@@ -697,6 +826,10 @@ pub fn build_carrier_flags(
         "--native-known-token-capacity".to_owned(),
         opts.known_token_capacity.to_string(),
     ]);
+    if opts.context_length != 65_536 {
+        flags.push("--context-length".to_owned());
+        flags.push(opts.context_length.to_string());
+    }
     if opts.raw_gguf {
         flags.push("--native-raw-decode".to_owned());
         flags.push("on".to_owned());
@@ -705,6 +838,7 @@ pub fn build_carrier_flags(
         ("--native-host-logit-views", opts.host_logit_views),
         ("--native-logit-topk", opts.logit_topk),
         ("--native-ple-async-gather", opts.ple_async_gather),
+        ("--native-ple-ram-resident", opts.ple_ram_resident),
         ("--native-mtp-fast-round", opts.mtp_fast_round),
         ("--native-prefill-router-fast", opts.prefill_router_fast),
         ("--native-dflash2-defer-context", opts.dflash2_defer_context),
@@ -748,6 +882,8 @@ pub fn build_carrier_flags(
     if opts.mtp_draft_slice {
         flags.push("--native-mtp-draft-slice".to_owned());
         flags.push("on".to_owned());
+    } else if opts.mtp_draft_slice_selection == Some(false) {
+        flags.extend(["--native-mtp-draft-slice".to_owned(), "off".to_owned()]);
     }
     if opts.verify_nax || opts.verify_nax_m8 {
         flags.push("--native-verify-nax".to_owned());
@@ -758,6 +894,8 @@ pub fn build_carrier_flags(
     if opts.verify_nax_m8 {
         flags.push("--native-verify-nax-m8".to_owned());
         flags.push("on".to_owned());
+    } else if opts.verify_nax_m8_selection == Some(false) {
+        flags.extend(["--native-verify-nax-m8".to_owned(), "off".to_owned()]);
     }
     flags.extend(
         [
@@ -824,6 +962,14 @@ pub fn build_carrier_flags(
     }
     if let Some(match_len) = opts.mtp_lookup_match {
         flags.push("--native-mtp-lookup-match".to_owned());
+        flags.push(match_len.to_string());
+    }
+    if opts.dflash2_lookup != "off" {
+        flags.push("--native-dflash2-lookup".to_owned());
+        flags.push(opts.dflash2_lookup.clone());
+    }
+    if let Some(match_len) = opts.dflash2_lookup_match {
+        flags.push("--native-dflash2-lookup-match".to_owned());
         flags.push(match_len.to_string());
     }
     flags.push("--tool-enum-validation".to_owned());
@@ -1290,6 +1436,40 @@ pub fn serve_foreground(layout: &RuntimeLayout, opts: &ServeOptions) -> Result<i
             .and_then(|b| std::str::from_utf8(b).ok())
             .unwrap_or(""),
     );
+    let target_assets = target_obj
+        .find("assets")
+        .ok()
+        .flatten()
+        .and_then(|a| a.array().ok())
+        .ok_or_else(|| CliError::Validation("adoption.json missing target assets".to_owned()))?;
+    let mut shards: Vec<String> = Vec::with_capacity(target_assets.len());
+    let mut adopted_pack: Option<PathBuf> = None;
+    for asset in target_assets {
+        let p = asset
+            .find("path")
+            .ok()
+            .flatten()
+            .and_then(|v| v.string().ok())
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .ok_or_else(|| CliError::Validation("adopted target asset missing path".to_owned()))?;
+        if crate::state::optional_asset_role(asset)? == Some("derived_pack") {
+            if adopted_pack.is_some() {
+                return Err(CliError::Validation(
+                    "multiple derived packs in adopted target assets".to_owned(),
+                ));
+            }
+            adopted_pack = Some(PathBuf::from(p));
+        } else {
+            shards.push(p.to_owned());
+        }
+    }
+    if adopted_pack.is_some() && opts.raw_gguf {
+        return Err(CliError::Validation(
+            "--raw-gguf is unavailable for pack-only adopted weights (no raw GPU GGUF shards)"
+                .to_owned(),
+        ));
+    }
+
     let (tokenizer, template) = resolve_tokenizer_and_template(&target_dir, &state, &configured);
 
     let pack_file = match opts.derived_pack.as_ref() {
@@ -1300,7 +1480,8 @@ pub fn serve_foreground(layout: &RuntimeLayout, opts: &ServeOptions) -> Result<i
                 source,
             })?
             .join(custom),
-        None => resolve_derived_pack_path(&tokspur_base, opts.pack_v3, true),
+        None => adopted_pack
+            .unwrap_or_else(|| resolve_derived_pack_path(&tokspur_base, opts.pack_v3, true)),
     };
     if !opts.raw_gguf && !pack_file.is_file() {
         return Err(CliError::Validation(format!(
@@ -1381,19 +1562,6 @@ pub fn serve_foreground(layout: &RuntimeLayout, opts: &ServeOptions) -> Result<i
         }
         SpeculativeAsset::MtpSidecar(&speculative_path)
     };
-
-    let shards: Vec<String> = target_obj
-        .find("assets")
-        .ok()
-        .flatten()
-        .and_then(|a| a.array().ok())
-        .ok_or_else(|| CliError::Validation("adoption.json missing target assets".to_owned()))?
-        .iter()
-        .filter_map(|a| a.find("path").ok().flatten())
-        .filter_map(|v| v.string().ok())
-        .filter_map(|b| std::str::from_utf8(b).ok())
-        .map(str::to_owned)
-        .collect();
 
     let model_alias = configured
         .find("model")

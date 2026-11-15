@@ -101,6 +101,7 @@ struct PackPlanV3 {
     uint64_t original_12b_scale_header_bytes = 0;
     uint64_t expanded_16b_scale_header_bytes = 0;
     std::string recipe = pack_recipe_v3;
+    std::string target_revision = derived_pack::target_revision;
     uint32_t version = pack_version_v3;
     uint32_t alignment = static_cast<uint32_t>(derived_pack::pack_alignment);
 };
