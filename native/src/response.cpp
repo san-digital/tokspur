@@ -375,6 +375,22 @@ ResponseStatus ResponseParser::feed(std::string_view bytes) {
     return status_;
 }
 
+void ResponseParser::prepare_forced_thinking_close() noexcept {
+    if (mode_ == Mode::thinking) literal_ = {};
+}
+
+bool ResponseParser::in_thinking() const noexcept { return mode_ == Mode::thinking; }
+
+bool ResponseParser::has_incomplete_utf8() const noexcept { return remaining_ != 0; }
+
+bool ResponseParser::thinking_ends_with_newline() const noexcept {
+    if (!pending_.empty()) return pending_.back() == '\n';
+    for (auto it = records_.rbegin(); it != records_.rend(); ++it) {
+        if (it->kind == ResponseKind::thinking) return !it->text.empty() && it->text.back() == '\n';
+    }
+    return false;
+}
+
 ResponseStatus ResponseParser::finish() {
     if (status_ != ResponseStatus::incomplete) return status_;
     try {

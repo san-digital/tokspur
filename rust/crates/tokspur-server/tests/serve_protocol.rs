@@ -12,10 +12,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokspur_json::{Json, Kind, parse_json};
 use tokspur_server::admission::{
-    ToolArgValidation, ToolEnumValidation, admit_chat, admit_chat_with_policies,
-    admit_chat_with_policy, parse_tool_arg_validation, parse_tool_enum_validation,
-    tool_arg_validation_policy, tool_enum_validation_policy, validate_executor_tool_arguments,
-    validate_tool_value, validate_tool_value_with_policy, validate_worker_ready,
+    ToolArgValidation, ToolEnumValidation, admit_chat, admit_chat_with_context,
+    admit_chat_with_policies, admit_chat_with_policy, parse_tool_arg_validation,
+    parse_tool_enum_validation, tool_arg_validation_policy, tool_enum_validation_policy,
+    validate_executor_tool_arguments, validate_tool_value, validate_tool_value_with_policy,
+    validate_worker_ready,
 };
 use tokspur_server::session::{ServeCodec, ServeError, ServeSession, ServeSink, SessionOptions};
 use tokspur_text::chat::RenderedChat;
@@ -1217,6 +1218,13 @@ fn main() {
         r#"{"type":"object","oneOf":[]}"#,
         r#"{"type":"object","additionalProperties":true}"#,
         r#"{"type":"array"}"#,
+        r#"{"type":"array","items":{"type":"string"},"minItems":3,"maxItems":2}"#,
+        r#"{"type":"array","items":{"type":"string"},"minItems":-1}"#,
+        r#"{"type":"array","items":{"type":"string"},"minItems":4097}"#,
+        r#"{"type":"array","items":{"type":"string"},"minItems":1.0}"#,
+        r#"{"type":"array","items":{"type":"string"},"maxItems":"2"}"#,
+        r#"{"anyOf":[{"type":"array","items":{"type":"string"}}],"minItems":1}"#,
+        r#"{"type":"string","minItems":1}"#,
         r#"{"type":["string","null"]}"#,
         r#"{"type":"object","required":["missing"]}"#,
     ] {
@@ -1230,7 +1238,7 @@ fn main() {
         refusal_admission(admit_chat(&with(&plain("A"), "tools", tools), b"tokspur"));
     }
     let schema = parse(
-        r#"{"type":"object","properties":{"n":{"type":"integer","minimum":1,"maximum":3},"values":{"type":"array","items":{"type":"string","enum":["x","y"]}}},"required":["n"]}"#,
+        r#"{"type":"object","properties":{"n":{"type":"integer","minimum":1,"maximum":3},"values":{"type":"array","items":{"type":"string","enum":["x","y"]},"minItems":1,"maxItems":2}},"required":["n"]}"#,
     );
     validate_tool_value(&schema, &parse(r#"{"n":2,"values":["x","y"]}"#)).unwrap();
     CHECKS.fetch_add(1, Ordering::Relaxed);
@@ -1239,6 +1247,8 @@ fn main() {
         r#"{"n":1.0}"#,
         r#"{"n":4}"#,
         r#"{"n":9007199254740993}"#,
+        r#"{"n":2,"values":[]}"#,
+        r#"{"n":2,"values":["x","y","x"]}"#,
         r#"{"n":2,"values":["z"]}"#,
         r#"{"n":2,"extra":true}"#,
         r#"{}"#,
@@ -1364,6 +1374,101 @@ fn main() {
         &mut sink,
     ));
     check(before == fake.borrow().prefills + fake.borrow().generations);
+    {
+        let large_req = plain(&"A".repeat(1_100_000));
+        refusal_admission(admit_chat(&large_req, b"tokspur"));
+        check(
+            admit_chat_with_context(
+                &large_req,
+                b"tokspur",
+                ToolEnumValidation::Strict,
+                ToolArgValidation::Strict,
+                131_072,
+            )
+            .unwrap()
+            .maximum_tokens
+                == 256,
+        );
+        refusal_admission(admit_chat_with_context(
+            &plain(&"A".repeat(4_200_000)),
+            b"tokspur",
+            ToolEnumValidation::Strict,
+            ToolArgValidation::Strict,
+            131_072,
+        ));
+        refusal_admission(admit_chat_with_context(
+            &plain("A"),
+            b"tokspur",
+            ToolEnumValidation::Strict,
+            ToolArgValidation::Strict,
+            100_000,
+        ));
+        refusal_admission(ServeSession::new(
+            codec(),
+            SessionOptions {
+                context_length: 100_000,
+                ..SessionOptions::default()
+            },
+        ));
+        let mut session128k = ServeSession::new(
+            codec(),
+            SessionOptions {
+                context_length: 131_072,
+                ..SessionOptions::default()
+            },
+        )
+        .unwrap();
+        let fake128k = RefCell::new(Fake::new());
+        let mut call128k = |job: &Json, event: Event<'_>| fake128k.borrow_mut().call(job, event);
+        let mut cancelled128k = || false;
+        let mut seed128k = || 77u64;
+        let mut sink128k = ServeSink {
+            chunk: None,
+            cancelled: &mut cancelled128k,
+            new_seed: &mut seed128k,
+            prefix_trace: None,
+        };
+        refusal(session128k.complete(
+            &plain(&"A".repeat(131_072)),
+            b"overflow128k",
+            &mut call128k,
+            &mut sink128k,
+        ));
+        check(fake128k.borrow().prefills + fake128k.borrow().generations == 0);
+        fake128k.borrow_mut().reply("ok<|im_end|>");
+        let r128k = session128k
+            .complete(
+                &plain(&"A".repeat(65_536)),
+                b"admitted128k",
+                &mut call128k,
+                &mut sink128k,
+            )
+            .unwrap();
+        check(
+            finish(&r128k).string().unwrap() == b"stop" && session128k.committed_tokens() == 65_539,
+        );
+        fake128k.borrow_mut().reply("xyz");
+        let append128k = format!("{}ok<|im_end|>{}", "A".repeat(65_536), "B".repeat(65_531));
+        let r128k_clamp = session128k
+            .complete(
+                &with(&plain(&append128k), "max_tokens", Json::integer(100)),
+                b"clamped128k",
+                &mut call128k,
+                &mut sink128k,
+            )
+            .unwrap();
+        check(
+            finish(&r128k_clamp).string().unwrap() == b"length"
+                && message(&r128k_clamp)
+                    .find("content")
+                    .unwrap()
+                    .unwrap()
+                    .string()
+                    .unwrap()
+                    == b"xy"
+                && session128k.committed_tokens() == 131_072,
+        );
+    }
     chunks.borrow_mut().clear();
     fake.borrow_mut().reply("why</think>\n\nVisible<|im_end|>");
     let result = serving
@@ -1608,6 +1713,7 @@ fn main() {
     check(arguments == br#"{"path":"true"}"#);
     executor_enum_contract();
     executor_arg_contract();
+    thinking_budget_contract();
     println!(
         "PASS owned serving protocol checks={} (model-free; no tools executed)",
         CHECKS.load(Ordering::Relaxed)
@@ -2195,6 +2301,482 @@ fn executor_arg_contract() {
             )
             .is_ok()
                 == allowed,
+        );
+    }
+}
+
+fn thinking_budget_contract() {
+    let base = parse(r#"{"model":"tokspur","messages":[{"role":"user","content":"Q"}]}"#);
+    check(
+        admit_chat(&base, b"tokspur")
+            .unwrap()
+            .thinking_budget
+            .is_none(),
+    );
+
+    // Admission: top-level, chat_template_kwargs, matching both, and alongside reasoning_effort.
+    let top = admit_chat(
+        &with(&base, "thinking_budget", Json::integer(128)),
+        b"tokspur",
+    )
+    .unwrap();
+    check(top.thinking && top.thinking_budget == Some(128));
+    check(top.render.find("thinking_budget").unwrap().is_none());
+
+    let kw = admit_chat(
+        &with(
+            &base,
+            "chat_template_kwargs",
+            parse(r#"{"thinking_budget":256,"reasoning_effort":"medium"}"#),
+        ),
+        b"tokspur",
+    )
+    .unwrap();
+    check(kw.thinking && kw.thinking_budget == Some(256));
+    check(
+        kw.render
+            .find("reasoning_effort")
+            .unwrap()
+            .unwrap()
+            .string()
+            .unwrap()
+            == b"medium",
+    );
+
+    let both = admit_chat(
+        &with(
+            &with(&base, "thinking_budget", Json::integer(512)),
+            "chat_template_kwargs",
+            parse(r#"{"thinking_budget":512}"#),
+        ),
+        b"tokspur",
+    )
+    .unwrap();
+    check(both.thinking && both.thinking_budget == Some(512));
+
+    let max_b = admit_chat(
+        &with(&base, "thinking_budget", Json::integer(32768)),
+        b"tokspur",
+    )
+    .unwrap();
+    check(max_b.thinking && max_b.thinking_budget == Some(32768));
+
+    // thinking_budget = 0 disables thinking and allows reasoning_effort = "none".
+    let zero = admit_chat(
+        &with(&base, "thinking_budget", Json::integer(0)),
+        b"tokspur",
+    )
+    .unwrap();
+    check(!zero.thinking && zero.thinking_budget.is_none());
+    check(
+        !zero
+            .render
+            .find("enable_thinking")
+            .unwrap()
+            .unwrap()
+            .boolean()
+            .unwrap(),
+    );
+
+    let zero_none = admit_chat(
+        &with(
+            &with(&base, "thinking_budget", Json::integer(0)),
+            "reasoning_effort",
+            Json::from("none"),
+        ),
+        b"tokspur",
+    )
+    .unwrap();
+    check(!zero_none.thinking && zero_none.thinking_budget.is_none());
+
+    let zero_false = admit_chat(
+        &with(
+            &with(&base, "thinking_budget", Json::integer(0)),
+            "enable_thinking",
+            Json::Bool(false),
+        ),
+        b"tokspur",
+    )
+    .unwrap();
+    check(!zero_false.thinking && zero_false.thinking_budget.is_none());
+
+    // Refusals: bounds, types, and conflicts.
+    for invalid in [
+        Json::Null,
+        Json::Bool(true),
+        Json::from("128"),
+        parse("-1"),
+        parse("1.5"),
+        Json::integer(32769),
+    ] {
+        refusal_admission(admit_chat(
+            &with(&base, "thinking_budget", invalid),
+            b"tokspur",
+        ));
+    }
+    refusal_admission(admit_chat(
+        &with(
+            &with(&base, "thinking_budget", Json::integer(0)),
+            "enable_thinking",
+            Json::Bool(true),
+        ),
+        b"tokspur",
+    ));
+    refusal_admission(admit_chat(
+        &with(
+            &with(&base, "thinking_budget", Json::integer(64)),
+            "chat_template_kwargs",
+            parse(r#"{"thinking_budget":128}"#),
+        ),
+        b"tokspur",
+    ));
+    // A positive budget with thinking explicitly off is admitted and ignored, wherever either option is given; it still has to be a valid budget.
+    for request in [
+        with(
+            &with(&base, "thinking_budget", Json::integer(64)),
+            "enable_thinking",
+            Json::Bool(false),
+        ),
+        with(
+            &base,
+            "chat_template_kwargs",
+            parse(r#"{"thinking_budget":64,"enable_thinking":false}"#),
+        ),
+        with(
+            &with(&base, "thinking_budget", Json::integer(64)),
+            "chat_template_kwargs",
+            parse(r#"{"enable_thinking":false}"#),
+        ),
+        with(
+            &with(
+                &with(&base, "thinking_budget", Json::integer(64)),
+                "enable_thinking",
+                Json::Bool(false),
+            ),
+            "reasoning_effort",
+            Json::from("none"),
+        ),
+    ] {
+        let off = admit_chat(&request, b"tokspur").unwrap();
+        check(!off.thinking && off.thinking_budget.is_none());
+        check(
+            !off.render
+                .find("enable_thinking")
+                .unwrap()
+                .unwrap()
+                .boolean()
+                .unwrap(),
+        );
+    }
+    refusal_admission(admit_chat(
+        &with(
+            &with(&base, "thinking_budget", Json::integer(32769)),
+            "enable_thinking",
+            Json::Bool(false),
+        ),
+        b"tokspur",
+    ));
+    refusal_admission(admit_chat(
+        &with(
+            &with(&base, "thinking_budget", Json::integer(64)),
+            "reasoning_effort",
+            Json::from("none"),
+        ),
+        b"tokspur",
+    ));
+
+    // Generation: forced cutoff without trailing newline + streaming verification.
+    let chunks = RefCell::new(Vec::new());
+    let mut chunk_cb = |chunk: &Json| {
+        chunks.borrow_mut().push(chunk.clone());
+        Ok(())
+    };
+    let mut cancelled = || false;
+    let mut seed = || 42u64;
+    let mut session = ServeSession::new(codec(), SessionOptions::default()).unwrap();
+    let fake = RefCell::new(Fake::new());
+    let mut call = |command: &Json, event: Event<'_>| fake.borrow_mut().call(command, event);
+
+    {
+        fake.borrow_mut().reply("abcdefVisible<|im_end|>");
+        let req = with(
+            &request("T", true, true),
+            "thinking_budget",
+            Json::integer(6),
+        );
+        let mut sink = ServeSink {
+            chunk: Some(&mut chunk_cb),
+            cancelled: &mut cancelled,
+            new_seed: &mut seed,
+            prefix_trace: None,
+        };
+        let res = session
+            .complete(&req, b"tb-cutoff", &mut call, &mut sink)
+            .unwrap();
+        check(finish(&res).string().unwrap() == b"stop");
+        check(
+            message(&res)
+                .find("reasoning_content")
+                .unwrap()
+                .unwrap()
+                .string()
+                .unwrap()
+                == b"abcdef\n",
+        );
+        check(
+            message(&res)
+                .find("content")
+                .unwrap()
+                .unwrap()
+                .string()
+                .unwrap()
+                == b"\n\nVisible",
+        );
+        let mut s_think = Vec::new();
+        let mut s_text = Vec::new();
+        for ev in chunks.borrow().iter() {
+            let delta = ev.find("choices").unwrap().unwrap().array().unwrap()[0]
+                .find("delta")
+                .unwrap()
+                .unwrap();
+            if let Some(t) = delta.find("reasoning_content").unwrap() {
+                s_think.extend_from_slice(t.string().unwrap());
+            }
+            if let Some(c) = delta.find("content").unwrap() {
+                s_text.extend_from_slice(c.string().unwrap());
+            }
+        }
+        check(s_think == b"abcdef\n" && s_text == b"\n\nVisible");
+    }
+
+    // Forced cutoff when thinking already ends with '\n' (avoids double newline before </think>).
+    {
+        chunks.borrow_mut().clear();
+        fake.borrow_mut().reply("abc\nDone<|im_end|>");
+        let req = with(
+            &request("T2", false, true),
+            "thinking_budget",
+            Json::integer(4),
+        );
+        let mut sink = ServeSink {
+            chunk: None,
+            cancelled: &mut cancelled,
+            new_seed: &mut seed,
+            prefix_trace: None,
+        };
+        let res = session
+            .complete(&req, b"tb-nl", &mut call, &mut sink)
+            .unwrap();
+        check(
+            message(&res)
+                .find("reasoning_content")
+                .unwrap()
+                .unwrap()
+                .string()
+                .unwrap()
+                == b"abc\n"
+                && message(&res)
+                    .find("content")
+                    .unwrap()
+                    .unwrap()
+                    .string()
+                    .unwrap()
+                    == b"\n\nDone",
+        );
+    }
+
+    // Forced cutoff inside an unclosed Markdown fence (```python\nx=1) + tool call in Phase 2.
+    {
+        let fence_think = "```py\nx=1";
+        let post_close = "<tool_call><function=read_file><parameter=path>\na.rs\n</parameter></function></tool_call><|im_end|>";
+        fake.borrow_mut()
+            .reply(&format!("{fence_think}{post_close}"));
+        let req = with(
+            &with(&request("F", true, true), "tools", tools()),
+            "thinking_budget",
+            Json::integer(fence_think.len() as u64),
+        );
+        chunks.borrow_mut().clear();
+        let mut sink = ServeSink {
+            chunk: Some(&mut chunk_cb),
+            cancelled: &mut cancelled,
+            new_seed: &mut seed,
+            prefix_trace: None,
+        };
+        let res = session
+            .complete(&req, b"tb-fence-tool", &mut call, &mut sink)
+            .unwrap();
+        check(finish(&res).string().unwrap() == b"tool_calls");
+        check(
+            message(&res)
+                .find("reasoning_content")
+                .unwrap()
+                .unwrap()
+                .string()
+                .unwrap()
+                == b"```py\nx=1\n",
+        );
+        check(
+            message(&res)
+                .find("tool_calls")
+                .unwrap()
+                .unwrap()
+                .array()
+                .unwrap()
+                .len()
+                == 1,
+        );
+    }
+
+    // Forced cutoff mid multi-byte UTF-8 character ("考" = 3 bytes; budget=1 steps 2 more bytes to complete the scalar before closing).
+    {
+        fake.borrow_mut().reply("考Yes<|im_end|>");
+        let req = with(
+            &request("U8", false, true),
+            "thinking_budget",
+            Json::integer(1),
+        );
+        let mut sink = ServeSink {
+            chunk: None,
+            cancelled: &mut cancelled,
+            new_seed: &mut seed,
+            prefix_trace: None,
+        };
+        let res = session
+            .complete(&req, b"tb-utf8", &mut call, &mut sink)
+            .unwrap();
+        check(
+            message(&res)
+                .find("reasoning_content")
+                .unwrap()
+                .unwrap()
+                .string()
+                .unwrap()
+                == "考\n".as_bytes()
+                && message(&res)
+                    .find("content")
+                    .unwrap()
+                    .unwrap()
+                    .string()
+                    .unwrap()
+                    == b"\n\nYes",
+        );
+    }
+
+    // Natural </think> before thinking_budget is reached.
+    {
+        fake.borrow_mut().reply("hi</think>\n\nNatural<|im_end|>");
+        let req = with(
+            &request("N", false, true),
+            "thinking_budget",
+            Json::integer(50),
+        );
+        let mut sink = ServeSink {
+            chunk: None,
+            cancelled: &mut cancelled,
+            new_seed: &mut seed,
+            prefix_trace: None,
+        };
+        let res = session
+            .complete(&req, b"tb-natural", &mut call, &mut sink)
+            .unwrap();
+        check(
+            message(&res)
+                .find("reasoning_content")
+                .unwrap()
+                .unwrap()
+                .string()
+                .unwrap()
+                == b"hi"
+                && message(&res)
+                    .find("content")
+                    .unwrap()
+                    .unwrap()
+                    .string()
+                    .unwrap()
+                    == b"\n\nNatural",
+        );
+    }
+
+    // The budget is reached after the model closed thinking on its own: on the close's last token (10) or inside the answer (13). Nothing is injected and the answer continues in phase 2.
+    for budget in [10u64, 13] {
+        fake.borrow_mut().reply("hi</think>\n\nNatural<|im_end|>");
+        let req = with(
+            &request("NB", false, true),
+            "thinking_budget",
+            Json::integer(budget),
+        );
+        let mut sink = ServeSink {
+            chunk: None,
+            cancelled: &mut cancelled,
+            new_seed: &mut seed,
+            prefix_trace: None,
+        };
+        let res = session
+            .complete(&req, b"tb-natural-boundary", &mut call, &mut sink)
+            .unwrap();
+        check(finish(&res).string().unwrap() == b"stop");
+        check(
+            message(&res)
+                .find("reasoning_content")
+                .unwrap()
+                .unwrap()
+                .string()
+                .unwrap()
+                == b"hi"
+                && message(&res)
+                    .find("content")
+                    .unwrap()
+                    .unwrap()
+                    .string()
+                    .unwrap()
+                    == b"\n\nNatural",
+        );
+        check(
+            res.find("usage")
+                .unwrap()
+                .unwrap()
+                .find("completion_tokens")
+                .unwrap()
+                .unwrap()
+                .unsigned_integer()
+                .unwrap()
+                == 20,
+        );
+    }
+
+    // Tight max_tokens truncation during forced close injection.
+    {
+        fake.borrow_mut().reply("abcdefghij");
+        let req = with(
+            &with(
+                &request("L", false, true),
+                "thinking_budget",
+                Json::integer(3),
+            ),
+            "max_tokens",
+            Json::integer(5),
+        );
+        let mut sink = ServeSink {
+            chunk: None,
+            cancelled: &mut cancelled,
+            new_seed: &mut seed,
+            prefix_trace: None,
+        };
+        let res = session
+            .complete(&req, b"tb-tight", &mut call, &mut sink)
+            .unwrap();
+        check(finish(&res).string().unwrap() == b"length");
+        check(
+            res.find("usage")
+                .unwrap()
+                .unwrap()
+                .find("completion_tokens")
+                .unwrap()
+                .unwrap()
+                .unsigned_integer()
+                .unwrap()
+                == 5,
         );
     }
 }

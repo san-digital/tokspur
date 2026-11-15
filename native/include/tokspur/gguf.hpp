@@ -51,6 +51,7 @@ public:
     [[nodiscard]] uint64_t inode() const noexcept { return inode_; }
     [[nodiscard]] ReadOnlyMapMode mapping_mode() const noexcept { return mapping_mode_; }
     void evict_clean_pages(uint64_t offset, uint64_t bytes) const noexcept;
+    void warm_clean_pages(uint64_t offset, uint64_t bytes) const noexcept;
     void assert_unchanged() const;
 
 private:
@@ -117,6 +118,7 @@ public:
         return mapping_.empty() ? nullptr : &mapping_.front();
     }
     void evict_tensor_pages(const Tensor& tensor, uint64_t offset = 0, uint64_t bytes = 0) const noexcept;
+    void warm_tensor_pages(const Tensor& tensor, uint64_t offset = 0, uint64_t bytes = 0) const noexcept;
     [[nodiscard]] uint64_t data_offset() const noexcept { return data_offset_; }
     [[nodiscard]] uint64_t file_size() const noexcept { return file_size_; }
     [[nodiscard]] bool header_only() const noexcept { return header_only_; }
@@ -158,6 +160,7 @@ public:
     [[nodiscard]] const Tensor& tensor(std::string_view name) const;
     [[nodiscard]] std::optional<TensorBackingFile> tensor_backing_file(std::string_view name) const;
     void evict_tensor_pages(std::string_view name, uint64_t offset = 0, uint64_t bytes = 0) const noexcept;
+    void warm_tensor_pages(std::string_view name, uint64_t offset = 0, uint64_t bytes = 0) const noexcept;
     [[nodiscard]] std::string_view architecture() const { return architecture_; }
     void assert_unchanged() const;
 

@@ -420,9 +420,14 @@ int main(int argc, char** argv) {
         for (uint32_t bad : {0u, 9u, UINT32_MAX}) reject([&] { static_cast<void>(qsa_verify_rows_plan(0, bad, actual)); });
         reject([&] { static_cast<void>(qsa_verify_rows_plan(UINT32_MAX, 8, actual)); });
         for (const auto field : {&QsaShape::channels, &QsaShape::query_heads, &QsaShape::kv_heads, &QsaShape::head_width, &QsaShape::index_heads,
-            &QsaShape::index_width, &QsaShape::rotary_width, &QsaShape::compression, &QsaShape::token_budget, &QsaShape::capacity}) {
+            &QsaShape::index_width, &QsaShape::rotary_width, &QsaShape::compression, &QsaShape::token_budget}) {
             auto bad = actual; ++(bad.*field); reject([&] { static_cast<void>(qsa_verify_rows_plan(0, 8, bad)); });
         }
+        // Capacity is bounded by the opt-in 128K window, not by the default 64K one.
+        auto window = actual; window.capacity = 131072;
+        const auto last = qsa_verify_rows_plan(131064, 8, window);
+        require(last.base_prefix == 131064 && last.rows == 8 && last.maximum_attended == 2051, "128K verifier-row host plan changed");
+        ++window.capacity; reject([&] { static_cast<void>(qsa_verify_rows_plan(0, 8, window)); });
         MetalGraph graph(argv[1], 512ull << 20); prepare_scalar(graph); const auto initial = graph.memory();
         graph.prepare_qsa_verify_rows(); same_memory(initial, graph.memory());
         for (uint32_t n = 1; n <= 8; ++n) {

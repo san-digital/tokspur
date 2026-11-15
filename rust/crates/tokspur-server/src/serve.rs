@@ -23,7 +23,7 @@ use tokspur_text::sha256::{hex, sha256};
 use tokspur_wire::worker::{CallbackFailed, OwnedWorker, WorkerError, WorkerOptions};
 
 use crate::admission::{
-    AdmissionError, ToolArgValidation, ToolEnumValidation, admit_chat_with_policies,
+    AdmissionError, ToolArgValidation, ToolEnumValidation, admit_chat_with_context,
     parse_tool_arg_validation, parse_tool_enum_validation, tool_arg_validation_name,
     tool_arg_validation_policy, tool_enum_validation_name, tool_enum_validation_policy,
     validate_worker_ready,
@@ -398,7 +398,7 @@ impl PrivateState {
                     })?;
             self.telemetry_trace = Some(file);
         }
-        let mut bytes = telemetry_record(record).dump_limited(1024 * 1024)?;
+        let mut bytes = telemetry_record(record).dump_limited(4 * 1024 * 1024)?;
         bytes.push(b'\n');
         if !telemetry_trace_has_room(self.telemetry_trace_bytes, bytes.len()) {
             return Err(ServerError::Refused(
@@ -424,7 +424,7 @@ impl PrivateState {
             )));
         }
         let mut bytes = record
-            .dump_limited(1024 * 1024)
+            .dump_limited(4 * 1024 * 1024)
             .map_err(|e| ServeError::Admission(AdmissionError::Json(e)))?;
         bytes.push(b'\n');
         if bytes.len() as u64 > (16 << 20) - self.prefix_trace_bytes {
@@ -910,6 +910,13 @@ fn options(args: &[OsString]) -> Result<Options> {
                 )?;
                 out.worker.ple_async_gather = Some(value == "on");
             }
+            "--native-ple-ram-resident" | "--ple-ram-resident" => {
+                require(
+                    value == "on" || value == "off",
+                    "native PLE RAM residency must be off or on",
+                )?;
+                out.worker.ple_ram_resident = Some(value == "on");
+            }
             "--native-mtp-fast-round" | "--mtp-fast-round" => {
                 require(
                     value == "on" || value == "off",
@@ -958,6 +965,10 @@ fn options(args: &[OsString]) -> Result<Options> {
                 out.worker.dflash2_max_drafts = Some(md);
             }
             "--native-dflash2-vocab-slice" | "--dflash2-vocab-slice" => {
+                require(
+                    out.worker.dflash2_vocab_gather.is_none(),
+                    "cannot combine --dflash2-vocab-slice and --dflash2-vocab-gather",
+                )?;
                 let slice = if value == "full" {
                     0u32
                 } else {
@@ -968,6 +979,15 @@ fn options(args: &[OsString]) -> Result<Options> {
                     "DFlash2 vocab slice must be 0, full, or a multiple of 32 in [256, 248319]",
                 )?;
                 out.worker.dflash2_vocab_slice = Some(slice);
+            }
+            "--native-dflash2-vocab-gather" | "--dflash2-vocab-gather" => {
+                require(
+                    out.worker.dflash2_vocab_slice.is_none(),
+                    "cannot combine --dflash2-vocab-slice and --dflash2-vocab-gather",
+                )?;
+                tokspur_wire::worker::validate_dflash2_vocab_gather(value, 248_320)
+                    .map_err(ServerError::Refused)?;
+                out.worker.dflash2_vocab_gather = Some(value.to_owned());
             }
             "--native-known-token-capacity" | "--known-token-capacity" => {
                 let cap = integer(value, 0, 2048)? as u32;
@@ -1166,6 +1186,16 @@ fn options(args: &[OsString]) -> Result<Options> {
             "--native-mtp-lookup-match" | "--mtp-lookup-match" => {
                 out.worker.mtp_lookup_match = Some(integer(value, 2, 16)?);
             }
+            "--native-dflash2-lookup" | "--dflash2-lookup" => {
+                require(
+                    value == "off" || value == "bypass" || value == "hybrid",
+                    "native DFlash2 lookup must be off, bypass or hybrid",
+                )?;
+                out.worker.dflash2_lookup = Some(value.to_owned());
+            }
+            "--native-dflash2-lookup-match" | "--dflash2-lookup-match" => {
+                out.worker.dflash2_lookup_match = Some(integer(value, 2, 16)?);
+            }
             "--native-prefill-m64" | "--prefill-m64" => {
                 require(
                     value == "off" || value == "on" || value == "short",
@@ -1221,6 +1251,14 @@ fn options(args: &[OsString]) -> Result<Options> {
                     "shared prefix cache must be off or on",
                 )?;
                 out.worker.shared_prefix_cache = Some(value == "on");
+            }
+            "--context-length" | "--native-context-length" => {
+                let ctx = integer(value, 65_536, 131_072)?;
+                require(
+                    ctx == 65_536 || ctx == 131_072,
+                    "context-length must be 65536 or 131072",
+                )?;
+                out.worker.context_length = ctx;
             }
             _ => return Err(ServerError::Refused("unknown server option")),
         }
@@ -1433,6 +1471,10 @@ fn options(args: &[OsString]) -> Result<Options> {
         "DFlash2 vocab slice requires --dflash2-dir",
     )?;
     require(
+        w.dflash2_vocab_gather.is_none() || !w.dflash2_dir.as_os_str().is_empty(),
+        "DFlash2 vocab gather requires --dflash2-dir",
+    )?;
+    require(
         !(w.prepared_validation
             || w.verify_cost_profile.is_some()
             || w.verify_m8_splits.is_some()
@@ -1458,6 +1500,10 @@ fn options(args: &[OsString]) -> Result<Options> {
     require(
         !w.ple_async_gather.unwrap_or(false) || has_spec,
         "native PLE async gather requires a speculative drafter",
+    )?;
+    require(
+        !w.ple_ram_resident.unwrap_or(false) || has_spec,
+        "native PLE RAM residency requires a speculative drafter",
     )?;
     require(
         !w.mtp_fast_round.unwrap_or(false) || !w.mtp_sidecar.as_os_str().is_empty(),
@@ -1609,6 +1655,7 @@ struct Serving<'a> {
     mtp_first_output_packet: Option<u32>,
     checkpoint_slots: u32,
     checkpoint_budget: u64,
+    context_length: u32,
     #[cfg(feature = "verify8")]
     verify8: bool,
     #[cfg(feature = "branch8")]
@@ -1736,6 +1783,7 @@ pub fn server_cli(args: &[OsString]) -> Result<()> {
     let stack_execution = config.worker.stack_execution.clone();
     let checkpoint_slots = config.worker.checkpoint_slots;
     let checkpoint_budget = config.worker.checkpoint_budget_bytes;
+    let context_length = config.worker.context_length;
     #[cfg(feature = "verify8")]
     let verify8 = config.worker.verify8;
     #[cfg(feature = "branch8")]
@@ -1818,6 +1866,7 @@ pub fn server_cli(args: &[OsString]) -> Result<()> {
             },
             mtp_first_output_packet: config.mtp_first_output_packet,
             overlap_prefill,
+            context_length,
         },
     )?;
     let shutdown = AtomicBool::new(false);
@@ -1838,6 +1887,7 @@ pub fn server_cli(args: &[OsString]) -> Result<()> {
         mtp_first_output_packet: config.mtp_first_output_packet,
         checkpoint_slots,
         checkpoint_budget,
+        context_length,
         #[cfg(feature = "verify8")]
         verify8,
         #[cfg(feature = "branch8")]
@@ -2380,7 +2430,12 @@ impl Serving<'_> {
             if let Some(prec) = self.ready_value.find("native_dflash2_precision")? {
                 ready.push((b"native_dflash2_precision".to_vec(), prec.clone()));
             }
-            for opt_name in ["native_dflash2_max_drafts", "native_dflash2_vocab_slice"] {
+            for opt_name in [
+                "native_dflash2_max_drafts",
+                "native_dflash2_vocab_slice",
+                "native_dflash2_vocab_gather",
+                "native_dflash2_vocab_gather_rows",
+            ] {
                 if let Some(v) = self.ready_value.find(opt_name)? {
                     ready.push((opt_name.as_bytes().to_vec(), v.clone()));
                 }
@@ -2391,6 +2446,7 @@ impl Serving<'_> {
                 "native_verify_hc_gdn_fused",
                 "native_logit_topk",
                 "native_ple_async_gather",
+                "native_ple_ram_resident",
                 "native_mtp_fast_round",
             ] {
                 if let Some(v) = self.ready_value.find(opt_name)? {
@@ -2412,6 +2468,12 @@ impl Serving<'_> {
             ready.push((
                 b"tool_arg_validation_policy".to_vec(),
                 Json::from(tool_arg_validation_policy(self.tool_args)),
+            ));
+        }
+        if self.context_length != 65_536 {
+            ready.push((
+                b"context_length".to_vec(),
+                Json::integer(u64::from(self.context_length)),
             ));
         }
         Ok(Json::Object(ready))
@@ -2466,7 +2528,11 @@ impl Serving<'_> {
                     }
                 }
                 let limits = Limits {
-                    body_bytes: 1024 * 1024,
+                    body_bytes: if self.context_length > 65_536 {
+                        4 * 1024 * 1024
+                    } else {
+                        1024 * 1024
+                    },
                     ..Limits::default()
                 };
                 let connection = match self
@@ -2645,12 +2711,18 @@ impl Serving<'_> {
             )?;
             return Ok(None);
         }
-        let input = parse_json_limited(&request.body, JsonLimits::new(1024 * 1024, 150_000, 32))?;
-        admit_chat_with_policies(
+        let (max_bytes, max_values) = if self.context_length > 65_536 {
+            (4 * 1024 * 1024, 300_000)
+        } else {
+            (1024 * 1024, 150_000)
+        };
+        let input = parse_json_limited(&request.body, JsonLimits::new(max_bytes, max_values, 32))?;
+        admit_chat_with_context(
             &input,
             self.alias.as_bytes(),
             self.tool_enums,
             self.tool_args,
+            self.context_length,
         )?; // No mutation on invalid admission.
         Ok(Some(input))
     }
@@ -3118,6 +3190,7 @@ mod tests {
                 mtp_first_output_packet: None,
                 checkpoint_slots: 4,
                 checkpoint_budget: 536_870_912,
+                context_length: 65_536,
                 #[cfg(feature = "verify8")]
                 verify8: false,
                 #[cfg(feature = "branch8")]
@@ -3191,6 +3264,7 @@ mod tests {
                 mtp_first_output_packet: None,
                 checkpoint_slots: 0,
                 checkpoint_budget: 0,
+                context_length: 65_536,
                 #[cfg(feature = "verify8")]
                 verify8: false,
                 #[cfg(feature = "branch8")]
@@ -3269,6 +3343,7 @@ mod readiness_network_tests {
                 mtp_first_output_packet: None,
                 checkpoint_slots: 0,
                 checkpoint_budget: 0,
+                context_length: 65_536,
                 #[cfg(feature = "verify8")]
                 verify8: false,
                 #[cfg(feature = "branch8")]

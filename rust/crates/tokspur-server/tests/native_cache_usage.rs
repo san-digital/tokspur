@@ -701,3 +701,501 @@ fn phase_stamps_are_taken_in_order_only_when_enabled() {
     assert!(after.prefill_start.is_none() && after.first_packet_done.is_none());
     assert_eq!(after.output_packets, 0);
 }
+
+#[test]
+fn thinking_budget_mtp_v2_forced_close_and_natural_exit_within_one_generation() {
+    let mut ready_v2 = ready();
+    put(
+        &mut ready_v2,
+        "native_mtp_carry_scope",
+        Json::from("http-generation-v2"),
+    );
+    let make_v2_gen = |id: u64,
+                       active: bool,
+                       remaining: u64,
+                       pending: bool,
+                       committed: u64,
+                       emitted: u64,
+                       overflow: u64,
+                       remaining_compute: u64,
+                       total_budget: u64,
+                       continuation_allowed: bool| {
+        Json::new_object([
+            ("id", Json::integer(id)),
+            ("active", Json::Bool(active)),
+            ("remaining", Json::integer(remaining)),
+            ("pending", Json::Bool(pending)),
+            ("committed", Json::integer(committed)),
+            ("emitted", Json::integer(emitted)),
+            ("overflow", Json::integer(overflow)),
+            ("remaining_compute", Json::integer(remaining_compute)),
+            ("total_budget", Json::integer(total_budget)),
+            ("continuation_allowed", Json::Bool(continuation_allowed)),
+            ("stop_queued", Json::Bool(false)),
+            ("stop_drained", Json::Bool(false)),
+            (
+                "stage_a_controller",
+                Json::new_object([
+                    ("ewma_alpha1", parse_json(b"0.45").unwrap()),
+                    ("current_mode", Json::integer(0)),
+                    ("consecutive_ordinary_steps", Json::integer(0)),
+                    (
+                        "controller_policy_digest",
+                        Json::Array(vec![Json::integer(0); 32]),
+                    ),
+                ]),
+            ),
+        ])
+    };
+    put(
+        &mut ready_v2,
+        "native_mtp_generation",
+        make_v2_gen(0, false, 0, false, 0, 0, 0, 0, 0, true),
+    );
+
+    let make_codec = || ServeCodec {
+        control_ids: Vec::new(),
+        render: Box::new(|request| {
+            let messages = get(request, "messages").array().unwrap();
+            Ok(RenderedChat {
+                prompt: get(messages.last().unwrap(), "content")
+                    .string()
+                    .unwrap()
+                    .to_vec(),
+                normalized_messages: Json::Array(Vec::new()),
+                parsed_tool_arguments: 0,
+                hoisted_system_messages: 0,
+                literal_ranges: Vec::new(),
+            })
+        }),
+        encode: Box::new(|text| {
+            if text.prompt == b"</think>" {
+                Ok(vec![2000])
+            } else {
+                Ok(text.prompt.iter().map(|&byte| u32::from(byte)).collect())
+            }
+        }),
+        decode: Box::new(|ids| {
+            let mut out = Vec::new();
+            for &id in ids {
+                match id {
+                    1000 => out.extend_from_slice(b"<|im_end|>"),
+                    1001 => out.extend_from_slice(b"<|endoftext|>"),
+                    2000 => out.extend_from_slice(b"</think>"),
+                    _ => out.push(u8::try_from(id).unwrap()),
+                }
+            }
+            Ok(out)
+        }),
+        admission: ResponseAdmission {
+            vocabulary: 4096,
+            im_end: 1000,
+            end_of_text: 1001,
+            im_start: 1002,
+        },
+    };
+
+    // Sub-case 1: the budget is reached. With thinking still open the close is forced as known input; with thinking already closed by the model nothing is injected. Either way phase 2 is one new generation and nothing is aborted.
+    let bytes = |text: &[u8]| text.iter().map(|&b| u32::from(b)).collect::<Vec<u32>>();
+    let natural_then_answer = [bytes(b"hi"), vec![2000], bytes(b"\n\nabc")].concat();
+    for (budget, first, second, jobs, reasoning, content) in [
+        (
+            2u64,
+            bytes(b"hi"),
+            bytes(b"ok"),
+            4usize,
+            &b"hi\n"[..],
+            &b"\n\nok"[..],
+        ),
+        (
+            8,
+            natural_then_answer,
+            bytes(b"d"),
+            3,
+            &b"hi"[..],
+            &b"\n\nabcd"[..],
+        ),
+    ] {
+        let mut session = ServeSession::new(
+            make_codec(),
+            SessionOptions {
+                mtp_ready: ready_v2.clone(),
+                ..SessionOptions::default()
+            },
+        )
+        .unwrap();
+        session.set_phase_stamps(true);
+
+        let request = Json::new_object([
+            ("model", Json::from("tokspur")),
+            (
+                "messages",
+                Json::Array(vec![Json::new_object([
+                    ("role", Json::from("user")),
+                    ("content", Json::from("go")),
+                ])]),
+            ),
+            ("thinking_budget", Json::integer(budget)),
+            ("max_tokens", Json::integer(12)),
+            ("seed", Json::integer(44)),
+            ("stream", Json::Bool(false)),
+        ]);
+
+        let mut position = 0u64;
+        let mut primes = 0u64;
+        let mut sampling = Json::Null;
+        let mut seen_jobs = Vec::new();
+        let mut phase1_tokens = VecDeque::from(first);
+        let mut phase2_tokens: VecDeque<u32> = second.into_iter().chain([1000u32]).collect();
+
+        let mut target = |job: &Json, event: TokenCallback<'_>| -> Result<Json, ServeError> {
+            seen_jobs.push(job.clone());
+            let reset = get(job, "reset").boolean().unwrap();
+            if reset {
+                position = 0;
+                sampling = get(job, "sampling").clone();
+            }
+            let inputs = get(job, "tokens").array().unwrap().len() as u64;
+            let generate = number(job, "generate");
+            let mut ids = Vec::new();
+            let mut status = "prefilled";
+            let mut stop_id = Json::Null;
+            let mut cont_allowed = true;
+            let gen_state = if inputs > 0 {
+                assert!(job.find("mtp_generation").unwrap().is_none());
+                position += inputs;
+                primes += inputs - u64::from(reset);
+                make_v2_gen(
+                    if reset { 0 } else { 1 },
+                    false,
+                    0,
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    true,
+                )
+            } else {
+                let gen_meta = get(job, "mtp_generation");
+                let gen_id = number(gen_meta, "id");
+                let rem = number(gen_meta, "remaining");
+                let total = number(gen_meta, "total_budget");
+                status = "length";
+                let queue = if gen_id == 1 {
+                    &mut phase1_tokens
+                } else {
+                    &mut phase2_tokens
+                };
+                let mut emitted_this_pkt = 0u64;
+                while emitted_this_pkt < generate {
+                    let tok = queue.pop_front().unwrap();
+                    position += 1;
+                    primes += 1;
+                    emitted_this_pkt += 1;
+                    ids.push(Json::integer(u64::from(tok)));
+                    event(&Json::new_object([
+                        ("event", Json::from("token")),
+                        ("id", Json::integer(u64::from(tok))),
+                        ("committed_prefix", Json::integer(position)),
+                        ("entropy_words", Json::integer(0)),
+                    ]))?;
+                    if tok == 1000 {
+                        status = "stopped";
+                        stop_id = Json::integer(1000);
+                        cont_allowed = false;
+                        break;
+                    }
+                }
+                let rem_after = if status == "stopped" {
+                    0
+                } else {
+                    rem - emitted_this_pkt
+                };
+                make_v2_gen(
+                    gen_id,
+                    rem_after > 0,
+                    rem_after,
+                    false,
+                    emitted_this_pkt,
+                    emitted_this_pkt,
+                    0,
+                    rem_after,
+                    total,
+                    cont_allowed,
+                )
+            };
+            let mut sampled = sampling.clone();
+            for (name, value) in [
+                ("valid", Json::Bool(true)),
+                ("entropy_prefix", Json::integer(position)),
+                ("entropy_words", Json::integer(0)),
+                ("seed", Json::integer(44)),
+            ] {
+                put(&mut sampled, name, value);
+            }
+            let mut done = ready_v2.clone();
+            for (name, value) in [
+                ("event", Json::from("done")),
+                ("committed_prefix", Json::integer(position)),
+                ("generated_ids", Json::Array(ids)),
+                ("sampling", sampled),
+                ("status", Json::from(status)),
+                ("stop_id", stop_id),
+                ("continuation_allowed", Json::Bool(cont_allowed)),
+                ("native_mtp_prime_calls", Json::integer(primes)),
+                ("native_mtp_generation", gen_state),
+            ] {
+                put(&mut done, name, value);
+            }
+            Ok(done)
+        };
+
+        let mut check_cancelled = || false;
+        let mut new_seed = || 44;
+        let mut sink = ServeSink {
+            chunk: None,
+            cancelled: &mut check_cancelled,
+            new_seed: &mut new_seed,
+            prefix_trace: None,
+        };
+
+        let response = session
+            .complete(&request, b"mtp-forced-close", &mut target, &mut sink)
+            .unwrap();
+        // Prefill, phase 1 (id=1), the forced-close input only when thinking was still open, phase 2 (id=2).
+        assert_eq!(seen_jobs.len(), jobs);
+        let known_inputs = seen_jobs
+            .iter()
+            .filter(|job| !get(job, "tokens").array().unwrap().is_empty())
+            .count();
+        assert_eq!(known_inputs, jobs - 2);
+        let generation_ids: Vec<u64> = seen_jobs
+            .iter()
+            .filter_map(|job| job.find("mtp_generation").unwrap())
+            .map(|generation| {
+                assert!(generation.find("abort").unwrap().is_none());
+                number(generation, "id")
+            })
+            .collect();
+        assert_eq!(generation_ids, [1, 2]);
+        let msg = get(&get(&response, "choices").array().unwrap()[0], "message");
+        assert_eq!(get(msg, "reasoning_content").string().unwrap(), reasoning);
+        assert_eq!(get(msg, "content").string().unwrap(), content);
+        assert_eq!(session.phase_stamps().output_packets, 2);
+        assert_eq!(
+            number(get(&response, "tokspur_private"), "generation_batches"),
+            2
+        );
+    }
+
+    // Sub-case 2: the model closes thinking early under http-generation-v2 while one speculative overflow token is already committed. The same generation carries on through the answer: the overflow token leads the next ordinary packet, and nothing is drained separately or aborted.
+    {
+        let mut session = ServeSession::new(
+            make_codec(),
+            SessionOptions {
+                mtp_ready: ready_v2.clone(),
+                ..SessionOptions::default()
+            },
+        )
+        .unwrap();
+        session.set_phase_stamps(true);
+
+        let request = Json::new_object([
+            ("model", Json::from("tokspur")),
+            (
+                "messages",
+                Json::Array(vec![Json::new_object([
+                    ("role", Json::from("user")),
+                    ("content", Json::from("go")),
+                ])]),
+            ),
+            ("thinking_budget", Json::integer(12)),
+            ("max_tokens", Json::integer(20)),
+            ("seed", Json::integer(44)),
+            ("stream", Json::Bool(false)),
+        ]);
+
+        let mut position = 0u64;
+        let mut primes = 0u64;
+        let mut head_calls = 0u64;
+        let mut rounds = 0u64;
+        let mut proposed = 0u64;
+        let mut accepted = 0u64;
+        let discarded = 0u64;
+        let mut sampling = Json::Null;
+        let mut carried = 0u64;
+        let mut output_packets = 0usize;
+
+        let mut target = |job: &Json, event: TokenCallback<'_>| -> Result<Json, ServeError> {
+            let reset = get(job, "reset").boolean().unwrap();
+            if reset {
+                position = 0;
+                sampling = get(job, "sampling").clone();
+            }
+            let inputs = get(job, "tokens").array().unwrap().len() as u64;
+            let generate = number(job, "generate");
+            let mut ids = Vec::new();
+            let mut status = "prefilled";
+            let mut stop_id = Json::Null;
+            let mut cont_allowed = true;
+            let gen_state = if inputs > 0 {
+                position += inputs;
+                primes += inputs - u64::from(reset);
+                make_v2_gen(0, false, 0, false, 0, 0, 0, 0, 0, true)
+            } else {
+                let gen_meta = get(job, "mtp_generation");
+                let gen_id = number(gen_meta, "id");
+                assert!(gen_meta.find("abort").unwrap().is_none());
+                assert_eq!(gen_id, 1);
+                output_packets += 1;
+                {
+                    let begin = get(gen_meta, "begin").boolean().unwrap();
+                    let rem = number(gen_meta, "remaining");
+                    let total = number(gen_meta, "total_budget");
+                    status = "length";
+                    if begin {
+                        // Emit 6 ordinary tokens ("think\n"), then an mtp_round committing 3 tokens:
+                        // emitted token 7 ('\n'), emitted token 8 (2000 = "</think>"), and 1 overflow token ('A').
+                        assert_eq!(generate, 8);
+                        for &b in b"think\n" {
+                            position += 1;
+                            primes += 1;
+                            ids.push(Json::integer(u64::from(b)));
+                            event(&Json::new_object([
+                                ("event", Json::from("token")),
+                                ("id", Json::integer(u64::from(b))),
+                                ("committed_prefix", Json::integer(position)),
+                                ("entropy_words", Json::integer(0)),
+                            ]))?;
+                        }
+                        let round_base = position;
+                        let round_end = round_base + 3;
+                        head_calls += 2;
+                        primes += 2;
+                        rounds += 1;
+                        proposed += 2;
+                        accepted += 2;
+                        event(&Json::new_object([
+                            ("event", Json::from("mtp_round")),
+                            ("base", Json::integer(round_base)),
+                            ("committed_prefix", Json::integer(round_end)),
+                            ("count", Json::integer(3)),
+                            ("accepted", Json::integer(2)),
+                            ("proposed", Json::integer(2)),
+                            ("head_calls", Json::integer(2)),
+                            ("prime_extra", Json::integer(0)),
+                            ("lookahead_anchor", Json::Bool(true)),
+                            ("used_carried_anchor", Json::Bool(false)),
+                            ("pending_anchor", Json::Bool(true)),
+                        ]))?;
+                        for (offset, tok) in [(1u64, u32::from(b'\n')), (2u64, 2000u32)] {
+                            ids.push(Json::integer(u64::from(tok)));
+                            event(&Json::new_object([
+                                ("event", Json::from("token")),
+                                ("id", Json::integer(u64::from(tok))),
+                                ("committed_prefix", Json::integer(round_end)),
+                                ("round_committed_prefix", Json::integer(round_end)),
+                                ("token_prefix", Json::integer(round_base + offset)),
+                                ("entropy_words", Json::integer(0)),
+                            ]))?;
+                        }
+                        position = round_end; // 1 overflow token ('A') already committed in KV/anchor state!
+                        make_v2_gen(gen_id, true, rem - 8, true, 9, 8, 1, total - 9, total, true)
+                    } else {
+                        // Continuation of the same generation with the rest of the phase budget: pops overflow 'A' with no GPU work, then decodes 'B' against the carried anchor and stops.
+                        assert_eq!(generate, 4);
+                        assert_eq!(rem, 4);
+                        assert_eq!(number(gen_meta, "pending"), 1);
+                        assert_eq!(number(gen_meta, "committed"), 9);
+                        assert_eq!(number(gen_meta, "emitted"), 8);
+                        let tok = u32::from(b'A');
+                        ids.push(Json::integer(u64::from(tok)));
+                        event(&Json::new_object([
+                            ("event", Json::from("token")),
+                            ("id", Json::integer(u64::from(tok))),
+                            ("committed_prefix", Json::integer(position)),
+                            ("round_committed_prefix", Json::integer(position)),
+                            ("token_prefix", Json::integer(position)),
+                            ("entropy_words", Json::integer(0)),
+                        ]))?;
+                        carried += 1;
+                        for tok in [u32::from(b'B'), 1000u32] {
+                            position += 1;
+                            primes += 1;
+                            ids.push(Json::integer(u64::from(tok)));
+                            event(&Json::new_object([
+                                ("event", Json::from("token")),
+                                ("id", Json::integer(u64::from(tok))),
+                                ("committed_prefix", Json::integer(position)),
+                                ("entropy_words", Json::integer(0)),
+                            ]))?;
+                        }
+                        status = "stopped";
+                        stop_id = Json::integer(1000);
+                        cont_allowed = false;
+                        make_v2_gen(gen_id, false, 0, false, 11, 11, 0, total - 11, total, false)
+                    }
+                }
+            };
+            let mut sampled = sampling.clone();
+            for (name, value) in [
+                ("valid", Json::Bool(true)),
+                ("entropy_prefix", Json::integer(position)),
+                ("entropy_words", Json::integer(0)),
+                ("seed", Json::integer(44)),
+            ] {
+                put(&mut sampled, name, value);
+            }
+            let mut done = ready_v2.clone();
+            for (name, value) in [
+                ("event", Json::from("done")),
+                ("committed_prefix", Json::integer(position)),
+                ("generated_ids", Json::Array(ids)),
+                ("sampling", sampled),
+                ("status", Json::from(status)),
+                ("stop_id", stop_id),
+                ("continuation_allowed", Json::Bool(cont_allowed)),
+                ("native_mtp_head_calls", Json::integer(head_calls)),
+                ("native_mtp_prime_calls", Json::integer(primes)),
+                ("native_mtp_rounds", Json::integer(rounds)),
+                ("native_mtp_proposed", Json::integer(proposed)),
+                ("native_mtp_accepted", Json::integer(accepted)),
+                ("native_mtp_carried_anchors", Json::integer(carried)),
+                ("native_mtp_discarded_anchors", Json::integer(discarded)),
+                ("native_mtp_generation", gen_state),
+            ] {
+                put(&mut done, name, value);
+            }
+            Ok(done)
+        };
+
+        let mut check_cancelled = || false;
+        let mut new_seed = || 44;
+        let mut sink = ServeSink {
+            chunk: None,
+            cancelled: &mut check_cancelled,
+            new_seed: &mut new_seed,
+            prefix_trace: None,
+        };
+
+        let response = session
+            .complete(&request, b"mtp-v2-natural-exit", &mut target, &mut sink)
+            .unwrap();
+        assert_eq!(output_packets, 2);
+        assert_eq!((carried, discarded), (1, 0));
+        let msg = get(&get(&response, "choices").array().unwrap()[0], "message");
+        assert_eq!(
+            get(msg, "reasoning_content").string().unwrap(),
+            b"think\n\n"
+        );
+        assert_eq!(get(msg, "content").string().unwrap(), b"AB");
+        // Two output packets of one generation; the response ends inside the thinking budget, so there is no phase 2.
+        assert_eq!(session.phase_stamps().output_packets, 2);
+        assert_eq!(
+            number(get(&response, "tokspur_private"), "generation_batches"),
+            2
+        );
+    }
+}

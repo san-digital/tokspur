@@ -240,16 +240,37 @@ MtpSharedBinding::MtpSharedBinding(std::shared_ptr<const ModelFiles> target,
       pack_(std::move(pack)) {
     require(bool(target_), "MTP target ownership is required");
     static_cast<void>(inspect_flash_next(*target_, pack_.get()));
-    require(target_->shards().size() == 4, "MTP target must use the pinned four-shard asset profile");
-    constexpr std::array<uint64_t, 4> sizes{10'946'624, 49'859'583'136, 49'376'141'504, 12'087'983'520};
     const Gguf* metadata = nullptr;
-    for (const auto& shard : target_->shards()) {
-        const auto number = shard.unsigned_value("split.no");
-        require(number < sizes.size() && shard.file_size() == sizes[number], "MTP target shard extent differs from pinned assets");
-        if (shard.find("qwen4exp.block_count")) {
-            require(!metadata, "ambiguous MTP target metadata");
-            metadata = &shard;
+    if (target_->shards().size() == 4) {
+        constexpr std::array<uint64_t, 4> sizes{0, 49'859'583'136, 49'376'141'504, 12'087'983'520};
+        std::array<bool, 4> seen_split{};
+        for (const auto& shard : target_->shards()) {
+            const auto number = shard.unsigned_value("split.no");
+            require(number < sizes.size() && !seen_split[number], "MTP target shard extent differs from pinned assets");
+            seen_split[number] = true;
+            if (number == 0) {
+                require(shard.tensors().empty() && shard.file_size() == shard.data_offset() &&
+                        shard.file_size() >= 1'000'000 && shard.file_size() <= (16ULL << 20),
+                        "MTP target shard extent differs from pinned assets");
+            } else {
+                require(shard.file_size() == sizes[number], "MTP target shard extent differs from pinned assets");
+            }
+            if (shard.find("qwen4exp.block_count")) {
+                require(!metadata, "ambiguous MTP target metadata");
+                metadata = &shard;
+            }
         }
+    } else if (target_->shards().size() == 1) {
+        const auto& shard = target_->shards().front();
+        require(!shard.find("split.no") && pack_ != nullptr &&
+                target_->tensors().size() == 2 &&
+                target_->tensors().contains("token_embd.weight") &&
+                target_->tensors().contains("per_layer_token_embd.weight") &&
+                shard.find("qwen4exp.block_count"),
+                "MTP single-file target requires a CPU-base GGUF and Pack v3");
+        metadata = &shard;
+    } else {
+        throw FormatError("MTP target must use the four-shard or CPU-base asset profile");
     }
     require(metadata, "missing MTP target metadata");
     require(sidecar_->shards().size() == 1, "MTP sidecar requires one admitted file");

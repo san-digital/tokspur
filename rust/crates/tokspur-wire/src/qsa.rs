@@ -63,7 +63,7 @@ pub fn validate_qsa_shape(s: QsaShape) -> Result<(), QsaError> {
         || !s.token_budget.is_multiple_of(s.compression)
         || s.token_budget / s.compression > 512
         || s.capacity == 0
-        || s.capacity > 65536;
+        || s.capacity > 131072;
     if invalid {
         Err(QsaError::Shape)
     } else {
@@ -125,6 +125,27 @@ mod tests {
         assert_eq!(qsa_dispatches(FLASH_NEXT, 2051), Ok(25));
         assert_eq!(qsa_dispatches(FLASH_NEXT, 2052), Ok(22));
         assert_eq!(qsa_dispatches(FLASH_NEXT, 65535), Ok(21 + 3 + 5));
+    }
+
+    #[test]
+    fn dispatches_add_one_merge_pass_above_16384_blocks_at_the_128k_capacity() {
+        let wide = QsaShape {
+            capacity: 131072,
+            ..FLASH_NEXT
+        };
+        // Up to 16,384 blocks the wider capacity counts exactly as the 64K shape does.
+        assert_eq!(qsa_dispatches(wide, 65535), Ok(21 + 3 + 5));
+        assert_eq!(qsa_dispatches(wide, 65536), Ok(18 + 3 + 5));
+        // Block 16,385 needs a sixth merge pass (span 16,384), through to the last position.
+        assert_eq!(qsa_dispatches(wide, 65539), Ok(21 + 3 + 6));
+        assert_eq!(qsa_dispatches(wide, 131070), Ok(18 + 3 + 6));
+        assert_eq!(qsa_dispatches(wide, 131071), Ok(21 + 3 + 6));
+        assert_eq!(qsa_dispatches(wide, 131072), Err(QsaError::Capacity));
+        let beyond = QsaShape {
+            capacity: 131073,
+            ..FLASH_NEXT
+        };
+        assert_eq!(qsa_dispatches(beyond, 0), Err(QsaError::Shape));
     }
 
     #[test]

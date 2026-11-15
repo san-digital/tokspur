@@ -68,6 +68,7 @@ struct PleGatherScratch {
 };
 struct PreadSource {
     int fd = -1;
+    bool ram_resident = false;
     uint64_t file_offset = 0;
     uint64_t byte_length = 0;
     [[nodiscard]] bool valid() const noexcept { return fd >= 0 && byte_length > 0; }
@@ -82,10 +83,13 @@ public:
     NocacheTensorFile& operator=(const NocacheTensorFile&) = delete;
     NocacheTensorFile(NocacheTensorFile&& other) noexcept;
     NocacheTensorFile& operator=(NocacheTensorFile&& other) noexcept;
-    [[nodiscard]] PreadSource source() const noexcept { return {fd_, file_offset_, byte_length_}; }
+    void set_ram_resident(bool resident = true) noexcept { ram_resident_ = resident; }
+    [[nodiscard]] bool ram_resident() const noexcept { return ram_resident_; }
+    [[nodiscard]] PreadSource source() const noexcept { return {fd_, ram_resident_, file_offset_, byte_length_}; }
     [[nodiscard]] bool valid() const noexcept { return fd_ >= 0 && byte_length_ > 0; }
 private:
     int fd_ = -1;
+    bool ram_resident_ = false;
     uint64_t file_offset_ = 0;
     uint64_t byte_length_ = 0;
 };

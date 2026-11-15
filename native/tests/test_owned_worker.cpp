@@ -210,6 +210,21 @@ void bounded_admission(const std::filesystem::path& executable) {
     check(fixture.commands() == 0 && worker.alive(), "multi-step admission wrote bytes or damaged persistent child");
     static_cast<void>(worker.request(request(true), Clock::now() + 3s, [] { return false; })); worker.close();
     auto bad = fixture.options; bad.shards[3] = bad.shards[0]; refuses([&] { OwnedWorker invalid(bad); });
+    bad = fixture.options; bad.shards.resize(1); refuses([&] { OwnedWorker invalid(bad); });
+    {
+        Fixture base_only(executable, "normal");
+        base_only.options.shards.resize(1);
+        base_only.options.derived_pack = base_only.directory / "pack.gguf";
+        { std::ofstream out(base_only.options.derived_pack); out << "pack\n"; }
+        auto two_with_pack = base_only.options;
+        two_with_pack.shards.push_back(base_only.directory / "shard-1");
+        refuses([&] { OwnedWorker invalid(two_with_pack); });
+        OwnedWorker pack_worker(base_only.options);
+        check(pack_worker.alive(), "1-shard CPU-base worker with derived pack not available");
+        const auto done = pack_worker.request(request(true), Clock::now() + 3s, [] { return false; });
+        check(done.find("committed_prefix")->unsigned_integer() == 1, "1-shard pack worker request failed");
+        pack_worker.close();
+    }
     bad = fixture.options; bad.executable = "/bin/sh"; refuses([&] { OwnedWorker invalid(bad); });
     for (const auto* execution : {"", "capture", "indirect-compatible", "unknown"}) {
         Fixture invalid_mode(executable, "normal"); invalid_mode.options.stack_execution = execution;

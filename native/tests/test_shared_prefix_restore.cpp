@@ -123,12 +123,44 @@ void refusal_and_success() {
     check(!restore_shared_prefix_checkpoint(stack, 2048, anchor_stack, absent, 1, 511, anchor_mtp), "MTP payload without owner admitted");
 
 }
+
+void sub2k_nax_slice_clamping_and_exact_lcp() {
+    std::vector<std::vector<uint32_t>> recent;
+    std::vector<uint32_t> p1(1484);
+    for (uint32_t i = 0; i < p1.size(); ++i) p1[i] = 1000 + i;
+    // Cold first session: no recent prefixes, so wide 2,048-row NAX slice stays unclamped (1,484 rows in one pass).
+    check(shared_prefix_best_lcp(recent, p1, 512, 2048) == 0, "cold session reported non-zero LCP");
+    check(clamp_chunk_to_shared_prefix_boundary(1484, 0, 0, 512) == 1484, "cold session unnecessarily split sub-2K NAX slice");
+
+    recent.push_back(p1);
+    // Repeated identical 1,484-token contract prompt: exact LCP is 1,484, 512-aligned boundary is 1,024.
+    const size_t exact_lcp = shared_prefix_best_lcp(recent, p1, 512, 2048);
+    check(exact_lcp == 1484, "identical 1,484-token prompt failed to report exact LCP");
+    const size_t boundary = (exact_lcp / 512) * 512;
+    check(boundary == 1024, "1,484-token LCP boundary was not 1,024");
+    check(clamp_chunk_to_shared_prefix_boundary(1484, 0, boundary, 512) == 1024, "wide NAX slice stepped past 1,024 shared-prefix boundary");
+    check(clamp_chunk_to_shared_prefix_boundary(460, 1024, boundary, 512) == 460, "tail chunk after 1,024 boundary was altered");
+
+    // Follow-up question sharing the first 1,350 contract tokens out of 1,490 total tokens.
+    std::vector<uint32_t> p2 = p1;
+    p2.resize(1490, 9999);
+    for (size_t i = 1350; i < p2.size(); ++i) p2[i] = uint32_t(50000 + i);
+    const size_t partial_lcp = shared_prefix_best_lcp(recent, p2, 512, 2048);
+    check(partial_lcp == 1350, "partial contract LCP mismatch");
+    check(clamp_chunk_to_shared_prefix_boundary(1490, 0, (partial_lcp / 512) * 512, 512) == 1024, "partial contract failed to clamp at 1,024");
+
+    // Below-512 common prefix must never split a wide NAX slice.
+    std::vector<uint32_t> p3 = p1;
+    for (size_t i = 400; i < p3.size(); ++i) p3[i] = uint32_t(80000 + i);
+    check(shared_prefix_best_lcp(recent, p3, 512, 2048) == 0, "sub-512 prefix should not qualify for shared-prefix capture");
+    check(clamp_chunk_to_shared_prefix_boundary(1484, 0, 0, 512) == 1484, "sub-512 prefix altered NAX slice");
+}
 }
 
 int main() {
     try {
         for (bool empty : {false, true}) for (bool fail_stack : {false, true}) for (Fault fault : {Fault::refuse, Fault::exception}) failed_restore(empty, fail_stack, fault);
-        rollback_failures(); refusal_and_success();
+        rollback_failures(); refusal_and_success(); sub2k_nax_slice_clamping_and_exact_lcp();
         std::cout << "Shared-prefix production transaction checks=" << checks << "; fault-injected checkpoint interfaces, no GPU state qualification\n";
         return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

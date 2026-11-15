@@ -366,6 +366,44 @@ void run_stack_experiments() {
         stack_refuses([&] { attempt(body); }, "all malformed options must refuse before reset publication");
     stack_check(!resets && retained.matches(7) && sampler.matches(7) && sampler.random() == entropy,
         "invalid same-resident options do not publish reset, retained-logit or entropy changes");
+    const auto parse128 = [&](std::string_view body, uint32_t prefix = 0, bool ready = true, uint32_t ctx = 131072) {
+        return request(parse_json(body), prefix, 0, 0, false, ready, ready, true, 0, false, false, 0, false, false, 0, false, false, false, false, ctx);
+    };
+    stack_check(parse128(R"({"tokens":[1],"generate":4096,"reset":false})", 70000).generate == 4096,
+        "128K target request admits >64K prefix plus full 4096 generation budget");
+    stack_check(parse128(R"({"tokens":[],"generate":1,"reset":false})", 131071).generate == 1,
+        "128K target request admits final context slot");
+    stack_refuses([&] { parse128(R"({"tokens":[],"generate":2,"reset":false})", 131071); },
+        "128K target request refuses overflow past 131072");
+    stack_refuses([&] { parse128(R"({"tokens":[],"generate":1,"reset":false})", 131072); },
+        "128K full prefix cannot generate");
+    stack_refuses([&] { parse128(R"({"tokens":[1],"generate":0,"reset":true})", 0, false, 100000); },
+        "unsupported target context length refused");
+    Json::Array exact128(131072, Json::integer(1));
+    stack_check(request(Json(Json::Object{{"tokens", Json(std::move(exact128))}, {"generate", Json::integer(0)}, {"reset", Json(true)}}),
+        0, 0, 0, false, false, false, true, 0, false, false, 0, false, false, 0, false, false, false, false, 131072).tokens.size() == 131072,
+        "128K target input token count upper bound accepted");
+    Json::Array over128(131073, Json::integer(1));
+    stack_refuses([&] { request(Json(Json::Object{{"tokens", Json(std::move(over128))}, {"generate", Json::integer(0)}, {"reset", Json(true)}}),
+        0, 0, 0, false, false, false, true, 0, false, false, 0, false, false, 0, false, false, false, false, 131072); },
+        "128K target input token count overflow refused");
+    stack_refuses([&] { static_cast<void>(TargetSampler::fresh_branch({}, 70000)); },
+        "default 64K sampler refuses >64K branch prefix");
+    const auto branch128 = TargetSampler::fresh_branch({}, 70000, 131072);
+    stack_check(branch128.matches(70000), "128K sampler admits >64K branch prefix");
+    stack_refuses([&] { static_cast<void>(TargetSampler::fresh_branch({}, 131073, 131072)); },
+        "128K sampler refuses >128K branch prefix");
+    BranchSession<uint32_t, FakeResult> bs128(2, 8, 131072);
+    std::vector<uint32_t> hist70k(70000, 1u);
+    stack_check(bs128.committed(70000, hist70k) && bs128.matches(70000), "128K branch session tracks >64K history");
+    TargetBroker broker128(7, 131072);
+    Json::Array broker_prompt70k(70000, Json::integer(1));
+    const Json broker_begin128(Json::Object{
+        {"broker_epoch", Json::integer(7)}, {"command_id", Json::integer(1)}, {"lease_id", Json::integer(1)},
+        {"expected_prefix", Json::integer(0)}, {"op", Json("branch_begin")}, {"prompt_ids", Json(std::move(broker_prompt70k))},
+        {"generation_requested", Json(true)}, {"allow_restore", Json(false)},
+        {"sampling", parse_json(R"({"temperature":0,"top_k":0,"top_p":1,"min_p":0})")}, {"seed", Json::integer(0)}});
+    stack_check(broker128.admit(broker_begin128, 0).begin, "128K broker admits >64K prompt_ids");
 }
 """
 

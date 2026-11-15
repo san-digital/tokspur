@@ -723,6 +723,39 @@ fn bounded_admission(executable: &Path) {
     bad.shards[3] = bad.shards[0].clone();
     refuses(OwnedWorker::new(bad));
     let mut bad = fixture.options();
+    bad.shards.truncate(1);
+    refuses(OwnedWorker::new(bad));
+    {
+        let base_only = Fixture::new(executable, "normal");
+        let pack_file = base_only.directory.join("pack.gguf");
+        std::fs::write(&pack_file, "pack\n").unwrap();
+        let mut two_with_pack = base_only.options();
+        two_with_pack.shards.truncate(2);
+        two_with_pack.derived_pack = Some(pack_file.clone());
+        refuses(OwnedWorker::new(two_with_pack));
+        let mut pack_opts = base_only.options();
+        pack_opts.shards.truncate(1);
+        pack_opts.derived_pack = Some(pack_file);
+        let mut pack_worker = OwnedWorker::new(pack_opts).unwrap();
+        check(
+            pack_worker.alive(),
+            "1-shard CPU-base worker with derived pack not available",
+        );
+        let done = pack_worker
+            .request(&request(true, false), soon(), Some(&mut never()), None)
+            .unwrap();
+        check(
+            done.find("committed_prefix")
+                .unwrap()
+                .unwrap()
+                .unsigned_integer()
+                .unwrap()
+                == 1,
+            "1-shard pack worker request failed",
+        );
+        pack_worker.close().unwrap();
+    }
+    let mut bad = fixture.options();
     bad.executable = PathBuf::from("/bin/sh");
     refuses(OwnedWorker::new(bad));
     for execution in ["", "capture", "indirect-compatible", "unknown"] {

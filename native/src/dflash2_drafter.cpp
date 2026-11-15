@@ -279,6 +279,59 @@ SampledSparseLaw build_selector_law(uint32_t vocab_size, std::span<const uint32_
 
 } // namespace
 
+DFlash2SelectorProposals dflash2_selector_proposals(std::span<const std::byte> selector_out, uint32_t count,
+    uint32_t vocabulary, uint32_t base_position, uint32_t anchor_id, const SamplingPolicy& policy, const SamplingRng& after_anchor) {
+    require(count >= 1u && count <= 7u && anchor_id < vocabulary &&
+        selector_out.size() == 7ull * 16ull * (sizeof(uint32_t) + sizeof(float)) + 7ull * 256ull * sizeof(float),
+        "DFlash2 selector result geometry mismatch");
+    const auto* candidates = reinterpret_cast<const uint32_t*>(selector_out.data());
+    const auto* unary = reinterpret_cast<const float*>(selector_out.data() + 7ull * 16ull * sizeof(uint32_t));
+    const auto* tables = reinterpret_cast<const float*>(selector_out.data() + 7ull * 16ull * (sizeof(uint32_t) + sizeof(float)));
+
+    DFlash2SelectorProposals out{};
+    SamplingRng trial_rng = after_anchor;
+    uint32_t pred_idx = 0;
+    uint32_t prev_token = anchor_id;
+    for (uint32_t pos = 0; pos < count; ++pos) {
+        std::array<uint32_t, 16> cands{};
+        std::array<float, 16> scores{};
+        const uint32_t* pos_cands = candidates + pos * 16u;
+        const float* pos_unary = unary + pos * 16u;
+        const float* pos_edges = tables + (pos * 16u + pred_idx) * 16u;
+        float best_score = -std::numeric_limits<float>::infinity();
+        for (uint32_t i = 0; i < 16u; ++i) {
+            cands[i] = pos_cands[i];
+            scores[i] = pos_unary[i] + pos_edges[i];
+            require(finite_bits(scores[i]), "nonfinite DFlash2 candidate score");
+            best_score = std::max(best_score, scores[i]);
+        }
+        double mass = 0.0;
+        for (uint32_t i = 0; i < 16u; ++i) {
+            mass += std::exp(double(scores[i] - best_score));
+        }
+        out.confidences[pos] = mass > 0.0 ? float(1.0 / mass) : 0.0f;
+
+        auto law = build_selector_law(vocabulary, cands, scores, policy);
+        const uint64_t ticket = law.deterministic() ? 0ull : uint64_t(std::ldexp(trial_rng.uniform(), 53));
+        const uint32_t selected = law.sample_at(ticket);
+
+        uint32_t next_pred_idx = 16u;
+        for (uint32_t i = 0; i < 16u; ++i) {
+            if (cands[i] == selected) {
+                next_pred_idx = i;
+                break;
+            }
+        }
+        require(next_pred_idx < 16u, "DFlash2 selected token missing from candidate support");
+
+        out.proposals[pos] = SampledProposalRow{base_position + 1u + pos, prev_token, selected, std::move(law)};
+        prev_token = selected;
+        pred_idx = next_pred_idx;
+    }
+    out.random_after = std::move(trial_rng);
+    return out;
+}
+
 void DFlash2ContextStage::prepare(GpuView storage, uint32_t width) {
     require(!storage_.owner && storage.owner && width && width <= 16u * 2560u && storage.bytes == uint64_t(8) * width * sizeof(float), "DFlash2 pending context storage bound");
     storage_ = storage;
@@ -305,10 +358,12 @@ void DFlash2ContextStage::truncate(uint32_t position) noexcept {
 DFlash2Drafter::DFlash2Drafter(MetalGraph& gpu, const std::filesystem::path& directory,
                                GpuView borrowed_output_weight, uint32_t known_token_capacity,
                                const EmbedFn& embed_token, DFlash2Precision precision, bool defer_context,
-                               bool bind_checkpoint_identity)
-    : precision_(precision), defer_context_(defer_context), gpu_(gpu), borrowed_output_weight_(borrowed_output_weight) {
+                               bool bind_checkpoint_identity, uint32_t max_context)
+    : precision_(precision), defer_context_(defer_context), gpu_(gpu),
+      borrowed_output_weight_(borrowed_output_weight), max_context_(max_context) {
     try {
         require(precision == DFlash2Precision::q8_0 || precision == DFlash2Precision::bf16, "unsupported DFlash2 precision");
+        require(max_context_ == 65536 || max_context_ == 131072, "unsupported DFlash2 context limit");
         require(borrowed_output_weight_.bytes > 0, "DFlash2 requires borrowed target output weight");
         require(bool(embed_token), "DFlash2 requires target embedding callback");
         const auto cfg_text = read_small_text_file(directory / "config.json", 1024 * 1024);
@@ -579,7 +634,7 @@ uint64_t DFlash2Drafter::ssd_cache_bytes(uint32_t rows) const {
 bool DFlash2Drafter::read_ssd_cache_span(uint64_t offset, std::span<std::byte> target) {
     // Materialise pending accepted features before recording the context frontier. The same flush is already required before the next draft.
     static_cast<void>(flush_context());
-    const DFlash2CheckpointLayout layout{first_absolute_position(), cache_rows(), sliding_window_, num_layers_, kv_heads_, head_dim_};
+    const DFlash2CheckpointLayout layout{first_absolute_position(), cache_rows(), sliding_window_, num_layers_, kv_heads_, head_dim_, max_context_};
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
     if (gpu_.carrier_gpu_readback_enabled()) {
         std::vector<CarrierStateRead> reads; reads.reserve(8192);
@@ -599,7 +654,7 @@ bool DFlash2Drafter::read_ssd_cache_span(uint64_t offset, std::span<std::byte> t
 }
 
 bool DFlash2Drafter::write_ssd_cache_span(uint32_t first, uint32_t rows, uint64_t offset, std::span<const std::byte> source) {
-    const DFlash2CheckpointLayout layout{first, rows, sliding_window_, num_layers_, kv_heads_, head_dim_};
+    const DFlash2CheckpointLayout layout{first, rows, sliding_window_, num_layers_, kv_heads_, head_dim_, max_context_};
     if (!layout.valid() || offset > layout.bytes() || source.size() > layout.bytes() - offset) return false;
     if (offset && (context_len_ != first + rows || pending_context_.rows())) return false;
     if (!offset) {
@@ -623,7 +678,23 @@ void DFlash2Drafter::set_max_drafts(uint32_t max_drafts) {
     max_drafts_ = max_drafts;
 }
 
+void DFlash2Drafter::release_draft_vocab_gather() {
+    active_output_weight_ = borrowed_output_weight_;
+    active_output_vocab_ = vocab_size_;
+    draft_token_ids_.clear();
+    for (GpuView* view : {&draft_row_token_ids_, &gathered_output_weight_}) {
+        if (!view->owner) continue;
+        const auto found = std::find_if(owned_views_.begin(), owned_views_.end(), [&](const GpuView& owned) { return owned.slot == view->slot; });
+        if (found != owned_views_.end()) owned_views_.erase(found);
+        weight_bytes_ -= view->bytes;
+        const GpuView released = *view;
+        *view = {};
+        gpu_.release(released);
+    }
+}
+
 void DFlash2Drafter::configure_draft_vocab_slice(uint32_t slice_vocab) {
+    release_draft_vocab_gather();
     if (slice_vocab == 0u || slice_vocab == vocab_size_) {
         active_output_weight_ = borrowed_output_weight_;
         active_output_vocab_ = vocab_size_;
@@ -633,6 +704,26 @@ void DFlash2Drafter::configure_draft_vocab_slice(uint32_t slice_vocab) {
         "DFlash2 draft_vocab_slice must be 0, full vocabulary, or a multiple of 32 in [256, vocab_size)");
     active_output_weight_ = gpu_.suballocate_draft_output_slice(borrowed_output_weight_, slice_vocab, hidden_size_);
     active_output_vocab_ = slice_vocab;
+}
+
+void DFlash2Drafter::configure_draft_vocab_gather(std::span<const uint32_t> token_ids) {
+    require(token_ids.size() >= 256u && token_ids.size() < vocab_size_ && (token_ids.size() % 32u) == 0u,
+        "DFlash2 gathered draft vocabulary must hold a multiple of 32 token IDs in [256, vocab_size)");
+    for (size_t i = 0; i < token_ids.size(); ++i)
+        require(token_ids[i] < vocab_size_ && (!i || token_ids[i] > token_ids[i - 1]),
+            "DFlash2 gathered draft vocabulary must be strictly ascending token IDs inside the vocabulary");
+    release_draft_vocab_gather();
+    // The gathered copy and its table are part of the drafter's weights: the copy replaces the borrowed prefix view as the output projection.
+    const auto track = [&](GpuView view) {
+        owned_views_.push_back(view);
+        weight_bytes_ = checked_add(weight_bytes_, view.bytes);
+        return view;
+    };
+    gathered_output_weight_ = track(gpu_.gather_draft_output_slice(borrowed_output_weight_, token_ids, hidden_size_));
+    draft_row_token_ids_ = track(gpu_.upload(std::as_bytes(token_ids), "dflash2.draft_row_token_ids", /*immutable=*/true));
+    draft_token_ids_.assign(token_ids.begin(), token_ids.end());
+    active_output_weight_ = gathered_output_weight_;
+    active_output_vocab_ = uint32_t(token_ids.size());
 }
 
 void DFlash2Drafter::dense_proj(GpuView matrix, GpuRowsF32 in, GpuRowsF32 out, bool swiglu) {
@@ -838,7 +929,7 @@ DFlash2DraftResult DFlash2Drafter::draft_block8(uint32_t k, uint32_t base_positi
         TOKSPUR_OPERATOR_CHECKPOINT(gpu_, "dense_q8", "dflash2_output_logits", {k, hidden_size_, out_vocab, 8});
         dense_proj(selector_proj_, final_rows_k, sel_hid_rows_k, false);
         gpu_.dflash2_select(logits_slice_k, draft_top_ids_, draft_top_vals_, draft_selector_out_,
-            sel_hid_slice_k, predecessor_codebook_, successor_codebook_, k, out_vocab, anchor_id, vocab_size_);
+            sel_hid_slice_k, predecessor_codebook_, successor_codebook_, k, out_vocab, anchor_id, vocab_size_, draft_row_token_ids_);
         TOKSPUR_OPERATOR_CHECKPOINT(gpu_, "dflash2", "draft_selector", {k, selector_rank_, out_vocab, 16});
     } catch (...) {
         try { gpu_.abort(); } catch (...) {}
@@ -869,54 +960,15 @@ DFlash2DraftResult DFlash2Drafter::draft_block8(uint32_t k, uint32_t base_positi
     }
     gpu_.read(draft_selector_out_, host_selector_out_);
 
-    const auto* candidates = reinterpret_cast<const uint32_t*>(host_selector_out_.data());
-    const auto* unary = reinterpret_cast<const float*>(host_selector_out_.data() + 7ull * 16ull * sizeof(uint32_t));
-    const auto* tables = reinterpret_cast<const float*>(host_selector_out_.data() + 7ull * 16ull * (sizeof(uint32_t) + sizeof(float)));
-
     DFlash2DraftResult out{};
     out.evaluated_proposals = k;
     out.proposal_begin_words = after_anchor.words_consumed();
     out.batch = batch;
 
-    SamplingRng trial_rng = after_anchor;
-    uint32_t pred_idx = 0;
-    uint32_t prev_token = anchor_id;
-    for (uint32_t pos = 0; pos < k; ++pos) {
-        std::array<uint32_t, 16> cands{};
-        std::array<float, 16> scores{};
-        const uint32_t* pos_cands = candidates + pos * 16u;
-        const float* pos_unary = unary + pos * 16u;
-        const float* pos_edges = tables + (pos * 16u + pred_idx) * 16u;
-        float best_score = -std::numeric_limits<float>::infinity();
-        for (uint32_t i = 0; i < 16u; ++i) {
-            cands[i] = pos_cands[i];
-            scores[i] = pos_unary[i] + pos_edges[i];
-            require(finite_bits(scores[i]), "nonfinite DFlash2 candidate score");
-            best_score = std::max(best_score, scores[i]);
-        }
-        double mass = 0.0;
-        for (uint32_t i = 0; i < 16u; ++i) {
-            mass += std::exp(double(scores[i] - best_score));
-        }
-        out.confidences[pos] = mass > 0.0 ? float(1.0 / mass) : 0.0f;
-
-        auto law = build_selector_law(vocab_size_, cands, scores, policy);
-        const uint64_t ticket = law.deterministic() ? 0ull : uint64_t(std::ldexp(trial_rng.uniform(), 53));
-        const uint32_t selected = law.sample_at(ticket);
-
-        uint32_t next_pred_idx = 16u;
-        for (uint32_t i = 0; i < 16u; ++i) {
-            if (cands[i] == selected) {
-                next_pred_idx = i;
-                break;
-            }
-        }
-        require(next_pred_idx < 16u, "DFlash2 selected token missing from candidate support");
-
-        out.proposals[pos] = SampledProposalRow{base_position + 1u + pos, prev_token, selected, std::move(law)};
-        prev_token = selected;
-        pred_idx = next_pred_idx;
-    }
+    auto drawn = dflash2_selector_proposals(host_selector_out_, k, vocab_size_, base_position, anchor_id, policy, after_anchor);
+    out.proposals = std::move(drawn.proposals);
+    out.confidences = drawn.confidences;
+    SamplingRng trial_rng = std::move(drawn.random_after);
 
     const uint32_t verify_rows = measured_budget_ ? measured_budget_(base_position, out.confidences, 1u + k) : adaptive_budget
         ? verify_budget_.choose_verify_rows(out.confidences, 1u + k)
@@ -948,8 +1000,8 @@ namespace {
 
 constexpr uint32_t kBudgetParams = 1u + DFlash2VerifyBudget::kPositions;
 constexpr uint32_t kBudgetMaxIters = 16u;
-constexpr std::array<double, 4> kSeedKnots{1.0, 2.0, 4.0, 8.0};
-constexpr std::array<double, 4> kSeedShape{0.60, 0.69, 0.85, 1.0};
+// Stepped verify-row seed costs reflecting 1-row GEMV (r=1), narrow M4 NAX matmul2d(4,32,32) (r=2..4), and wide M8 NAX matmul2d(8,32,32) plus MoE union scaling (r=5..8).
+constexpr std::array<double, DFlash2VerifyBudget::kBlockRows> kSeedCosts{0.60, 0.68, 0.71, 0.74, 0.83, 0.885, 0.942, 1.0};
 
 using BudgetVector = std::array<double, kBudgetParams>;
 
@@ -1019,38 +1071,29 @@ BudgetVector solve_spd_system(std::array<BudgetVector, kBudgetParams> h, BudgetV
 
 double DFlash2VerifyBudget::seed_cost(uint32_t rows) {
     require(rows >= 1u && rows <= kBlockRows, "invalid DFlash2VerifyBudget row count");
-    const double r = double(rows);
-    uint32_t upper = 1u;
-    while (upper < 3u && r > kSeedKnots[upper]) ++upper;
-    const double t = (r - kSeedKnots[upper - 1u]) / (kSeedKnots[upper] - kSeedKnots[upper - 1u]);
-    return kSeedShape[upper - 1u] + t * (kSeedShape[upper] - kSeedShape[upper - 1u]);
-}
-
-std::optional<std::pair<double, double>> DFlash2VerifyBudget::fit_cost_line() const noexcept {
-    if (cost_.weight <= 0.0) return std::nullopt;
-    const double mean_rows = cost_.rows / cost_.weight;
-    const double mean_time = cost_.time / cost_.weight;
-    const double spread = std::max(cost_.rows_squared / cost_.weight - mean_rows * mean_rows, 0.0);
-    const double cov = cost_.rows_time / cost_.weight - mean_rows * mean_time;
-    const double seed_slope = (seed_cost(kBlockRows) - seed_cost(1u)) / double(kBlockRows - 1u);
-    const uint32_t rounded_rows = uint32_t(std::clamp<long>(std::lround(mean_rows), 1L, long(kBlockRows)));
-    const double prior_slope = seed_slope * mean_time / seed_cost(rounded_rows);
-    const double slope = std::max((cost_.weight * cov + kPriorCycles * prior_slope) / (cost_.weight * spread + kPriorCycles), 0.0);
-    return std::pair{mean_time - slope * mean_rows, slope};
+    return kSeedCosts[rows - 1u];
 }
 
 std::array<float, DFlash2VerifyBudget::kBlockRows + 1> DFlash2VerifyBudget::costs() const {
     std::array<float, kBlockRows + 1> result{};
-    const auto fit_line = fit_cost_line();
-    if (!fit_line) {
+    double weighted_seed = 0.0;
+    for (uint32_t r = 1u; r <= kBlockRows; ++r) {
+        weighted_seed += cost_.row_weight[r] * seed_cost(r);
+    }
+    if (cost_.weight <= 0.0 || weighted_seed <= 0.0) {
         for (uint32_t r = 1u; r <= kBlockRows; ++r) {
             result[r] = float(seed_cost(r));
         }
         return result;
     }
+    const double base_scale = cost_.time / weighted_seed;
     const double floor_cost = 0.05 * (cost_.time / cost_.weight);
+    double prev = floor_cost;
     for (uint32_t r = 1u; r <= kBlockRows; ++r) {
-        result[r] = float(std::max(fit_line->first + fit_line->second * double(r), floor_cost));
+        const double prior_ms = base_scale * seed_cost(r);
+        const double estimate = (cost_.row_time[r] + kPriorRowCycles * prior_ms) / (cost_.row_weight[r] + kPriorRowCycles);
+        prev = std::max(estimate, prev);
+        result[r] = float(prev);
     }
     return result;
 }
@@ -1151,15 +1194,18 @@ void DFlash2VerifyBudget::observe(
         "invalid DFlash2VerifyBudget round outcome");
     if (std::isfinite(milliseconds) && milliseconds > 0.0) {
         double clamped_ms = milliseconds;
-        if (const auto fit_line = fit_cost_line()) {
-            const double expected = std::max(fit_line->first + fit_line->second * double(verify_rows), 1.0e-3);
+        if (cost_.weight > 0.0) {
+            const double expected = std::max(double(costs()[verify_rows]), 1.0e-3);
             clamped_ms = std::clamp(milliseconds, 0.5 * expected, 2.0 * expected);
         }
         cost_.weight = kDecay * cost_.weight + 1.0;
-        cost_.rows = kDecay * cost_.rows + double(verify_rows);
-        cost_.rows_squared = kDecay * cost_.rows_squared + double(verify_rows) * double(verify_rows);
         cost_.time = kDecay * cost_.time + clamped_ms;
-        cost_.rows_time = kDecay * cost_.rows_time + double(verify_rows) * clamped_ms;
+        for (uint32_t r = 1u; r <= kBlockRows; ++r) {
+            cost_.row_weight[r] *= kDecay;
+            cost_.row_time[r] *= kDecay;
+        }
+        cost_.row_weight[verify_rows] += 1.0;
+        cost_.row_time[verify_rows] += clamped_ms;
     }
     // Only positions actually verified against the target row (0 .. verify_rows - 2, up to the first rejection) receive labels.
     if (record_labels && verify_rows >= 2u) {

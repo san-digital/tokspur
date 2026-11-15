@@ -414,6 +414,9 @@ void files() {
             "shared mapping preserves all bytes");
     tokspur::ModelFiles shared_model({immutable}, tokspur::ReadOnlyMapMode::shared_file);
     tokspur::ModelFiles private_model({immutable});
+    shared_model.warm_tensor_pages("tensor");
+    shared_model.warm_tensor_pages("missing");
+    private_model.warm_tensor_pages("tensor", 4, 8);
     require(shared_model.architecture() == private_model.architecture() && shared_model.tensors().size() == 1 &&
             std::equal(shared_model.tensor_bytes("tensor").begin(), shared_model.tensor_bytes("tensor").end(),
                        private_model.tensor_bytes("tensor").begin(), private_model.tensor_bytes("tensor").end()),

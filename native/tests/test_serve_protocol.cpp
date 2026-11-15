@@ -724,14 +724,18 @@ int main() {
         }
         for (const auto schema : {
             R"({"type":"object","oneOf":[]})", R"({"type":"object","additionalProperties":true})",
-            R"({"type":"array"})", R"({"type":["string","null"]})", R"({"type":"object","required":["missing"]})"
+            R"({"type":"array"})", R"({"type":"array","items":{"type":"string"},"minItems":3,"maxItems":2})",
+            R"({"type":"array","items":{"type":"string"},"minItems":-1})", R"({"type":"string","minItems":1})",
+            R"({"type":"array","items":{"type":"string"},"minItems":4097})", R"({"type":"array","items":{"type":"string"},"minItems":1.0})",
+            R"({"type":"array","items":{"type":"string"},"maxItems":"2"})", R"({"anyOf":[{"type":"array","items":{"type":"string"}}],"minItems":1})",
+            R"({"type":["string","null"]})", R"({"type":"object","required":["missing"]})"
         }) {
             auto declaration = tools().array()[0]; auto function = with(*declaration.find("function"), "parameters", parse_json(schema));
             refusal([&] { static_cast<void>(admit_chat(with(request(), "tools", Json(Json::Array{with(declaration, "function", function)})), "tokspur")); });
         }
-        const auto schema = parse_json(R"({"type":"object","properties":{"n":{"type":"integer","minimum":1,"maximum":3},"values":{"type":"array","items":{"type":"string","enum":["x","y"]}}},"required":["n"]})");
+        const auto schema = parse_json(R"({"type":"object","properties":{"n":{"type":"integer","minimum":1,"maximum":3},"values":{"type":"array","items":{"type":"string","enum":["x","y"]},"minItems":1,"maxItems":2}},"required":["n"]})");
         validate_tool_value(schema, parse_json(R"({"n":2,"values":["x","y"]})")); ++checks;
-        for (const auto value : {R"({"n":1.5})", R"({"n":1.0})", R"({"n":4})", R"({"n":9007199254740993})", R"({"n":2,"values":["z"]})", R"({"n":2,"extra":true})", R"({})"}) refusal([&] { validate_tool_value(schema, parse_json(value)); });
+        for (const auto value : {R"({"n":1.5})", R"({"n":1.0})", R"({"n":4})", R"({"n":9007199254740993})", R"({"n":2,"values":[]})", R"({"n":2,"values":["x","y","x"]})", R"({"n":2,"values":["z"]})", R"({"n":2,"extra":true})", R"({})"}) refusal([&] { validate_tool_value(schema, parse_json(value)); });
         refusal([&] { validate_tool_value(parse_json(R"({"type":"integer"})"), parse_json("1.00000000000000001")); });
         refusal([&] { validate_tool_value(parse_json(R"({"type":"number","enum":[1]})"), parse_json("1.00000000000000001")); });
         refusal([&] { validate_tool_value(parse_json(R"({"type":"number","enum":[9007199254740992]})"), parse_json("9007199254740993")); });
@@ -766,6 +770,49 @@ int main() {
         const auto before = fake.prefills + fake.generations;
         refusal([&] { session.complete(with(request(), "n", Json::integer(2)), "invalid", call, sink); }); check(before == fake.prefills + fake.generations);
         refusal([&] { session.complete(request(std::string(65536, 'A')), "overflow", call, sink); }); check(before == fake.prefills + fake.generations);
+        {
+            const auto make_session_ctx = [&](uint32_t ctx) {
+                return ServeSession(codec(), "tokspur", "direct", Json()
+#ifdef TOKSPUR_PRIVATE_HTTP_VERIFY8
+                    , false, Json()
+#endif
+#ifdef TOKSPUR_PRIVATE_HTTP_BRANCH8
+                    , false
+#endif
+                    , ToolEnumValidation::strict
+#ifdef TOKSPUR_PRIVATE_HTTP_SAMPLED_PREFILL
+                    , false
+#endif
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+                    , Json()
+#endif
+#ifdef TOKSPUR_PRIVATE_LANE_LAYOUT
+                    , Json()
+#endif
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+                    , std::nullopt
+#endif
+                    , ToolArgValidation::strict, ctx);
+            };
+            const auto large_req = request(std::string(1100000, 'A'));
+            refusal([&] { admit_chat(large_req, "tokspur"); });
+            check(admit_chat(large_req, "tokspur", ToolEnumValidation::strict, ToolArgValidation::strict, 131072).maximum_tokens == 256);
+            refusal([&] { admit_chat(request(std::string(4200000, 'A')), "tokspur", ToolEnumValidation::strict, ToolArgValidation::strict, 131072); });
+            refusal([&] { admit_chat(request(), "tokspur", ToolEnumValidation::strict, ToolArgValidation::strict, 100000); });
+            refusal([&] { static_cast<void>(make_session_ctx(100000)); });
+            auto session128k = make_session_ctx(131072);
+            Fake fake128k;
+            auto call128k = [&](const Json& job, const auto& event) { return fake128k(job, event); };
+            ServeSink sink128k{[](const Json&) {}, [] { return false; }, [] { return uint64_t(77); }};
+            refusal([&] { session128k.complete(request(std::string(131072, 'A')), "overflow128k", call128k, sink128k); });
+            check(fake128k.prefills + fake128k.generations == 0);
+            fake128k.reply("ok<|im_end|>");
+            const auto r128k = session128k.complete(request(std::string(65536, 'A')), "admitted128k", call128k, sink128k);
+            check(finish(r128k).string() == "stop" && session128k.committed_tokens() == 65539);
+            fake128k.reply("xyz");
+            const auto r128k_clamp = session128k.complete(with(request(std::string(65536, 'A') + "ok<|im_end|>" + std::string(65531, 'B')), "max_tokens", Json::integer(100)), "clamped128k", call128k, sink128k);
+            check(finish(r128k_clamp).string() == "length" && message(r128k_clamp).find("content")->string() == "xy" && session128k.committed_tokens() == 131072);
+        }
         chunks.clear(); fake.reply("why</think>\n\nVisible<|im_end|>");
         result = session.complete(request("T", true, true), "thinking", call, sink);
         check(message(result).find("reasoning_content")->string() == "why" && message(result).find("content")->string() == "\n\nVisible");
@@ -814,6 +861,81 @@ int main() {
         refusal([&] { session.complete(tool_request, "unknown", call, sink); });
         fake.reply("<tool_call><function=read_file><parameter=path>\ntrue\n</parameter></function></tool_call><|im_end|>");
         result = session.complete(tool_request, "rawstring", call, sink); check(message(result).find("tool_calls")->array()[0].find("function")->find("arguments")->string() == "{\"path\":\"true\"}");
+        {
+            const auto base = parse_json(R"({"model":"tokspur","messages":[{"role":"user","content":"Q"}]})");
+            check(!admit_chat(base, "tokspur").thinking_budget.has_value());
+            const auto top = admit_chat(with(base, "thinking_budget", Json::integer(128)), "tokspur");
+            check(top.thinking && top.thinking_budget == std::optional<uint32_t>(128) && !top.render.find("thinking_budget"));
+            const auto kw = admit_chat(with(base, "chat_template_kwargs", parse_json(R"({"thinking_budget":256,"reasoning_effort":"medium"})")), "tokspur");
+            check(kw.thinking && kw.thinking_budget == std::optional<uint32_t>(256) && kw.render.find("reasoning_effort")->string() == "medium");
+            const auto both = admit_chat(with(with(base, "thinking_budget", Json::integer(512)), "chat_template_kwargs", parse_json(R"({"thinking_budget":512})")), "tokspur");
+            check(both.thinking && both.thinking_budget == std::optional<uint32_t>(512));
+            const auto max_b = admit_chat(with(base, "thinking_budget", Json::integer(32768)), "tokspur");
+            check(max_b.thinking && max_b.thinking_budget == std::optional<uint32_t>(32768));
+            const auto zero = admit_chat(with(base, "thinking_budget", Json::integer(0)), "tokspur");
+            check(!zero.thinking && !zero.thinking_budget.has_value() && !zero.render.find("enable_thinking")->boolean());
+            const auto zero_none = admit_chat(with(with(base, "thinking_budget", Json::integer(0)), "reasoning_effort", Json("none")), "tokspur");
+            check(!zero_none.thinking && !zero_none.thinking_budget.has_value());
+            const auto zero_false = admit_chat(with(with(base, "thinking_budget", Json::integer(0)), "enable_thinking", Json(false)), "tokspur");
+            check(!zero_false.thinking && !zero_false.thinking_budget.has_value());
+            for (const auto& invalid : {Json(), Json(true), Json("128"), parse_json("-1"), parse_json("1.5"), Json::integer(32769)})
+                refusal([&] { static_cast<void>(admit_chat(with(base, "thinking_budget", invalid), "tokspur")); });
+            refusal([&] { static_cast<void>(admit_chat(with(with(base, "thinking_budget", Json::integer(0)), "enable_thinking", Json(true)), "tokspur")); });
+            // A positive budget with thinking explicitly off is admitted and ignored, wherever either option is given; it still has to be a valid budget.
+            for (const auto& off_request : {
+                with(with(base, "thinking_budget", Json::integer(64)), "enable_thinking", Json(false)),
+                with(base, "chat_template_kwargs", parse_json(R"({"thinking_budget":64,"enable_thinking":false})")),
+                with(with(base, "thinking_budget", Json::integer(64)), "chat_template_kwargs", parse_json(R"({"enable_thinking":false})")),
+                with(with(with(base, "thinking_budget", Json::integer(64)), "enable_thinking", Json(false)), "reasoning_effort", Json("none"))}) {
+                const auto off = admit_chat(off_request, "tokspur");
+                check(!off.thinking && !off.thinking_budget.has_value() && !off.render.find("enable_thinking")->boolean());
+            }
+            refusal([&] { static_cast<void>(admit_chat(with(with(base, "thinking_budget", Json::integer(32769)), "enable_thinking", Json(false)), "tokspur")); });
+            refusal([&] { static_cast<void>(admit_chat(with(with(base, "thinking_budget", Json::integer(64)), "chat_template_kwargs", parse_json(R"({"thinking_budget":128})")), "tokspur")); });
+            refusal([&] { static_cast<void>(admit_chat(with(with(base, "thinking_budget", Json::integer(64)), "reasoning_effort", Json("none")), "tokspur")); });
+
+            chunks.clear(); fake.reply("abcdefVisible<|im_end|>");
+            auto tb_res = session.complete(with(request("T", true, true), "thinking_budget", Json::integer(6)), "tb-cutoff", call, sink);
+            check(finish(tb_res).string() == "stop" && message(tb_res).find("reasoning_content")->string() == "abcdef\n" &&
+                message(tb_res).find("content")->string() == "\n\nVisible");
+            std::string s_think, s_text;
+            for (const auto& ev : chunks) {
+                const auto& delta = *ev.find("choices")->array()[0].find("delta");
+                if (const auto* t = delta.find("reasoning_content")) s_think += t->string();
+                if (const auto* c = delta.find("content")) s_text += c->string();
+            }
+            check(s_think == "abcdef\n" && s_text == "\n\nVisible");
+
+            chunks.clear(); fake.reply("abc\nDone<|im_end|>");
+            tb_res = session.complete(with(request("T2", false, true), "thinking_budget", Json::integer(4)), "tb-nl", call, sink);
+            check(message(tb_res).find("reasoning_content")->string() == "abc\n" && message(tb_res).find("content")->string() == "\n\nDone");
+
+            const std::string fence_think = "```py\nx=1";
+            chunks.clear(); fake.reply(fence_think + tool_response);
+            tb_res = session.complete(with(with(request("F", true, true), "tools", tools()), "thinking_budget", Json::integer(fence_think.size())), "tb-fence-tool", call, sink);
+            check(finish(tb_res).string() == "tool_calls" && message(tb_res).find("reasoning_content")->string() == "```py\nx=1\n" &&
+                message(tb_res).find("tool_calls")->array().size() == 1);
+
+            chunks.clear(); fake.reply("考Yes<|im_end|>");
+            tb_res = session.complete(with(request("U8", false, true), "thinking_budget", Json::integer(1)), "tb-utf8", call, sink);
+            check(message(tb_res).find("reasoning_content")->string() == "考\n" && message(tb_res).find("content")->string() == "\n\nYes");
+
+            chunks.clear(); fake.reply("hi</think>\n\nNatural<|im_end|>");
+            tb_res = session.complete(with(request("N", false, true), "thinking_budget", Json::integer(50)), "tb-natural", call, sink);
+            check(message(tb_res).find("reasoning_content")->string() == "hi" && message(tb_res).find("content")->string() == "\n\nNatural");
+
+            // The budget is reached after the model closed thinking on its own: on the close's last token (10) or inside the answer (13). Nothing is injected and the answer continues in phase 2.
+            for (const uint64_t budget : {10u, 13u}) {
+                chunks.clear(); fake.reply("hi</think>\n\nNatural<|im_end|>");
+                tb_res = session.complete(with(request("NB", false, true), "thinking_budget", Json::integer(budget)), "tb-natural-boundary", call, sink);
+                check(finish(tb_res).string() == "stop" && message(tb_res).find("reasoning_content")->string() == "hi" &&
+                    message(tb_res).find("content")->string() == "\n\nNatural" && tb_res.find("usage")->find("completion_tokens")->unsigned_integer() == 20);
+            }
+
+            chunks.clear(); fake.reply("abcdefghij");
+            tb_res = session.complete(with(with(request("L", false, true), "thinking_budget", Json::integer(3)), "max_tokens", Json::integer(5)), "tb-tight", call, sink);
+            check(finish(tb_res).string() == "length" && tb_res.find("usage")->find("completion_tokens")->unsigned_integer() == 5);
+        }
         std::cout << "PASS owned serving protocol checks=" << checks << " (model-free; no tools executed)\n";
         return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

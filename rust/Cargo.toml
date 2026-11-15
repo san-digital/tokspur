@@ -7,6 +7,7 @@ members = [
     "crates/tokspur-gguf",
     "crates/tokspur-sys",
     "crates/tokspur-pack",
+    "crates/tokspur-quant",
     "crates/tokspur-cli",
     "crates/tokspur-wire",
     "crates/tokspur-server",
@@ -16,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.99.1"
 license = "Apache-2.0"
@@ -28,6 +29,7 @@ tokspur-text = { path = "crates/tokspur-text" }
 tokspur-gguf = { path = "crates/tokspur-gguf" }
 tokspur-sys = { path = "crates/tokspur-sys" }
 tokspur-pack = { path = "crates/tokspur-pack" }
+tokspur-quant = { path = "crates/tokspur-quant" }
 tokspur-cli = { path = "crates/tokspur-cli" }
 tokspur-wire = { path = "crates/tokspur-wire" }
 tokspur-testkit = { path = "crates/tokspur-testkit" }

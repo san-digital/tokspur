@@ -140,7 +140,30 @@ def identity(path: Path) -> dict:
     return result
 
 
+def _optional_role(entry: dict) -> str | None:
+    if "role" not in entry:
+        return None
+    role = entry["role"]
+    if role != "derived_pack":
+        raise ValueError(f"unsupported asset role '{role}'")
+    return role
+
+
+def candidate_file_specs(
+    expected: dict, group: str, *, include_legacy_draft: bool = False
+) -> list[list[dict]]:
+    group_obj = expected[group]
+    specs = [group_obj["files"]]
+    for variant in group_obj.get("variants", ()):
+        specs.append(variant["files"])
+    if include_legacy_draft and group == "draft" and "legacy_dflash2_draft" in expected:
+        specs.append(expected["legacy_dflash2_draft"]["files"])
+    return specs
+
+
 def verify_asset(path: Path, expected: dict) -> dict:
+    role = _optional_role(expected)
+    is_derived_pack = role == "derived_pack"
     path = path.resolve(strict=True)
     before = identity(path)
     if before["size"] != expected["size"]:
@@ -148,8 +171,11 @@ def verify_asset(path: Path, expected: dict) -> dict:
     digest = hashlib.sha256()
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
             raise ValueError("Asset must be a regular file")
+        if is_derived_pack and st.st_nlink != 1:
+            raise ValueError("Derived pack asset must not have multiple hard links")
         if os.uname().sysname == "Darwin":
             # Avoid filling the unified file cache with a second target.
             fcntl.fcntl(fd, 48, 1)  # F_NOCACHE
@@ -159,13 +185,29 @@ def verify_asset(path: Path, expected: dict) -> dict:
         opened = os.fstat(fd)
         if (opened.st_dev, opened.st_ino) != (before["device"], before["inode"]):
             raise ValueError("Asset changed while opening")
+        if identity(path) != before:
+            raise ValueError("Asset changed during verification")
+        if digest.hexdigest() != expected["sha256"]:
+            raise ValueError(f"Checksum mismatch: {path.name}")
+        if is_derived_pack:
+            if opened.st_mode & 0o222:
+                os.fchmod(fd, 0o444)
+            sealed = os.fstat(fd)
+            if (sealed.st_mode & 0o222) != 0 or sealed.st_nlink != 1:
+                raise ValueError(
+                    "Derived pack asset must be read-only with a single link"
+                )
     finally:
         os.close(fd)
-    if identity(path) != before:
+    recorded = identity(path) if is_derived_pack else before
+    if is_derived_pack and any(
+        recorded[k] != before[k] for k in ("device", "inode", "size", "mtime_ns")
+    ):
         raise ValueError("Asset changed during verification")
-    if digest.hexdigest() != expected["sha256"]:
-        raise ValueError(f"Checksum mismatch: {path.name}")
-    return {"path": str(path), "sha256": digest.hexdigest(), **before}
+    out = {"path": str(path), "sha256": digest.hexdigest(), **recorded}
+    if role is not None:
+        out["role"] = role
+    return out
 
 
 def check_adoption(data: dict) -> None:
@@ -174,20 +216,33 @@ def check_adoption(data: dict) -> None:
     expected = read_json(ROOT / "profiles/flash-next-assets.json")
     for group in ("target", "draft"):
         assets = data[group]["assets"]
-        candidate_specs = [expected[group]["files"]]
-        if group == "draft" and "legacy_dflash2_draft" in expected:
-            candidate_specs.append(expected["legacy_dflash2_draft"]["files"])
+        same_len = [
+            spec_files
+            for spec_files in candidate_file_specs(
+                expected, group, include_legacy_draft=True
+            )
+            if len(assets) == len(spec_files)
+        ]
+        if not same_len:
+            raise ValueError("Incomplete adopted asset set")
         matched_spec = None
-        for spec_files in candidate_specs:
-            if len(assets) == len(spec_files):
+        for spec_files in same_len:
+            if all(
+                asset["sha256"] == spec["sha256"]
+                and _optional_role(asset) == _optional_role(spec)
+                for asset, spec in zip(assets, spec_files, strict=True)
+            ):
                 matched_spec = spec_files
                 break
         if matched_spec is None:
-            raise ValueError("Incomplete adopted asset set")
+            raise ValueError("Asset manifest differs from the pinned profile")
         for asset, spec in zip(assets, matched_spec, strict=True):
-            if asset["sha256"] != spec["sha256"]:
-                raise ValueError("Asset manifest differs from the pinned profile")
-            actual = identity(Path(asset["path"]))
+            asset_path = Path(asset["path"])
+            actual = identity(asset_path)
+            if _optional_role(spec) == "derived_pack":
+                st = os.stat(asset_path, follow_symlinks=False)
+                if (st.st_mode & 0o222) != 0 or st.st_nlink != 1:
+                    raise ValueError(f"Asset changed; re-adopt: {spec['name']}")
             device = asset["device"]
             if type(device) is not int or not 0 <= device <= 0x7FFFFFFF:
                 raise ValueError("invalid recorded asset device")
@@ -207,7 +262,7 @@ def check_adoption(data: dict) -> None:
             ):
                 raise ValueError(f"Asset changed; re-adopt: {spec['name']}")
             selected = Path(data[group]["directory"]) / spec["name"]
-            if selected.resolve(strict=True) != Path(asset["path"]):
+            if selected.resolve(strict=True) != asset_path:
                 raise ValueError("Selected asset link changed; re-adopt")
 
 

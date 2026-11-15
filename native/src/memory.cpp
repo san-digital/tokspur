@@ -3,6 +3,9 @@
 #include "tokspur/numeric.hpp"
 
 #include <algorithm>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #include <atomic>
 #include <bit>
 #include <cerrno>
@@ -207,12 +210,14 @@ NocacheTensorFile::~NocacheTensorFile() {
 }
 NocacheTensorFile::NocacheTensorFile(NocacheTensorFile&& other) noexcept
     : fd_(std::exchange(other.fd_, -1)),
+      ram_resident_(std::exchange(other.ram_resident_, false)),
       file_offset_(std::exchange(other.file_offset_, 0)),
       byte_length_(std::exchange(other.byte_length_, 0)) {}
 NocacheTensorFile& NocacheTensorFile::operator=(NocacheTensorFile&& other) noexcept {
     if (this != &other) {
         if (fd_ >= 0) ::close(fd_);
         fd_ = std::exchange(other.fd_, -1);
+        ram_resident_ = std::exchange(other.ram_resident_, false);
         file_offset_ = std::exchange(other.file_offset_, 0);
         byte_length_ = std::exchange(other.byte_length_, 0);
     }
@@ -306,7 +311,7 @@ void dequantize_rows_sorted_dedup(std::span<const std::byte> source, uint32_t en
             }
             return;
         }
-        if (source.size() >= (16ull << 20)) {
+        if (!pread_source.ram_resident && source.size() >= (16ull << 20)) {
             constexpr uint64_t merge_gap = 65536, max_window = 4ull << 20;
             bool active = false;
             uint64_t win_lo = 0, win_hi = 0;
@@ -473,8 +478,22 @@ bool EmbeddingRows::try_copy(uint64_t row, std::span<float> destination) {
 void EmbeddingRows::insert_decoded(uint64_t row, std::span<const float> decoded, bool count_miss) {
     if (thread_ != std::this_thread::get_id()) throw FormatError("embedding cache used from another host thread");
     if (row >= logical_rows_ || decoded.size() != width_) throw FormatError("invalid decoded embedding row");
-    for (const float v : decoded) {
-        if (!std::isfinite(v)) throw FormatError("nonfinite decoded embedding row");
+    size_t idx = 0;
+#if defined(__aarch64__)
+    const uint32x4_t exp_mask = vdupq_n_u32(0x7f800000u);
+    uint32x4_t bad = vdupq_n_u32(0u);
+    for (; idx + 16 <= decoded.size(); idx += 16) {
+        const float* fp = decoded.data() + idx;
+        const uint32x4_t c0 = vceqq_u32(vandq_u32(vreinterpretq_u32_f32(vld1q_f32(fp)), exp_mask), exp_mask);
+        const uint32x4_t c1 = vceqq_u32(vandq_u32(vreinterpretq_u32_f32(vld1q_f32(fp + 4)), exp_mask), exp_mask);
+        const uint32x4_t c2 = vceqq_u32(vandq_u32(vreinterpretq_u32_f32(vld1q_f32(fp + 8)), exp_mask), exp_mask);
+        const uint32x4_t c3 = vceqq_u32(vandq_u32(vreinterpretq_u32_f32(vld1q_f32(fp + 12)), exp_mask), exp_mask);
+        bad = vorrq_u32(bad, vorrq_u32(vorrq_u32(c0, c1), vorrq_u32(c2, c3)));
+    }
+    if (vmaxvq_u32(bad) != 0u) throw FormatError("nonfinite decoded embedding row");
+#endif
+    for (; idx < decoded.size(); ++idx) {
+        if (!std::isfinite(decoded[idx])) throw FormatError("nonfinite decoded embedding row");
     }
     if (!capacity_) { if (count_miss) ++stats_.misses; return; }
     auto at = find(row);
@@ -546,7 +565,7 @@ void EmbeddingRows::gather(std::span<const uint64_t> ids, std::span<float> out) 
         return;
     }
 
-    if (!pread_source_.valid()) {
+    if (!pread_source_.valid() && !pread_source_.ram_resident) {
         for (size_t m = 0; m < miss_count; ++m) {
             const uint64_t lo = unique_misses[m] * row_bytes_;
             advise_willneed_bounded(source_, lo, lo + row_bytes_);
@@ -710,7 +729,7 @@ void EmbeddingRows::gather_chunk_dedup(std::span<const uint64_t> ids, std::span<
     std::sort(scratch.pairs.begin(), scratch.pairs.end(), [](const auto& a, const auto& b) {
         return a.first != b.first ? a.first < b.first : a.second < b.second;
     });
-    if (!pread_source_.valid() && source_.size() >= (16ull << 20)) {
+    if (!pread_source_.valid() && !pread_source_.ram_resident && source_.size() >= (16ull << 20)) {
         constexpr uint64_t merge_gap = 65536, max_window = 4ull << 20;
         bool active = false;
         uint64_t win_lo = 0, win_hi = 0;

@@ -19,6 +19,7 @@ import pytest
         "CACHE_PRESSURE_RECLAIM",
         "MEMORY_PLAN_REPORT",
         "SHARED_PREFIX_EVICTION_COUNTERS",
+        "DFLASH2_TAP_DUMP",
     ],
 )
 def test_shared_objects_rebuild_on_a_b_a_policy_switch(tmp_path, control):

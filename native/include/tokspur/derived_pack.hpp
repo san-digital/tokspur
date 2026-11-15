@@ -20,7 +20,7 @@ inline constexpr uint32_t pack_version = 2;
 inline constexpr const char* pack_recipe = "tokspur-pack-v2";
 inline constexpr const char* pack_architecture = "tokspur_pack";
 inline constexpr const char* source_architecture = "qwen4exp";
-inline constexpr const char* target_revision = "766911a6b7369840a91dbcd95f9f997acaab6cd6";
+inline constexpr const char* target_revision = "34567a4712bc9766c4449e2e98e4468bfa24d915";
 inline constexpr const char* mtp_sidecar_sha256 = "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6";
 inline constexpr size_t expected_gpu_tensors = 1254;
 

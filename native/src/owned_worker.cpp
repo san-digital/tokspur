@@ -1,5 +1,6 @@
 #include "tokspur/owned_worker.hpp"
 #include "tokspur/raw_decode_wire.hpp"
+#include "tokspur/speculative_controls.hpp"
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
 #include "tokspur/mtp_wire.hpp"
 #endif
@@ -35,7 +36,7 @@
 namespace tokspur {
 namespace {
 using Clock = std::chrono::steady_clock;
-constexpr size_t line_limit = 1024 * 1024, stderr_limit = 64 * 1024;
+constexpr size_t line_limit = 1024 * 1024, extended_line_limit = 4 * line_limit, stderr_limit = 64 * 1024;
 constexpr int poll_slice_ms = 25;
 enum : int { armed_notice = 1, launched_notice = 2, exit_notice = 3, failure_notice = 4 };
 struct Notice { int kind, value; };
@@ -89,16 +90,21 @@ void nonblocking(int fd) { const auto flags = fcntl(fd, F_GETFL); require(flags 
 // Everything below in the forked guardian/exec child uses precomputed data and
 // fixed-size storage, no C++ allocation, locks, streams, Foundation or callbacks.
 // Thus a multithreaded HTTP parent does not run heap/Objective-C work after fork.
-bool child_notice(int fd, int kind, int value) noexcept {
+#if defined(__clang__) || defined(__GNUC__)
+#define TOKSPUR_POST_FORK_NO_SANITIZE __attribute__((no_sanitize("address", "undefined")))
+#else
+#define TOKSPUR_POST_FORK_NO_SANITIZE
+#endif
+TOKSPUR_POST_FORK_NO_SANITIZE bool child_notice(int fd, int kind, int value) noexcept {
     const Notice n{kind, value}; const char* bytes = reinterpret_cast<const char*>(&n); size_t sent = 0;
     while (sent < sizeof(n)) { const auto count = write(fd, bytes + sent, sizeof(n) - sent); if (count > 0) sent += size_t(count); else if (count < 0 && errno == EINTR) continue; else return false; }
     return true;
 }
-bool child_byte(int fd, char expected) noexcept {
+TOKSPUR_POST_FORK_NO_SANITIZE bool child_byte(int fd, char expected) noexcept {
     char byte = 0; ssize_t n; do { n = read(fd, &byte, 1); } while (n < 0 && errno == EINTR);
     return n == 1 && byte == expected;
 }
-void child_close_except(int ceiling, const int* kept, size_t count) noexcept {
+TOKSPUR_POST_FORK_NO_SANITIZE void child_close_except(int ceiling, const int* kept, size_t count) noexcept {
 #ifdef __APPLE__
     static_cast<void>(ceiling);
     proc_fdinfo descriptors[256];
@@ -112,7 +118,7 @@ void child_close_except(int ceiling, const int* kept, size_t count) noexcept {
             bool keep = false; for (size_t i = 0; i < count; ++i) if (descriptors[n].proc_fd == kept[i]) keep = true;
             if (!keep) { close(descriptors[n].proc_fd); ++closed; }
         }
-        if (entries < std::size(descriptors)) return;
+        if (entries < sizeof(descriptors) / sizeof(*descriptors)) return;
         if (!closed) _exit(119);
     }
 #else
@@ -123,16 +129,16 @@ void child_close_except(int ceiling, const int* kept, size_t count) noexcept {
 #endif
 }
 
-bool exited_without_reaping(pid_t pid) noexcept {
+TOKSPUR_POST_FORK_NO_SANITIZE bool exited_without_reaping(pid_t pid) noexcept {
     siginfo_t info{};
     return waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT) == 0 && info.si_pid == pid;
 }
-int reap_child(pid_t pid) noexcept {
+TOKSPUR_POST_FORK_NO_SANITIZE int reap_child(pid_t pid) noexcept {
     int status = 0; pid_t result;
     do { result = waitpid(pid, &status, 0); } while (result < 0 && errno == EINTR);
     return result == pid ? status : -1;
 }
-[[noreturn]] void guardian(Channels c, int ceiling, pid_t parent, char* const* argv, char* const* environment) noexcept {
+[[noreturn]] TOKSPUR_POST_FORK_NO_SANITIZE void guardian(Channels c, int ceiling, pid_t parent, char* const* argv, char* const* environment) noexcept {
     struct sigaction action{}; sigemptyset(&action.sa_mask); action.sa_handler = SIG_IGN;
     sigaction(SIGPIPE, &action, nullptr); action.sa_handler = SIG_DFL; sigaction(SIGCHLD, &action, nullptr);
     const int keep[]{c.control[1], c.status[1], c.input[1], c.output[1], c.error[1], c.gate[0], c.gate[1]};
@@ -334,6 +340,7 @@ struct OwnedWorker::Impl {
     mutable std::mutex mutex;
     explicit Impl(OwnedWorkerOptions value) : options(std::move(value)) {}
     ~Impl() { try { shutdown(); } catch (...) {} drop_channels(channels); }
+    size_t max_line_bytes() const { return options.context_length > 65536 ? extended_line_limit : line_limit; }
     void broker_storage(const Json& value) const {
         require(worker_integer(value, "checkpoint_slots") == options.checkpoint_slots &&
             worker_integer(value, "checkpoint_combined_budget_bytes") == options.checkpoint_budget_bytes,
@@ -355,6 +362,7 @@ struct OwnedWorker::Impl {
     }
     void start() {
         require(options.stack_execution == "direct" || options.stack_execution == "recurrent-replay", "unsupported owned startup execution mode");
+        require(options.context_length == 65536 || options.context_length == 131072, "unsupported owned worker context length");
 #ifdef TOKSPUR_PRIVATE_RAW_DECODE
 #ifdef TOKSPUR_PRIVATE_HTTP_MTP_CONCURRENT
         require(!options.raw_decode.has_value() || owned_concurrent_transport(options), "raw routed decode HTTP requires the current fixed MTP transport");
@@ -466,6 +474,11 @@ struct OwnedWorker::Impl {
         require(options.drafter != std::optional<std::string>("mtp") || options.dflash2_dir.empty(), "mtp drafter refuses --dflash2-dir");
         require(!options.dflash2_precision || (!options.dflash2_dir.empty() && (*options.dflash2_precision == "q8_0" || *options.dflash2_precision == "bf16")),
             "dflash2 precision requires --dflash2-dir and q8_0 or bf16");
+        if (options.dflash2_vocab_gather) {
+            require(!options.dflash2_dir.empty() && !options.dflash2_vocab_slice.has_value(),
+                "dflash2 vocab gather requires --dflash2-dir and replaces --dflash2-vocab-slice");
+            admit_dflash2_vocab_gather(*options.dflash2_vocab_gather, 248320);
+        }
         const bool has_spec = !options.mtp_sidecar.empty() || !options.dflash2_dir.empty();
         require(!has_spec || (scalar_transport && !options.sampled_prefill),
             "native MTP requires its distinct fixed scalar-channel startup consent");
@@ -515,7 +528,7 @@ struct OwnedWorker::Impl {
         require(options.executable.filename() == "tokspur-native" && access(options.executable.c_str(), X_OK) == 0, "only an explicit owned tokspur-native executable is admitted");
 #endif
         options.policy = fixed_file(options.policy); options.library = fixed_file(options.library);
-        require(options.shards.size() == 4, "owned target requires four fixed shards");
+        require(options.shards.size() == 4 || (options.shards.size() == 1 && !options.derived_pack.empty()), "owned target requires four fixed shards");
         std::set<std::filesystem::path> distinct;
         for (auto& shard : options.shards) { shard = fixed_file(shard); require(distinct.emplace(shard).second, "owned target shard paths must be distinct"); }
         for (const auto timeout : {options.startup_timeout, options.step_timeout, options.drain_timeout})
@@ -550,11 +563,13 @@ struct OwnedWorker::Impl {
                 if (options.dflash2_precision) words.insert(words.end(), {"--dflash2-precision", *options.dflash2_precision});
                 if (options.dflash2_max_drafts) words.insert(words.end(), {"--dflash2-max-drafts", std::to_string(*options.dflash2_max_drafts)});
                 if (options.dflash2_vocab_slice) words.insert(words.end(), {"--dflash2-vocab-slice", std::to_string(*options.dflash2_vocab_slice)});
+                if (options.dflash2_vocab_gather) words.insert(words.end(), {"--dflash2-vocab-gather", *options.dflash2_vocab_gather});
             } else {
                 words.insert(words.end(), {"--mtp-sidecar", options.mtp_sidecar.string(), "--mtp-lookahead-anchor", "on"});
             }
             if (options.logit_topk.has_value()) words.insert(words.end(), {"--native-logit-topk", *options.logit_topk ? "on" : "off"});
             if (options.ple_async_gather.has_value()) words.insert(words.end(), {"--native-ple-async-gather", *options.ple_async_gather ? "on" : "off"});
+            if (options.ple_ram_resident.has_value()) words.insert(words.end(), {"--native-ple-ram-resident", *options.ple_ram_resident ? "on" : "off"});
             if (options.mtp_fast_round.has_value()) words.insert(words.end(), {"--native-mtp-fast-round", *options.mtp_fast_round ? "on" : "off"});
         }
 #ifdef TOKSPUR_PRIVATE_RAW_DECODE
@@ -649,6 +664,12 @@ struct OwnedWorker::Impl {
         if (options.mtp_lookup_match.has_value()) {
             words.insert(words.end(), {"--mtp-lookup-match", std::to_string(*options.mtp_lookup_match)});
         }
+        if (options.dflash2_lookup.has_value()) {
+            words.insert(words.end(), {"--dflash2-lookup", *options.dflash2_lookup});
+        }
+        if (options.dflash2_lookup_match.has_value()) {
+            words.insert(words.end(), {"--dflash2-lookup-match", std::to_string(*options.dflash2_lookup_match)});
+        }
         if (options.prefill_m64.has_value()) {
             words.insert(words.end(), {"--prefill-m64", *options.prefill_m64});
         }
@@ -679,6 +700,9 @@ struct OwnedWorker::Impl {
 #if defined(TOKSPUR_PRIVATE_Q8_THREE_ROWS) && defined(TOKSPUR_PRIVATE_NATIVE_MTP)
         if(options.q8_three_rows.has_value())words.insert(words.end(),{"--q8-three-rows",*options.q8_three_rows?"on":"off"});
 #endif
+        if (options.context_length != 65536) {
+            words.insert(words.end(), {"--context-length", std::to_string(options.context_length)});
+        }
         for (const auto& shard : options.shards) words.push_back(shard.string());
         std::vector<char*> arguments; for (auto& word : words) arguments.push_back(word.data()); arguments.push_back(nullptr);
         // No loader/preload, Python, remote-model or runtime-selection variables.
@@ -698,6 +722,11 @@ struct OwnedWorker::Impl {
         send_control('E', deadline);
         ready_value = next(deadline);
         require(ready_value.kind() == Json::Kind::object && event_is(ready_value, "ready"), "owned target did not emit a single ready event");
+        if (options.context_length != 65536) {
+            require(worker_integer(ready_value, "context_length") == options.context_length, "owned worker context length readiness differs");
+        } else if (const auto* ctx = ready_value.find("context_length")) {
+            require(ctx->unsigned_integer() == 65536, "owned worker context length readiness differs");
+        }
 #ifdef TOKSPUR_PRIVATE_RAW_DECODE
         validate_raw_decode_ready(ready_value, options.raw_decode);
 #else
@@ -793,6 +822,13 @@ struct OwnedWorker::Impl {
                 if (options.dflash2_vocab_slice)
                     require(worker_integer(ready_value, "native_dflash2_vocab_slice") == *options.dflash2_vocab_slice,
                         "owned DFlash2 vocab slice readiness differs");
+                if (options.dflash2_vocab_gather) {
+                    require(worker_field(ready_value, "native_dflash2_vocab_gather").string() == *options.dflash2_vocab_gather,
+                        "owned DFlash2 vocab gather readiness differs");
+                    const auto gather_rows = worker_integer(ready_value, "native_dflash2_vocab_gather_rows");
+                    require(gather_rows >= 256 && gather_rows < 248320 && gather_rows % 32 == 0,
+                        "owned DFlash2 vocab gather row count invalid");
+                }
                 if (options.prepared_validation) require(worker_field(ready_value, "native_prepared_validation").boolean(), "prepared validation startup differs");
                 if (options.verify_cost_profile) require(worker_field(ready_value, "native_measured_controller").boolean() && worker_integer(ready_value, "native_measured_timing_schema") == 1 && worker_field(ready_value, "native_controller_policy_digest").array().size() == 32, "measured controller startup differs");
                 if (options.dflash2_draft_policy == "auto") require(worker_field(ready_value, "native_dflash2_draft_policy").string() == "auto", "drafting policy startup differs");
@@ -805,6 +841,9 @@ struct OwnedWorker::Impl {
                 if (options.ple_async_gather.has_value())
                     require(worker_field(ready_value, "native_ple_async_gather").boolean() == *options.ple_async_gather,
                         "owned PLE async gather readiness differs");
+                if (options.ple_ram_resident.has_value())
+                    require(worker_field(ready_value, "native_ple_ram_resident").boolean() == *options.ple_ram_resident,
+                        "owned PLE RAM residency readiness differs");
                 if (options.mtp_fast_round.has_value())
                     require(worker_field(ready_value, "native_mtp_fast_round").boolean() == *options.mtp_fast_round,
                         "owned MTP fast round readiness differs");
@@ -858,8 +897,9 @@ struct OwnedWorker::Impl {
             if (n < 0) { if (errno == EINTR) continue; if (errno == EAGAIN || errno == EWOULDBLOCK) break; throw WorkerError("owned worker pipe read failed"); }
             if (standard_output && !discard) {
                 pending.append(data.data(), size_t(n));
+                const auto max_line = max_line_bytes();
                 const auto newline = pending.find('\n');
-                require((newline == std::string::npos ? pending.size() : newline) <= line_limit && pending.size() <= line_limit + 65536,
+                require((newline == std::string::npos ? pending.size() : newline) <= max_line && pending.size() <= max_line + 65536,
                     "owned worker output framing limit exceeded");
             } else if (!standard_output) stderr_bytes = std::min(stderr_limit, stderr_bytes + size_t(n));
         }
@@ -890,9 +930,10 @@ struct OwnedWorker::Impl {
             require(Clock::now() < deadline, "owned worker response deadline expired");
             const auto newline = pending.find('\n');
             if (newline != std::string::npos) {
-                require(newline && newline <= line_limit, "owned worker emitted an empty/oversized line");
+                const auto max_line = max_line_bytes();
+                require(newline && newline <= max_line, "owned worker emitted an empty/oversized line");
                 const auto line = pending.substr(0, newline); pending.erase(0, newline + 1);
-                try { return parse_json(line, {line_limit, 300000, 12}); }
+                try { return parse_json(line, {max_line, 300000, 12}); }
                 catch (...) { throw WorkerError("owned worker emitted malformed JSON"); }
             }
             require(!out_eof && !worker_exited && !status_eof, "owned worker ended before a complete response");
@@ -1000,7 +1041,7 @@ Json OwnedWorker::request_locked(const Json& body, WorkerDeadline deadline, cons
             if (begin) {
                 worker_keys(body, {"op", "prompt_ids", "generation_requested", "allow_restore", "sampling", "seed"});
                 const auto& prompt = worker_field(body, "prompt_ids").array();
-                require(!prompt.empty() && prompt.size() <= 65536, "owned broker future prompt bound");
+                require(!prompt.empty() && prompt.size() <= p.options.context_length, "owned broker future prompt bound");
                 for (const auto& token : prompt) require(token.unsigned_integer() < 248320, "owned broker future token bound");
                 static_cast<void>(worker_field(body, "generation_requested").boolean());
                 allow_restore = worker_field(body, "allow_restore").boolean();
@@ -1120,7 +1161,7 @@ Json OwnedWorker::request_locked(const Json& body, WorkerDeadline deadline, cons
         }
 #endif
     }
-    const auto bytes = wire.dump(line_limit - 1) + '\n';
+    const auto bytes = wire.dump(p.max_line_bytes() - 1) + '\n';
     bool cancellation = false, timed_out = false, consumer_failure = false; auto drain_deadline = deadline;
     try {
         p.idle_check(); size_t sent = 0;
@@ -1214,7 +1255,7 @@ Json OwnedWorker::request_locked(const Json& body, WorkerDeadline deadline, cons
                 if (p.broker_epoch) {
                     p.broker_identity(value, command, lease); p.broker_storage(value);
                     const auto position = worker_integer(value, "committed_prefix");
-                    require(position <= 65536 && worker_integer(value, "checkpoint_retained") <= p.options.checkpoint_slots,
+                    require(position <= p.options.context_length && worker_integer(value, "checkpoint_retained") <= p.options.checkpoint_slots,
                         "owned broker prefix/retention bound");
                     const auto& generated = worker_field(value, "generated_ids").array();
                     if (control) {

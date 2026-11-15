@@ -318,6 +318,14 @@ static int pack_command(int argc, char **argv) {
 int main(int argc, char **argv) {
     if (argc > 1 && (!strcmp(argv[1], "pack-v3-plan") || !strcmp(argv[1], "pack-v3-build")))
         return pack_command(argc, argv);
+    const char *argv_out = getenv("FAKE_SERVER_ARGV_FILE");
+    if (argv_out && argv_out[0]) {
+        FILE *af = fopen(argv_out, "w");
+        if (af) {
+            for (int i = 0; i < argc; ++i) fprintf(af, "%s\n", argv[i]);
+            fclose(af);
+        }
+    }
     const char *mode = getenv("FAKE_SERVER_MODE");
     if (!mode) {
         mode = "sleep_sigterm";
@@ -2218,4 +2226,246 @@ fn staged_layout_invoked_from_unrelated_working_directory() {
     kill(srv.id() as i32, SIGTERM).unwrap();
     assert_eq!(srv.wait().unwrap().code(), Some(0));
     wait_until_pid_gone(srv_pid, Duration::from_secs(2));
+}
+
+#[test]
+fn pack_only_variant_adoption_seals_pack_and_refuses_raw_gguf_and_repack() {
+    let _serial = SERVE_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut fixture = SyntheticCheckout::create("pack-only-variant");
+
+    let pack_stage = fixture._tmp.path().join("weights/pack-stage");
+    let alt4_stage = fixture._tmp.path().join("weights/alt4-stage");
+    fs::create_dir_all(&pack_stage).unwrap();
+    fs::create_dir_all(&alt4_stage).unwrap();
+
+    let base_gguf = pack_stage.join("Qwen3.8-Flash-Next-base.gguf");
+    let pack_gguf = pack_stage.join("Qwen3.8-Flash-Next-Q4_K.tokspur.gguf");
+    write_mode(&base_gguf, b"synthetic-cpu-base-gguf\n", 0o644);
+    write_mode(&pack_gguf, b"synthetic-prebuilt-pack-v3\n", 0o644);
+
+    let mut alt4_files = Vec::new();
+    for i in 1..=4 {
+        let name = format!("Qwen3.8-Flash-Next-Q4_K-0000{i}-of-00004.gguf");
+        let content = format!("synthetic-own-shard-{i}\n");
+        write_mode(&alt4_stage.join(&name), content.as_bytes(), 0o644);
+        alt4_files.push(Json::new_object([
+            ("name", Json::from(name)),
+            ("size", Json::integer(content.len() as u64)),
+            ("sha256", Json::from(sha256_bytes(content.as_bytes()))),
+        ]));
+    }
+
+    let pack_files = vec![
+        Json::new_object([
+            ("name", Json::from("Qwen3.8-Flash-Next-base.gguf")),
+            (
+                "size",
+                Json::integer(b"synthetic-cpu-base-gguf\n".len() as u64),
+            ),
+            (
+                "sha256",
+                Json::from(sha256_bytes(b"synthetic-cpu-base-gguf\n")),
+            ),
+        ]),
+        Json::new_object([
+            ("name", Json::from("Qwen3.8-Flash-Next-Q4_K.tokspur.gguf")),
+            (
+                "size",
+                Json::integer(b"synthetic-prebuilt-pack-v3\n".len() as u64),
+            ),
+            (
+                "sha256",
+                Json::from(sha256_bytes(b"synthetic-prebuilt-pack-v3\n")),
+            ),
+            ("role", Json::from("derived_pack")),
+        ]),
+    ];
+
+    let assets_path = fixture.root.join("profiles/flash-next-assets.json");
+    let mut assets_json = parse_json(&fs::read(&assets_path).unwrap()).unwrap();
+    {
+        let Json::Object(root_obj) = &mut assets_json else {
+            panic!("assets root object");
+        };
+        let Json::Object(target_obj) =
+            &mut root_obj.iter_mut().find(|(k, _)| k == b"target").unwrap().1
+        else {
+            panic!("target object");
+        };
+        target_obj.push((
+            b"variants".to_vec(),
+            Json::Array(vec![
+                Json::new_object([("files", Json::Array(alt4_files))]),
+                Json::new_object([("files", Json::Array(pack_files))]),
+            ]),
+        ));
+    }
+    write_mode(&assets_path, &dump_json(&assets_json), 0o644);
+    fixture.refresh_build_manifest();
+
+    // Alternative 4-file variant adopts and verifies without colliding with the primary 4-file variant.
+    let alt_adopt = Command::new(fixture.cli_bin())
+        .args(["adopt", "--target"])
+        .arg(&alt4_stage)
+        .arg("--draft")
+        .arg(&fixture.draft_dir)
+        .output()
+        .unwrap();
+    assert!(
+        alt_adopt.status.success(),
+        "alt4 adopt stderr={}",
+        String::from_utf8_lossy(&alt_adopt.stderr)
+    );
+    assert!(
+        Command::new(fixture.cli_bin())
+            .args(["adopt", "--check-only"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // Hard-linked derived pack is refused before sealing.
+    let hard_link = fixture._tmp.path().join("extra-pack.link");
+    fs::hard_link(&pack_gguf, &hard_link).unwrap();
+    let link_refused = Command::new(fixture.cli_bin())
+        .args(["adopt", "--target"])
+        .arg(&pack_stage)
+        .arg("--draft")
+        .arg(&fixture.draft_dir)
+        .output()
+        .unwrap();
+    assert!(!link_refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&link_refused.stderr).contains("hard links"),
+        "stderr={}",
+        String::from_utf8_lossy(&link_refused.stderr)
+    );
+    fs::remove_file(&hard_link).unwrap();
+
+    // Pack-only variant adopts, seals 0444 in place, and passes --check-only.
+    let pack_adopt = Command::new(fixture.cli_bin())
+        .args(["adopt", "--target"])
+        .arg(&pack_stage)
+        .arg("--draft")
+        .arg(&fixture.draft_dir)
+        .output()
+        .unwrap();
+    assert!(
+        pack_adopt.status.success(),
+        "pack adopt stderr={}",
+        String::from_utf8_lossy(&pack_adopt.stderr)
+    );
+    assert_eq!(
+        fs::metadata(&pack_gguf).unwrap().permissions().mode() & 0o777,
+        0o444
+    );
+    assert!(
+        Command::new(fixture.cli_bin())
+            .args(["adopt", "--check-only"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // Making the derived pack writable after adoption fails check-only.
+    fs::set_permissions(&pack_gguf, fs::Permissions::from_mode(0o644)).unwrap();
+    let unsealed_check = Command::new(fixture.cli_bin())
+        .args(["adopt", "--check-only"])
+        .output()
+        .unwrap();
+    assert!(!unsealed_check.status.success());
+    fs::set_permissions(&pack_gguf, fs::Permissions::from_mode(0o444)).unwrap();
+    // Re-adopt so ctime_ns matches the re-sealed inode.
+    assert!(
+        Command::new(fixture.cli_bin())
+            .args(["adopt", "--target"])
+            .arg(&pack_stage)
+            .arg("--draft")
+            .arg(&fixture.draft_dir)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // `tokspur pack plan` refuses when the adopted target already uses a pre-built derived pack.
+    let repack_refused = Command::new(fixture.cli_bin())
+        .args(["pack", "plan", "--format", "v3"])
+        .output()
+        .unwrap();
+    assert!(!repack_refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&repack_refused.stderr)
+            .contains("already uses a pre-built derived pack"),
+        "stderr={}",
+        String::from_utf8_lossy(&repack_refused.stderr)
+    );
+
+    let port = free_loopback_port();
+    assert!(
+        Command::new(fixture.cli_bin())
+            .args(["configure", "--port", &port.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // `tokspur serve --raw-gguf` refuses when the adopted target requires pack-backed serving.
+    let raw_refused = Command::new(fixture.cli_bin())
+        .args(["serve", "--raw-gguf"])
+        .output()
+        .unwrap();
+    assert!(!raw_refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&raw_refused.stderr)
+            .contains("--raw-gguf is unavailable for pack-only adopted weights"),
+        "stderr={}",
+        String::from_utf8_lossy(&raw_refused.stderr)
+    );
+
+    // `tokspur serve` passes `--derived-pack <pack_gguf>` and single `<base_gguf>` positional shard.
+    let pid_file = fixture._tmp.path().join("pack-srv.pid");
+    let argv_file = fixture._tmp.path().join("pack-srv.argv");
+    let serve_ok = output_serve_retrying_transient_workers(
+        || {
+            let mut cmd = Command::new(fixture.cli_bin());
+            cmd.args(["serve", "--drain-timeouts-ms", "300,300,300,300"])
+                .env("FAKE_SERVER_MODE", "exit_code")
+                .env("FAKE_EXIT_CODE", "0")
+                .env("FAKE_SERVER_PID_FILE", &pid_file)
+                .env("FAKE_SERVER_ARGV_FILE", &argv_file);
+            cmd
+        },
+        Duration::from_secs(15),
+    );
+    assert_eq!(
+        serve_ok.status.code(),
+        Some(0),
+        "pack-only serve failed: {}",
+        String::from_utf8_lossy(&serve_ok.stderr)
+    );
+    let argv_lines: Vec<String> = fs::read_to_string(&argv_file)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        argv_lines
+            .windows(2)
+            .any(|w| { w[0] == "--derived-pack" && Path::new(&w[1]) == pack_gguf }),
+        "missing --derived-pack in server argv: {argv_lines:?}"
+    );
+    assert!(
+        argv_lines.iter().any(|a| Path::new(a) == base_gguf),
+        "missing base.gguf in server argv: {argv_lines:?}"
+    );
+    assert_eq!(
+        argv_lines
+            .iter()
+            .filter(|a| Path::new(a.as_str()) == pack_gguf)
+            .count(),
+        1,
+        "pack_gguf must only appear once (after --derived-pack), not as a positional shard: {argv_lines:?}"
+    );
 }

@@ -141,7 +141,7 @@ if (mtp && (mtp_depth == 2 || mtp_depth == 3)) {
                 }
                 cache.gather(batch_ple_rows, std::span(mtp_candidate_memory).first(4 * 2560));
             }
-            selector_storage.emplace(TargetMtpSelection2{base, anchor, first, &*second, &*third, sampler.options().policy, job.stops, {}, {}});
+            selector_storage.emplace(TargetMtpSelection2{base, anchor, first, &*second, &*third, sampler.options().policy, job.stops, {}, {}, shape.attention.capacity});
             verified = stack.verify_sampled_depth3(candidates,
                 std::span(mtp_candidate_rows).first(4 * 2560),
                 std::span(mtp_candidate_memory).first(4 * 2560),
@@ -166,7 +166,7 @@ if (mtp && (mtp_depth == 2 || mtp_depth == 3)) {
                 }
                 cache.gather(batch_ple_rows, std::span(mtp_candidate_memory).first(3 * 2560));
             }
-            selector_storage.emplace(TargetMtpSelection2{base, anchor, first, &*second, nullptr, sampler.options().policy, job.stops, {}, {}});
+            selector_storage.emplace(TargetMtpSelection2{base, anchor, first, &*second, nullptr, sampler.options().policy, job.stops, {}, {}, shape.attention.capacity});
             verified = stack.verify_sampled_depth2(candidates,
                 std::span(mtp_candidate_rows).first(3 * 2560),
                 std::span(mtp_candidate_memory).first(3 * 2560),
@@ -191,7 +191,7 @@ if (mtp && (mtp_depth == 2 || mtp_depth == 3)) {
                 }
                 cache.gather(batch_ple_rows, std::span(mtp_candidate_memory).first(2 * 2560));
             }
-            selector_storage.emplace(TargetMtpSelection2{base, anchor, first, nullptr, nullptr, sampler.options().policy, job.stops, {}, {}});
+            selector_storage.emplace(TargetMtpSelection2{base, anchor, first, nullptr, nullptr, sampler.options().policy, job.stops, {}, {}, shape.attention.capacity});
             verified = stack.verify_sampled2(std::span(candidates),
                 std::span(mtp_candidate_rows).first(2 * 2560),
                 std::span(mtp_candidate_memory).first(2 * 2560),
@@ -453,7 +453,7 @@ if (mtp && (mtp_depth == 2 || mtp_depth == 3)) {
                     }
                     cache.gather(batch_ple_rows, std::span(mtp_candidate_memory).first(4 * 2560));
                 }
-                selector_storage.emplace(TargetMtpSelection2{base, anchor, first, &*second, &*third, sampler.options().policy, job.stops, {}, {}});
+                selector_storage.emplace(TargetMtpSelection2{base, anchor, first, &*second, &*third, sampler.options().policy, job.stops, {}, {}, shape.attention.capacity});
                 const auto verified = stack.verify_sampled_depth3(candidates,
                     std::span(mtp_candidate_rows).first(4 * 2560),
                     std::span(mtp_candidate_memory).first(4 * 2560),
@@ -557,7 +557,7 @@ if (mtp && (mtp_depth == 2 || mtp_depth == 3)) {
                         cache.gather(staged[t].rows, std::span(mtp_candidate_memory).subspan(uint64_t(t) * 2560, 2560));
                     }
                 }
-                selector_storage.emplace(TargetMtpSelection2{base, anchor, first, &*second, nullptr, sampler.options().policy, job.stops, {}, {}});
+                selector_storage.emplace(TargetMtpSelection2{base, anchor, first, &*second, nullptr, sampler.options().policy, job.stops, {}, {}, shape.attention.capacity});
                 const auto verified = stack.verify_sampled_depth2(candidates,
                     std::span(mtp_candidate_rows).first(3 * 2560),
                     std::span(mtp_candidate_memory).first(3 * 2560),
@@ -653,7 +653,7 @@ if (mtp && (mtp_depth == 2 || mtp_depth == 3)) {
                 }
                 cache.gather(batch_ple_rows, std::span(mtp_candidate_memory).first(2 * 2560));
             }
-            selector_storage.emplace(TargetMtpSelection2{base, anchor, first, nullptr, nullptr, sampler.options().policy, job.stops, {}, {}});
+            selector_storage.emplace(TargetMtpSelection2{base, anchor, first, nullptr, nullptr, sampler.options().policy, job.stops, {}, {}, shape.attention.capacity});
             const auto verified = stack.verify_sampled2(std::span(candidates),
                 std::span(mtp_candidate_rows).first(2 * 2560),
                 std::span(mtp_candidate_memory).first(2 * 2560),

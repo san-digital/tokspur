@@ -2,6 +2,7 @@
 
 #include "tokspur/gguf.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -11,6 +12,31 @@
 #include <vector>
 
 namespace tokspur {
+
+// Maximum exact common prefix length (capped at max_prefix_tokens) shared with any recent session, or 0 when below boundary_tokens.
+template<class RecentPrefixes>
+[[nodiscard]] inline size_t shared_prefix_best_lcp(const RecentPrefixes& recent_prefixes, std::span<const uint32_t> candidate,
+    size_t boundary_tokens, size_t max_prefix_tokens) noexcept {
+    if (!boundary_tokens || candidate.size() < boundary_tokens) return 0;
+    const size_t limit = std::min(candidate.size(), max_prefix_tokens);
+    size_t best = 0;
+    for (const auto& prev : recent_prefixes) {
+        const size_t bound = std::min(limit, prev.size());
+        size_t lcp = 0;
+        while (lcp < bound && prev[lcp] == candidate[lcp]) ++lcp;
+        best = std::max(best, lcp);
+    }
+    return best >= boundary_tokens ? best : 0;
+}
+
+// Clamps a prefill slice of length `chunk_count` starting at `abs_pos` so wide NAX prefill slices (up to 2,048 rows) do not step over a shared-prefix boundary eligible for capture.
+[[nodiscard]] inline size_t clamp_chunk_to_shared_prefix_boundary(size_t chunk_count, size_t abs_pos, size_t lcp_boundary,
+    size_t boundary_tokens) noexcept {
+    if (!chunk_count || !boundary_tokens || lcp_boundary <= abs_pos) return chunk_count;
+    const size_t target = (lcp_boundary / boundary_tokens) * boundary_tokens;
+    if (target <= abs_pos || abs_pos + chunk_count <= target) return chunk_count;
+    return target - abs_pos;
+}
 
 // A failed rollback is fatal: the target must not continue from an uncertain target/drafter pair.
 class SharedPrefixRollbackError final : public std::runtime_error {

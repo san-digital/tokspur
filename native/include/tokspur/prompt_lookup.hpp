@@ -17,7 +17,7 @@ namespace tokspur {
 // source only and is unrelated to the model's n-gram embedding history.
 inline constexpr uint32_t maximum_match_tokens = 64;
 inline constexpr uint32_t maximum_proposal_tokens = 16;
-inline constexpr uint32_t maximum_history_tokens = 65536;
+inline constexpr uint32_t maximum_history_tokens = 131072;
 inline constexpr uint32_t maximum_lookup_buckets = 1u << 22;
 inline constexpr uint32_t maximum_lookup_work = 1u << 20;
 inline constexpr uint64_t maximum_lookup_budget_bytes = 1ull << 30;
@@ -29,7 +29,7 @@ struct LookupConfig {
     uint32_t proposal_tokens = 7;
     // Retained committed tokens, in (match_tokens, maximum_history_tokens].
     // Older tokens leave the window oldest first and are never proposed.
-    uint32_t history_tokens = maximum_history_tokens;
+    uint32_t history_tokens = 65536;
     // Exclusive bound on accepted token IDs; at least two. Appends carrying a
     // token at or above it are refused before any state changes.
     uint32_t token_limit = 1u << 20;

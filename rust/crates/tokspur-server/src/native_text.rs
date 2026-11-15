@@ -4,6 +4,7 @@
 
 use std::fmt;
 use std::path::Path;
+use std::sync::Mutex;
 
 use tokspur_gguf::{GgufError, MappedFile, ModelFiles};
 use tokspur_json::{
@@ -13,7 +14,7 @@ use tokspur_json::{
 use tokspur_sys::foundation::{Regex, RegexError, Utf16String};
 use tokspur_text::sha256::{Sha256, hex, sha256};
 use tokspur_text::tokenizer::{
-    AddedToken, BpeData, ByteBpe, TextProcessor, TokenizerError, byte_level_decode,
+    AddedToken, BpeData, ByteBpe, SegmentMemo, TextProcessor, TokenizerError, byte_level_decode,
 };
 use tokspur_text::unicode::{NormalizeError, normalize_nfc9, push_scalar_utf8};
 
@@ -467,7 +468,14 @@ pub struct NativeText {
     processor: AppleProcessor,
     vocabulary_fingerprint: String,
     merge_fingerprint: String,
+    /// Rendered-chat segments seen before, so each turn splits and merges only its new messages. Exact: see `SegmentMemo`.
+    memo: Mutex<SegmentMemo>,
 }
+
+/// What the rendered-chat segment memo may hold: text plus four bytes per ID, so roughly thirty 128K-token conversations.
+const SEGMENT_MEMO_BYTES: usize = 32 << 20;
+/// Shorter segments (role headers, separators) cost less to encode again than to look up and keep.
+const SEGMENT_MEMO_MINIMUM: usize = 64;
 
 impl fmt::Debug for NativeText {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -514,6 +522,7 @@ impl NativeText {
             processor,
             vocabulary_fingerprint: parsed.vocabulary_fingerprint,
             merge_fingerprint: parsed.merge_fingerprint,
+            memo: Mutex::new(SegmentMemo::new(SEGMENT_MEMO_BYTES, SEGMENT_MEMO_MINIMUM)),
         })
     }
 
@@ -533,8 +542,20 @@ impl NativeText {
     }
 
     pub fn encode_rendered(&self, rendered: &tokspur_text::chat::RenderedChat) -> Result<Vec<u32>> {
+        let mut memo = self.memo.lock().unwrap_or_else(|poisoned| {
+            // A panic mid-insert may leave the byte charge off; the entries themselves are always whole. Start again empty.
+            self.memo.clear_poison();
+            let mut memo = poisoned.into_inner();
+            memo.clear();
+            memo
+        });
         self.bpe
-            .encode_with_literals(&rendered.prompt, &self.processor, &rendered.literal_ranges)
+            .encode_with_literals_memo(
+                &rendered.prompt,
+                &self.processor,
+                &rendered.literal_ranges,
+                &mut memo,
+            )
             .map_err(TextError::Tokenizer)
     }
 

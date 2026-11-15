@@ -255,9 +255,12 @@ options:
   --prefill-dense {f32-staged,nax,f32,f16}    Dense Q8 prefill kernel mode (default: f32-staged)
   --prefill-grouped {f32,auto,serial,nax}     Grouped MoE prefill kernel mode (default: f32)
   --known-token-capacity {512,1024,2048}           Known-token IPC packet capacity (default: 2048)
+  --context-length {65536,131072}             Active prompt and generation context length (default: 65536)
   --native-host-logit-views {off,on}          Opt-in native host logit views (default: off)
   --native-logit-topk {off,on}                Opt-in GPU two-stage logit top-k verification (default: off)
   --native-ple-async-gather {off,on}          Opt-in asynchronous 16-bucket PLE gather overlap (default: off)
+  --ple-ram-resident, --no-ple-ram-resident   Opt-in clean read-only mmap PLE RAM residency (default: off)
+  --native-ple-ram-resident {off,on}          Explicit native PLE RAM residency mode (default: off)
   --native-mtp-fast-round {off,on}            Opt-in GPU-resident MTP fast round and fused priming (default: off)
   --native-verify-hc-gdn-fused {off,on}       Opt-in fused HC+GDN multi-row verification (default: off)
   --native-dflash2-defer-context {off,on}     Opt-in native deferred DFlash2 context (default: off)
@@ -268,10 +271,13 @@ options:
   --native-dflash2-verify-rows {all,auto}     Opt-in DFlash2 verify row budget (default: all)
   --dflash2-max-drafts <1..7>                 Opt-in DFlash2 maximum drafted proposals per round
   --dflash2-vocab-slice <n>                   Opt-in DFlash2 draft vocabulary slice (0 or multiple of 32)
-  --mtp-draft-slice                           Opt-in top-32K MTP draft vocabulary slice
+  --dflash2-vocab-gather <spec>               Opt-in DFlash2 gathered draft vocabulary (control32k, cjk48k, cjk64k, cjk80k, or ID ranges)
+  --mtp-draft-slice, --no-mtp-draft-slice     Opt-in top-32K MTP draft vocabulary slice (default: off)
+  --native-mtp-draft-slice {off,on}           Explicit native top-32K MTP draft vocabulary slice (default: off)
   --verify-nax, --no-verify-nax               Opt-in Metal 4 NAX batched speculative verification (default: off)
   --native-verify-nax {off,on}                Explicit native batched verification mode (default: off)
-  --verify-nax-m8                             Opt-in Metal 4 matmul2d(8,32,32) speculative verification
+  --verify-nax-m8, --no-verify-nax-m8         Opt-in Metal 4 matmul2d(8,32,32) speculative verification (default: off)
+  --native-verify-nax-m8 {off,on}             Explicit native matmul2d(8,32,32) verification mode (default: off)
   --native-verify-m8-splits <path>             Explicit M8 split policy (requires --verify-nax-m8)
   --request-timeout-seconds <1..86400>         Overall request deadline (default: 3600 seconds)
   --speed-preset                              Opt-in Pack v3, NAX, MTP3/DFlash2, first8/output64 and executor speed preset
@@ -290,6 +296,8 @@ options:
   --shared-prefix-cache, --no-shared-prefix-cache Host-RAM shared system-prefix cache (default: on for mtp)
   --mtp-lookup {off,bypass,hybrid}            Opt-in MTP prompt-lookup mode (default: off)
   --mtp-lookup-match <2..16>                  Opt-in MTP prompt-lookup match length
+  --dflash2-lookup {off,bypass,hybrid}        Opt-in DFlash2 prompt-lookup mode (default: off)
+  --dflash2-lookup-match <2..16>              Opt-in DFlash2 prompt-lookup match length
   --tool-enum-validation {strict,executor}    OpenAI tool enum schema policy (default: strict)
   --tool-arg-validation {strict,executor}     OpenAI tool argument schema policy (default: strict)
   --private-prefix-trace                      Opt-in private prefix reuse trace telemetry
@@ -524,7 +532,9 @@ where
             let mut opts = ServeOptions::default();
             let mut prefill_dense_explicit = false;
             let mut prefill_grouped_explicit = false;
+            let mut mtp_draft_slice_explicit = false;
             let mut verify_nax_explicit = false;
+            let mut verify_nax_m8_explicit = false;
             let mut prepared_validation_explicit = false;
             let mut output_packet_explicit = false;
             let mut tool_enum_explicit = false;
@@ -655,16 +665,31 @@ where
                         }
                         opts.known_token_capacity = cap;
                     }
+                    "--context-length" | "--native-context-length" => {
+                        let val = take_val(flag, inline_val, &mut i, "requires 65536 or 131072")?;
+                        let ctx = val.parse::<u32>().map_err(|_| {
+                            CliError::Usage(format!("invalid {flag} integer: {val}"))
+                        })?;
+                        if !matches!(ctx, 65_536 | 131_072) {
+                            return Err(CliError::Usage(format!(
+                                "invalid {flag} '{ctx}' (expected 65536 or 131072)"
+                            )));
+                        }
+                        opts.context_length = ctx;
+                    }
                     "--native-host-logit-views"
                     | "--native-logit-topk"
                     | "--native-ple-async-gather"
+                    | "--native-ple-ram-resident"
                     | "--native-mtp-fast-round"
                     | "--mtp-fast-round"
                     | "--native-prefill-router-fast"
                     | "--prefill-router-fast"
                     | "--native-verify-hc-gdn-fused"
                     | "--native-dflash2-defer-context"
-                    | "--native-verify-nax" => {
+                    | "--native-mtp-draft-slice"
+                    | "--native-verify-nax"
+                    | "--native-verify-nax-m8" => {
                         let value = take_val(flag, inline_val, &mut i, "requires off or on")?;
                         let enabled = match value.as_str() {
                             "off" => false,
@@ -679,6 +704,7 @@ where
                             "--native-host-logit-views" => opts.host_logit_views = Some(enabled),
                             "--native-logit-topk" => opts.logit_topk = Some(enabled),
                             "--native-ple-async-gather" => opts.ple_async_gather = Some(enabled),
+                            "--native-ple-ram-resident" => opts.ple_ram_resident = Some(enabled),
                             "--native-mtp-fast-round" | "--mtp-fast-round" => {
                                 opts.mtp_fast_round = Some(enabled);
                             }
@@ -688,10 +714,20 @@ where
                             "--native-verify-hc-gdn-fused" => {
                                 opts.verify_hc_gdn_fused = Some(enabled);
                             }
+                            "--native-mtp-draft-slice" => {
+                                opts.mtp_draft_slice = enabled;
+                                opts.mtp_draft_slice_selection = Some(enabled);
+                                mtp_draft_slice_explicit = true;
+                            }
                             "--native-verify-nax" => {
                                 opts.verify_nax = enabled;
                                 opts.verify_nax_selection = Some(enabled);
                                 verify_nax_explicit = true;
+                            }
+                            "--native-verify-nax-m8" => {
+                                opts.verify_nax_m8 = enabled;
+                                opts.verify_nax_m8_selection = Some(enabled);
+                                verify_nax_m8_explicit = true;
                             }
                             _ => opts.dflash2_defer_context = Some(enabled),
                         }
@@ -699,6 +735,22 @@ where
                     "--mtp-draft-slice" => {
                         forbid_val(flag, inline_val)?;
                         opts.mtp_draft_slice = true;
+                        opts.mtp_draft_slice_selection = Some(true);
+                        mtp_draft_slice_explicit = true;
+                    }
+                    "--ple-ram-resident" => {
+                        forbid_val(flag, inline_val)?;
+                        opts.ple_ram_resident = Some(true);
+                    }
+                    "--no-ple-ram-resident" => {
+                        forbid_val(flag, inline_val)?;
+                        opts.ple_ram_resident = Some(false);
+                    }
+                    "--no-mtp-draft-slice" => {
+                        forbid_val(flag, inline_val)?;
+                        opts.mtp_draft_slice = false;
+                        opts.mtp_draft_slice_selection = Some(false);
+                        mtp_draft_slice_explicit = true;
                     }
                     "--verify-nax" => {
                         forbid_val(flag, inline_val)?;
@@ -715,6 +767,14 @@ where
                     "--verify-nax-m8" => {
                         forbid_val(flag, inline_val)?;
                         opts.verify_nax_m8 = true;
+                        opts.verify_nax_m8_selection = Some(true);
+                        verify_nax_m8_explicit = true;
+                    }
+                    "--no-verify-nax-m8" => {
+                        forbid_val(flag, inline_val)?;
+                        opts.verify_nax_m8 = false;
+                        opts.verify_nax_m8_selection = Some(false);
+                        verify_nax_m8_explicit = true;
                     }
                     "--request-timeout-seconds" => {
                         let value = take_val(flag, inline_val, &mut i, "requires seconds")?;
@@ -857,6 +917,20 @@ where
                         }
                         opts.dflash2_vocab_slice = Some(vs);
                     }
+                    "--dflash2-vocab-gather" | "--native-dflash2-vocab-gather" => {
+                        let val = take_val(
+                            flag,
+                            inline_val,
+                            &mut i,
+                            "requires control32k, cjk48k, cjk64k, cjk80k, or ascending token IDs/ranges",
+                        )?;
+                        if !serve::is_valid_dflash2_vocab_gather(&val, 248_320) {
+                            return Err(CliError::Usage(format!(
+                                "invalid {flag} '{val}' (expected control32k, cjk48k, cjk64k, cjk80k, or ascending IDs/ranges multiple of 32 in 256..248319)"
+                            )));
+                        }
+                        opts.dflash2_vocab_gather = Some(val);
+                    }
                     "--concurrent-dispatch" => {
                         forbid_val(flag, inline_val)?;
                         opts.concurrent_dispatch = true;
@@ -952,6 +1026,30 @@ where
                             )));
                         }
                         opts.mtp_lookup_match = Some(match_len);
+                    }
+                    "--dflash2-lookup" => {
+                        let val =
+                            take_val(flag, inline_val, &mut i, "requires off, bypass or hybrid")?;
+                        if !matches!(val.as_str(), "off" | "bypass" | "hybrid") {
+                            return Err(CliError::Usage(format!(
+                                "invalid --dflash2-lookup '{val}' (expected off, bypass or hybrid)"
+                            )));
+                        }
+                        opts.dflash2_lookup = val;
+                    }
+                    "--dflash2-lookup-match" => {
+                        let val = take_val(flag, inline_val, &mut i, "requires an integer 2..16")?;
+                        let match_len = val.parse::<u32>().map_err(|_| {
+                            CliError::Usage(format!(
+                                "invalid --dflash2-lookup-match integer: {val}"
+                            ))
+                        })?;
+                        if !(2..=16).contains(&match_len) {
+                            return Err(CliError::Usage(format!(
+                                "invalid --dflash2-lookup-match '{match_len}' (expected 2..16)"
+                            )));
+                        }
+                        opts.dflash2_lookup_match = Some(match_len);
                     }
                     "--tool-enum-validation" => {
                         let val =
@@ -1084,12 +1182,26 @@ where
                     opts.tool_arg_validation = "executor".to_owned();
                 }
                 if opts.drafter == "mtp" {
+                    if opts.verify_nax
+                        && !verify_nax_m8_explicit
+                        && opts.verify_cost_profile.is_none()
+                    {
+                        opts.verify_nax_m8 = true;
+                    }
+                    if opts.mtp_fast_round.is_none() && opts.verify_cost_profile.is_none() {
+                        opts.mtp_fast_round = Some(true);
+                    }
                     if opts.mtp_depth.is_none() {
                         opts.mtp_depth = Some(3);
                     }
-                    opts.mtp_draft_slice = true;
+                    if !mtp_draft_slice_explicit {
+                        opts.mtp_draft_slice = true;
+                    }
                 } else if opts.drafter == "dflash2" {
-                    if opts.verify_nax {
+                    if opts.verify_nax
+                        && !verify_nax_m8_explicit
+                        && opts.verify_cost_profile.is_none()
+                    {
                         opts.verify_nax_m8 = true;
                     }
                     if opts.dflash2_precision.is_none() {
@@ -1101,7 +1213,7 @@ where
                     if opts.dflash2_max_drafts.is_none() {
                         opts.dflash2_max_drafts = Some(7);
                     }
-                    if opts.dflash2_vocab_slice.is_none() {
+                    if opts.dflash2_vocab_slice.is_none() && opts.dflash2_vocab_gather.is_none() {
                         opts.dflash2_vocab_slice = Some(32_768);
                     }
                     if opts.dflash2_verify_rows.is_none() {
@@ -1894,6 +2006,8 @@ mod tests {
         let mut cached_dflash2 = dflash2_opts.clone();
         cached_dflash2.shared_prefix_cache = Some(true);
         cached_dflash2.checkpoint_cap_gib = Some(4.0);
+        cached_dflash2.dflash2_lookup = "hybrid".to_owned();
+        cached_dflash2.dflash2_lookup_match = Some(4);
         let flags = build_carrier_flags(
             &cached_dflash2,
             SpeculativeAsset::DFlash2Dir(dflash2),
@@ -1904,6 +2018,8 @@ mod tests {
             ["--shared-prefix-cache", "on"],
             ["--checkpoint-ssd", "on"],
             ["--checkpoint-cap-gib", "4"],
+            ["--native-dflash2-lookup", "hybrid"],
+            ["--native-dflash2-lookup-match", "4"],
         ] {
             assert!(flags.windows(2).any(|window| window == pair));
         }
@@ -1929,6 +2045,8 @@ mod tests {
                 "--mtp-lookup",
                 "bypass",
             ],
+            vec!["serve", "--dflash2-lookup", "hybrid"],
+            vec!["serve", "--dflash2-lookup-match", "4"],
             vec!["serve", "--prefill-grouped", "serial"],
             vec![
                 "serve",
@@ -1983,6 +2101,8 @@ mod tests {
             "--prefill-grouped",
             "--known-token-capacity",
             "--mtp-draft-slice",
+            "--no-mtp-draft-slice",
+            "--native-mtp-draft-slice",
             "--verify-nax",
             "--no-verify-nax",
             "--native-verify-nax",
@@ -2000,6 +2120,8 @@ mod tests {
             "--shared-prefix-cache",
             "--mtp-lookup",
             "--mtp-lookup-match",
+            "--dflash2-lookup",
+            "--dflash2-lookup-match",
             "--tool-enum-validation",
             "--private-prefix-trace",
             "--telemetry-stdout",
@@ -2311,7 +2433,7 @@ mod tests {
         assert_eq!(preset.prefill_router_fast, None);
         assert!(!preset.gdn_prefill_only);
         assert!(preset.verify_nax);
-        assert!(!preset.verify_nax_m8);
+        assert!(preset.verify_nax_m8);
         assert_eq!(preset.dflash2_verify_rows, None);
         assert_eq!(preset.verify_hc_gdn_fused, Some(true));
         assert_eq!(preset.host_logit_views, Some(true));
@@ -2322,18 +2444,26 @@ mod tests {
         assert_eq!(preset.tool_arg_validation, "executor");
         assert_eq!(preset.mtp_depth, Some(3));
         assert!(preset.mtp_draft_slice);
-        assert_eq!(preset.mtp_fast_round, None);
+        assert_eq!(preset.mtp_fast_round, Some(true));
         assert_eq!(preset.output_packet, 64);
         assert_eq!(preset.first_output_packet, Some(8));
 
-        let Command::Serve(preset_fast_on) =
-            parse_args(["serve", "--speed-preset", "--native-mtp-fast-round", "on"])
-                .unwrap()
-                .command
+        let Command::Serve(preset_fast_off) = parse_args([
+            "serve",
+            "--speed-preset",
+            "--native-mtp-fast-round",
+            "off",
+            "--no-verify-nax-m8",
+        ])
+        .unwrap()
+        .command
         else {
             panic!("expected Serve");
         };
-        assert_eq!(preset_fast_on.mtp_fast_round, Some(true));
+        assert_eq!(preset_fast_off.mtp_fast_round, Some(false));
+        assert!(preset_fast_off.verify_nax);
+        assert!(!preset_fast_off.verify_nax_m8);
+        assert_eq!(preset_fast_off.verify_nax_m8_selection, Some(false));
 
         let Command::Serve(preset_overrides) = parse_args([
             "serve",
@@ -2353,6 +2483,7 @@ mod tests {
         };
         assert_eq!(preset_overrides.mtp_depth, Some(2));
         assert!(!preset_overrides.verify_nax);
+        assert!(!preset_overrides.verify_nax_m8);
         assert_eq!(preset_overrides.verify_hc_gdn_fused, None);
         assert_eq!(preset_overrides.tool_enum_validation, "strict");
         assert_eq!(preset_overrides.tool_arg_validation, "strict");
@@ -2377,9 +2508,66 @@ mod tests {
         assert_eq!(preset_df.dflash2_defer_context, Some(true));
         assert_eq!(preset_df.dflash2_max_drafts, Some(7));
         assert_eq!(preset_df.dflash2_vocab_slice, Some(32_768));
+        assert_eq!(preset_df.dflash2_vocab_gather, None);
         assert_eq!(preset_df.dflash2_verify_rows.as_deref(), Some("auto"));
         assert_eq!(preset_df.output_packet, 64);
         assert_eq!(preset_df.first_output_packet, Some(8));
+
+        for gather in [
+            "control32k",
+            "cjk48k",
+            "cjk64k",
+            "cjk80k",
+            "0-32734,248044-248076",
+        ] {
+            let Command::Serve(gather_df) = parse_args([
+                "serve",
+                "--speed-preset",
+                "--drafter",
+                "dflash2",
+                "--dflash2-dir",
+                "/tmp/dflash2",
+                "--dflash2-vocab-gather",
+                gather,
+            ])
+            .unwrap()
+            .command
+            else {
+                panic!("expected Serve");
+            };
+            assert_eq!(gather_df.dflash2_vocab_slice, None);
+            assert_eq!(gather_df.dflash2_vocab_gather.as_deref(), Some(gather));
+            let flags = serve::build_carrier_flags(
+                &gather_df,
+                serve::SpeculativeAsset::DFlash2Dir(Path::new("/tmp/dflash2")),
+                Path::new("/tmp/state"),
+            )
+            .unwrap();
+            assert!(!flags.iter().any(|f| f == "--native-dflash2-vocab-slice"));
+            let idx = flags
+                .iter()
+                .position(|f| f == "--native-dflash2-vocab-gather")
+                .unwrap();
+            assert_eq!(flags[idx + 1], gather);
+        }
+        assert!(parse_args(["serve", "--dflash2-vocab-gather", "bad"]).is_err());
+        let Command::Serve(conflict_df) = parse_args([
+            "serve",
+            "--drafter",
+            "dflash2",
+            "--dflash2-dir",
+            "/tmp/dflash2",
+            "--dflash2-vocab-slice",
+            "32768",
+            "--dflash2-vocab-gather",
+            "cjk64k",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("expected Serve");
+        };
+        assert!(serve::validate_serve_options(&conflict_df).is_err());
 
         for preset_first in [false, true] {
             let mut args = vec![
@@ -2435,9 +2623,9 @@ mod tests {
                 .any(|pair| pair == ["--native-mtp-first-output-packet", "8"])
         );
         assert!(
-            !preset64_flags
-                .iter()
-                .any(|arg| arg == "--native-mtp-fast-round")
+            preset64_flags
+                .windows(2)
+                .any(|pair| pair == ["--native-mtp-fast-round", "on"])
         );
         assert!(
             preset64_flags
@@ -2448,6 +2636,11 @@ mod tests {
             preset64_flags
                 .windows(2)
                 .any(|pair| pair == ["--native-verify-nax", "on"])
+        );
+        assert!(
+            preset64_flags
+                .windows(2)
+                .any(|pair| pair == ["--native-verify-nax-m8", "on"])
         );
         assert!(
             preset64_flags
@@ -2513,6 +2706,31 @@ mod tests {
             panic!("expected Serve");
         };
         assert!(!vnax_native_off.verify_nax);
+
+        let Command::Serve(mds_off) =
+            parse_args(["serve", "--mtp-draft-slice", "--no-mtp-draft-slice"])
+                .unwrap()
+                .command
+        else {
+            panic!("expected Serve");
+        };
+        assert!(!mds_off.mtp_draft_slice);
+        let Command::Serve(mds_native_on) = parse_args(["serve", "--native-mtp-draft-slice", "on"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected Serve");
+        };
+        assert!(mds_native_on.mtp_draft_slice);
+        let Command::Serve(mds_native_off) =
+            parse_args(["serve", "--speed-preset", "--native-mtp-draft-slice=off"])
+                .unwrap()
+                .command
+        else {
+            panic!("expected Serve");
+        };
+        assert!(!mds_native_off.mtp_draft_slice);
+        assert_eq!(mds_native_off.mtp_depth, Some(3));
 
         let Command::Serve(df_bf16) = parse_args([
             "serve",
@@ -2595,7 +2813,82 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair == ["--native-prefill-router-fast", "off"])
         );
+        assert!(!rf_flags.iter().any(|arg| arg == "--context-length"));
         assert!(parse_args(["serve", "--tool-arg-validation", "permissive"]).is_err());
+
+        let Command::Serve(ctx64) = parse_args(["serve", "--context-length", "65536"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected Serve");
+        };
+        assert_eq!(ctx64.context_length, 65_536);
+        let ctx64_flags = build_carrier_flags(
+            &ctx64,
+            SpeculativeAsset::MtpSidecar(Path::new("/tmp/mtp.gguf")),
+            Path::new("/tmp/state"),
+        )
+        .unwrap();
+        assert!(!ctx64_flags.iter().any(|arg| arg == "--context-length"));
+
+        for flag in ["--context-length", "--native-context-length"] {
+            let Command::Serve(ctx128) = parse_args(["serve", flag, "131072"]).unwrap().command
+            else {
+                panic!("expected Serve");
+            };
+            assert_eq!(ctx128.context_length, 131_072);
+            let ctx128_flags = build_carrier_flags(
+                &ctx128,
+                SpeculativeAsset::MtpSidecar(Path::new("/tmp/mtp.gguf")),
+                Path::new("/tmp/state"),
+            )
+            .unwrap();
+            assert!(
+                ctx128_flags
+                    .windows(2)
+                    .any(|pair| pair == ["--context-length", "131072"])
+            );
+        }
+        for bad in ["0", "32768", "100000", "262144", "abc"] {
+            assert!(parse_args(["serve", "--context-length", bad]).is_err());
+        }
+
+        let Command::Serve(ple_ram_on) =
+            parse_args(["serve", "--ple-ram-resident"]).unwrap().command
+        else {
+            panic!("expected Serve");
+        };
+        assert_eq!(ple_ram_on.ple_ram_resident, Some(true));
+        let ple_ram_on_flags = build_carrier_flags(
+            &ple_ram_on,
+            SpeculativeAsset::MtpSidecar(Path::new("/tmp/mtp.gguf")),
+            Path::new("/tmp/state"),
+        )
+        .unwrap();
+        assert!(
+            ple_ram_on_flags
+                .windows(2)
+                .any(|pair| pair == ["--native-ple-ram-resident", "on"])
+        );
+
+        let Command::Serve(ple_ram_off) = parse_args(["serve", "--no-ple-ram-resident"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected Serve");
+        };
+        assert_eq!(ple_ram_off.ple_ram_resident, Some(false));
+        let ple_ram_off_flags = build_carrier_flags(
+            &ple_ram_off,
+            SpeculativeAsset::MtpSidecar(Path::new("/tmp/mtp.gguf")),
+            Path::new("/tmp/state"),
+        )
+        .unwrap();
+        assert!(
+            ple_ram_off_flags
+                .windows(2)
+                .any(|pair| pair == ["--native-ple-ram-resident", "off"])
+        );
     }
 
     #[test]

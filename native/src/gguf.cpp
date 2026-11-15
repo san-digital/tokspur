@@ -11,6 +11,7 @@
 #include <set>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 #include <utility>
 
@@ -216,6 +217,73 @@ void MappedFile::evict_clean_pages(uint64_t offset, uint64_t bytes) const noexce
     const uint64_t hi = (end / page) * page;
     if (hi > lo) {
         static_cast<void>(posix_madvise(const_cast<std::byte*>(data_ + lo), static_cast<size_t>(hi - lo), POSIX_MADV_DONTNEED));
+    }
+}
+
+void MappedFile::warm_clean_pages(uint64_t offset, uint64_t bytes) const noexcept {
+    if (!data_ || !bytes || offset >= size_) return;
+    const uint64_t page = static_cast<uint64_t>(getpagesize());
+    if (!page) return;
+    const uint64_t end = bytes > size_ - offset ? size_ : offset + bytes;
+    const uint64_t lo = (offset / page) * page;
+    const uint64_t hi = end > std::numeric_limits<uint64_t>::max() - (page - 1)
+        ? size_
+        : std::min<uint64_t>(size_, ((end + page - 1) / page) * page);
+    if (hi <= lo) return;
+
+    const auto warm_slice = [&](uint64_t slice_lo, uint64_t slice_hi) noexcept {
+        constexpr uint64_t kAdviseWindow = 64ull << 20;
+        volatile unsigned char sink = 0;
+        for (uint64_t win = slice_lo; win < slice_hi;) {
+            const uint64_t win_end = std::min(slice_hi, win + kAdviseWindow);
+            if (win_end > win) {
+                static_cast<void>(posix_madvise(
+                    const_cast<std::byte*>(data_ + win),
+                    static_cast<size_t>(win_end - win),
+                    POSIX_MADV_WILLNEED));
+            }
+            unsigned char acc = 0;
+            for (uint64_t p = win; p < win_end; p += page) {
+                acc ^= std::to_integer<unsigned char>(data_[p]);
+            }
+            sink ^= acc;
+            win = win_end;
+        }
+        static_cast<void>(sink);
+    };
+
+    const uint64_t total_pages = (hi - lo + page - 1) / page;
+    constexpr uint64_t kParallelMinBytes = 64ull << 20;
+    if (hi - lo < kParallelMinBytes || total_pages < 8) {
+        warm_slice(lo, hi);
+        return;
+    }
+    constexpr size_t kWorkers = 8;
+    std::array<std::thread, kWorkers - 1> workers{};
+    size_t launched = 0;
+    try {
+        for (size_t w = 1; w < kWorkers; ++w) {
+            const uint64_t p0 = (total_pages * w) / kWorkers;
+            const uint64_t p1 = (total_pages * (w + 1)) / kWorkers;
+            const uint64_t w_lo = lo + p0 * page;
+            const uint64_t w_hi = std::min(hi, lo + p1 * page);
+            if (w_hi > w_lo) {
+                workers[launched++] = std::thread([&, w_lo, w_hi]() noexcept {
+                    warm_slice(w_lo, w_hi);
+                });
+            }
+        }
+    } catch (...) {
+        for (size_t i = 0; i < launched; ++i) {
+            if (workers[i].joinable()) workers[i].join();
+        }
+        warm_slice(lo, hi);
+        return;
+    }
+    const uint64_t p1 = total_pages / kWorkers;
+    warm_slice(lo, std::min(hi, lo + p1 * page));
+    for (size_t i = 0; i < launched; ++i) {
+        if (workers[i].joinable()) workers[i].join();
     }
 }
 
@@ -427,6 +495,13 @@ void Gguf::evict_tensor_pages(const Tensor& tensor, uint64_t offset, uint64_t by
     mapping_.front().evict_clean_pages(tensor.offset + offset, span);
 }
 
+void Gguf::warm_tensor_pages(const Tensor& tensor, uint64_t offset, uint64_t bytes) const noexcept {
+    if (mapping_.empty() || header_only_ || offset >= tensor.bytes) return;
+    const uint64_t span = bytes ? std::min(bytes, tensor.bytes - offset) : (tensor.bytes - offset);
+    if (tensor.offset > mapping_.front().size() || offset > mapping_.front().size() - tensor.offset) return;
+    mapping_.front().warm_clean_pages(tensor.offset + offset, span);
+}
+
 void Gguf::assert_unchanged() const {
     for (const auto& item : mapping_) item.assert_unchanged();
 }
@@ -492,6 +567,13 @@ void ModelFiles::evict_tensor_pages(std::string_view name, uint64_t offset, uint
     if (item == tensors_.end()) return;
     const auto& shard = shards_[item->second.shard];
     shard.evict_tensor_pages(shard.tensors()[item->second.index], offset, bytes);
+}
+
+void ModelFiles::warm_tensor_pages(std::string_view name, uint64_t offset, uint64_t bytes) const noexcept {
+    const auto item = tensors_.find(name);
+    if (item == tensors_.end()) return;
+    const auto& shard = shards_[item->second.shard];
+    shard.warm_tensor_pages(shard.tensors()[item->second.index], offset, bytes);
 }
 
 void ModelFiles::assert_unchanged() const {

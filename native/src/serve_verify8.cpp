@@ -168,13 +168,33 @@ void fixed(const Json& v, bool branch8 = false) {
     need(!v.find("expert_route_trace") && !v.find("trace_expert_routes") && !v.find("moe_token_tile_enabled"), "private V8 unrelated feature metadata");
     zero_routes(v, "wide_q8_exact_routes", 4); zero_routes(v, "wide_q8_many_routes", 6);
 }
-uint64_t ordinary(uint32_t prefix, bool stage8_enabled = false, bool channel_enabled = false) {
+uint64_t ordinary(uint32_t prefix, bool stage8_enabled = false, bool channel_enabled = false, uint32_t capacity = 65536) {
     // This private endpoint binds the adopted fixed 48-layer architecture:
     // 12 QSA layers, compression4 and a 2048-token selection budget.
     // 2222 includes 18 ordinary QSA dispatches per layer. Selection begins
     // at token2052 and adds sort/merge work; never bless an observed count.
-    constexpr QsaShape shape{2560, 24, 2, 256, 4, 128, 64, 4, 2048, 65536};
+    const QsaShape shape{2560, 24, 2, 256, 4, 128, 64, 4, 2048, capacity};
     return 2222 + 12 * (qsa_dispatches(shape, prefix) - 18) + 12 * uint64_t(stage8_enabled) + 12 * uint64_t(channel_enabled);
+}
+uint32_t ready_context_limit(const Json& v) {
+    if (v.kind() != Json::Kind::object) return 65536;
+    if (const auto* field = v.find("context_length")) {
+        const auto ctx = field->unsigned_integer();
+        need(ctx == 65536 || ctx == 131072, "private V8 capability");
+        if (const auto* hist = v.find("lookup_history_tokens")) {
+            const auto h = hist->unsigned_integer();
+            need(!h || h == ctx, "private V8 capability");
+        }
+        return uint32_t(ctx);
+    }
+    if (const auto* hist = v.find("lookup_history_tokens")) {
+        const auto h = hist->unsigned_integer();
+        if (h) {
+            need(h == 65536 || h == 131072, "private V8 capability");
+            return uint32_t(h);
+        }
+    }
+    return 65536;
 }
 void sampling(const Json& v, const Json& policy, uint64_t seed, uint32_t prefix) {
     const auto& s = get(v, "sampling");
@@ -213,7 +233,10 @@ void ready(const Json& v, bool branch8) {
 #endif
     for (const auto name : {"allow_request_kernel_experiments", "allow_request_stack_experiments", "allow_request_prefill_experiments"})
         need(!get(v, name).boolean(), "private V8 request-time experiment");
-    need(integer(v, "lookup_match_tokens") == 16 && integer(v, "lookup_history_tokens") == 65536 &&
+    const auto history_tokens = integer(v, "lookup_history_tokens");
+    const auto context_limit = uint64_t(ready_context_limit(v));
+    need(integer(v, "lookup_match_tokens") == 16 && (history_tokens == 65536 || history_tokens == 131072) &&
+        history_tokens == context_limit &&
         integer(v, "lookup_proposal_tokens") == 7 && integer(v, "lookup_verification_budget_bytes") == (128ull << 20), "private V8 capability");
     uint64_t total = 0;
     for (const auto name : {"lookup_caller_host_bytes", "verification_host_bytes", "verification_gpu_bytes"}) {
@@ -285,8 +308,9 @@ void validate_scalar_channel_done(const Json& ready, const Json& previous, const
     const auto outputs = integer(job, "generate");
     need(inputs <= 1 && outputs <= 1 && inputs + outputs == 1, "scalar-channel one-step command required");
     const bool reset = get(job, "reset").boolean();
+    const auto context_limit = uint64_t(ready_context_limit(ready));
     const auto before = get(previous, "event").string() == "ready" ? 0 : integer(previous, "committed_prefix");
-    need(integer(done, "committed_prefix") == (reset ? 0 : before) + 1 && integer(done, "committed_prefix") <= 65536,
+    need(integer(done, "committed_prefix") == (reset ? 0 : before) + 1 && integer(done, "committed_prefix") <= context_limit,
         "scalar-channel committed prefix");
     for (const auto name : {"qsa_stage_v8_calls", "qsa_channel_calls"}) {
         const auto prior = integer(previous, name), current = integer(done, name);
@@ -387,9 +411,10 @@ void validate_sampled_prefill_done(const Json& ready, const Json& previous, cons
     for (const auto& id : get(job, "tokens").array()) need(id.unsigned_integer() < 248320, "sampled prefill input outside vocabulary");
     const bool reset = get(job, "reset").boolean(), was_ready = get(previous, "event").string() == "ready";
     need((!was_ready || reset) && (!outputs || !reset), "sampled prefill reset/continuation ancestry differs");
+    const auto context_limit = uint64_t(ready_context_limit(ready));
     const auto before = was_ready ? 0 : integer(previous, "committed_prefix");
     const auto count = inputs + outputs;
-    need(integer(done, "committed_prefix") == (reset ? 0 : before) + count && integer(done, "committed_prefix") <= 65536,
+    need(integer(done, "committed_prefix") == (reset ? 0 : before) + count && integer(done, "committed_prefix") <= context_limit,
         "sampled prefill committed prefix differs");
     for (const auto name : {"qsa_stage_v8_calls", "qsa_channel_calls"}) sampled_delta(previous, done, name, outputs ? 12 : 0);
     need(integer(done, "qsa_stage_v8_request_calls") == (outputs ? 12 : 0) &&
@@ -474,7 +499,7 @@ const Json& branch8_session(const Json& reply) {
 #ifdef TOKSPUR_PRIVATE_HTTP_FAST_MATH
     static_cast<void>(fast_metadata(state));
 #endif
-    const auto prefix = integer(state, "committed_prefix"); need(prefix <= 65536 && integer(state, "lookup_history_epoch"), "private branch8 state prefix/epoch");
+    const auto prefix = integer(state, "committed_prefix"); need(prefix <= 131072 && integer(state, "lookup_history_epoch"), "private branch8 state prefix/epoch");
     for (const auto name : cost_fields) static_cast<void>(integer(state, name));
     for (const auto name : graph_fields) static_cast<void>(integer(state, name));
     hc_shape(get(state, "hc_exact_routes"));
@@ -537,8 +562,9 @@ void validate_branch8_control(const Json& prepared, const Json& previous, const 
     }
     need(operation == "branch_begin", "private branch8 unknown control");
     keys(job, {"op", "prompt_ids", "generation_requested", "allow_restore", "sampling", "seed"});
+    const auto context_limit = uint64_t(ready_context_limit(prepared));
     const auto count = get(job, "prompt_ids").array().size(); const bool allow = get(job, "allow_restore").boolean();
-    need(count && count <= 65536 && (!cold_resync || !allow) && (allow || !common) && common <= std::min<uint64_t>(before, count) && prefix <= common &&
+    need(count && count <= context_limit && (!cold_resync || !allow) && (allow || !common) && common <= std::min<uint64_t>(before, count) && prefix <= common &&
         ((outcome == "restored" && prefix && allow && !cold_resync) || (outcome == "cold_miss" && !prefix)), "private branch8 ancestor restore/cold selection");
     for (const auto& id : get(job, "prompt_ids").array()) need(id.unsigned_integer() < 248320, "private branch8 future ID");
     const auto& policy = get(job, "sampling"); keys(policy, {"temperature", "top_k", "top_p", "min_p"});
@@ -610,8 +636,9 @@ Verify8Reply::Verify8Reply(const Json& ready, const Json& previous, const Json& 
         "private branch8 model work requires a separately admitted cold/restore control");
 #endif
     keys(job, {"tokens", "generate", "reset", "stop_ids", "sampling", "seed", "prompt_lookup"});
+    context_limit_ = ready_context_limit(ready_);
     need(get(job, "tokens").array().size() <= 8 && integer(job, "generate") <= 8 &&
-        bool(inputs_) != bool(maximum_) && before <= 65536, "private V8 one bounded input OR generation batch required");
+        bool(inputs_) != bool(maximum_) && before <= context_limit_, "private V8 one bounded input OR generation batch required");
     keys(policy, {"temperature", "top_k", "top_p", "min_p"});
     need(real(policy, "temperature") == 0 && integer(policy, "top_k") <= 248320 && real(policy, "top_p") > 0 &&
         real(policy, "top_p") <= 1 && real(policy, "min_p") >= 0 && real(policy, "min_p") <= 1, "private V8 is greedy-only");
@@ -621,7 +648,7 @@ Verify8Reply::Verify8Reply(const Json& ready, const Json& previous, const Json& 
             (inputs_ || get(previous_, "continuation_allowed").boolean()), "private V8 continuation policy/lineage");
         sampling(previous_, policy, seed, before);
     }
-    need(base_ + inputs_ + maximum_ <= 65536 && (inputs_ || base_), "private V8 context bound");
+    need(base_ + inputs_ + maximum_ <= context_limit_ && (inputs_ || base_), "private V8 context bound");
     for (const auto& id : get(job, "tokens").array()) need(id.unsigned_integer() < 248320, "private V8 input ID");
     need((reset_ ? get(job, "prompt_lookup").boolean() : !job.find("prompt_lookup")) && (!reset_resync_ || reset_), "private V8 reset-only lookup/resync policy");
     if (maximum_) {
@@ -660,7 +687,7 @@ void Verify8Reply::event(const Json& v) {
         need(!pending_ && ++rounds_ <= 8 && integer(v, "round_id") == rounds_ && integer(v, "round_base") == position_, "private V8 round chronology");
         const auto n = integer(v, "verified_tokens"), k = integer(v, "accepted_verified_tokens"), o = integer(v, "ordinary_tokens"), p = integer(v, "proposed_tokens");
         const auto count = integer(v, "useful_tokens");
-        need(p <= 7 && (n == 0 || (n >= 2 && n <= 7)) && k <= n && n <= p && n <= maximum_ - count_ && n <= 65536 - position_ &&
+        need(p <= 7 && (n == 0 || (n >= 2 && n <= 7)) && k <= n && n <= p && n <= maximum_ - count_ && n <= context_limit_ - position_ &&
             o <= 1 && count == k + o && count && count <= maximum_ - count_ &&
             (!n ? !k && o == 1 : k >= 1 && o == uint64_t(k < n)) && integer(v, "verification_max_tokens") == 8 &&
             integer(v, "verification_head_dispatches") == uint32_t(std::popcount(uint32_t(n))) && integer(v, "committed_prefix") == position_ + count,
@@ -684,9 +711,9 @@ void Verify8Reply::event(const Json& v) {
 #else
         constexpr bool channel_enabled = false;
 #endif
-        uint64_t serial = 0; for (uint32_t t = 0; t < n; ++t) serial += ordinary(position_ + t, stage_enabled, channel_enabled);
+        uint64_t serial = 0; for (uint32_t t = 0; t < n; ++t) serial += ordinary(position_ + t, stage_enabled, channel_enabled, context_limit_);
         const auto work = (n ? serial - 72 * (n - 1) - 253 * (n - std::popcount(uint32_t(n))) : 0) +
-            (k && k < n ? 72 : 0) + (o ? ordinary(position_ + uint32_t(k), stage_enabled, channel_enabled) : 0);
+            (k && k < n ? 72 : 0) + (o ? ordinary(position_ + uint32_t(k), stage_enabled, channel_enabled, context_limit_) : 0);
         need(integer(v, "dispatches") == work && !integer(v, "capture_executes") && !get(v, "timings_qualified").boolean() && get(v, "gpu_profile").is_null(), "private V8 physical work/profile"); dispatches_ += work;
         const auto& r = get(v, "hc_exact_round_routes"); hc_shape(r);
         for (size_t i = 0; i < hc.size(); ++i) { const auto expected = i == 0 ? 25 * n + 97 * o : (n & (1u << (i - 1)) ? 72 : 0);

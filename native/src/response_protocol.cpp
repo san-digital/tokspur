@@ -56,8 +56,10 @@ Json parse_native_response(const Json& data, ResponseAdmission admission, const 
         admission.end_of_text < admission.vocabulary && admission.im_start < admission.vocabulary &&
         admission.im_end != admission.end_of_text && admission.im_end != admission.im_start && admission.end_of_text != admission.im_start,
         "invalid tokenizer-derived response admission");
-    keys(data, {"ids", "tools", "initial_thinking", "finish_reason", "stop_id", "executor_parameters"});
+    keys(data, {"ids", "tools", "initial_thinking", "finish_reason", "stop_id", "executor_parameters", "forced_thinking_close_index"});
     const bool executor_parameters = data.find("executor_parameters") ? data.find("executor_parameters")->boolean() : false;
+    const auto forced_thinking_close_index = data.find("forced_thinking_close_index")
+        ? std::optional<uint64_t>(data.find("forced_thinking_close_index")->unsigned_integer()) : std::nullopt;
     require(maximum_ids && maximum_ids <= response_maximum_accumulated_ids, "invalid response ID admission bound");
     const auto& input = field(data, "ids").array(); require(input.size() <= maximum_ids, "response ID count limit");
     const auto finish = field(data, "finish_reason").string();
@@ -81,7 +83,20 @@ Json parse_native_response(const Json& data, ResponseAdmission admission, const 
         const std::string_view marker = stop.unsigned_integer() == admission.im_end ? "<|im_end|>" : "<|endoftext|>";
         require(bytes.ends_with(marker), "response decoder/terminal identity mismatch"); bytes.resize(bytes.size() - marker.size());
     }
-    require(parser.feed(bytes) != ResponseStatus::error, "invalid response bytes or frames");
+    const size_t body_len = finish == "stop" ? ids.size() - 1 : ids.size();
+    if (forced_thinking_close_index) {
+        require(*forced_thinking_close_index <= body_len, "forced thinking close index out of bounds");
+        const auto split = size_t(*forced_thinking_close_index);
+        const auto prefix = decode(std::span<const uint32_t>(ids).first(split));
+        const auto suffix = decode(std::span<const uint32_t>(ids).subspan(split, body_len - split));
+        require(prefix.size() + suffix.size() == bytes.size() && std::string_view(bytes).starts_with(prefix) &&
+            std::string_view(bytes).substr(prefix.size()) == suffix, "response decoder/terminal identity mismatch");
+        require(parser.feed(prefix) != ResponseStatus::error, "invalid response bytes or frames");
+        parser.prepare_forced_thinking_close();
+        require(parser.feed(suffix) != ResponseStatus::error, "invalid response bytes or frames");
+    } else {
+        require(parser.feed(bytes) != ResponseStatus::error, "invalid response bytes or frames");
+    }
     if (finish == "stop") require(parser.finish() == ResponseStatus::complete, "incomplete or invalid stopped response");
     std::string content, thinking; Json::Array calls;
     for (const auto& record : parser.records()) {

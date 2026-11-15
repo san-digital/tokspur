@@ -893,6 +893,271 @@ void test_nax_qsa_attention_and_bf16_reuse(const char* metallib) {
             std::cout << "PASS nax_qsa_select_blocks(base=2040, n=73) exact selected IDs in 4 dispatches\n";
         }
     }
+
+    // 3. Test >64K (128K context) QSA tile-list multi-window & block selection up to 131,072 tokens (32,768 blocks)
+    {
+        MetalGraph g_nax128(metallib, 768ull << 20), g_ref128(metallib, 768ull << 20), g_vnax128(metallib, 512ull << 20);
+        g_nax128.configure_prefill_dense_f32(true);
+        g_nax128.configure_prefill_dense_nax(true);
+        g_nax128.prepare_gdn_chunk(); g_nax128.prepare_qsa_prefill();
+        g_ref128.prepare_gdn_chunk(); g_ref128.prepare_qsa_prefill();
+        // Verify-only scope, without prefill_dense_nax: it keeps the small verify scratch at every context length.
+        g_vnax128.configure_verify_nax(true);
+        g_vnax128.prepare_verify_nax({});
+
+        const QsaShape shape128k{256, 24, 2, 256, 4, 128, 64, 4, 2048, 131072};
+        need(g_nax128.nax_qsa_attention_supported(shape128k), "g_nax128 must support nax_qsa_attention at 131072 capacity");
+        need(g_vnax128.verify_nax_qsa_attention_supported(shape128k) && !g_vnax128.nax_qsa_attention_supported(shape128k),
+            "g_vnax128 must support only verify-scope nax_qsa_attention at 131072 capacity");
+
+        const uint32_t k_dim = shape128k.kv_heads * shape128k.head_width; // 512
+        const uint32_t q_dim = shape128k.query_heads * shape128k.head_width; // 8192
+        const uint32_t block_cap = shape128k.capacity / 4; // 32768
+        const uint32_t block_budget = shape128k.token_budget / 4; // 512
+
+        std::mt19937 rng128(2026128);
+        std::array<uint16_t, 4099> k_pat{}, v_pat{};
+        for (auto& x : k_pat) x = finite_bf16(float(int(rng128() % 2001) - 1000) * 0.0008f);
+        for (auto& x : v_pat) x = finite_bf16(float(int(rng128() % 2001) - 1000) * 0.0008f);
+        std::vector<uint16_t> h_keys(uint64_t(shape128k.capacity) * k_dim), h_vals(uint64_t(shape128k.capacity) * k_dim);
+        for (size_t i = 0; i < h_keys.size(); ++i) {
+            h_keys[i] = k_pat[i % k_pat.size()];
+            h_vals[i] = v_pat[i % v_pat.size()];
+        }
+        const auto k_nax = g_nax128.upload(std::as_bytes(std::span(h_keys)), "k_nax_128k");
+        const auto v_nax = g_nax128.upload(std::as_bytes(std::span(h_vals)), "v_nax_128k");
+        const auto k_ref = g_ref128.upload(std::as_bytes(std::span(h_keys)), "k_ref_128k");
+        const auto v_ref = g_ref128.upload(std::as_bytes(std::span(h_vals)), "v_ref_128k");
+        const auto k_ver = g_vnax128.upload(std::as_bytes(std::span(h_keys)), "k_ver_128k");
+        const auto v_ver = g_vnax128.upload(std::as_bytes(std::span(h_vals)), "v_ver_128k");
+        h_keys = {}; h_vals = {};
+
+        // Selected-block layouts for one row batch. The tile-list kernel walks the history in 16,384-block windows, so the layouts put blocks on both sides of that boundary, in one window only, and in disjoint sets per row.
+        enum class Ids128 { spread, window_edge, low_window, high_window, disjoint_rows };
+        const auto make_ids_128k = [&](uint32_t base, uint32_t n, Ids128 pattern) {
+            std::vector<uint32_t> h_ids(uint64_t(n) * block_budget, 0u);
+            for (uint32_t r = 0; r < n; ++r) {
+                const uint32_t blocks = (base + r + 1) / 4;
+                need(blocks > 16384u + block_budget / 2u || (blocks > 16000u && pattern != Ids128::window_edge && pattern != Ids128::low_window),
+                    "128K block layout needs a history past the first window");
+                uint32_t* row = h_ids.data() + uint64_t(r) * block_budget;
+                switch (pattern) {
+                case Ids128::spread: {
+                    // Evenly spaced over the whole history, ending on the last complete block.
+                    const uint32_t span_step = std::max(1u, (blocks - 1u) / (block_budget - 1u));
+                    for (uint32_t b = 0; b + 1 < block_budget; ++b) row[b] = b * span_step;
+                    row[block_budget - 1u] = blocks - 1u;
+                    break;
+                }
+                case Ids128::window_edge:
+                    // Block 0, a contiguous run across blocks 16,383 and 16,384, and the last complete block.
+                    row[0] = 0u;
+                    for (uint32_t b = 1; b + 1 < block_budget; ++b) row[b] = 16384u - block_budget / 2u + b;
+                    row[block_budget - 1u] = blocks - 1u;
+                    break;
+                case Ids128::low_window:
+                    // Every selected block in the first window, ending on its last block: later windows hold partial blocks only.
+                    for (uint32_t b = 0; b < block_budget; ++b) row[b] = 16384u - block_budget + b;
+                    break;
+                case Ids128::high_window:
+                    // The newest complete blocks only: the first window is empty once the history is long enough.
+                    for (uint32_t b = 0; b < block_budget; ++b) row[b] = blocks - block_budget + b;
+                    break;
+                case Ids128::disjoint_rows: {
+                    // The eight rows of a tile share no block, so its list holds 8 * 512 entries plus the partial blocks.
+                    const uint32_t stride = ((blocks - 8u) / (block_budget - 1u)) / 8u * 8u;
+                    for (uint32_t b = 0; b < block_budget; ++b) row[b] = (r % 8u) + stride * b;
+                    break;
+                }
+                }
+                for (uint32_t b = 0; b < block_budget; ++b)
+                    need(row[b] < blocks && (b == 0 || row[b] > row[b - 1u]), "128K block layout must be ascending and inside the history");
+            }
+            return h_ids;
+        };
+
+        auto run_case_128k = [&](uint32_t base, uint32_t n, Ids128 pattern, const char* layout) {
+            std::vector<float> h_q(uint64_t(n) * q_dim);
+            for (auto& x : h_q) x = float(int(rng128() % 2001) - 1000) * 0.0008f;
+            const auto h_ids = make_ids_128k(base, n, pattern);
+
+            const auto q_nax = g_nax128.upload(std::as_bytes(std::span(h_q)), "q_nax_128k");
+            const auto ids_nax = g_nax128.upload(std::as_bytes(std::span(h_ids)), "ids_nax_128k");
+            const auto out_nax = g_nax128.zeros(uint64_t(n) * q_dim * 4, "out_nax_128k");
+
+            g_nax128.begin();
+            g_nax128.nax_qsa_attention(q_nax, k_nax, v_nax, ids_nax, out_nax, base, n, shape128k, block_budget);
+            static_cast<void>(g_nax128.submit());
+
+            const uint32_t tiles = (shape128k.token_budget + 3 + 127) / 128;
+            const auto q_ref = g_ref128.upload(std::as_bytes(std::span(h_q)), "q_ref_128k");
+            const auto ids_ref = g_ref128.upload(std::as_bytes(std::span(h_ids)), "ids_ref_128k");
+            const auto partials = g_ref128.zeros(uint64_t(32) * shape128k.query_heads * tiles * (shape128k.head_width + 2) * 4, "partials_128k");
+            const auto out_ref = g_ref128.zeros(uint64_t(n) * q_dim * 4, "out_ref_128k");
+
+            g_ref128.begin();
+            for (uint32_t first = 0; first < n; first += 32) {
+                const uint32_t sn = std::min(32u, n - first), sb = base + first;
+                const auto qs = g_ref128.slice(q_ref, uint64_t(first) * q_dim * 4, uint64_t(sn) * q_dim * 4);
+                const auto is = g_ref128.slice(ids_ref, uint64_t(first) * block_budget * 4, uint64_t(sn) * block_budget * 4);
+                const auto os = g_ref128.slice(out_ref, uint64_t(first) * q_dim * 4, uint64_t(sn) * q_dim * 4);
+                const std::array<GpuView, 5> b1{qs, k_ref, v_ref, is, partials};
+                g_ref128.qsa_prefill_dispatch(QsaPrefillOp::attention_partial128, b1,
+                    {sn, sb, shape128k.query_heads, shape128k.kv_heads, shape128k.head_width, 4, block_budget, q_dim, block_budget, tiles});
+                const std::array<GpuView, 2> b2{partials, os};
+                g_ref128.qsa_prefill_dispatch(QsaPrefillOp::attention_reduce, b2,
+                    {sn, sb, shape128k.query_heads, shape128k.head_width, 4, block_budget, tiles, q_dim});
+            }
+            static_cast<void>(g_ref128.submit());
+
+            std::vector<float> got(uint64_t(n) * q_dim), want(uint64_t(n) * q_dim);
+            g_nax128.read(out_nax, std::as_writable_bytes(std::span(got)));
+            g_ref128.read(out_ref, std::as_writable_bytes(std::span(want)));
+            const double nmse = nmse_f32(got, want);
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < got.size(); ++i) {
+                max_abs = std::max(max_abs, std::fabs(got[i] - want[i]));
+                ++total_checks;
+            }
+            need(nmse <= 1e-4 && max_abs <= 5e-3f, "128K nax_qsa_attention NMSE or max_abs exceeded BF16 tolerance");
+            std::cout << "PASS 128K nax_qsa_attention(base=" << base << ", n=" << n << ", " << layout << ") nmse=" << nmse << " max_abs=" << max_abs << '\n';
+
+            for (auto v : {q_nax, ids_nax, out_nax}) g_nax128.release(v);
+            for (auto v : {q_ref, ids_ref, partials, out_ref}) g_ref128.release(v);
+        };
+        run_case_128k(98300, 8, Ids128::spread, "spread");
+        run_case_128k(98300, 23, Ids128::spread, "spread");
+        run_case_128k(131064, 8, Ids128::spread, "spread");
+        run_case_128k(131048, 24, Ids128::spread, "spread");
+        // Rows on both sides of position 65,536: histories of 16,383 to 16,386 blocks, so the second window holds one or two blocks.
+        run_case_128k(65532, 8, Ids128::spread, "spread");
+        run_case_128k(65532, 8, Ids128::high_window, "newest blocks");
+        run_case_128k(65536, 16, Ids128::disjoint_rows, "disjoint rows");
+        // Blocks on both sides of the window boundary, in one window only, and full-length tile lists.
+        run_case_128k(98300, 23, Ids128::window_edge, "window edge");
+        run_case_128k(131064, 8, Ids128::window_edge, "window edge");
+        run_case_128k(98300, 8, Ids128::low_window, "first window only");
+        run_case_128k(131048, 24, Ids128::low_window, "first window only");
+        run_case_128k(131064, 8, Ids128::high_window, "newest blocks");
+        run_case_128k(98300, 24, Ids128::disjoint_rows, "disjoint rows");
+        run_case_128k(131048, 24, Ids128::disjoint_rows, "disjoint rows");
+
+        // Verify-only scope above 64K: at most eight rows, bit-identical to the prefill kernel, in the same dispatch count as at any shorter context.
+        {
+            struct VerifyCase { uint32_t base; Ids128 pattern; const char* layout; };
+            for (const auto& c : {VerifyCase{65532, Ids128::high_window, "newest blocks"}, VerifyCase{98300, Ids128::window_edge, "window edge"},
+                    VerifyCase{131064, Ids128::spread, "spread"}, VerifyCase{131064, Ids128::disjoint_rows, "disjoint rows"}}) {
+                const uint32_t n = 8;
+                std::vector<float> h_q(uint64_t(n) * q_dim);
+                for (auto& x : h_q) x = float(int(rng128() % 2001) - 1000) * 0.0008f;
+                const auto h_ids = make_ids_128k(c.base, n, c.pattern);
+                const auto q_v = g_vnax128.upload(std::as_bytes(std::span(h_q)), "q_v_128k");
+                const auto ids_v = g_vnax128.upload(std::as_bytes(std::span(h_ids)), "ids_v_128k");
+                const auto out_v = g_vnax128.zeros(uint64_t(n) * q_dim * 4, "out_v_128k");
+                g_vnax128.set_verify_nax_scope(true);
+                g_vnax128.begin();
+                g_vnax128.nax_qsa_attention(q_v, k_ver, v_ver, ids_v, out_v, c.base, n, shape128k, block_budget);
+                const auto b_v = g_vnax128.submit();
+                g_vnax128.set_verify_nax_scope(false);
+                need(b_v.dispatches == qsa_nax_attention_dispatches(c.base, n, shape128k), "128K verify_nax G12 QSA dispatch count mismatch");
+
+                const auto q_n = g_nax128.upload(std::as_bytes(std::span(h_q)), "q_n_128k");
+                const auto ids_n = g_nax128.upload(std::as_bytes(std::span(h_ids)), "ids_n_128k");
+                const auto out_n = g_nax128.zeros(uint64_t(n) * q_dim * 4, "out_n_128k");
+                g_nax128.begin();
+                g_nax128.nax_qsa_attention(q_n, k_nax, v_nax, ids_n, out_n, c.base, n, shape128k, block_budget);
+                static_cast<void>(g_nax128.submit());
+
+                std::vector<float> got_v(uint64_t(n) * q_dim), got_n(uint64_t(n) * q_dim);
+                g_vnax128.read(out_v, std::as_writable_bytes(std::span(got_v)));
+                g_nax128.read(out_n, std::as_writable_bytes(std::span(got_n)));
+                for (size_t i = 0; i < got_v.size(); ++i) {
+                    need(got_v[i] == got_n[i], "128K verify_nax G12 QSA output differed from prefill G12 QSA");
+                    ++total_checks;
+                }
+                for (auto v : {q_v, ids_v, out_v}) g_vnax128.release(v);
+                for (auto v : {q_n, ids_n, out_n}) g_nax128.release(v);
+                std::cout << "PASS 128K verify_nax G12 QSA attention(base=" << c.base << ", n=8, " << c.layout << ") bit-identical to prefill G12\n";
+            }
+
+            // A repeated block ID in a later window must still raise the sticky error: block validity is judged once, during the first window's pass.
+            const uint32_t base = 131064, n = 8;
+            std::vector<float> h_q(uint64_t(n) * q_dim);
+            for (auto& x : h_q) x = float(int(rng128() % 2001) - 1000) * 0.0008f;
+            auto bad = make_ids_128k(base, n, Ids128::high_window);
+            need(bad[10] >= 16384u, "repeated block must sit beyond the first window");
+            bad[10] = bad[9];
+            const auto q_v = g_vnax128.upload(std::as_bytes(std::span(h_q)), "q_bad_128k");
+            const auto bad_ids = g_vnax128.upload(std::as_bytes(std::span(bad)), "bad_ids_128k");
+            const auto out_v = g_vnax128.zeros(uint64_t(n) * q_dim * 4, "out_bad_128k");
+            g_vnax128.set_verify_nax_scope(true);
+            g_vnax128.begin();
+            g_vnax128.nax_qsa_attention(q_v, k_ver, v_ver, bad_ids, out_v, base, n, shape128k, block_budget);
+            bool caught_bad = false;
+            try { static_cast<void>(g_vnax128.submit()); } catch (const FormatError&) { caught_bad = true; }
+            g_vnax128.set_verify_nax_scope(false);
+            need(caught_bad, "repeated block ID beyond the first window must fail nax_qsa_build_tile_lists with sticky FormatError");
+            for (auto v : {q_v, bad_ids, out_v}) g_vnax128.release(v);
+            std::cout << "PASS 128K invalid block ID beyond the first window is rejected\n";
+        }
+
+        g_nax128.release(k_nax); g_nax128.release(v_nax);
+        g_ref128.release(k_ref); g_ref128.release(v_ref);
+        g_vnax128.release(k_ver); g_vnax128.release(v_ver);
+
+        {
+            const uint32_t base = 131048, n = 24;
+            const uint32_t iq_dim = shape128k.index_heads * shape128k.index_width; // 512
+            std::vector<float> h_iq(uint64_t(n) * iq_dim);
+            for (auto& x : h_iq) x = float(int(rng128() % 2001) - 1000) * 0.001f;
+            std::vector<uint16_t> h_ik(uint64_t(block_cap) * shape128k.index_width);
+            for (auto& x : h_ik) x = finite_bf16(float(int(rng128() % 2001) - 1000) * 0.001f);
+
+            const auto iq_n = g_nax128.upload(std::as_bytes(std::span(h_iq)), "iq_n_128k");
+            const auto ik_n = g_nax128.upload(std::as_bytes(std::span(h_ik)), "ik_n_128k");
+            const auto out_ids_n = g_nax128.zeros(uint64_t(n) * block_budget * 4, "out_ids_n_128k");
+            g_nax128.begin();
+            g_nax128.nax_qsa_select_blocks(iq_n, ik_n, out_ids_n, base, n, shape128k, block_budget);
+            static_cast<void>(g_nax128.submit());
+
+            const auto iq_r = g_ref128.upload(std::as_bytes(std::span(h_iq)), "iq_r_128k");
+            const auto ik_r = g_ref128.upload(std::as_bytes(std::span(h_ik)), "ik_r_128k");
+            const auto out_ids_r = g_ref128.zeros(uint64_t(n) * block_budget * 4, "out_ids_r_128k");
+            const uint32_t sel_stride = ((block_cap + 511u) / 512u) * block_budget;
+            const auto sc_r = g_ref128.zeros(uint64_t(32) * block_cap * 4, "sc_r_128k");
+            const auto sa_r = g_ref128.zeros(uint64_t(32) * sel_stride * 4, "sa_r_128k");
+            const auto ia_r = g_ref128.zeros(uint64_t(32) * sel_stride * 4, "ia_r_128k");
+            const auto sb_r = g_ref128.zeros(uint64_t(32) * sel_stride * 4, "sb_r_128k");
+            const auto ib_r = g_ref128.zeros(uint64_t(32) * sel_stride * 4, "ib_r_128k");
+            g_ref128.begin();
+            const uint32_t mb = (base + n) / 4u;
+            g_ref128.qsa_prefill_dispatch(QsaPrefillOp::index_scores, std::array<GpuView, 3>{iq_r, ik_r, sc_r},
+                {n, base, shape128k.index_heads, shape128k.index_width, block_cap, iq_dim, block_budget});
+            g_ref128.qsa_prefill_dispatch(QsaPrefillOp::select_sort, std::array<GpuView, 3>{sc_r, sa_r, ia_r},
+                {n, base, block_cap, sel_stride, block_budget});
+            GpuView in_s = sa_r, in_i = ia_r, out_s = sb_r, out_i = ib_r;
+            for (uint32_t span = 512u; span < mb; span *= 2u) {
+                g_ref128.qsa_prefill_dispatch(QsaPrefillOp::select_merge, std::array<GpuView, 4>{in_s, in_i, out_s, out_i},
+                    {n, base, sel_stride, block_budget, span});
+                std::swap(in_s, out_s);
+                std::swap(in_i, out_i);
+            }
+            g_ref128.qsa_prefill_dispatch(QsaPrefillOp::select_ids, std::array<GpuView, 2>{in_i, out_ids_r},
+                {n, base, sel_stride, block_budget, block_budget});
+            static_cast<void>(g_ref128.submit());
+
+            std::vector<uint32_t> got_ids(uint64_t(n) * block_budget), ref_ids(uint64_t(n) * block_budget);
+            g_nax128.read(out_ids_n, std::as_writable_bytes(std::span(got_ids)));
+            g_ref128.read(out_ids_r, std::as_writable_bytes(std::span(ref_ids)));
+            for (size_t i = 0; i < got_ids.size(); ++i) {
+                need(got_ids[i] == ref_ids[i], "128K nax_qsa_select_blocks selected ID mismatch");
+                ++total_checks;
+            }
+            for (auto v : {iq_n, ik_n, out_ids_n}) g_nax128.release(v);
+            for (auto v : {iq_r, ik_r, out_ids_r, sc_r, sa_r, ia_r, sb_r, ib_r}) g_ref128.release(v);
+            std::cout << "PASS 128K nax_qsa_select_blocks(base=131048, n=24) exact selected IDs across 32,768 blocks\n";
+        }
+    }
 }
 
 void test_verify_nax_m2_m3_m8(const char* metallib) {
@@ -2022,7 +2287,20 @@ void test_dflash2_verify_budget() {
          "IRLS refit must raise acceptance intercept under high acceptance vs zero acceptance");
     need(b_hi.choose_verify_rows(mid, 8u) > b_lo.choose_verify_rows(mid, 8u),
          "calibrated high-acceptance budget must choose strictly more verify rows than zero-acceptance budget");
-    std::cout << "PASS DFlash2VerifyBudget (seed costs, unbiased prefix labels, 1-in-32 exploration, 64-cycle IRLS calibration)\n";
+
+    // Stepped M4 (r=2..4) vs M8 (r=5..8) per-row EWMA cost preservation: high-row M8 observations must not smear across narrow M4 rows
+    DFlash2VerifyBudget b_stepped;
+    for (uint32_t c = 0; c < 30u; ++c) {
+        b_stepped.observe(mid, 4u, 3u, 37.6, true);
+        if ((c % 8u) == 7u) b_stepped.observe(high, 8u, 6u, 50.2, true);
+    }
+    const auto stepped_costs = b_stepped.costs();
+    for (uint32_t r = 1u; r < 8u; ++r) {
+        need(stepped_costs[r] <= stepped_costs[r + 1u], "stepped DFlash2VerifyBudget costs must remain monotone");
+    }
+    need((stepped_costs[4] - stepped_costs[2]) < (stepped_costs[5] - stepped_costs[4]),
+         "narrow M4 span (2..4) must remain flatter than the M4->M8 tile step (4->5)");
+    std::cout << "PASS DFlash2VerifyBudget (stepped M4/M8 costs, unbiased prefix labels, 1-in-32 exploration, 64-cycle IRLS calibration)\n";
 }
 
 void test_nax_dense_q8_swiglu_and_fast_router(const char* metallib, bool bounded_policy = false) {
@@ -3599,7 +3877,16 @@ int main(int argc, char** argv) {
             std::cout << "PASS registered Q8 tile64 M32 exact small-output and large-output digest parity with nominal component ABBA\n";
             return 0;
         }
-        if (argc != 2) throw FormatError("usage: test-nax_prefill_metal OWNED_METALLIB [--target-shared-gu-splits 8|4 | --target-shared-down-splits 4|2 | --q8-cache-policy-only | --q8-t64-m32-only | --q8-t64-m32-control CONTROL_METALLIB | --q8-t64-m8-single-only | --q8-t64-m8-single-control CONTROL_METALLIB | --q8-t64-m8-concurrent-control CONTROL_METALLIB]");
+        if (argc == 3 && std::strcmp(argv[2], "--qsa-attention-only") == 0) {
+            test_nax_qsa_attention_and_bf16_reuse(argv[1]);
+            std::cout << "ALL NAX QSA ATTENTION CHECKS PASSED (" << total_checks << " checks)\n";
+            return 0;
+        }
+        if (argc == 3 && std::strcmp(argv[2], "--dflash2-verify-budget-only") == 0) {
+            test_dflash2_verify_budget();
+            return 0;
+        }
+        if (argc != 2) throw FormatError("usage: test-nax_prefill_metal OWNED_METALLIB [--target-shared-gu-splits 8|4 | --target-shared-down-splits 4|2 | --q8-cache-policy-only | --q8-t64-m32-only | --q8-t64-m32-control CONTROL_METALLIB | --q8-t64-m8-single-only | --q8-t64-m8-single-control CONTROL_METALLIB | --q8-t64-m8-concurrent-control CONTROL_METALLIB | --qsa-attention-only]");
         test_dense_nax(argv[1]);
         test_q8_cache_preparation_entries(argv[1]);
         test_registered_q8_m8_cache_policy(argv[1]);

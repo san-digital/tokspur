@@ -1534,6 +1534,9 @@ kernel void planar_moe_gate_up_swiglu_m4(device const uchar* pair_lo [[buffer(0)
     } else if (n_est == 2u) {
         planar_v3_detail::planar_moe_gate_up_swiglu_union_impl<2, 4>(
             pair_lo, pair_hi, input, expert_hidden, meta, a, error, group, sg, lane, tid);
+    } else if (n_est == 3u) {
+        planar_v3_detail::planar_moe_gate_up_swiglu_union_impl<3, 4>(
+            pair_lo, pair_hi, input, expert_hidden, meta, a, error, group, sg, lane, tid);
     } else {
         planar_v3_detail::planar_moe_gate_up_swiglu_union_impl<4, 4>(
             pair_lo, pair_hi, input, expert_hidden, meta, a, error, group, sg, lane, tid);
@@ -1558,8 +1561,14 @@ kernel void planar_moe_gate_up_swiglu_m8(device const uchar* pair_lo [[buffer(0)
     } else if (n_est == 2u) {
         planar_v3_detail::planar_moe_gate_up_swiglu_union_impl<2, 8>(
             pair_lo, pair_hi, input, expert_hidden, meta, a, error, group, sg, lane, tid);
-    } else if (n_est >= 3u && n_est <= 4u) {
+    } else if (n_est == 3u) {
+        planar_v3_detail::planar_moe_gate_up_swiglu_union_impl<3, 8>(
+            pair_lo, pair_hi, input, expert_hidden, meta, a, error, group, sg, lane, tid);
+    } else if (n_est == 4u) {
         planar_v3_detail::planar_moe_gate_up_swiglu_union_impl<4, 8>(
+            pair_lo, pair_hi, input, expert_hidden, meta, a, error, group, sg, lane, tid);
+    } else if (n_est == 5u) {
+        planar_v3_detail::planar_moe_gate_up_swiglu_union_impl<5, 8>(
             pair_lo, pair_hi, input, expert_hidden, meta, a, error, group, sg, lane, tid);
     } else {
         planar_v3_detail::planar_moe_gate_up_swiglu_union_impl<8, 8>(
@@ -1769,6 +1778,9 @@ kernel void planar_moe_down_m4(device const uchar* down_weights [[buffer(0)]],
     } else if (n_est == 2u) {
         planar_v3_detail::planar_moe_down_union_impl<2, 4>(
             down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid, sx);
+    } else if (n_est == 3u) {
+        planar_v3_detail::planar_moe_down_union_impl<3, 4>(
+            down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid, sx);
     } else {
         planar_v3_detail::planar_moe_down_union_impl<4, 4>(
             down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid, sx);
@@ -1793,8 +1805,14 @@ kernel void planar_moe_down_m8(device const uchar* down_weights [[buffer(0)]],
     } else if (n_est == 2u) {
         planar_v3_detail::planar_moe_down_union_impl<2, 8>(
             down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid, sx);
-    } else if (n_est >= 3u && n_est <= 4u) {
+    } else if (n_est == 3u) {
+        planar_v3_detail::planar_moe_down_union_impl<3, 8>(
+            down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid, sx);
+    } else if (n_est == 4u) {
         planar_v3_detail::planar_moe_down_union_impl<4, 8>(
+            down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid, sx);
+    } else if (n_est == 5u) {
+        planar_v3_detail::planar_moe_down_union_impl<5, 8>(
             down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid, sx);
     } else {
         planar_v3_detail::planar_moe_down_union_impl<8, 8>(

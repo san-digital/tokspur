@@ -2,6 +2,7 @@
 #include "tokspur/expert_lanes.hpp"
 #include "tokspur/json.hpp"
 #include "tokspur/lane_sidecar.hpp"
+#include "tokspur/model.hpp"
 #include "tokspur/numeric.hpp"
 
 #ifndef __APPLE__
@@ -144,7 +145,7 @@ std::string build_manifest_v3(const PackPlanV3& plan) {
         {"schema", Json::integer(plan.version)},
         {"recipe", Json(plan.recipe)},
         {"source_architecture", Json(derived_pack::source_architecture)},
-        {"target_revision", Json(derived_pack::target_revision)},
+        {"target_revision", Json(plan.target_revision)},
         {"mtp_sidecar_sha256", Json(derived_pack::mtp_sidecar_sha256)},
         {"source_payload_bytes", Json::integer(plan.source_payload_bytes)},
         {"payload_bytes", Json::integer(plan.payload_bytes)},
@@ -391,44 +392,60 @@ PackTensorV3 make_coloc_entry(const Tensor& t, bool is_gate, std::string partner
     };
 }
 
-PackPlanV3 plan_filtered_v3(
-    const ModelFiles& source,
-    const ModelFiles* mtp_sidecar,
-    std::string_view prefix_filter,
-    std::string recipe_name,
+std::string resolve_source_target_revision(const ModelFiles& source) {
+    std::optional<std::string> found;
+    for (const auto& shard : source.shards()) {
+        const auto* meta = shard.find("tokspur.source.revision");
+        if (!meta) continue;
+        require(meta->type == 8, "invalid tokspur.source.revision metadata type");
+        const std::string rev(shard.string_value("tokspur.source.revision"));
+        require(!rev.empty(), "empty tokspur.source.revision metadata");
+        if (found) require(*found == rev, "conflicting tokspur.source.revision across shards");
+        else found = rev;
+    }
+    return found.value_or(std::string(derived_pack::target_revision));
+}
+
+bool is_cpu_base_only_source(const ModelFiles& source) {
+    return source.architecture() == derived_pack::source_architecture &&
+           source.shards().size() == 1 &&
+           !source.shards()[0].find("split.no") &&
+           source.tensors().size() == 2 &&
+           source.tensors().contains("token_embd.weight") &&
+           source.tensors().contains("per_layer_token_embd.weight");
+}
+
+uint64_t expected_gguf_tensor_bytes(uint32_t type_id, const std::vector<uint64_t>& dims) {
+    require(!dims.empty() && dims[0] != 0, "empty tensor dimensions in pack v3 manifest");
+    const auto& enc = tokspur::encoding(type_id);
+    require(dims[0] % enc.elements_per_block == 0, "unaligned tensor row in pack v3 manifest");
+    uint64_t bytes = checked_mul(dims[0] / enc.elements_per_block, enc.bytes_per_block);
+    for (size_t d = 1; d < dims.size(); ++d) {
+        require(dims[d] != 0, "zero tensor dimension in pack v3 manifest");
+        bytes = checked_mul(bytes, dims[d]);
+    }
+    return bytes;
+}
+
+template <typename LookupMeta>
+void populate_plan_entries_v3(
+    PackPlanV3& plan,
+    const std::vector<std::string>& candidate_names,
+    const std::set<std::string>& seen,
+    LookupMeta&& lookup_meta,
     uint64_t byte_budget
 ) {
-    source.assert_unchanged();
-    require(source.architecture() != derived_pack::pack_architecture, "cannot repack an existing derived pack");
-    if (mtp_sidecar) mtp_sidecar->assert_unchanged();
-
-    std::vector<std::string> candidate_names;
-    std::set<std::string> seen;
-    const auto collect = [&](const ModelFiles& files) {
-        for (const auto& [name, loc] : files.tensors()) {
-            static_cast<void>(loc);
-            if (!derived_pack::is_gpu_pack_tensor(name)) continue;
-            if (!prefix_filter.empty() && std::string_view(name).substr(0, prefix_filter.size()) != prefix_filter) continue;
-            if (seen.insert(name).second) candidate_names.push_back(name);
-        }
-    };
-    collect(source);
-    if (mtp_sidecar) collect(*mtp_sidecar);
-    require(!candidate_names.empty(), "empty pack v3 tensor selection");
-
-    PackPlanV3 plan;
-    plan.recipe = std::move(recipe_name);
     std::set<std::string> emitted;
 
     for (const auto& name : candidate_names) {
         if (emitted.contains(name)) continue;
-        const Tensor* meta = lookup_tensor_meta(source, mtp_sidecar, name);
+        const Tensor* meta = lookup_meta(name);
         require(meta != nullptr, "missing tensor metadata while planning pack v3");
 
         // Pair ffn_gate_exps.weight immediately with ffn_up_exps.weight for co-located adjacency.
         if (ends_with(name, ".ffn_gate_exps.weight")) {
             const std::string up_name = name.substr(0, name.size() - std::strlen(".ffn_gate_exps.weight")) + ".ffn_up_exps.weight";
-            const Tensor* up_meta = lookup_tensor_meta(source, mtp_sidecar, up_name);
+            const Tensor* up_meta = lookup_meta(up_name);
             if (up_meta && seen.contains(up_name) && !emitted.contains(up_name) && coloc_eligible(*meta, *up_meta)) {
                 auto g_entry = make_coloc_entry(*meta, true, up_name);
                 auto u_entry = make_coloc_entry(*up_meta, false, name);
@@ -492,6 +509,134 @@ PackPlanV3 plan_filtered_v3(
     plan.data_offset = hdr.size();
     plan.file_bytes = checked_add(plan.data_offset, relative_offset);
     require(plan.file_bytes <= byte_budget, "planned pack v3 exceeds byte budget");
+}
+
+void reconstruct_cpu_base_plan_v3(
+    PackPlanV3& plan,
+    const Gguf& file,
+    const ModelFiles& model,
+    const ModelFiles* mtp_sidecar
+) {
+    require(model.tensors().size() == derived_pack::expected_gpu_tensors,
+            "pack v3 tensor count does not satisfy full GPU census");
+    std::map<std::string, TensorRequirement, std::less<>> req_map;
+    for (auto& item : flash_next_requirements(1)) {
+        if (derived_pack::is_cpu_pinned_embedding(item.name)) continue;
+        require(req_map.emplace(item.name, item).second, "duplicate Flash-Next GPU tensor requirement");
+    }
+
+    const auto mjson = parse_json(file.string_value("tokspur_pack.manifest"), {max_header_bytes, 600'000, 16});
+    const auto* mtensors = mjson.find("tensors");
+    require(mtensors && mtensors->kind() == Json::Kind::array &&
+            mtensors->array().size() == derived_pack::expected_gpu_tensors,
+            "pack v3 manifest tensor count mismatch");
+
+    const auto parse_dims = [](const Json* arr_p) {
+        require(arr_p && arr_p->kind() == Json::Kind::array && !arr_p->array().empty(),
+                "pack v3 manifest tensor dimensions missing");
+        std::vector<uint64_t> out;
+        out.reserve(arr_p->array().size());
+        for (const auto& d : arr_p->array()) out.push_back(d.unsigned_integer());
+        return out;
+    };
+
+    std::map<std::string, Tensor, std::less<>> synth_target;
+    std::map<std::string, Tensor, std::less<>> synth_mtp;
+    for (const auto& entry : mtensors->array()) {
+        const auto* name_p = entry.find("name");
+        const auto* src_type_p = entry.find("source_type");
+        const auto* src_bytes_p = entry.find("source_bytes");
+        require(name_p && src_type_p && src_bytes_p, "incomplete pack v3 tensor manifest entry");
+        const std::string tname(name_p->string());
+        require(derived_pack::is_gpu_pack_tensor(tname) && model.tensors().contains(tname),
+                "unexpected tensor in pack v3 manifest");
+        const uint32_t src_type = static_cast<uint32_t>(src_type_p->unsigned_integer());
+        auto src_dims = parse_dims(entry.find("source_dimensions"));
+        const uint64_t src_bytes = src_bytes_p->unsigned_integer();
+        require(expected_gguf_tensor_bytes(src_type, src_dims) == src_bytes,
+                "pack v3 manifest source_bytes mismatch");
+
+        Tensor synth{};
+        synth.name = tname;
+        synth.dimensions = std::move(src_dims);
+        synth.type = src_type;
+        synth.bytes = src_bytes;
+
+        if (tname.starts_with("blk.48.")) {
+            if (mtp_sidecar) {
+                require(mtp_sidecar->tensors().contains(tname), "pack v3 MTP tensor missing from MTP sidecar");
+                const auto& sidecar_t = mtp_sidecar->tensor(tname);
+                require(sidecar_t.type == synth.type && sidecar_t.dimensions == synth.dimensions &&
+                        sidecar_t.bytes == synth.bytes,
+                        "pack v3 MTP tensor differs from MTP sidecar");
+            }
+            require(synth_mtp.emplace(tname, std::move(synth)).second, "duplicate MTP tensor in pack v3 manifest");
+        } else {
+            const auto req_it = req_map.find(tname);
+            require(req_it != req_map.end(), "unrecognised target GPU tensor in pack v3 manifest");
+            require(synth.dimensions == req_it->second.shape &&
+                    std::find(req_it->second.encodings.begin(), req_it->second.encodings.end(), synth.type) != req_it->second.encodings.end(),
+                    "pack v3 target tensor violates Flash-Next geometry or encoding contract");
+            require(synth_target.emplace(tname, std::move(synth)).second, "duplicate target tensor in pack v3 manifest");
+        }
+    }
+
+    require(synth_target.size() == req_map.size() &&
+            (!mtp_sidecar || synth_mtp.size() == mtp_sidecar->tensors().size()) &&
+            synth_target.size() + synth_mtp.size() == derived_pack::expected_gpu_tensors,
+            "pack v3 manifest missing required target or MTP GPU tensors");
+
+    std::vector<std::string> candidate_names;
+    candidate_names.reserve(derived_pack::expected_gpu_tensors);
+    std::set<std::string> seen;
+    for (const auto& [name, _] : synth_target) {
+        seen.insert(name);
+        candidate_names.push_back(name);
+    }
+    for (const auto& [name, _] : synth_mtp) {
+        seen.insert(name);
+        candidate_names.push_back(name);
+    }
+
+    const auto lookup_synth = [&](std::string_view name) -> const Tensor* {
+        if (const auto it = synth_target.find(name); it != synth_target.end()) return &it->second;
+        if (const auto it = synth_mtp.find(name); it != synth_mtp.end()) return &it->second;
+        return nullptr;
+    };
+    populate_plan_entries_v3(plan, candidate_names, seen, lookup_synth, derived_pack::max_pack_bytes);
+}
+
+PackPlanV3 plan_filtered_v3(
+    const ModelFiles& source,
+    const ModelFiles* mtp_sidecar,
+    std::string_view prefix_filter,
+    std::string recipe_name,
+    uint64_t byte_budget
+) {
+    source.assert_unchanged();
+    require(source.architecture() != derived_pack::pack_architecture, "cannot repack an existing derived pack");
+    if (mtp_sidecar) mtp_sidecar->assert_unchanged();
+
+    std::vector<std::string> candidate_names;
+    std::set<std::string> seen;
+    const auto collect = [&](const ModelFiles& files) {
+        for (const auto& [name, loc] : files.tensors()) {
+            static_cast<void>(loc);
+            if (!derived_pack::is_gpu_pack_tensor(name)) continue;
+            if (!prefix_filter.empty() && std::string_view(name).substr(0, prefix_filter.size()) != prefix_filter) continue;
+            if (seen.insert(name).second) candidate_names.push_back(name);
+        }
+    };
+    collect(source);
+    if (mtp_sidecar) collect(*mtp_sidecar);
+    require(!candidate_names.empty(), "empty pack v3 tensor selection");
+
+    PackPlanV3 plan;
+    plan.recipe = std::move(recipe_name);
+    plan.target_revision = resolve_source_target_revision(source);
+    populate_plan_entries_v3(plan, candidate_names, seen, [&](std::string_view name) {
+        return lookup_tensor_meta(source, mtp_sidecar, name);
+    }, byte_budget);
 
     source.assert_unchanged();
     if (mtp_sidecar) mtp_sidecar->assert_unchanged();
@@ -518,6 +663,8 @@ void parse_manifest_v3_into_plan(PackPlanV3& plan, const Gguf& file) {
             "stale or incompatible pack v3 metadata");
 
     const auto json = parse_json(file.string_value("tokspur_pack.manifest"), {max_header_bytes, 600'000, 16});
+    const auto* rev_p = json.find("target_revision");
+    require(rev_p && rev_p->string() == plan.target_revision, "pack v3 manifest target_revision mismatch");
     const auto* tensors_val = json.find("tensors");
     require(tensors_val && tensors_val->kind() == Json::Kind::array, "pack v3 manifest missing tensors array");
     const auto& entries = tensors_val->array();
@@ -1305,8 +1452,11 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
             "adopted file is not a valid tokspur_pack GGUF");
 
     const auto& file = model->shards()[0];
-    if (!mtp_sidecar && model->tensors().size() == derived_pack::expected_gpu_tensors &&
-        plan.tensors.size() < derived_pack::expected_gpu_tensors) {
+    const bool cpu_base_only = require_full_census && plan.tensors.empty() && is_cpu_base_only_source(*source);
+    if (cpu_base_only) {
+        reconstruct_cpu_base_plan_v3(plan, file, *model, mtp_sidecar.get());
+    } else if (!mtp_sidecar && model->tensors().size() == derived_pack::expected_gpu_tensors &&
+               plan.tensors.size() < derived_pack::expected_gpu_tensors) {
         const auto mjson = parse_json(file.string_value("tokspur_pack.manifest"), {max_header_bytes, 600'000, 16});
         const auto* mtensors = mjson.find("tensors");
         require(mtensors && mtensors->kind() == Json::Kind::array &&
@@ -1427,6 +1577,9 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
     std::atomic<bool> source_read{false};
     const auto verify_unit = [&](size_t unit_idx) {
         if (check_cancelled) check_cancelled();
+        const auto is_pack_only_tensor = [&](std::string_view tname) {
+            return tname.starts_with("blk.48.") ? (mtp_sidecar == nullptr) : cpu_base_only;
+        };
         const size_t i = units[unit_idx];
         const auto& t = plan.tensors[i];
         const auto& packed_meta = model->tensor(t.name);
@@ -1445,9 +1598,11 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
                     up_meta.offset == checked_add(canonical_header.size(), t_up.offset),
                     "pack v3 co-located up tensor metadata mismatch");
 
-            const bool pack_only_trailing_mtp = !mtp_sidecar && t.name.starts_with("blk.48.") && t_up.name.starts_with("blk.48.");
-            AuthenticationSource gate_orig(*source, mtp_sidecar.get(), t.name, !pack_only_trailing_mtp, chunk_bytes);
-            AuthenticationSource up_orig(*source, mtp_sidecar.get(), t_up.name, !pack_only_trailing_mtp, chunk_bytes);
+            require(is_pack_only_tensor(t.name) == is_pack_only_tensor(t_up.name),
+                    "mismatched source presence for co-located pack v3 tensor pair");
+            const bool pack_only_pair = is_pack_only_tensor(t.name);
+            AuthenticationSource gate_orig(*source, mtp_sidecar.get(), t.name, !pack_only_pair, chunk_bytes);
+            AuthenticationSource up_orig(*source, mtp_sidecar.get(), t_up.name, !pack_only_pair, chunk_bytes);
             const auto lo_packed = model->tensor_bytes(t.name);
             const auto hi_packed = model->tensor_bytes(t_up.name);
 
@@ -1481,7 +1636,7 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
                                                     static_cast<size_t>(spec.planar_expert_bytes));
                 unpack_expert_planar_v3(spec, g_pk, restored_gate);
                 unpack_expert_planar_v3(spec, u_pk, restored_up);
-                if (!pack_only_trailing_mtp) {
+                if (!pack_only_pair) {
                     const auto g_in = gate_orig.read(static_cast<size_t>(e * spec.source_expert_bytes),
                                                         static_cast<size_t>(spec.source_expert_bytes));
                     const auto u_in = up_orig.read(static_cast<size_t>(e * spec.source_expert_bytes),
@@ -1501,7 +1656,7 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
                     hi_pack_h.add(u_pk);
                 }
             }
-            require((pack_only_trailing_mtp || (gate_src_h.finish() == t.source_sha256 &&
+            require((pack_only_pair || (gate_src_h.finish() == t.source_sha256 &&
                     up_src_h.finish() == t_up.source_sha256)) &&
                     lo_pack_h.finish() == t.packed_sha256 &&
                     hi_pack_h.finish() == t_up.packed_sha256,
@@ -1510,12 +1665,12 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
             up_orig.evict();
             check_padding_after(i);
             check_padding_after(i + 1);
-            if (!pack_only_trailing_mtp) source_read.store(true, std::memory_order_relaxed);
+            if (!pack_only_pair) source_read.store(true, std::memory_order_relaxed);
             return;
         }
 
-        const bool pack_only_trailing_mtp = !mtp_sidecar && t.name.starts_with("blk.48.");
-        AuthenticationSource orig(*source, mtp_sidecar.get(), t.name, !pack_only_trailing_mtp, chunk_bytes);
+        const bool pack_only_tensor = is_pack_only_tensor(t.name);
+        AuthenticationSource orig(*source, mtp_sidecar.get(), t.name, !pack_only_tensor, chunk_bytes);
         const auto packed_bytes = model->tensor_bytes(t.name);
         Sha256 src_h, pack_h;
 
@@ -1539,7 +1694,7 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
                 const auto exp_pk = packed_bytes.subspan(static_cast<size_t>(e * spec.planar_expert_bytes),
                                                          static_cast<size_t>(spec.planar_expert_bytes));
                 unpack_expert_planar_v3(spec, exp_pk, restored);
-                if (!pack_only_trailing_mtp) {
+                if (!pack_only_tensor) {
                     const auto exp_in = orig.read(static_cast<size_t>(e * spec.source_expert_bytes),
                                                      static_cast<size_t>(spec.source_expert_bytes));
                     require(std::ranges::equal(exp_in, restored), "pack v3 adoption down inverse byte proof failed");
@@ -1561,7 +1716,7 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
                 const auto pk_chunk = packed_bytes.subspan(static_cast<size_t>(at), n);
                 auto inv_chunk = std::span(restored).first(n);
                 lanes::unpack_rows(layout, pk_chunk, inv_chunk);
-                if (!pack_only_trailing_mtp) {
+                if (!pack_only_tensor) {
                     const auto in_chunk = orig.read(static_cast<size_t>(at), n);
                     require(std::ranges::equal(in_chunk, inv_chunk), "pack v3 adoption q8_lanes_v1 inverse proof failed");
                     src_h.add(in_chunk);
@@ -1577,7 +1732,7 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
                 model->assert_unchanged();
                 const size_t n = static_cast<size_t>(std::min(chunk_bytes, t.bytes - at));
                 const auto pk_chunk = packed_bytes.subspan(static_cast<size_t>(at), n);
-                if (!pack_only_trailing_mtp) {
+                if (!pack_only_tensor) {
                     const auto in_chunk = orig.read(static_cast<size_t>(at), n);
                     require(std::ranges::equal(in_chunk, pk_chunk), "pack v3 adoption plain tensor byte proof failed");
                     src_h.add(in_chunk);
@@ -1588,11 +1743,11 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
             }
         }
 
-        require((pack_only_trailing_mtp || src_h.finish() == t.source_sha256) && pack_h.finish() == t.packed_sha256,
+        require((pack_only_tensor || src_h.finish() == t.source_sha256) && pack_h.finish() == t.packed_sha256,
                 "stale source or corrupt tensor digest in pack v3");
         orig.evict();
         check_padding_after(i);
-        if (!pack_only_trailing_mtp) source_read.store(true, std::memory_order_relaxed);
+        if (!pack_only_tensor) source_read.store(true, std::memory_order_relaxed);
     };
 
     uint32_t effective_workers = 1;
@@ -1747,7 +1902,15 @@ AdoptedPackV3 adopt_derived_pack_v3(
     bool require_full_census
 ) {
     require(bool(source), "missing source model files");
-    auto plan = plan_derived_pack_v3(*source, mtp_sidecar.get());
+    PackPlanV3 plan;
+    if (require_full_census && is_cpu_base_only_source(*source)) {
+        source->assert_unchanged();
+        if (mtp_sidecar) mtp_sidecar->assert_unchanged();
+        plan.recipe = pack_recipe_v3;
+        plan.target_revision = resolve_source_target_revision(*source);
+    } else {
+        plan = plan_derived_pack_v3(*source, mtp_sidecar.get());
+    }
     return adopt_pack_v3_with_plan(std::move(plan), std::move(source), std::move(mtp_sidecar),
                                    path, experts_per_chunk, chunk_bytes, authentication_workers,
                                    trust_mode, require_full_census);

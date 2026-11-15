@@ -288,13 +288,171 @@ struct Candidate {
     output: u32,
 }
 
+/// Hashes the merge table's `pair_key`s. The table is fixed at load and lookups never insert, so query text cannot lengthen a probe sequence; a full 64-bit finalizer (MurmurHash3 `fmix64`) spreads the packed IDs well. Unlike SipHash it costs a few cycles, and the BPE loop looks a pair up for every queued merge.
+#[derive(Default)]
+struct PairHasher(u64);
+
+impl std::hash::Hasher for PairHasher {
+    fn finish(&self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        x ^ (x >> 33)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(byte);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 ^= value;
+    }
+}
+
+type PairMap = HashMap<u64, Merge, std::hash::BuildHasherDefault<PairHasher>>;
+
+/// An exact, bounded memo of ordinary-segment encodings for [`ByteBpe::encode_with_literals_memo`].
+///
+/// `encode` hands the text between two recognized added tokens to the processor and BPE on its own, carrying nothing across a marker, so a segment's IDs depend only on its bytes, the `ByteBpe` and the processor. A chat prompt repeats every earlier message on each turn; with a memo only the new segments are split and merged again. Only segments that encoded in full are kept, so every refusal is recomputed. Entries are charged their key bytes, four bytes per ID and a fixed overhead against `budget_bytes`; the least recently used go first when an insert would pass it.
+pub struct SegmentMemo {
+    entries: HashMap<Vec<u8>, MemoEntry>,
+    held_bytes: usize,
+    budget_bytes: usize,
+    minimum_segment_bytes: usize,
+    clock: u64,
+    hits: u64,
+    misses: u64,
+}
+
+struct MemoEntry {
+    ids: Vec<u32>,
+    used: u64,
+}
+
+/// The per-entry charge beyond key and ID bytes: table slot, two vector headers and the stamp.
+const MEMO_ENTRY_OVERHEAD: usize = 96;
+
+impl fmt::Debug for SegmentMemo {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SegmentMemo")
+            .field("entries", &self.entries.len())
+            .field("held_bytes", &self.held_bytes)
+            .field("budget_bytes", &self.budget_bytes)
+            .field("hits", &self.hits)
+            .field("misses", &self.misses)
+            .finish()
+    }
+}
+
+impl SegmentMemo {
+    /// Keeps segments of at least `minimum_segment_bytes` (shorter ones are cheaper to encode again) within `budget_bytes`.
+    pub fn new(budget_bytes: usize, minimum_segment_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            held_bytes: 0,
+            budget_bytes,
+            minimum_segment_bytes: minimum_segment_bytes.max(1),
+            clock: 0,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn admits(&self, segment: &[u8]) -> bool {
+        self.budget_bytes != 0 && segment.len() >= self.minimum_segment_bytes
+    }
+
+    fn charge(segment: usize, ids: usize) -> usize {
+        segment
+            .saturating_add(ids.saturating_mul(4))
+            .saturating_add(MEMO_ENTRY_OVERHEAD)
+    }
+
+    fn get(&mut self, segment: &[u8]) -> Option<&[u32]> {
+        self.clock += 1;
+        let Some(entry) = self.entries.get_mut(segment) else {
+            self.misses += 1;
+            return None;
+        };
+        self.hits += 1;
+        entry.used = self.clock;
+        Some(&entry.ids)
+    }
+
+    fn insert(&mut self, segment: &[u8], ids: &[u32]) {
+        let charge = Self::charge(segment.len(), ids.len());
+        if charge > self.budget_bytes || self.entries.contains_key(segment) {
+            return;
+        }
+        if self.held_bytes + charge > self.budget_bytes {
+            // Evict in one pass to a quarter below the budget, so a run of inserts does not rescan the table each time.
+            let goal = (self.budget_bytes - charge).min(self.budget_bytes / 4 * 3);
+            let mut order: Vec<(u64, usize)> = self
+                .entries
+                .iter()
+                .map(|(key, entry)| (entry.used, Self::charge(key.len(), entry.ids.len())))
+                .collect();
+            order.sort_unstable();
+            let mut held = self.held_bytes;
+            let mut cutoff = 0;
+            for (used, cost) in order {
+                if held <= goal {
+                    break;
+                }
+                held -= cost;
+                cutoff = used + 1;
+            }
+            self.entries.retain(|_, entry| entry.used >= cutoff);
+            self.held_bytes = held;
+        }
+        self.clock += 1;
+        self.entries.insert(
+            segment.to_vec(),
+            MemoEntry {
+                ids: ids.to_vec(),
+                used: self.clock,
+            },
+        );
+        self.held_bytes += charge;
+    }
+
+    /// Drops every entry; the counters keep counting.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.held_bytes = 0;
+    }
+
+    pub fn entries(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn held_bytes(&self) -> usize {
+        self.held_bytes
+    }
+
+    pub fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    pub fn misses(&self) -> u64 {
+        self.misses
+    }
+}
+
 /// `ByteBpe`. `Debug` is hand-written and prints only sizes.
 pub struct ByteBpe {
     vocabulary: Vec<Vec<u8>>,
     special: Vec<bool>,
     single: [u32; 256],
-    merges: HashMap<u64, Merge>,
+    merges: PairMap,
     markers: Vec<MarkerNode>,
+    /// Whether some added token starts with the byte: `markers[0]` has a child for it. Text scanning skips every other byte with one table read.
+    marker_starts: [bool; 256],
 }
 
 impl fmt::Debug for ByteBpe {
@@ -388,7 +546,7 @@ impl ByteBpe {
             };
             *slot = found;
         }
-        let mut merges = HashMap::with_capacity(ranked.len());
+        let mut merges = PairMap::with_capacity_and_hasher(ranked.len(), Default::default());
         for (rank, (left, right)) in ranked.iter().enumerate() {
             let (l, r) = match (ids.get(left.as_slice()), ids.get(right.as_slice())) {
                 (Some(&l), Some(&r))
@@ -418,12 +576,17 @@ impl ByteBpe {
                 }
             }
         }
+        let mut marker_starts = [false; 256];
+        for &byte in markers[0].next.keys() {
+            marker_starts[usize::from(byte)] = true;
+        }
         Ok(Self {
             vocabulary,
             special,
             single,
             merges,
             markers,
+            marker_starts,
         })
     }
 
@@ -533,6 +696,33 @@ impl ByteBpe {
     where
         P: TextProcessor + ?Sized,
     {
+        self.encode_segments(text, processor, literal_ranges, None)
+    }
+
+    /// `encode_with_literals`, reusing and filling `memo`. The IDs and every refusal are exactly those of `encode_with_literals`; see [`SegmentMemo`]. A memo must only ever serve one `ByteBpe` and one processor.
+    pub fn encode_with_literals_memo<P>(
+        &self,
+        text: &[u8],
+        processor: &P,
+        literal_ranges: &[std::ops::Range<usize>],
+        memo: &mut SegmentMemo,
+    ) -> Result<Vec<u32>, TokenizerError<P::Error>>
+    where
+        P: TextProcessor + ?Sized,
+    {
+        self.encode_segments(text, processor, literal_ranges, Some(memo))
+    }
+
+    fn encode_segments<P>(
+        &self,
+        text: &[u8],
+        processor: &P,
+        literal_ranges: &[std::ops::Range<usize>],
+        mut memo: Option<&mut SegmentMemo>,
+    ) -> Result<Vec<u32>, TokenizerError<P::Error>>
+    where
+        P: TextProcessor + ?Sized,
+    {
         if text.len() > INPUT_LIMIT {
             return Err(TokenizerError::Encode("tokenizer input exceeds limit"));
         }
@@ -544,11 +734,19 @@ impl ByteBpe {
             last = range.end;
         }
         let mut output = Vec::new();
-        let ordinary =
+        let mut ordinary =
             |output: &mut Vec<u32>, segment: &[u8]| -> Result<(), TokenizerError<P::Error>> {
                 if segment.is_empty() {
                     return Ok(());
                 }
+                let mut memo = memo.as_deref_mut().filter(|memo| memo.admits(segment));
+                if let Some(memo) = memo.as_deref_mut()
+                    && let Some(ids) = memo.get(segment)
+                {
+                    // The piece loop below appended these same IDs before; only the output bound can refuse them now, and it refuses them here exactly when it would have partway through.
+                    return append_ids(output, ids);
+                }
+                let start = output.len();
                 let mut normalized_bytes = 0usize;
                 for piece in processor.pieces(segment).map_err(TokenizerError::Pieces)? {
                     normalized_bytes += piece.len();
@@ -560,12 +758,20 @@ impl ByteBpe {
                         &self.encode_piece(&piece).map_err(TokenizerError::widen)?,
                     )?;
                 }
+                if let Some(memo) = memo {
+                    memo.insert(segment, &output[start..]);
+                }
                 Ok(())
             };
         let mut plain_start = 0;
         let mut i = 0;
         let mut literal = 0;
         while i < text.len() {
+            // A byte no added token starts with matches nothing, exactly as the walk below would find.
+            if !self.marker_starts[usize::from(text[i])] {
+                i += 1;
+                continue;
+            }
             let mut node = 0;
             // The C++ `match`, a keyword here.
             let mut found = None;

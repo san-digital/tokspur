@@ -57,7 +57,7 @@ LogitTrace::~LogitTrace() noexcept {
 
 void LogitTrace::append(uint32_t position, std::span<const float> logits) {
     require(!failed_ && rows_ < limit_, "private logit trace failed or exhausted; no retry");
-    require(position && position <= 65536 && logits.size() == vocabulary_ &&
+    require(position && position <= 131072 && logits.size() == vocabulary_ &&
         std::all_of(logits.begin(), logits.end(), [](float x) { return std::isfinite(x); }),
         "private logit trace requires complete finite committed vocabulary");
     const auto filename = "logits-" + std::to_string(rows_) + ".f32";

@@ -56,6 +56,10 @@ public:
                    ResponseLimits limits = {}, bool executor_parameters = false, bool token_framing = false);
     ResponseStatus feed(std::string_view bytes);
     ResponseStatus finish();
+    void prepare_forced_thinking_close() noexcept;
+    [[nodiscard]] bool in_thinking() const noexcept;
+    [[nodiscard]] bool has_incomplete_utf8() const noexcept;
+    [[nodiscard]] bool thinking_ends_with_newline() const noexcept;
     [[nodiscard]] ResponseStatus status() const noexcept { return status_; }
     [[nodiscard]] std::string_view error() const noexcept { return error_; }
     [[nodiscard]] std::span<const ResponseRecord> records() const noexcept { return records_; }

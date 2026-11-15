@@ -51,7 +51,7 @@ public:
 private:
     const Json &ready_, &previous_, &job_, &sampling_;
     uint64_t seed_;
-    uint32_t base_, position_, inputs_, maximum_;
+    uint32_t base_, position_, inputs_, maximum_, context_limit_ = 65536;
     std::array<Json, 16> events_{};
     std::array<uint32_t, 8> ids_{};
     std::array<uint64_t, 5> routes_{};

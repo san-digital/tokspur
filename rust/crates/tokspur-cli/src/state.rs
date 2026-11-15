@@ -487,10 +487,91 @@ fn json_i128(obj: &Json, key: &str) -> Result<i128, CliError> {
         .map_err(|_| CliError::Validation(format!("invalid integer in field '{key}'")))
 }
 
+pub(crate) fn optional_asset_role(obj: &Json) -> Result<Option<&str>, CliError> {
+    let Some(val) = obj.find("role").map_err(|source| CliError::Json {
+        context: "expected JSON object",
+        source,
+    })?
+    else {
+        return Ok(None);
+    };
+    let raw = val.string().map_err(|source| CliError::Json {
+        context: "expected JSON string in field 'role'",
+        source,
+    })?;
+    let role = std::str::from_utf8(raw)
+        .map_err(|_| CliError::Validation("non-UTF-8 string in field 'role'".to_owned()))?;
+    if role != "derived_pack" {
+        return Err(CliError::Validation(format!(
+            "unsupported asset role '{role}'"
+        )));
+    }
+    Ok(Some(role))
+}
+
+fn group_candidate_file_specs<'a>(
+    assets_profile: &'a Json,
+    group: &str,
+    include_legacy_draft: bool,
+) -> Result<Vec<&'a Vec<Json>>, CliError> {
+    let group_obj =
+        assets_profile.find(group).ok().flatten().ok_or_else(|| {
+            CliError::Validation("flash-next-assets.json missing group".to_owned())
+        })?;
+    let primary_files = group_obj
+        .find("files")
+        .ok()
+        .flatten()
+        .and_then(|f| f.array().ok())
+        .ok_or_else(|| {
+            CliError::Validation("flash-next-assets.json missing group files".to_owned())
+        })?;
+    let mut out = vec![primary_files];
+    if let Some(variants) = group_obj
+        .find("variants")
+        .map_err(|source| CliError::Json {
+            context: "invalid variants field in flash-next-assets.json",
+            source,
+        })?
+    {
+        let arr = variants.array().map_err(|source| CliError::Json {
+            context: "variants in flash-next-assets.json must be an array",
+            source,
+        })?;
+        for variant in arr {
+            let v_files = variant
+                .find("files")
+                .ok()
+                .flatten()
+                .and_then(|f| f.array().ok())
+                .ok_or_else(|| {
+                    CliError::Validation(
+                        "flash-next-assets.json variant missing files list".to_owned(),
+                    )
+                })?;
+            out.push(v_files);
+        }
+    }
+    if include_legacy_draft
+        && group == "draft"
+        && let Some(legacy_files) = assets_profile
+            .find("legacy_dflash2_draft")
+            .ok()
+            .flatten()
+            .and_then(|g| g.find("files").ok().flatten())
+            .and_then(|f| f.array().ok())
+    {
+        out.push(legacy_files);
+    }
+    Ok(out)
+}
+
 fn verify_asset(path: &Path, spec: &Json) -> Result<Json, CliError> {
     let spec_name = json_str(spec, "name")?;
     let expected_size = json_u64(spec, "size")?;
     let expected_sha256 = json_str(spec, "sha256")?;
+    let role = optional_asset_role(spec)?;
+    let is_derived_pack = role == Some("derived_pack");
 
     let resolved = fs::canonicalize(path).map_err(|source| CliError::Io {
         context: format!("cannot resolve asset {spec_name}"),
@@ -533,6 +614,11 @@ fn verify_asset(path: &Path, spec: &Json) -> Result<Json, CliError> {
             "Asset must be a regular file".to_owned(),
         ));
     }
+    if is_derived_pack && opened.nlink != 1 {
+        return Err(CliError::Validation(
+            "Derived pack asset must not have multiple hard links".to_owned(),
+        ));
+    }
     set_nocache(file.as_fd(), true).map_err(|source| CliError::Io {
         context: "cannot set F_NOCACHE on asset".to_owned(),
         source,
@@ -560,8 +646,6 @@ fn verify_asset(path: &Path, spec: &Json) -> Result<Json, CliError> {
             "Asset changed while opening".to_owned(),
         ));
     }
-    drop(file);
-
     if FileIdentity::of_resolved_path(&resolved)? != before {
         return Err(CliError::Validation(
             "Asset changed during verification".to_owned(),
@@ -576,27 +660,69 @@ fn verify_asset(path: &Path, spec: &Json) -> Result<Json, CliError> {
         return Err(CliError::Validation(format!("Checksum mismatch: {short}")));
     }
 
+    let mut recorded_identity = before;
+    if is_derived_pack {
+        if (after_open.mode & 0o222) != 0 {
+            fchmod(file.as_fd(), 0o444).map_err(|source| CliError::Io {
+                context: format!("cannot seal derived pack {spec_name} read-only (0444)"),
+                source,
+            })?;
+        }
+        let sealed = fstat(file.as_fd()).map_err(|source| CliError::Io {
+            context: "cannot stat sealed derived pack".to_owned(),
+            source,
+        })?;
+        if (sealed.mode & 0o222) != 0 || sealed.nlink != 1 {
+            return Err(CliError::Validation(
+                "Derived pack asset must be read-only with a single link".to_owned(),
+            ));
+        }
+        drop(file);
+        let post_seal = FileIdentity::of_resolved_path(&resolved)?;
+        if (
+            post_seal.device,
+            post_seal.inode,
+            post_seal.size,
+            post_seal.mtime_ns,
+        ) != (
+            recorded_identity.device,
+            recorded_identity.inode,
+            recorded_identity.size,
+            recorded_identity.mtime_ns,
+        ) {
+            return Err(CliError::Validation(
+                "Asset changed during verification".to_owned(),
+            ));
+        }
+        recorded_identity = post_seal;
+    } else {
+        drop(file);
+    }
+
     let resolved_str = resolved
         .to_str()
         .ok_or_else(|| CliError::Validation("asset path is not valid UTF-8".to_owned()))?;
-    let device_u64 = u64::try_from(before.device)
+    let device_u64 = u64::try_from(recorded_identity.device)
         .map_err(|_| CliError::Validation("negative st_dev on asset".to_owned()))?;
-    let mtime_u64 = u64::try_from(before.mtime_ns)
+    let mtime_u64 = u64::try_from(recorded_identity.mtime_ns)
         .map_err(|_| CliError::Validation("negative mtime_ns on asset".to_owned()))?;
-    let ctime_u64 = u64::try_from(before.ctime_ns)
+    let ctime_u64 = u64::try_from(recorded_identity.ctime_ns)
         .map_err(|_| CliError::Validation("negative ctime_ns on asset".to_owned()))?;
 
     let mut record = vec![
         ("path", Json::from(resolved_str)),
         ("sha256", Json::from(digest)),
         ("device", Json::integer(device_u64)),
-        ("inode", Json::integer(before.inode)),
-        ("size", Json::integer(before.size)),
+        ("inode", Json::integer(recorded_identity.inode)),
+        ("size", Json::integer(recorded_identity.size)),
         ("mtime_ns", Json::integer(mtime_u64)),
         ("ctime_ns", Json::integer(ctime_u64)),
     ];
-    if let Some(uuid) = before.volume_uuid {
+    if let Some(uuid) = recorded_identity.volume_uuid {
         record.push(("volume_uuid", Json::from(uuid)));
+    }
+    if let Some(role_name) = role {
+        record.push(("role", Json::from(role_name)));
     }
     Ok(Json::new_object(record))
 }
@@ -649,46 +775,59 @@ pub fn check_adoption(adoption: &Json, assets_profile: &Json) -> Result<(), CliE
                 source,
             })?;
 
-        let primary_files = assets_profile
-            .find(group)
-            .ok()
-            .flatten()
-            .and_then(|g| g.find("files").ok().flatten())
-            .and_then(|f| f.array().ok())
-            .ok_or_else(|| {
-                CliError::Validation("flash-next-assets.json missing group files".to_owned())
-            })?;
-
-        let mut candidate_specs: Vec<&Vec<Json>> = vec![primary_files];
-        if group == "draft"
-            && let Some(legacy_files) = assets_profile
-                .find("legacy_dflash2_draft")
-                .ok()
-                .flatten()
-                .and_then(|g| g.find("files").ok().flatten())
-                .and_then(|f| f.array().ok())
-        {
-            candidate_specs.push(legacy_files);
+        let candidate_specs = group_candidate_file_specs(assets_profile, group, true)?;
+        let same_len: Vec<&Vec<Json>> = candidate_specs
+            .into_iter()
+            .filter(|spec_files| assets.len() == spec_files.len())
+            .collect();
+        if same_len.is_empty() {
+            return Err(CliError::Validation(
+                "Incomplete adopted asset set".to_owned(),
+            ));
         }
 
-        let matched_spec = candidate_specs
-            .into_iter()
-            .find(|spec_files| assets.len() == spec_files.len())
-            .ok_or_else(|| CliError::Validation("Incomplete adopted asset set".to_owned()))?;
+        let mut matched_spec: Option<&Vec<Json>> = None;
+        for spec_files in &same_len {
+            let mut all_match = true;
+            for (asset, spec) in assets.iter().zip(spec_files.iter()) {
+                let spec_sha = json_str(spec, "sha256")?;
+                let asset_sha = json_str(asset, "sha256")?;
+                let spec_role = optional_asset_role(spec)?;
+                let asset_role = optional_asset_role(asset)?;
+                if asset_sha != spec_sha || asset_role != spec_role {
+                    all_match = false;
+                    break;
+                }
+            }
+            if all_match {
+                matched_spec = Some(*spec_files);
+                break;
+            }
+        }
+        let matched_spec = matched_spec.ok_or_else(|| {
+            CliError::Validation("Asset manifest differs from the pinned profile".to_owned())
+        })?;
 
         for (asset, spec) in assets.iter().zip(matched_spec.iter()) {
             let spec_name = json_str(spec, "name")?;
-            let spec_sha = json_str(spec, "sha256")?;
-            let asset_sha = json_str(asset, "sha256")?;
-            if asset_sha != spec_sha {
-                return Err(CliError::Validation(
-                    "Asset manifest differs from the pinned profile".to_owned(),
-                ));
-            }
+            let is_derived_pack = optional_asset_role(spec)? == Some("derived_pack");
             let asset_path = PathBuf::from(json_str(asset, "path")?);
             let actual = FileIdentity::of_resolved_path(&asset_path).map_err(|_| {
                 CliError::Validation(format!("Asset changed; re-adopt: {spec_name}"))
             })?;
+            if is_derived_pack {
+                let f = File::open(&asset_path).map_err(|_| {
+                    CliError::Validation(format!("Asset changed; re-adopt: {spec_name}"))
+                })?;
+                let st = fstat(f.as_fd()).map_err(|_| {
+                    CliError::Validation(format!("Asset changed; re-adopt: {spec_name}"))
+                })?;
+                if (st.mode & 0o222) != 0 || st.nlink != 1 {
+                    return Err(CliError::Validation(format!(
+                        "Asset changed; re-adopt: {spec_name}"
+                    )));
+                }
+            }
             let recorded = FileIdentity {
                 device: i32::try_from(json_i128(asset, "device")?).map_err(|_| {
                     CliError::Validation("invalid recorded asset device".to_owned())
@@ -747,15 +886,32 @@ pub fn adopt_weights(
         let dir_str = directory
             .to_str()
             .ok_or_else(|| CliError::Validation("directory path is not valid UTF-8".to_owned()))?;
-        let spec_files = specs
-            .find(group)
-            .ok()
-            .flatten()
-            .and_then(|g| g.find("files").ok().flatten())
-            .and_then(|f| f.array().ok())
-            .ok_or_else(|| {
-                CliError::Validation("flash-next-assets.json missing files list".to_owned())
-            })?;
+        let candidates = group_candidate_file_specs(&specs, group, false)?;
+        let spec_files = if candidates.len() == 1 {
+            candidates[0]
+        } else {
+            let mut present = Vec::new();
+            for cand in &candidates {
+                let mut all_exist = true;
+                for spec in *cand {
+                    let name = json_str(spec, "name")?;
+                    if !directory.join(name).exists() {
+                        all_exist = false;
+                        break;
+                    }
+                }
+                if all_exist {
+                    present.push(*cand);
+                }
+            }
+            if present.len() > 1 {
+                return Err(CliError::Validation(format!(
+                    "Ambiguous {group} asset variants present in {}",
+                    directory.display()
+                )));
+            }
+            present.first().copied().unwrap_or(candidates[0])
+        };
         let mut verified = Vec::with_capacity(spec_files.len());
         for spec in spec_files {
             let name = json_str(spec, "name")?;
@@ -801,8 +957,11 @@ pub fn adopt_weights(
     let first = assets
         .first()
         .ok_or_else(|| CliError::Validation("empty target assets".to_owned()))?;
-    if json_str(first, "sha256")? == crate::text_assets::SHARD1_SHA256 {
-        crate::text_assets::derive(&tokspur_base, Path::new(json_str(first, "path")?))?;
+    let first_path = Path::new(json_str(first, "path")?);
+    if json_str(first, "sha256")? == crate::text_assets::SHARD1_SHA256
+        || crate::text_assets::has_flash_next_text_metadata(first_path)
+    {
+        crate::text_assets::derive(&tokspur_base, first_path)?;
         writeln!(
             out,
             "Pinned tokenizer and chat template derived from verified metadata."

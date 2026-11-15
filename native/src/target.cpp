@@ -66,6 +66,10 @@
 #include "tokspur/mtp_anchor_state.hpp"
 #include "tokspur/dflash2_drafter.hpp"
 #include "tokspur/dflash2_checkpoint.hpp"
+#if defined(TOKSPUR_PRIVATE_NATIVE_MTP) && defined(TOKSPUR_PRIVATE_DFLASH2_TAP_DUMP) && TOKSPUR_PRIVATE_DFLASH2_TAP_DUMP
+#include "tokspur/dflash2_tap_dump.hpp"
+#define TOKSPUR_DFLASH2_TAP_DUMP_ENABLED 1
+#endif
 #include "tokspur/checkpoint_drafter.hpp"
 #include "tokspur/sampled_path.hpp"
 #include "tokspur/speculative_controls.hpp"
@@ -358,9 +362,13 @@ void other_workers() {
             throw FormatError("known inference worker is still running: " + std::string(name.data()) + " (" + std::to_string(pid) + ")");
     }
 }
-void admit(const FlashLayout& layout) {
+void admit(const FlashLayout& layout, uint32_t context_length) {
     other_workers(); require(sysctl_value("hw.memsize") >= 128 * gib, "full target requires at least 128 GiB unified memory");
-    const auto m = memory(); const uint64_t estimate = checked_add(layout.resident_matrix_bytes, 5 * gib);
+    require(context_length == 65536 || context_length == 131072, "unsupported target context length");
+    // The 5 GiB allowance was sized with the 64K caches. State that grows with the context is added per token beyond that: BF16 keys and values for the 12 QSA layers, their pooled index keys, and the MTP draft keys and values.
+    constexpr uint64_t context_bytes_per_token = 12ull * 2 * 256 * 2 * 2 + 12ull * 128 * 2 / 4 + 2ull * 256 * 2 * 2;
+    const uint64_t context_extra = uint64_t(context_length - 65536) * context_bytes_per_token;
+    const auto m = memory(); const uint64_t estimate = checked_add(checked_add(layout.resident_matrix_bytes, 5 * gib), context_extra);
     // Read-only file cache can be active, not just inactive. Do not count
     // anonymous inactive pages as freely disposable or double-count speculative
     // file cache. This remains a hint; the unchanged pressure/footprint guard and
@@ -368,10 +376,10 @@ void admit(const FlashLayout& layout) {
     if (m.pressure != 1 || m.free_file < checked_add(estimate, 8 * gib))
         throw FormatError("insufficient host headroom for complete target: " + describe(m).dump());
 }
-bool read_line(std::istream& input, std::string& out) {
+bool read_line(std::istream& input, std::string& out, size_t max_bytes = 1024 * 1024) {
     out.clear(); bool any = false, too_long = false; char c;
-    while (input.get(c)) { any = true; if (c == '\n') break; if (out.size() < 1024 * 1024) out.push_back(c); else too_long = true; }
-    require(!too_long, "target request exceeds 1-MiB bound"); return any;
+    while (input.get(c)) { any = true; if (c == '\n') break; if (out.size() < max_bytes) out.push_back(c); else too_long = true; }
+    require(!too_long, max_bytes > 1024 * 1024 ? "target request exceeds 4-MiB bound" : "target request exceeds 1-MiB bound"); return any;
 }
 // BEGIN owned target protocol: this CPU-only region is checked independently.
 // The retained value is published only after a complete stack step. A failed
@@ -430,30 +438,36 @@ class TargetSampler {
     TargetSampling options_;
     SamplingRng random_;
     uint32_t prefix_ = 0;
+    uint32_t context_length_ = 65536;
     bool valid_ = true;
 public:
-    explicit TargetSampler(TargetSampling options = {}) : options_(options), random_(options.seed) {}
-    static TargetSampler fresh_branch(TargetSampling options, uint32_t prefix) {
-        require(options.policy.temperature == 0 && prefix && prefix <= 65536,
+    explicit TargetSampler(TargetSampling options = {}, uint32_t context_length = 65536)
+        : options_(options), random_(options.seed), context_length_(context_length) {
+        require(context_length_ == 65536 || context_length_ == 131072, "unsupported target context length");
+    }
+    static TargetSampler fresh_branch(TargetSampling options, uint32_t prefix, uint32_t context_length = 65536) {
+        require((context_length == 65536 || context_length == 131072) &&
+            options.policy.temperature == 0 && prefix && prefix <= context_length,
             "branch restore requires greedy policy and nonempty bounded prefix");
-        TargetSampler out(options); out.prefix_ = prefix; return out;
+        TargetSampler out(options, context_length); out.prefix_ = prefix; return out;
     }
-    static TargetSampler restore_branch(TargetSampling options, uint32_t prefix, const SamplingRng& rng) {
-        require(prefix && prefix <= 65536,
+    static TargetSampler restore_branch(TargetSampling options, uint32_t prefix, const SamplingRng& rng, uint32_t context_length = 65536) {
+        require((context_length == 65536 || context_length == 131072) && prefix && prefix <= context_length,
             "branch restore requires nonempty bounded prefix");
-        TargetSampler out(options); out.prefix_ = prefix; out.random_ = rng; return out;
+        TargetSampler out(options, context_length); out.prefix_ = prefix; out.random_ = rng; return out;
     }
-    static TargetSampler restore_stochastic_branch(TargetSampling options, uint32_t prefix, const SamplingRng& rng) {
-        return restore_branch(options, prefix, rng);
+    static TargetSampler restore_stochastic_branch(TargetSampling options, uint32_t prefix, const SamplingRng& rng, uint32_t context_length = 65536) {
+        return restore_branch(options, prefix, rng, context_length);
     }
     [[nodiscard]] bool matches(uint32_t prefix) const noexcept { return valid_ && prefix_ == prefix; }
     [[nodiscard]] bool valid() const noexcept { return valid_; }
     [[nodiscard]] uint32_t prefix() const noexcept { return prefix_; }
+    [[nodiscard]] uint32_t context_length() const noexcept { return context_length_; }
     [[nodiscard]] const TargetSampling& options() const noexcept { return options_; }
     [[nodiscard]] const SamplingRng& random() const noexcept { return random_; }
     void invalidate() noexcept { valid_ = false; }
     bool committed_input(uint32_t prefix) noexcept {
-        if (!valid_ || prefix_ >= 65536 || prefix != prefix_ + 1) { invalidate(); return false; }
+        if (!valid_ || prefix_ >= context_length_ || prefix != prefix_ + 1) { invalidate(); return false; }
         prefix_ = prefix; return true;
     }
     void publish(SamplingRng&& random) noexcept {
@@ -471,7 +485,7 @@ template<class Result> void reconcile_failure(CommittedResult<Result>& retained,
 
 template<class Result, class Reset> void reset_session(CommittedResult<Result>& retained, TargetSampler& sampler,
                                                       TargetSampling options, Reset&& reset) {
-    TargetSampler replacement(options); // Construct before any model mutation.
+    TargetSampler replacement(options, sampler.context_length()); // Construct before any model mutation.
     reset(); // Refusal preserves the old policy, engine and retained logits.
     retained.clear();
     static_assert(std::is_nothrow_move_assignable_v<TargetSampler>);
@@ -544,7 +558,7 @@ template<class Handle, class Result> class BranchSession {
 #endif
     std::optional<Result> transfer_;
     uint64_t order_ = 0;
-    uint32_t used_ = 0, vocabulary_;
+    uint32_t used_ = 0, vocabulary_, context_length_ = 65536;
     bool valid_ = true;
     void stage(std::span<const float> logits) {
         require(logits.size() == vocabulary_ && transfer_ && transfer_->logits.size() == vocabulary_, "branch logit storage mismatch");
@@ -577,23 +591,25 @@ template<class Handle, class Result> class BranchSession {
     }
 #endif
 public:
-    static uint64_t minimum_bytes(uint32_t slots, uint32_t vocabulary) {
-        require(slots && slots <= 4 && vocabulary && vocabulary <= maximum_sampling_vocabulary, "branch session shape bound");
+    static uint64_t minimum_bytes(uint32_t slots, uint32_t vocabulary, uint32_t context_length = 65536) {
+        require(slots && slots <= 4 && vocabulary && vocabulary <= maximum_sampling_vocabulary &&
+            (context_length == 65536 || context_length == 131072), "branch session shape bound");
         return sizeof(BranchSession) + uint64_t(slots) * sizeof(Record) +
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
-            2ull * 65536ull * sizeof(uint32_t) +
+            2ull * uint64_t(context_length) * sizeof(uint32_t) +
 #else
-            65536ull * sizeof(uint32_t) +
+            uint64_t(context_length) * sizeof(uint32_t) +
 #endif
             uint64_t(slots + 1) * vocabulary * sizeof(float);
     }
-    BranchSession(uint32_t slots, uint32_t vocabulary) : vocabulary_(vocabulary) {
+    BranchSession(uint32_t slots, uint32_t vocabulary, uint32_t context_length = 65536)
+        : vocabulary_(vocabulary), context_length_(context_length) {
         static_assert(std::is_nothrow_swappable_v<Result> && std::is_nothrow_copy_assignable_v<Handle> &&
             std::is_nothrow_copy_constructible_v<Handle>);
-        static_cast<void>(minimum_bytes(slots, vocabulary));
-        records_.resize(slots); history_.resize(65536);
+        static_cast<void>(minimum_bytes(slots, vocabulary, context_length));
+        records_.resize(slots); history_.resize(context_length);
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
-        partitions_.reserve(65536);
+        partitions_.reserve(context_length);
 #endif
         transfer_.emplace(); transfer_->logits.resize(vocabulary);
         for (auto& record : records_) record.result.logits.resize(vocabulary);
@@ -733,10 +749,10 @@ public:
         for (auto value : retained.get(used_).logits) require(std::isfinite(value), "nonfinite current branch logits");
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
         auto replacement = (record.has_rng && options.policy.temperature > 0 && options.seed == record.rng.seed())
-            ? TargetSampler::restore_branch(options, prefix, record.rng)
-            : TargetSampler::fresh_branch(options, prefix);
+            ? TargetSampler::restore_branch(options, prefix, record.rng, context_length_)
+            : TargetSampler::fresh_branch(options, prefix, context_length_);
 #else
-        auto replacement = TargetSampler::fresh_branch(options, prefix);
+        auto replacement = TargetSampler::fresh_branch(options, prefix, context_length_);
 #endif
         stage(record.result.logits);
         const auto actual = restore(record.handle);
@@ -780,13 +796,15 @@ template<class Result> class TargetLookup {
 #ifdef TOKSPUR_PRIVATE_VERIFY_EIGHT
         , uint32_t proposal_tokens
 #endif
+        , uint32_t context_length = 65536
     ) {
+        require(context_length == 65536 || context_length == 131072, "unsupported target context length");
         LookupConfig out; out.match_tokens = 16; out.proposal_tokens = 2;
 #ifdef TOKSPUR_PRIVATE_VERIFY_EIGHT
         require(proposal_tokens == 2 || proposal_tokens == 7, "private lookup proposal limit must be 2 or 7");
         out.proposal_tokens = proposal_tokens;
 #endif
-        out.history_tokens = 65536; out.token_limit = vocabulary; out.memory_budget_bytes = budget; return out;
+        out.history_tokens = context_length; out.token_limit = vocabulary; out.memory_budget_bytes = budget; return out;
     }
 public:
     std::vector<float> rows, embeddings;
@@ -794,11 +812,12 @@ public:
 #ifdef TOKSPUR_PRIVATE_VERIFY_EIGHT
         , uint32_t proposal_tokens = 2
 #endif
+        , uint32_t context_length = 65536
     )
 #ifdef TOKSPUR_PRIVATE_VERIFY_EIGHT
-        : history_(config(vocabulary, budget, proposal_tokens)), rows(uint64_t(proposal_tokens) * channels), embeddings(uint64_t(proposal_tokens) * embedding) {
+        : history_(config(vocabulary, budget, proposal_tokens, context_length)), rows(uint64_t(proposal_tokens) * channels), embeddings(uint64_t(proposal_tokens) * embedding) {
 #else
-        : history_(config(vocabulary, budget)), rows(2ull * channels), embeddings(2ull * embedding) {
+        : history_(config(vocabulary, budget, context_length)), rows(2ull * channels), embeddings(2ull * embedding) {
 #endif
         spare_.emplace(); spare_->logits.resize(vocabulary);
         require(charged_bytes() < budget, "lookup/caller host preparation exceeds combined verification budget");
@@ -834,17 +853,18 @@ public:
     }
     [[nodiscard]] bool eligible(const LookupProposal& proposal, uint32_t prefix, std::span<const float> logits,
                                 uint32_t remaining, std::span<const uint32_t> stops) const {
+        const uint32_t max_prefix = history_.config().history_tokens - 2;
 #ifdef TOKSPUR_PRIVATE_VERIFY_EIGHT
         require(matches(prefix) && proposal.epoch == epoch() && proposal.base_prefix == prefix && proposal.count <= proposal_tokens(),
             "stale lookup proposal epoch/base");
         const auto first = greedy(logits);
-        return proposal.count >= 2 && remaining >= 2 && prefix <= 65534 && proposal.tokens[0] == first &&
+        return proposal.count >= 2 && remaining >= 2 && prefix <= max_prefix && proposal.tokens[0] == first &&
             std::find(stops.begin(), stops.end(), first) == stops.end();
 #else
         require(matches(prefix) && proposal.epoch == epoch() && proposal.base_prefix == prefix && proposal.count <= 2,
             "stale lookup proposal epoch/base");
         const auto first = greedy(logits);
-        return proposal.count == 2 && remaining >= 2 && prefix <= 65534 && proposal.tokens[0] == first &&
+        return proposal.count == 2 && remaining >= 2 && prefix <= max_prefix && proposal.tokens[0] == first &&
             std::find(stops.begin(), stops.end(), first) == stops.end();
 #endif
     }
@@ -980,6 +1000,7 @@ struct BrokerCommand {
 };
 class TargetBroker {
     uint64_t epoch_, command_ = 0, lease_ = 0, reply_lease_ = 0;
+    uint32_t context_length_ = 65536;
     bool revoked_ = true, input_boundary_ = false;
 #ifdef TOKSPUR_PRIVATE_HTTP_BRANCH8
     const bool batch8_;
@@ -989,11 +1010,15 @@ public:
 #ifdef TOKSPUR_PRIVATE_HTTP_BRANCH8
         , bool batch8 = false
 #endif
-        ) : epoch_(epoch)
+        , uint32_t context_length = 65536
+        ) : epoch_(epoch), context_length_(context_length)
 #ifdef TOKSPUR_PRIVATE_HTTP_BRANCH8
         , batch8_(batch8)
 #endif
-        { require(epoch, "nonzero native broker epoch required"); }
+        {
+            require(epoch, "nonzero native broker epoch required");
+            require(context_length_ == 65536 || context_length_ == 131072, "unsupported target context length");
+        }
     [[nodiscard]] uint64_t epoch() const noexcept { return epoch_; }
     [[nodiscard]] BrokerCommand admit(const Json& wire, uint32_t prefix) const {
         require(field(wire, "broker_epoch").unsigned_integer() == epoch_ &&
@@ -1016,7 +1041,7 @@ public:
             require(out.begin || out.capture, "unknown broker control operation");
             if (out.begin) {
                 keys(input_wire, {"broker_epoch", "command_id", "lease_id", "expected_prefix", "op", "prompt_ids", "generation_requested", "allow_restore", "sampling", "seed"});
-                const auto& prompt = field(input_wire, "prompt_ids").array(); require(!prompt.empty() && prompt.size() <= 65536, "broker future prompt bound");
+                const auto& prompt = field(input_wire, "prompt_ids").array(); require(!prompt.empty() && prompt.size() <= context_length_, "broker future prompt bound");
                 for (const auto& token : prompt) require(token.unsigned_integer() < 248320, "broker future token bound");
                 static_cast<void>(field(input_wire, "generation_requested").boolean());
                 const auto restore = field(input_wire, "allow_restore").boolean();
@@ -1099,7 +1124,8 @@ Request request(const Json& data, uint32_t position, uint32_t current_splits, ui
                 uint32_t current_execution = 0, bool allow_stack_experiments = false, bool replay_prepared = false,
                 uint32_t known_capacity = 0, bool allow_prefill_experiments = false, bool current_residual_reuse = false,
                 uint32_t checkpoint_slots = 0, bool lookup_prepared = false, bool allow_lookup_experiments = false,
-                bool current_lookup = false, bool final_input_logits = false) {
+                bool current_lookup = false, bool final_input_logits = false, uint32_t context_length = 65536) {
+    require(context_length == 65536 || context_length == 131072, "unsupported target context length");
     keys(data, {"tokens", "generate", "reset", "stop_ids", "small_gemv_splits", "block_gemv_formats", "sampling", "seed", "stack_execution", "known_prefill", "known_residual_reuse", "checkpoint_mode", "prompt_lookup"
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
         , "mtp_generation"
@@ -1108,7 +1134,7 @@ Request request(const Json& data, uint32_t position, uint32_t current_splits, ui
         , "prefill_final"
 #endif
     }); Request out;
-    const auto& ids = field(data, "tokens").array(); require(ids.size() <= 65536, "target input token count limit");
+    const auto& ids = field(data, "tokens").array(); require(ids.size() <= context_length, "target input token count limit");
     out.tokens.reserve(ids.size());
     for (const auto& id : ids) { const auto token = id.unsigned_integer(); require(token < 248320, "target token outside vocabulary"); out.tokens.push_back(uint32_t(token)); }
     const auto gen = field(data, "generate").unsigned_integer(); require(gen <= 4096, "target generate limit is 4096"); out.generate = uint32_t(gen);
@@ -1194,7 +1220,7 @@ Request request(const Json& data, uint32_t position, uint32_t current_splits, ui
             "residual reuse override requires explicit startup consent and a fresh prefix");
         out.residual_reuse = reuse->boolean();
     }
-    require(uint64_t(prefix) + out.tokens.size() + out.generate <= 65536, "target request exceeds total context reservation");
+    require(uint64_t(prefix) + out.tokens.size() + out.generate <= context_length, "target request exceeds total context reservation");
     if (const auto* stops = data.find("stop_ids")) {
         require(stops->array().size() <= 16, "too many target stop IDs");
         for (const auto& value : stops->array()) { const auto id = value.unsigned_integer(); require(id < 248320, "stop ID outside vocabulary"); out.stops.push_back(uint32_t(id)); }
@@ -1280,6 +1306,7 @@ struct TargetMtpSelection {
     std::span<const uint32_t> stops;
     std::optional<SampledPathDecision> decision;
     std::optional<MtpAnchorPublication> anchor_publication;
+    uint32_t context_limit = 65536;
     static uint32_t choose(void* raw, const StackSampledVerificationRows& rows) {
         auto& self = *static_cast<TargetMtpSelection*>(raw);
         require(rows.position == self.base && rows.count == 2 && rows.residual_width == 10240,
@@ -1293,7 +1320,7 @@ struct TargetMtpSelection {
         }
         require(self.decision->accepted <= 1 && self.decision->count >= 1 && self.decision->count <= 2,
             "native MTP sampled decision shape mismatch");
-        self.anchor_publication.emplace(prepare_mtp_anchor_publication(self.base, *self.decision));
+        self.anchor_publication.emplace(prepare_mtp_anchor_publication(self.base, *self.decision, self.context_limit));
         return 1 + self.decision->accepted;
     }
 };
@@ -1391,6 +1418,7 @@ struct TargetMtpSelection2 {
     SamplingPolicy policy; std::span<const uint32_t> stops;
     std::optional<SampledPathDecision> decision;
     std::optional<MtpAnchorPublication> publication;
+    uint32_t context_limit = 65536;
     static uint32_t choose(void* raw, const StackSampledVerificationRows& rows) {
         auto& self = *static_cast<TargetMtpSelection2*>(raw);
         if (self.third) {
@@ -1424,7 +1452,7 @@ struct TargetMtpSelection2 {
                     rows.logits[0], rows.logits[1], self.policy, self.stops));
             }
         }
-        self.publication.emplace(prepare_mtp_anchor_publication2(self.base, *self.decision));
+        self.publication.emplace(prepare_mtp_anchor_publication2(self.base, *self.decision, self.context_limit));
         return 1 + self.decision->accepted;
     }
 };
@@ -1435,6 +1463,7 @@ struct TargetDFlash2Selection {
     std::span<const uint32_t> stops;
     std::optional<SampledPathDecision> decision;
     std::optional<MtpAnchorPublication> publication;
+    uint32_t context_limit = 65536;
     static uint32_t choose(void* raw, const StackSampledVerificationRows& rows) {
         auto& self = *static_cast<TargetDFlash2Selection*>(raw);
         require(rows.position == self.base && rows.count == 1 + self.draft.count &&
@@ -1460,7 +1489,7 @@ struct TargetDFlash2Selection {
                 self.policy, 1 + self.draft.count, self.stops,
                 self.draft.random_after, self.draft.proposal_begin_words));
         }
-        self.publication.emplace(prepare_mtp_anchor_publication8(self.base, *self.decision));
+        self.publication.emplace(prepare_mtp_anchor_publication8(self.base, *self.decision, self.context_limit));
         return 1 + self.decision->accepted;
     }
 };
@@ -2125,6 +2154,8 @@ int target_cli(int argc, char** argv) {
     Q8ThreeMsgMode q8_three_msg = Q8ThreeMsgMode::off;
     MtpLookupMode mtp_lookup_mode = MtpLookupMode::off;
     uint32_t mtp_lookup_match = 4;
+    MtpLookupMode dflash2_lookup_mode = MtpLookupMode::off;
+    std::optional<uint32_t> dflash2_lookup_match;
     PrefillM64Mode prefill_m64 = PrefillM64Mode::off;
     bool prefill_multiseg = false, prefill_swizzle = false, qsa_prefill_fused = false, hc_consumer_fused = false;
     bool ple_overlap = false, shared_prefix_cache_enabled = false;
@@ -2177,6 +2208,7 @@ int target_cli(int argc, char** argv) {
     std::optional<Task4ProfileBoundary> task4_profile_boundary;
 #endif
     uint32_t small_gemv_splits = 0, block_gemv_formats = 0, known_token_capacity = 0; bool allow_kernel_experiments = false;
+    uint32_t target_context_length = 65536;
     uint32_t hc_q8_splits = 0;
 #ifdef TOKSPUR_PRIVATE_PREFILL_CHUNK
     std::optional<bool> grouped_prefill_ffn;
@@ -2328,8 +2360,10 @@ int target_cli(int argc, char** argv) {
 #endif
     std::optional<uint32_t> dflash2_max_drafts;
     std::optional<uint32_t> dflash2_vocab_slice;
+    std::optional<std::string> dflash2_vocab_gather; // Opt-in gathered draft vocabulary: explicit token IDs instead of the first N.
     std::optional<bool> native_logit_topk;
     std::optional<bool> native_ple_async_gather;
+    std::optional<bool> native_ple_ram_resident;
     std::optional<bool> native_mtp_fast_round;
     std::string drafter_mode = "auto";
     bool mtp_lookahead_anchor = false, mtp_request_carry = false, native_mtp_draft_slice = false;
@@ -2433,6 +2467,10 @@ int target_cli(int argc, char** argv) {
         else if (option == "--dflash2-vocab-slice" || option == "--native-dflash2-vocab-slice") {
             dflash2_vocab_slice = parse_dflash2_vocab_slice(value);
         }
+        else if (option == "--dflash2-vocab-gather" || option == "--native-dflash2-vocab-gather") {
+            admit_dflash2_vocab_gather(value, 248320);
+            dflash2_vocab_gather = std::string(value);
+        }
         else if (option == "--native-host-logit-views") {
             require(value == "off" || value == "on", "native host logit views must be off or on");
             host_logit_views = value == "on";
@@ -2444,6 +2482,10 @@ int target_cli(int argc, char** argv) {
         else if (option == "--ple-async-gather" || option == "--native-ple-async-gather") {
             require(value == "off" || value == "on", "native PLE async gather must be off or on");
             native_ple_async_gather = value == "on";
+        }
+        else if (option == "--ple-ram-resident" || option == "--native-ple-ram-resident") {
+            require(value == "off" || value == "on", "native PLE RAM residency must be off or on");
+            native_ple_ram_resident = value == "on";
         }
         else if (option == "--mtp-fast-round" || option == "--native-mtp-fast-round") {
             require(value == "off" || value == "on", "native MTP fast round must be off or on");
@@ -2811,6 +2853,21 @@ int target_cli(int argc, char** argv) {
                 mtp_lookup_match >= 2 && mtp_lookup_match <= 16, "MTP lookup match width must be 2..16");
             candidate_opt_selected = true;
         }
+        else if (option == "--dflash2-lookup" || option == "--native-dflash2-lookup") {
+            if (value == "off") dflash2_lookup_mode = MtpLookupMode::off;
+            else if (value == "bypass") dflash2_lookup_mode = MtpLookupMode::bypass;
+            else if (value == "hybrid") dflash2_lookup_mode = MtpLookupMode::hybrid;
+            else throw FormatError("DFlash2 lookup bypass requires off, bypass or hybrid");
+            candidate_opt_selected = true;
+        }
+        else if (option == "--dflash2-lookup-match" || option == "--native-dflash2-lookup-match") {
+            uint32_t parsed_match = 0;
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), parsed_match);
+            require(parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size() &&
+                parsed_match >= 2 && parsed_match <= 16, "DFlash2 lookup match width must be 2..16");
+            dflash2_lookup_match = parsed_match;
+            candidate_opt_selected = true;
+        }
         else if (option == "--prefill-m64" || option == "--native-prefill-m64") {
             if (value == "off") prefill_m64 = PrefillM64Mode::off;
             else if (value == "on") prefill_m64 = PrefillM64Mode::on;
@@ -2939,6 +2996,11 @@ int target_cli(int argc, char** argv) {
             task4_profile_boundary = value == "dispatch" ? Task4ProfileBoundary::dispatch : Task4ProfileBoundary::encoder_late8;
         }
 #endif
+        else if (option == "--context-length" || option == "--native-context-length") {
+            if (value == "65536") target_context_length = 65536;
+            else if (value == "131072") target_context_length = 131072;
+            else throw FormatError("context-length must be 65536 or 131072");
+        }
         else if (option == "--allow-full-model" || option == "--preflight-only" || option == "--profile" || option == "--allow-kernel-experiments" || option == "--allow-stack-experiments" || option == "--allow-prefill-experiments" || option == "--reuse-residual-projections") {
             require(value == "true" || value == "false", "expected explicit target boolean");
             if (option == "--allow-full-model") allow = value == "true"; else if (option == "--profile") profiling = value == "true";
@@ -2970,11 +3032,14 @@ int target_cli(int argc, char** argv) {
     require(!host_logit_views || has_speculative, "native host logit views require a sampled speculative verifier");
     require(!native_logit_topk.value_or(false) || has_speculative, "native logit top-k requires a sampled speculative verifier");
     require(!native_ple_async_gather.value_or(false) || has_speculative, "native PLE async gather requires a sampled speculative verifier");
+    require(!native_ple_ram_resident.value_or(false) || has_speculative, "native PLE RAM residency requires a sampled speculative verifier");
     require(!native_mtp_fast_round.value_or(false) || mtp_sidecar.has_value(), "native MTP fast round requires the native MTP sidecar");
     require(!dflash2_defer_context || dflash2_dir.has_value(), "native DFlash2 deferred context requires DFlash2");
     require(!dflash2_adaptive_budget || dflash2_dir.has_value(), "native DFlash2 verify rows auto requires DFlash2");
     require(!dflash2_max_drafts.has_value() || dflash2_dir.has_value(), "native DFlash2 max drafts requires DFlash2");
     require(!dflash2_vocab_slice.has_value() || dflash2_dir.has_value(), "native DFlash2 vocab slice requires DFlash2");
+    require(!dflash2_vocab_gather.has_value() || (dflash2_dir.has_value() && !dflash2_vocab_slice.has_value()),
+        "native DFlash2 vocab gather requires DFlash2 and replaces the vocab slice");
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
     if (native_verify_nax_m8 == true && !native_verify_nax.has_value()) native_verify_nax = true;
     require(!native_verify_nax_m8.value_or(false) || native_verify_nax.value_or(false),
@@ -3405,7 +3470,7 @@ int target_cli(int argc, char** argv) {
         "explicit chronological QSA OFF/ON requires Stage-V8 ON and combined exact-HC");
 #endif
     using TargetBranches = BranchSession<StackCheckpoint, StackResult>;
-    require(!checkpoint_slots || TargetBranches::minimum_bytes(checkpoint_slots, 248320) < checkpoint_budget,
+    require(!checkpoint_slots || TargetBranches::minimum_bytes(checkpoint_slots, 248320, target_context_length) < checkpoint_budget,
         "combined checkpoint budget cannot cover host session storage");
 #ifdef TOKSPUR_PRIVATE_VERIFICATION_COST
     require(!verification_cost_manifest || (!dry && !profiling && !worker_broker && !worker_broker8 &&
@@ -3466,7 +3531,8 @@ int target_cli(int argc, char** argv) {
         require(mtp_request_carry && (mtp_depth == 2 || mtp_depth == 3 || mtp_depth == 7) &&
             !native_verify_nax.value_or(false) && !native_verify_nax_m8.value_or(false) &&
             !native_verify_hc_gdn_fused.value_or(false) && !native_mtp_fast_round.value_or(false) &&
-            mtp_lookup_mode == MtpLookupMode::off && (!dflash2_dir || dflash2_adaptive_budget),
+            mtp_lookup_mode == MtpLookupMode::off && dflash2_lookup_mode == MtpLookupMode::off &&
+            !dflash2_lookup_match.has_value() && (!dflash2_dir || dflash2_adaptive_budget),
             "measured controllers require exact target verification, scoped v2 carry, fast round off and no lookup");
         MappedFile profile_file(*verify_cost_profile_path);
         require(profile_file.size() <= 1024 * 1024, "measured profile exceeds its byte bound");
@@ -3567,8 +3633,13 @@ int target_cli(int argc, char** argv) {
         && !operator_checkpoints.has_value()
 #endif
         ), "MTP lookup bypass requires depth-two or depth-three direct native MTP");
+    require((dflash2_lookup_mode == MtpLookupMode::off && !dflash2_lookup_match.has_value()) || (dflash2_dir.has_value() && mtp_depth == 7 && execution == StackExecution::direct && !allow_kernel_experiments && !allow_stack_experiments
+#ifdef TOKSPUR_PRIVATE_OPERATOR_CHECKPOINTS
+        && !operator_checkpoints.has_value()
+#endif
+        ), "DFlash2 lookup bypass requires direct native DFlash2");
 #else
-    require(mtp_lookup_mode == MtpLookupMode::off, "MTP lookup bypass requires the depth-two native MTP build");
+    require(mtp_lookup_mode == MtpLookupMode::off && dflash2_lookup_mode == MtpLookupMode::off && !dflash2_lookup_match.has_value(), "MTP/DFlash2 lookup bypass requires the speculative native build");
 #endif
 #ifdef TOKSPUR_PRIVATE_RAW_DECODE
     require(!native_raw_decode.value_or(false) || (execution == StackExecution::direct && !allow_kernel_experiments && !allow_stack_experiments && !worker_broker && !prompt_lookup && !checkpoint_slots),
@@ -3623,7 +3694,7 @@ int target_cli(int argc, char** argv) {
     const std::shared_ptr<const ModelFiles> pack_model = pack ? pack->model : (pack_v3 ? pack_v3->model : nullptr);
     const bool pack_shared_mapping = pack_model && pack_model->shards().front().backing_mapping() &&
         pack_model->shards().front().backing_mapping()->mapping_mode() == ReadOnlyMapMode::shared_file;
-    const auto layout = inspect_flash_next(files, pack_model.get()); admit(layout);
+    const auto layout = inspect_flash_next(files, pack_model.get(), target_context_length); admit(layout, target_context_length);
     const auto before = memory();
     if (dry) { std::cout << Json(Json::Object{{"event", Json("preflight")}, {"memory", describe(before)}, {"full_model_loaded", Json(false)}
 #ifdef TOKSPUR_PRIVATE_PLE_GATE_COMPAT
@@ -3957,7 +4028,11 @@ int target_cli(int argc, char** argv) {
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
     const auto mtp_borrowed_output = weights.output;
 #endif
-    require(consumed.size() == files.tensors().size(), "full target left a declared tensor unaccounted");
+    require(consumed.size() == layout.tensors, "full target left a declared tensor unaccounted");
+    for (const auto& [name, location] : files.tensors()) {
+        static_cast<void>(location);
+        require(consumed.contains(name), "full target left a declared tensor unaccounted");
+    }
 #if defined(TOKSPUR_PRIVATE_RAW_DECODE) && defined(TOKSPUR_PRIVATE_GROUPED_MM)
     if (native_raw_decode.value_or(false)) for (const auto& layer : weights.layers) std::visit([&](const auto& weight) {
         for (const auto* matrix : {&weight.ffn.gate, &weight.ffn.up, &weight.ffn.down}) if (matrix->encoding == 7 || matrix->encoding == 12)
@@ -3972,8 +4047,16 @@ int target_cli(int argc, char** argv) {
 #else
         false;
 #endif
+    const bool ple_ram_resident_enabled =
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+        native_ple_ram_resident.value_or(false);
+#else
+        false;
+#endif
     NocacheTensorFile ple_nocache_file;
-    if (ple_async_gather_enabled) {
+    if (ple_ram_resident_enabled) {
+        ple_nocache_file.set_ram_resident(true);
+    } else if (ple_async_gather_enabled) {
         if (const auto backing = files.tensor_backing_file(table.name)) {
             ple_nocache_file = NocacheTensorFile(backing->path, backing->offset, backing->bytes, backing->device, backing->inode);
             files.evict_tensor_pages(table.name);
@@ -3998,7 +4081,7 @@ int target_cli(int argc, char** argv) {
     };
 #endif
     uint64_t stateless_prefill_ple_rows = 0;
-    StackShape shape{{4, 2560, 320}, {2560, 16, 48, 128, 128, 4}, {2560, 24, 2, 256, 4, 128, 64, 4, 2048, 65536}, {2560, 640, 512, 10}, {4, 2560, 2560, 4, dil}, 248320, 1};
+    StackShape shape{{4, 2560, 320}, {2560, 16, 48, 128, 128, 4}, {2560, 24, 2, 256, 4, 128, 64, 4, 2048, target_context_length}, {2560, 640, 512, 10}, {4, 2560, 2560, 4, dil}, 248320, 1};
     if (ple_gate_transform) shape.memory.gate_transform = *ple_gate_transform;
     auto effective_policy = chosen_policy; effective_policy.recurrent.rms_epsilon = effective_policy.attention.rms_epsilon = float(layout.rms_epsilon);
 #ifdef TOKSPUR_PRIVATE_GDN_LEGACY_BATCH
@@ -4163,7 +4246,7 @@ int target_cli(int argc, char** argv) {
             1'000'000);
         stack.prepare_sampled_verification2(maximum_stack_verification_budget, {true, QsaVerifyRowsMode::core_and_q8});
         mtp_binding = std::make_unique<MtpSharedBinding>(source, *mtp_sidecar, MtpTemplatePolicy::target_rendered_ids_only, pack_model);
-        mtp = std::make_unique<MtpHead>(gpu, *mtp_binding, mtp_borrowed_output, 65536, mtp_draft_attention, pack_model ? &pack_views : nullptr);
+        mtp = std::make_unique<MtpHead>(gpu, *mtp_binding, mtp_borrowed_output, target_context_length, mtp_draft_attention, pack_model ? &pack_views : nullptr);
         if (native_mtp_draft_slice) {
             const auto draft_slice = gpu.suballocate_draft_output_slice(mtp_borrowed_output.view, 32768, 2560);
             static_cast<void>(gpu.allocate_draft_embedding_slice(32768, 2560));
@@ -4195,9 +4278,9 @@ int target_cli(int argc, char** argv) {
             LookupConfig lookup_cfg{};
             lookup_cfg.match_tokens = mtp_lookup_match;
             lookup_cfg.proposal_tokens = mtp_depth == 3 ? 3 : 2;
-            lookup_cfg.history_tokens = 65536;
+            lookup_cfg.history_tokens = target_context_length;
             lookup_cfg.token_limit = shape.vocabulary;
-            lookup_cfg.memory_budget_bytes = 4ull << 20;
+            lookup_cfg.memory_budget_bytes = target_context_length > 65536 ? (8ull << 20) : (4ull << 20);
             mtp_lookup = std::make_unique<PromptLookup>(lookup_cfg);
             mtp_lookup_valid = true;
         }
@@ -4215,10 +4298,38 @@ int target_cli(int argc, char** argv) {
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
                 || !carrier_identity_path.empty()
 #endif
-                ));
+                ), target_context_length);
         dflash2->set_adaptive_budget(dflash2_adaptive_budget);
         if (dflash2_max_drafts.has_value()) dflash2->set_max_drafts(*dflash2_max_drafts);
         if (dflash2_vocab_slice.has_value()) dflash2->configure_draft_vocab_slice(*dflash2_vocab_slice);
+        if (dflash2_vocab_gather.has_value()) {
+            std::vector<std::string_view> gguf_tokens;
+            if (is_dflash2_vocab_gather_preset(*dflash2_vocab_gather) && *dflash2_vocab_gather != "control32k") {
+                for (const auto& shard : files.shards()) {
+                    if (!shard.find("tokenizer.ggml.tokens")) continue;
+                    gguf_tokens = shard.string_array("tokenizer.ggml.tokens");
+                    break;
+                }
+                require(!gguf_tokens.empty(), "GGUF shard set lacks tokenizer.ggml.tokens for DFlash2 CJK vocab gather");
+            }
+            const auto draft_token_ids = resolve_dflash2_vocab_gather(*dflash2_vocab_gather, dflash2->vocabulary(), gguf_tokens);
+            dflash2->configure_draft_vocab_gather(draft_token_ids);
+        }
+        if (dflash2_lookup_mode != MtpLookupMode::off) {
+            mtp_lookup_mode = dflash2_lookup_mode;
+            // DFlash2 proposes up to 7 tokens (entering the 8-row M8 NAX tile and flushing staged context), so require a 10-token exact suffix match by default unless explicitly overridden via --dflash2-lookup-match.
+            mtp_lookup_match = dflash2_lookup_match.value_or(10u);
+            LookupConfig lookup_cfg{};
+            lookup_cfg.match_tokens = mtp_lookup_match;
+            lookup_cfg.proposal_tokens = dflash2->max_drafts();
+            lookup_cfg.history_tokens = target_context_length;
+            lookup_cfg.token_limit = shape.vocabulary;
+            lookup_cfg.memory_budget_bytes = target_context_length > 65536 ? (8ull << 20) : (4ull << 20);
+            mtp_lookup = std::make_unique<PromptLookup>(lookup_cfg);
+            mtp_lookup_valid = true;
+        } else if (dflash2_lookup_match.has_value()) {
+            mtp_lookup_match = *dflash2_lookup_match;
+        }
         stack.prepare_dflash_tap(dflash2->target_layer_ids(), dflash2_tap_budget(
 #ifdef TOKSPUR_PRIVATE_HTTP_PREFILL512
             mtp_chunked_prefill ? known_token_capacity :
@@ -4227,6 +4338,20 @@ int target_cli(int argc, char** argv) {
         stack.prepare_sampled_verification2(maximum_stack_verification_budget, {true, QsaVerifyRowsMode::core_and_q8});
         own_memory_guard();
     }
+#ifdef TOKSPUR_DFLASH2_TAP_DUMP_ENABLED
+    // Private diagnostic for offline drafter training: dump every tap row the drafter is fed. The environment variable names a directory that must not hold an earlier dump.
+    std::unique_ptr<DFlash2TapDump> dflash2_tap_dump;
+    if (const char* dump_directory = std::getenv("TOKSPUR_DFLASH2_TAP_DUMP_DIR"); dump_directory && *dump_directory) {
+        require(bool(dflash2), "DFlash2 tap dump requires the DFlash2 drafter");
+        dflash2_tap_dump = std::make_unique<DFlash2TapDump>(dump_directory);
+    }
+    const auto dump_dflash2_taps = [&](DFlash2TapDump::Source source, const StackDFlashCapture& cap, uint32_t first_position, std::span<const uint32_t> tokens) {
+        if (!dflash2_tap_dump) return;
+        const uint32_t width = cap.slot_count * cap.slot_width;
+        require(cap.count == tokens.size() && cap.stride_bytes == uint64_t(width) * sizeof(float), "DFlash2 tap dump capture layout differs");
+        dflash2_tap_dump->write(source, first_position, tokens, std::span(gpu.host_floats(cap.rows), uint64_t(cap.count) * width), width);
+    };
+#endif
 #ifdef TOKSPUR_PRIVATE_MTP_DISPATCH_PROFILE
     TargetMtpProfileSink mtp_profile_sink;
     mtp_profile_sink.boundary = mtp_profile_boundary.value_or(MtpProfileBoundary::dispatch);
@@ -4255,7 +4380,7 @@ int target_cli(int argc, char** argv) {
 #endif
     std::unique_ptr<TargetBranches> branches;
     if (checkpoint_slots) {
-        auto prepared = std::make_unique<TargetBranches>(checkpoint_slots, shape.vocabulary);
+        auto prepared = std::make_unique<TargetBranches>(checkpoint_slots, shape.vocabulary, target_context_length);
         require(prepared->charged_bytes() < checkpoint_budget, "actual host branch storage exceeds combined budget");
         stack.prepare_checkpoints({checkpoint_slots, checkpoint_budget - prepared->charged_bytes()});
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
@@ -4469,11 +4594,16 @@ int target_cli(int argc, char** argv) {
             feed_str(dflash2->state_identity_sha256());
             feed_pod(dflash2->precision());
             feed_pod(dflash2->draft_vocab_slice());
+            if (!dflash2->draft_vocab_gather().empty()) {
+                // Only a gathered vocabulary adds bytes here, so every other configuration keeps its checkpoint identity.
+                feed_str("dflash2-draft-vocab-gather-v1");
+                feed_bytes(std::as_bytes(dflash2->draft_vocab_gather()));
+            }
             for (auto layer : dflash2->target_layer_ids()) feed_pod(layer);
         }
 
         feed_str(options.dump());
-        feed_str(layout.describe().dump());
+        feed_str(layout.describe(target_context_length).dump());
         feed_pod(shape.vocabulary);
         feed_pod(shape.memory_layer);
         feed_pod(shape.memory.dilation);
@@ -4610,6 +4740,7 @@ int target_cli(int argc, char** argv) {
         if (dflash2_adaptive_budget) feed_pod(dflash2_adaptive_budget);
         if (native_logit_topk.has_value()) feed_opt_bool(native_logit_topk);
         if (native_ple_async_gather.has_value()) feed_opt_bool(native_ple_async_gather);
+        if (native_ple_ram_resident.has_value()) feed_opt_bool(native_ple_ram_resident);
         if (native_mtp_fast_round.has_value()) feed_opt_bool(native_mtp_fast_round);
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
         if (native_verify_nax_m8.has_value()) feed_opt_bool(native_verify_nax_m8);
@@ -4684,7 +4815,7 @@ int target_cli(int argc, char** argv) {
         require(ssd_manager->enabled(), "failed to initialize SSD checkpoint directory");
         ssd_manager->set_execution_identity(
             ssd_execution_digest_for(uint32_t(execution), reuse_residual, gpu.kernel_policy()));
-        ssd_token_history.reserve(65536);
+        ssd_token_history.reserve(target_context_length);
         own_memory_guard();
         }
     }
@@ -4757,7 +4888,7 @@ int target_cli(int argc, char** argv) {
     if (prompt_lookup) {
 #ifdef TOKSPUR_PRIVATE_VERIFY_EIGHT
         auto prepared = std::make_unique<TargetLookup<StackResult>>(shape.vocabulary, shape.residual.channels, shape.memory.embedding, verification_budget,
-            verification_max_tokens == 8 ? 7 : 2);
+            verification_max_tokens == 8 ? 7 : 2, target_context_length);
         if (verification_max_tokens == 8) stack.prepare_transient_verification8(verification_budget - prepared->charged_bytes()
 #ifdef TOKSPUR_PRIVATE_VERIFY_QSA_ROWS
             , {verification_qsa_rows.has_value(), verification_qsa_rows.value_or(QsaVerifyRowsMode::off)}
@@ -4765,13 +4896,13 @@ int target_cli(int argc, char** argv) {
             );
         else stack.prepare_transient_verification(verification_budget - prepared->charged_bytes());
 #else
-        auto prepared = std::make_unique<TargetLookup<StackResult>>(shape.vocabulary, shape.residual.channels, shape.memory.embedding, verification_budget);
+        auto prepared = std::make_unique<TargetLookup<StackResult>>(shape.vocabulary, shape.residual.channels, shape.memory.embedding, verification_budget, target_context_length);
         stack.prepare_transient_verification(verification_budget - prepared->charged_bytes());
 #endif
         lookup = std::move(prepared); own_memory_guard();
     }
     bool lookup_active = bool(lookup);
-    TargetSampler sampler;
+    TargetSampler sampler({}, target_context_length);
     CommittedResult<StackResult> retained;
     std::unique_ptr<TargetBroker> broker;
     if (worker_broker) {
@@ -4781,6 +4912,7 @@ int target_cli(int argc, char** argv) {
 #ifdef TOKSPUR_PRIVATE_HTTP_BRANCH8
             , worker_broker8
 #endif
+            , target_context_length
             );
     }
 #ifdef TOKSPUR_PRIVATE_HTTP_BRANCH8
@@ -5115,6 +5247,7 @@ int target_cli(int argc, char** argv) {
                 fields.emplace_back("native_host_logit_views", Json(stack.sampled_logit_views()));
                 if (native_logit_topk.has_value()) fields.emplace_back("native_logit_topk", Json(stack.sampled_logit_topk()));
                 if (native_ple_async_gather.has_value()) fields.emplace_back("native_ple_async_gather", Json(*native_ple_async_gather));
+                if (native_ple_ram_resident.has_value()) fields.emplace_back("native_ple_ram_resident", Json(*native_ple_ram_resident));
                 if (native_mtp_fast_round.has_value()) fields.emplace_back("native_mtp_fast_round", Json(mtp && mtp->fast_round()));
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
                 if (native_verify_hc_gdn_fused.has_value()) fields.emplace_back("native_verify_hc_gdn_fused", Json(gpu.verify_hc_gdn_fused_enabled()));
@@ -5128,6 +5261,13 @@ int target_cli(int argc, char** argv) {
                     fields.emplace_back("native_dflash2_verify_rows", Json(dflash2->adaptive_budget() ? "auto" : "all"));
                     if (dflash2_max_drafts.has_value()) fields.emplace_back("native_dflash2_max_drafts", Json::integer(dflash2->max_drafts()));
                     if (dflash2_vocab_slice.has_value()) fields.emplace_back("native_dflash2_vocab_slice", Json::integer(dflash2->draft_vocab_slice()));
+                    if (dflash2_vocab_gather.has_value()) {
+                        fields.emplace_back("native_dflash2_vocab_gather", Json(*dflash2_vocab_gather));
+                        fields.emplace_back("native_dflash2_vocab_gather_rows", Json::integer(dflash2->draft_vocab_gather().size()));
+                    }
+#ifdef TOKSPUR_DFLASH2_TAP_DUMP_ENABLED
+                    fields.emplace_back("native_dflash2_tap_dump", Json(bool(dflash2_tap_dump)));
+#endif
                 }
 #ifdef TOKSPUR_PRIVATE_MTP_OUTPUT64
                 if (mtp_output_packet_limit) {
@@ -5569,10 +5709,21 @@ int target_cli(int argc, char** argv) {
     std::vector<float> known_rows(uint64_t(known_token_capacity) * 2560), known_embeddings(known_rows.size());
     own_memory_guard();
 #endif
+    if (ple_ram_resident_enabled) {
+        files.warm_tensor_pages(table.name);
+#if defined(TOKSPUR_PRIVATE_CACHE_PRESSURE_RECLAIM) && TOKSPUR_PRIVATE_CACHE_PRESSURE_RECLAIM
+        own_memory_guard();
+#endif
+    }
     if (!profiling && std::getenv("TOKSPUR_ALLOW_KNOWN_PROFILE")) {
         counter_sampling = gpu.configure_profiling(16384);
     }
     const auto decorate_ready = [&](Json value) {
+        if (target_context_length != 65536) {
+            auto fields = value.object();
+            fields.emplace_back("context_length", Json::integer(target_context_length));
+            value = Json(std::move(fields));
+        }
         return decorate(std::move(value));
     };
     std::cout << decorate_ready(Json(Json::Object{{"event", Json("ready")}, {"scope", Json("complete 48-layer text target, experimental checkpoint policies; not quality or performance qualified")},
@@ -5627,7 +5778,7 @@ int target_cli(int argc, char** argv) {
         {"checkpoint_broker", Json(bool(broker))}, {"broker_epoch", Json::integer(broker ? broker->epoch() : 0)},
         {"prompt_lookup", Json(bool(lookup))}, {"lookup_match_tokens", Json::integer(lookup ? 16 : 0)},
         {"allow_prompt_lookup_experiments", Json(allow_lookup_experiments)},
-        {"lookup_history_tokens", Json::integer(lookup ? 65536 : 0)},
+        {"lookup_history_tokens", Json::integer(lookup ? target_context_length : 0)},
 #ifdef TOKSPUR_PRIVATE_VERIFY_EIGHT
         {"lookup_proposal_tokens", Json::integer(lookup ? lookup->proposal_tokens() : 0)},
         {"verification_max_tokens", Json::integer(
@@ -5690,7 +5841,7 @@ int target_cli(int argc, char** argv) {
     std::vector<float> row(2560), embedding(2560); const auto& token_table = files.tensor("token_embd.weight"); const auto row_bytes = token_table.bytes / 248320;
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
     std::vector<float> mtp_previous_hc(mtp ? 10240 : 0), mtp_candidate_rows((mtp || dflash2) ? 2560 * (mtp_depth + 1) : 0), mtp_candidate_memory((mtp || dflash2) ? 2560 * (mtp_depth + 1) : 0);
-    std::vector<float> mtp_lookup_prime_hc(mtp_lookup ? 10240 * (mtp_depth + 1) : 0);
+    std::vector<float> mtp_lookup_prime_hc((mtp && mtp_lookup) ? 10240 * (mtp_depth + 1) : 0);
     std::optional<StackResult> mtp_spare;
     if (mtp || dflash2) { mtp_spare.emplace(); mtp_spare->logits.resize(shape.vocabulary); }
     std::unique_ptr<PleAsyncGatherer> ple_async;
@@ -5744,6 +5895,9 @@ int target_cli(int argc, char** argv) {
         if (dflash2) {
             const auto cap = stack.last_dflash_capture();
             require(cap.rows.owner && cap.count == 1, "DFlash2 step tap capture mismatch");
+#ifdef TOKSPUR_DFLASH2_TAP_DUMP_ENABLED
+            dump_dflash2_taps(DFlash2TapDump::Source::step, cap, base_before, std::span<const uint32_t>(&token, 1));
+#endif
             const auto started = Clock::now();
             const auto batch = dflash2->commit_context(cap.rows, 1, base_before);
             ++mtp_prime_calls; mtp_prime_gpu_ms += batch.gpu_ms; mtp_prime_wall_ms += milliseconds(started);
@@ -5849,6 +6003,9 @@ int target_cli(int argc, char** argv) {
         } else if (dflash2) {
             const auto cap = stack.last_dflash_capture();
             require(cap.rows.owner && cap.count == tokens.size(), "DFlash2 known tap capture mismatch");
+#ifdef TOKSPUR_DFLASH2_TAP_DUMP_ENABLED
+            dump_dflash2_taps(DFlash2TapDump::Source::prefill, cap, base, tokens);
+#endif
             const auto started = Clock::now();
             // Keep every ring row while a shared anchor can still be captured. Later packets only need their final sliding window.
             const auto batch = dflash2->commit_context(cap.rows, uint32_t(tokens.size()), base,
@@ -6286,9 +6443,9 @@ int target_cli(int argc, char** argv) {
         if (expect_logits) restored_res.logits = std::move(out_meta.logits);
         retained.commit(std::move(restored_res), target_pfx, expect_logits);
         if (sampling_opts.policy.temperature > 0 && sampling_opts.seed == out_meta.rng.seed()) {
-            sampler = TargetSampler::restore_branch(sampling_opts, target_pfx, out_meta.rng);
+            sampler = TargetSampler::restore_branch(sampling_opts, target_pfx, out_meta.rng, target_context_length);
         } else {
-            TargetSampler fresh(sampling_opts);
+            TargetSampler fresh(sampling_opts, target_context_length);
             for (uint32_t p = 1; p <= target_pfx; ++p) {
                 require(fresh.committed_input(p), "SSD checkpoint sampler prefix restore failed");
             }
@@ -6353,23 +6510,20 @@ int target_cli(int argc, char** argv) {
         }
         shared_prefix_cache.recent_prefixes.emplace_back(cand.begin(), cand.end());
     };
-    const auto shared_prefix_lcp_boundary = [&](std::span<const uint32_t> cand) -> size_t {
-        if (!shared_prefix_cache_enabled || cand.size() < SharedPrefixCacheState::boundary_tokens) return 0;
-        const size_t limit = std::min<size_t>(cand.size(), SharedPrefixCacheState::max_prefix_tokens);
-        size_t best = 0;
-        for (const auto& prev : shared_prefix_cache.recent_prefixes) {
-            const size_t bound = std::min(limit, prev.size());
-            size_t lcp = 0;
-            while (lcp < bound && prev[lcp] == cand[lcp]) ++lcp;
-            best = std::max(best, lcp);
-        }
-        return (best / SharedPrefixCacheState::boundary_tokens) * SharedPrefixCacheState::boundary_tokens;
+    const auto shared_prefix_best_lcp_len = [&](std::span<const uint32_t> cand) -> size_t {
+        if (!shared_prefix_cache_enabled) return 0;
+        return shared_prefix_best_lcp(shared_prefix_cache.recent_prefixes, cand,
+            SharedPrefixCacheState::boundary_tokens, SharedPrefixCacheState::max_prefix_tokens);
     };
-    const auto capture_shared_prefix = [&](std::span<const uint32_t> prefix_tokens) -> bool {
+    const auto shared_prefix_lcp_boundary = [&](std::span<const uint32_t> cand) -> size_t {
+        return (shared_prefix_best_lcp_len(cand) / SharedPrefixCacheState::boundary_tokens) *
+            SharedPrefixCacheState::boundary_tokens;
+    };
+    const auto capture_shared_prefix = [&](std::span<const uint32_t> prefix_tokens, bool allow_exact_boundary = false) -> bool {
         if (!shared_prefix_cache_enabled) return false;
         const uint32_t pfx = stack.position();
-        if (!pfx || pfx > SharedPrefixCacheState::max_prefix_tokens ||
-            pfx % SharedPrefixCacheState::boundary_tokens != 0 || prefix_tokens.size() != pfx) {
+        if (!pfx || pfx < SharedPrefixCacheState::boundary_tokens || pfx > SharedPrefixCacheState::max_prefix_tokens ||
+            (!allow_exact_boundary && pfx % SharedPrefixCacheState::boundary_tokens != 0) || prefix_tokens.size() != pfx) {
             return false;
         }
         const auto kp = gpu.kernel_policy();
@@ -6474,9 +6628,9 @@ int target_cli(int argc, char** argv) {
         if (expect_logits) restored_res.logits = anchor.logits;
         retained.commit(std::move(restored_res), target_pfx, expect_logits);
         if (sampling_opts.policy.temperature > 0 && sampling_opts.seed == anchor.rng.seed()) {
-            sampler = TargetSampler::restore_branch(sampling_opts, target_pfx, anchor.rng);
+            sampler = TargetSampler::restore_branch(sampling_opts, target_pfx, anchor.rng, target_context_length);
         } else {
-            TargetSampler fresh(sampling_opts);
+            TargetSampler fresh(sampling_opts, target_context_length);
             for (uint32_t p = 1; p <= target_pfx; ++p) {
                 require(fresh.committed_input(p), "shared prefix cache sampler prefix restore failed");
             }
@@ -6509,12 +6663,14 @@ int target_cli(int argc, char** argv) {
     uint64_t last_prefill_dispatches = 0;
     PrefillTop10MixtureTelemetry last_prefill_top10_mixture_stats{};
 #endif
+    const size_t max_wire_bytes = target_context_length > 65536 ? 4 * 1024 * 1024 : 1024 * 1024;
+    const size_t max_wire_nodes = target_context_length > 65536 ? 600000 : 300000;
     std::string line;
     while (true) {
         try {
-            if (!read_line(std::cin, line)) break;
+            if (!read_line(std::cin, line, max_wire_bytes)) break;
             const auto position = stack.position();
-            const auto wire = parse_json(line, {1024 * 1024, 300000, 8});
+            const auto wire = parse_json(line, {max_wire_bytes, max_wire_nodes, 8});
             std::optional<BrokerCommand> ticket;
             if (broker) ticket = broker->admit(wire, position);
             const auto& body = ticket ? ticket->body : wire;
@@ -6794,7 +6950,10 @@ int target_cli(int argc, char** argv) {
                 stack.known_residual_reuse(), checkpoint_slots, bool(lookup), allow_lookup_experiments, lookup_active
 #ifdef TOKSPUR_PRIVATE_HTTP_PREFILL512
                 , native_prefill_final_logits
+#else
+                , false
 #endif
+                , target_context_length
                 ); files.assert_unchanged();
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
             require(!carrier_forced_input || !job.generate, "forced-history components cannot measure live controller decisions");
@@ -7286,20 +7445,37 @@ int target_cli(int argc, char** argv) {
                     std::min<size_t>(known_token_capacity, 512u);
 #endif
                 const size_t base_pos_at_input = stack.position();
+                size_t prefill_shared_lcp_boundary = 0;
+                if (shared_prefix_cache_enabled && !job.branch && !broker && shared_prefix_cache.active_valid &&
+                    shared_prefix_cache.active_tokens.size() == base_pos_at_input &&
+                    base_pos_at_input < SharedPrefixCacheState::max_prefix_tokens) {
+                    std::vector<uint32_t> prospective = shared_prefix_cache.active_tokens;
+                    const size_t room = SharedPrefixCacheState::max_prefix_tokens - prospective.size();
+                    const size_t add_n = std::min<size_t>(job.tokens.size() - input_at, room);
+                    prospective.insert(prospective.end(), job.tokens.begin() + input_at, job.tokens.begin() + input_at + add_n);
+                    prefill_shared_lcp_boundary = shared_prefix_lcp_boundary(prospective);
+                }
                 const auto chunk_count_at = [&](size_t offset) -> size_t {
                     if (offset >= job.tokens.size()) return 0;
+                    const size_t abs_pos = base_pos_at_input + (offset - input_at);
                     size_t n = std::min<size_t>(prefill_slice_cap, job.tokens.size() - offset);
                     if (split_boundary_16 && job.tokens.size() - offset > 16) {
                         n = std::min<size_t>(n, (job.tokens.size() - 16) - offset);
                     } else if (ple_async_gather_enabled && ple_overlap && ple_host_cap >= 512) {
-                        const size_t abs_pos = base_pos_at_input + (offset - input_at);
                         if (prefill_slice_cap <= 512 && offset == input_at && (job.tokens.size() - offset >= 1024) && n > 512) {
                             n = 512;
                         } else if (prefill_slice_cap == 2048 && (abs_pos % 512 == 0) && (abs_pos % 2048 != 0)) {
                             n = std::min<size_t>(n, 2048 - (abs_pos % 2048));
                         }
                     }
-                    if (ple_async_gather_enabled && !split_boundary_16 && n > 2 && (job.tokens.size() - offset - n == 1)) --n;
+                    const size_t clamped = clamp_chunk_to_shared_prefix_boundary(
+                        n, abs_pos, prefill_shared_lcp_boundary, SharedPrefixCacheState::boundary_tokens);
+                    const bool clamped_for_shared_prefix = clamped < n;
+                    n = clamped;
+                    if (!clamped_for_shared_prefix && ple_async_gather_enabled && !split_boundary_16 && n > 2 &&
+                        (job.tokens.size() - offset - n == 1)) {
+                        --n;
+                    }
                     return n;
                 };
                 bool has_prefetched_chunk = false;
@@ -7401,13 +7577,18 @@ int target_cli(int argc, char** argv) {
                         const size_t append_n = std::min(count, room);
                         shared_prefix_cache.active_tokens.insert(shared_prefix_cache.active_tokens.end(),
                             job.tokens.begin() + at, job.tokens.begin() + at + append_n);
-                        if (stack.position() <= SharedPrefixCacheState::max_prefix_tokens &&
-                            stack.position() % SharedPrefixCacheState::boundary_tokens == 0 &&
-                            shared_prefix_cache.active_tokens.size() == stack.position() &&
-                            shared_prefix_lcp_boundary(shared_prefix_cache.active_tokens) >= stack.position()) {
-                            const auto cap_started = Clock::now();
-                            if (capture_shared_prefix(shared_prefix_cache.active_tokens)) {
-                                capture_ms += milliseconds(cap_started);
+                        if (stack.position() >= SharedPrefixCacheState::boundary_tokens &&
+                            stack.position() <= SharedPrefixCacheState::max_prefix_tokens &&
+                            shared_prefix_cache.active_tokens.size() == stack.position()) {
+                            const bool aligned_boundary = (stack.position() % SharedPrefixCacheState::boundary_tokens == 0) &&
+                                shared_prefix_lcp_boundary(shared_prefix_cache.active_tokens) >= stack.position();
+                            const bool exact_packet_end = (at + count == job.tokens.size()) && chunk_emit_logits &&
+                                shared_prefix_best_lcp_len(shared_prefix_cache.active_tokens) >= stack.position();
+                            if (aligned_boundary || exact_packet_end) {
+                                const auto cap_started = Clock::now();
+                                if (capture_shared_prefix(shared_prefix_cache.active_tokens, exact_packet_end)) {
+                                    capture_ms += milliseconds(cap_started);
+                                }
                             }
                         }
                     }
@@ -7669,7 +7850,7 @@ int target_cli(int argc, char** argv) {
                                 cache.gather(staged[t].rows, std::span(mtp_candidate_memory).subspan(uint64_t(t) * 2560, 2560));
                             }
                         }
-                        TargetMtpSelection selector{base, anchor, draft, sampler.options().policy, job.stops, {}, {}};
+                        TargetMtpSelection selector{base, anchor, draft, sampler.options().policy, job.stops, {}, {}, shape.attention.capacity};
                         const auto verified = stack.verify_sampled2(candidates, mtp_candidate_rows, mtp_candidate_memory,
                             base, {TargetMtpSelection::choose, &selector, current_allow_topk()});
                         require(selector.decision && verified.committed == 1 + selector.decision->accepted,

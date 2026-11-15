@@ -165,14 +165,15 @@ void write_gguf_shard(
     const std::vector<SyntheticTensorSpec>& specs,
     uint16_t split_no = 0,
     uint16_t split_count = 1,
-    uint32_t split_tensors_count = 0
+    uint32_t split_tensors_count = 0,
+    std::string_view source_revision = {}
 ) {
     constexpr uint64_t alignment = 32;
     Bytes header;
     push_u(header, 0x46554747, 4);
     push_u(header, 3, 4);
     push_u(header, specs.size(), 8);
-    const uint64_t meta_count = split_count > 1 ? 5 : 2;
+    const uint64_t meta_count = (split_count > 1 ? 5 : 2) + (source_revision.empty() ? 0 : 1);
     push_u(header, meta_count, 8);
     push_meta_str(header, "general.architecture", architecture);
     push_meta_u32(header, "general.alignment", uint32_t(alignment));
@@ -180,6 +181,9 @@ void write_gguf_shard(
         push_meta_u16(header, "split.no", split_no);
         push_meta_u16(header, "split.count", split_count);
         push_meta_u32(header, "split.tensors.count", split_tensors_count);
+    }
+    if (!source_revision.empty()) {
+        push_meta_str(header, "tokspur.source.revision", source_revision);
     }
 
     std::vector<uint64_t> offsets;
@@ -364,6 +368,32 @@ void test_v3_authentication_sources(const std::filesystem::path& dir) {
     const auto sidecar = std::make_shared<const ModelFiles>(std::vector<std::filesystem::path>{changed_mtp_path});
     refuses([&] { static_cast<void>(adopt(source, sidecar, 4)); },
             "v3 full authentication accepted changed MTP source tail");
+    {
+        // tokspur.source.revision metadata propagates into target_revision and refuses mismatched sources.
+        const std::string custom_rev = "34567a4712bc9766c4449e2e98e4468bfa24d915";
+        const auto rev_source_path = dir / "rev-source.gguf";
+        const auto rev_pack_path = dir / "rev-pack.asa.gguf";
+        write_gguf_shard(rev_source_path, "qwen35moe", tensors, 0, 1, 0, custom_rev);
+        const auto rev_source = std::make_shared<const ModelFiles>(std::vector<std::filesystem::path>{rev_source_path});
+        static_cast<void>(build_derived_pack_v3(rev_source, mtp, rev_pack_path, 2, 0, 32768));
+        const auto rev_adopted = adopt_derived_pack_v3(rev_source, mtp, rev_pack_path, 2, 32768, 2, TrustMode::full, false);
+        require(rev_adopted.plan.target_revision == custom_rev, "v3 pack recorded custom tokspur.source.revision");
+        const auto wrong_rev_path = dir / "wrong-rev-source.gguf";
+        write_gguf_shard(wrong_rev_path, "qwen35moe", tensors, 0, 1, 0, "0000000000000000000000000000000000000000");
+        const auto wrong_rev_source = std::make_shared<const ModelFiles>(std::vector<std::filesystem::path>{wrong_rev_path});
+        refuses([&] {
+            static_cast<void>(adopt_derived_pack_v3(wrong_rev_source, mtp, rev_pack_path, 2, 32768, 2, TrustMode::full, false));
+        }, "v3 pack refused mismatched tokspur.source.revision");
+
+        // 1-file CPU-base-only source enforces full 1,254-tensor census when reconstructing plan from pack.
+        const std::vector<SyntheticTensorSpec> cpu_base_only{tensors[0], tensors[1]};
+        const auto cpu_base_path = dir / "cpu-base-only.gguf";
+        write_gguf_shard(cpu_base_path, "qwen4exp", cpu_base_only, 0, 1, 0, custom_rev);
+        const auto cpu_base_source = std::make_shared<const ModelFiles>(std::vector<std::filesystem::path>{cpu_base_path});
+        refuses([&] {
+            static_cast<void>(adopt_derived_pack_v3(cpu_base_source, mtp, rev_pack_path, 2, 32768, 2, TrustMode::full, false));
+        }, "CPU-base-only v3 adoption enforces full 1,254-tensor census");
+    }
 #if defined(TOKSPUR_PRIVATE_PACK_AUTH_RECLAIM) && TOKSPUR_PRIVATE_PACK_AUTH_RECLAIM
     // The bounded descriptor must bind the same file as the retained mapping.
     std::filesystem::rename(source_path, dir / "original-source.gguf");

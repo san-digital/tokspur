@@ -28,8 +28,8 @@ struct CheckpointDrafter {
         } else if (mtp) mtp->reset(first);
     }
     bool matches(uint32_t prefix, uint32_t first, uint32_t rows) const {
-        if (dflash) return first <= prefix && rows == prefix - first && rows == std::min(prefix, 2048u);
-        return mtp ? first < 65536 && rows <= 65536 - first : rows == 0;
+        if (dflash) return prefix <= dflash->max_context() && first <= prefix && rows == prefix - first && rows == std::min(prefix, 2048u);
+        return mtp ? first < mtp->max_positions() && rows <= mtp->max_positions() - first : rows == 0;
     }
 };
 

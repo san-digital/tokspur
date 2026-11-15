@@ -27,6 +27,15 @@ struct DFlash2DraftResult {
     BatchResult batch{};
 };
 
+// Host half of one draft. selector_out is the packed selector result (uint candidates[7*16], float unary[7*16], float edges[7*16*16]) whose candidates are token IDs in the full vocabulary, whichever draft vocabulary produced them. Each proposal carries the actual law it was drawn from; random_after has consumed one word per non-deterministic law.
+struct DFlash2SelectorProposals {
+    std::array<SampledProposalRow, 7> proposals{};
+    std::array<float, 7> confidences{};
+    SamplingRng random_after{0};
+};
+[[nodiscard]] DFlash2SelectorProposals dflash2_selector_proposals(std::span<const std::byte> selector_out, uint32_t count,
+    uint32_t vocabulary, uint32_t base_position, uint32_t anchor_id, const SamplingPolicy& policy, const SamplingRng& after_anchor);
+
 // Adapted from incoai/splash 1.4.0 runtime/model/VerifyBudget.hpp (Apache-2.0).
 class DFlash2VerifyBudget {
 public:
@@ -37,6 +46,7 @@ public:
     static constexpr uint32_t kExploreCycles = 32;
     static constexpr double kDecay = 0.97;
     static constexpr double kPriorCycles = 24.0;
+    static constexpr double kPriorRowCycles = 6.0;
     static constexpr double kSlopePrecision = 50.0;
     static constexpr double kInterceptPrecision = 4.0;
 
@@ -68,13 +78,10 @@ public:
 private:
     struct CostStats {
         double weight = 0.0;
-        double rows = 0.0;
-        double rows_squared = 0.0;
         double time = 0.0;
-        double rows_time = 0.0;
+        std::array<double, kBlockRows + 1> row_weight{};
+        std::array<double, kBlockRows + 1> row_time{};
     };
-
-    [[nodiscard]] std::optional<std::pair<double, double>> fit_cost_line() const noexcept;
 
     Acceptance acceptance_{};
     CostStats cost_{};
@@ -105,7 +112,7 @@ public:
     DFlash2Drafter(MetalGraph& gpu, const std::filesystem::path& directory, GpuView borrowed_output_weight,
                    uint32_t known_token_capacity, const EmbedFn& embed_token,
                    DFlash2Precision precision = DFlash2Precision::q8_0, bool defer_context = false,
-                   bool bind_checkpoint_identity = true);
+                   bool bind_checkpoint_identity = true, uint32_t max_context = 65536);
     ~DFlash2Drafter();
 
     DFlash2Drafter(const DFlash2Drafter&) = delete;
@@ -124,6 +131,9 @@ public:
     void configure_draft_vocab_slice(uint32_t slice_vocab);
     [[nodiscard]] uint32_t draft_vocab_slice() const noexcept { return active_output_vocab_ < vocab_size_ ? active_output_vocab_ : 0u; }
     [[nodiscard]] uint32_t active_output_vocabulary() const noexcept { return active_output_vocab_; }
+    // Gathered draft vocabulary: draft over these token IDs (strictly ascending, a multiple of 32 in [256, vocabulary)) instead of the first N. It replaces any slice, and a later configure_draft_vocab_slice replaces it.
+    void configure_draft_vocab_gather(std::span<const uint32_t> token_ids);
+    [[nodiscard]] std::span<const uint32_t> draft_vocab_gather() const noexcept { return draft_token_ids_; }
 
     void stage_context_commit(GpuView captured_target_hidden, uint32_t rows, uint32_t start_position);
     BatchResult flush_context();
@@ -149,6 +159,7 @@ public:
     [[nodiscard]] bool deferred_context() const noexcept { return defer_context_; }
     [[nodiscard]] std::span<const uint32_t> target_layer_ids() const noexcept { return target_layer_ids_; }
     [[nodiscard]] uint32_t context_len() const noexcept { return context_len_; }
+    [[nodiscard]] uint32_t max_context() const noexcept { return max_context_; }
     [[nodiscard]] uint32_t mask_token_id() const noexcept { return mask_token_id_; }
     [[nodiscard]] uint32_t vocabulary() const noexcept { return vocab_size_; }
     [[nodiscard]] uint64_t weight_bytes() const noexcept { return weight_bytes_; }
@@ -160,6 +171,7 @@ public:
 
 private:
     void dense_proj(GpuView matrix, GpuRowsF32 in, GpuRowsF32 out, bool swiglu = false);
+    void release_draft_vocab_gather();
     void encode_context_commit_chunk(GpuView captured_target_hidden, uint32_t rows, uint32_t start_position);
 
     DFlash2Precision precision_ = DFlash2Precision::q8_0;
@@ -187,6 +199,9 @@ private:
     GpuView borrowed_output_weight_{};
     GpuView active_output_weight_{};
     uint32_t active_output_vocab_ = 248320;
+    std::vector<uint32_t> draft_token_ids_; // Row r of a gathered active_output_weight_ is token draft_token_ids_[r]; empty otherwise.
+    GpuView gathered_output_weight_{};
+    GpuView draft_row_token_ids_{};
     uint32_t max_drafts_ = 7;
 
     uint32_t hidden_size_ = 2560;
@@ -248,6 +263,7 @@ private:
     uint64_t workspace_bytes_ = 0;
     uint64_t priming_batch_bytes_ = 0;
     uint32_t context_len_ = 0;
+    uint32_t max_context_ = 65536;
     bool adaptive_budget_ = false;
     DFlash2VerifyBudget verify_budget_{};
     MeasuredBudget measured_budget_;

@@ -265,6 +265,7 @@ fn ready_and_options(mode: Mode) -> (Json, Options) {
             Options {
                 checkpoint_slots: 2,
                 checkpoint_budget_bytes: 1 << 20,
+                context_length: 65_536,
                 #[cfg(feature = "verify8")]
                 verify8: false,
                 #[cfg(feature = "branch8")]
@@ -277,6 +278,7 @@ fn ready_and_options(mode: Mode) -> (Json, Options) {
             Options {
                 checkpoint_slots: 4,
                 checkpoint_budget_bytes: 512 << 20,
+                context_length: 65_536,
                 verify8: true,
                 branch8: true,
             },

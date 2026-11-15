@@ -9,12 +9,14 @@ namespace tokspur {
 // The caller supplies the recorded effective messages; no persona is injected.
 class TranscriptReplay {
 public:
-    TranscriptReplay(ServeCodec codec, std::string alias, ToolEnumValidation = ToolEnumValidation::strict);
+    TranscriptReplay(ServeCodec codec, std::string alias, ToolEnumValidation = ToolEnumValidation::strict,
+                     uint32_t context_length = 65536);
     Json turn(const Json& record);
 private:
     ServeCodec codec_;
     std::string alias_;
     const ToolEnumValidation tool_enums_;
+    const uint32_t context_length_;
     std::vector<uint32_t> previous_prompt_, previous_canonical_committed_;
     std::string previous_sampling_;
     std::optional<uint64_t> previous_seed_;

@@ -585,10 +585,46 @@ impl ResponseParser {
 
     /// Appends the bytes of one added token. Under [`Self::with_control_tokens`] a control marker fed here frames the response; any other bytes are plain [`Self::feed`] input.
     pub fn feed_control(&mut self, bytes: &[u8]) -> ResponseStatus {
-        if self.control_tokens && CONTROL_MARKERS.contains(&bytes) {
+        if self.control_tokens
+            && CONTROL_MARKERS.contains(&bytes)
+            && self.controls.last() != Some(&self.received)
+        {
             self.controls.push(self.received);
         }
         self.feed(bytes)
+    }
+
+    /// Whether the parser is currently inside an open `<think>` block.
+    pub fn in_thinking(&self) -> bool {
+        self.mode == Mode::Thinking
+    }
+
+    /// Whether the byte stream is currently mid-codepoint in a multi-byte UTF-8 sequence.
+    pub fn has_incomplete_utf8(&self) -> bool {
+        self.remaining != 0
+    }
+
+    /// Whether at least one thinking byte has been received and the latest byte is `'\n'`.
+    pub fn thinking_ends_with_newline(&self) -> bool {
+        if let Some(&b) = self.pending.last() {
+            return b == b'\n';
+        }
+        self.records
+            .iter()
+            .rev()
+            .find(|record| record.kind == ResponseKind::Thinking)
+            .and_then(|record| record.text.last())
+            .is_some_and(|&b| b == b'\n')
+    }
+
+    /// Resets Markdown literal-suppression state before a server-injected `</think>` boundary so an unclosed fence or code span inside capped thinking cannot swallow the forced close.
+    pub fn prepare_forced_thinking_close(&mut self) {
+        if self.mode == Mode::Thinking {
+            self.literal = LiteralState::default();
+            if self.control_tokens && self.controls.last() != Some(&self.received) {
+                self.controls.push(self.received);
+            }
+        }
     }
 
     /// Whether an added control token begins at `index` of `pending`.

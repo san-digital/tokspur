@@ -2,6 +2,9 @@
 #include "tokspur/gguf.hpp"
 
 #include <array>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #include <bit>
 #include <cmath>
 
@@ -76,6 +79,17 @@ void validate(uint32_t type, size_t bytes, size_t elements) {
     }
 }
 
+#if defined(__aarch64__)
+inline void store_scaled_s8x16(const int8x16_t q, const float32x4_t vscale, float* out) {
+    const int16x8_t lo16 = vmovl_s8(vget_low_s8(q));
+    const int16x8_t hi16 = vmovl_s8(vget_high_s8(q));
+    vst1q_f32(out + 0,  vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16))),  vscale));
+    vst1q_f32(out + 4,  vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(lo16)),           vscale));
+    vst1q_f32(out + 8,  vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16))),  vscale));
+    vst1q_f32(out + 12, vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(hi16)),           vscale));
+}
+#endif
+
 } // namespace
 
 float binary16(uint16_t bits) {
@@ -96,33 +110,58 @@ bool can_decode(uint32_t type) {
 
 void dequantize(uint32_t type, std::span<const std::byte> bytes, std::span<float> output) {
     validate(type, bytes.size(), output.size());
-#ifdef TOKSPUR_PRIVATE_M5_CPU_CANDIDATES
     if (type == 8) {
+        // Exact 0-ULP proof: FP16 scale has 11 significand bits (exp >= -24) and int8 has <= 7
+        // magnitude bits, so their exact product uses <= 18 <= 24 FP32 significand bits with zero rounding.
         const size_t blocks = output.size() / 32;
         const auto* src = reinterpret_cast<const uint8_t*>(bytes.data());
         float* dst = output.data();
         for (size_t b = 0; b < blocks; ++b) {
             const uint8_t* bp = src + b * 34;
             const uint16_t d_bits = uint16_t(bp[0]) | (uint16_t(bp[1]) << 8);
+            if ((d_bits & 0x7c00u) == 0x7c00u) throw FormatError("nonfinite model weight");
             const float scale = binary16(d_bits);
-            if ((std::bit_cast<uint32_t>(scale) & 0x7f800000u) == 0x7f800000u) throw FormatError("nonfinite model weight");
             const auto* qs = reinterpret_cast<const int8_t*>(bp + 2);
             float* out_b = dst + b * 32;
+#if defined(__aarch64__)
+            const float32x4_t vscale = vdupq_n_f32(scale);
+            store_scaled_s8x16(vld1q_s8(qs), vscale, out_b);
+            store_scaled_s8x16(vld1q_s8(qs + 16), vscale, out_b + 16);
+#else
             for (size_t i = 0; i < 32; ++i) out_b[i] = scale * static_cast<float>(qs[i]);
+#endif
         }
         return;
     }
     if (type == 20) {
-        constexpr std::array<float, 16> alphabet{-127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
-                                                 1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 89.0f, 113.0f};
         const size_t blocks = output.size() / 32;
         const auto* src = reinterpret_cast<const uint8_t*>(bytes.data());
         float* dst = output.data();
+#if defined(__aarch64__)
+        alignas(16) static constexpr int8_t kIq4NlLut[16] = {
+            -127, -104, -83, -65, -49, -35, -22, -10,
+            1, 13, 25, 38, 53, 69, 89, 113
+        };
+        const int8x16_t lut = vld1q_s8(kIq4NlLut);
+        const uint8x16_t mask_lo = vdupq_n_u8(0x0fu);
         for (size_t b = 0; b < blocks; ++b) {
             const uint8_t* bp = src + b * 18;
             const uint16_t d_bits = uint16_t(bp[0]) | (uint16_t(bp[1]) << 8);
+            if ((d_bits & 0x7c00u) == 0x7c00u) throw FormatError("nonfinite model weight");
+            const float32x4_t vscale = vdupq_n_f32(binary16(d_bits));
+            const uint8x16_t packed = vld1q_u8(bp + 2);
+            float* out_b = dst + b * 32;
+            store_scaled_s8x16(vqtbl1q_s8(lut, vandq_u8(packed, mask_lo)), vscale, out_b);
+            store_scaled_s8x16(vqtbl1q_s8(lut, vshrq_n_u8(packed, 4)), vscale, out_b + 16);
+        }
+#else
+        constexpr std::array<float, 16> alphabet{-127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
+                                                 1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 89.0f, 113.0f};
+        for (size_t b = 0; b < blocks; ++b) {
+            const uint8_t* bp = src + b * 18;
+            const uint16_t d_bits = uint16_t(bp[0]) | (uint16_t(bp[1]) << 8);
+            if ((d_bits & 0x7c00u) == 0x7c00u) throw FormatError("nonfinite model weight");
             const float scale = binary16(d_bits);
-            if ((std::bit_cast<uint32_t>(scale) & 0x7f800000u) == 0x7f800000u) throw FormatError("nonfinite model weight");
             const uint8_t* qs = bp + 2;
             float* out_b = dst + b * 32;
             for (size_t i = 0; i < 16; ++i) {
@@ -131,9 +170,9 @@ void dequantize(uint32_t type, std::span<const std::byte> bytes, std::span<float
                 out_b[i + 16] = scale * alphabet[packed >> 4u];
             }
         }
+#endif
         return;
     }
-#endif
     const auto& layout = encoding(type);
     for (size_t start = 0; start < output.size(); start += layout.elements_per_block) {
         const auto block = bytes.subspan((start / layout.elements_per_block) * layout.bytes_per_block, layout.bytes_per_block);

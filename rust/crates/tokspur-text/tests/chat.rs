@@ -286,7 +286,7 @@ fn data_literals_extract_profile_strings_and_refuse_bad_sources() {
     assert_eq!(checks.0, 3);
 }
 
-/// Reads the pinned `chat_template.jinja` named by `TOKSPUR_PINNED_TEMPLATE` (SHA-256 `12827f24…aadce`; `rust/tools/diff/chat_response.sh` checks the hash). The template is a model asset and never enters Git, so without the variable this test does nothing.
+/// Reads the pinned `chat_template.jinja` named by `TOKSPUR_PINNED_TEMPLATE` (SHA-256 `c3cf9e34…81041`; `rust/tools/diff/chat_response.sh` checks the hash). The template is a model asset and never enters Git, so without the variable this test does nothing.
 #[test]
 fn pinned_template_literals_extract_and_render() {
     let Some(path) = std::env::var_os("TOKSPUR_PINNED_TEMPLATE") else {

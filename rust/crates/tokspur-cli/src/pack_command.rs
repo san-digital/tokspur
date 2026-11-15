@@ -18,13 +18,22 @@ pub(super) fn adopted_pack_sources(
     let assets_profile = read_json_file(&layout.assets_profile_path())?;
     check_adoption(&adoption, &assets_profile)?;
 
-    let shard_paths: Vec<PathBuf> = adoption
+    let target_assets = adoption
         .find("target")
         .ok()
         .flatten()
         .and_then(|t| t.find("assets").ok().flatten())
         .and_then(|a| a.array().ok())
-        .ok_or_else(|| CliError::Validation("adoption missing target assets".to_owned()))?
+        .ok_or_else(|| CliError::Validation("adoption missing target assets".to_owned()))?;
+    for asset in target_assets {
+        if crate::state::optional_asset_role(asset)? == Some("derived_pack") {
+            return Err(CliError::Validation(
+                "adopted target already uses a pre-built derived pack; raw GGUF source shards are required to plan or build a pack"
+                    .to_owned(),
+            ));
+        }
+    }
+    let shard_paths: Vec<PathBuf> = target_assets
         .iter()
         .filter_map(|a| a.find("path").ok().flatten())
         .filter_map(|v| v.string().ok())

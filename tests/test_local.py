@@ -273,3 +273,102 @@ def test_profile_has_explicit_conservative_contract():
     assert p["verify_rows"] == "all" and not p["persistent_cache"]
     assert p["resident_experts"] and p["queue_size"] == 1
     assert p["native_memory_gib"] < p["api_memory_ceiling_gib"] < 128
+
+
+def test_adoption_variants_and_derived_pack_sealing(sandbox, tmp_path, monkeypatch):
+    from tokspur import cli
+
+    monkeypatch.setattr(cli, "ROOT", sandbox)
+
+    def make_spec(path: Path, role: str | None = None) -> dict:
+        entry = {
+            "name": path.name,
+            "size": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        if role is not None:
+            entry["role"] = role
+        return entry
+
+    primary_dir = tmp_path / "primary"
+    alt4_dir = tmp_path / "alt4"
+    pack_dir = tmp_path / "pack"
+    draft_dir = tmp_path / "draft"
+    for d in (primary_dir, alt4_dir, pack_dir, draft_dir):
+        d.mkdir()
+
+    primary_specs = []
+    alt4_specs = []
+    for i in range(4):
+        p = primary_dir / f"primary-{i}.gguf"
+        p.write_bytes(f"primary-{i}".encode())
+        primary_specs.append(make_spec(p))
+        a = alt4_dir / f"own-{i}.gguf"
+        a.write_bytes(f"own-{i}".encode())
+        alt4_specs.append(make_spec(a))
+
+    base_gguf = pack_dir / "Qwen3.8-Flash-Next-base.gguf"
+    base_gguf.write_bytes(b"cpu-base-gguf")
+    pack_gguf = pack_dir / "Qwen3.8-Flash-Next-Q4_K.tokspur.gguf"
+    pack_gguf.write_bytes(b"prebuilt-pack-v3")
+    pack_gguf.chmod(0o644)
+    pack_specs = [make_spec(base_gguf), make_spec(pack_gguf, role="derived_pack")]
+
+    draft_file = draft_dir / "mtp.gguf"
+    draft_file.write_bytes(b"draft-mtp")
+    draft_spec = make_spec(draft_file)
+
+    profile = {
+        "schema": 1,
+        "target": {
+            "files": primary_specs,
+            "variants": [
+                {"files": alt4_specs},
+                {"files": pack_specs},
+            ],
+        },
+        "draft": {"files": [draft_spec]},
+    }
+    profiles_dir = sandbox / "profiles"
+    profiles_dir.mkdir()
+    (profiles_dir / "flash-next-assets.json").write_text(json.dumps(profile))
+
+    # Hard-linked derived pack is refused before sealing or adoption.
+    extra_link = tmp_path / "extra-pack.link"
+    extra_link.hardlink_to(pack_gguf)
+    with pytest.raises(ValueError, match="hard links"):
+        cli.adopt(pack_dir, draft_dir)
+    extra_link.unlink()
+
+    # Writable derived pack is verified and sealed 0444 during adoption.
+    cli.adopt(pack_dir, draft_dir)
+    receipt = local.read_json(sandbox / ".tokspur/adoption.json")
+    assert pack_gguf.stat().st_mode & 0o777 == 0o444
+    assert receipt["target"]["assets"][1]["role"] == "derived_pack"
+    local.check_adoption(receipt)
+
+    # Unsealing after adoption is caught by check_adoption.
+    pack_gguf.chmod(0o644)
+    with pytest.raises(ValueError, match="Asset changed"):
+        local.check_adoption(receipt)
+    pack_gguf.chmod(0o444)
+
+    # Alternative 4-file variant adopts cleanly without colliding with primary 4-file variant.
+    cli.adopt(alt4_dir, draft_dir)
+    alt_receipt = local.read_json(sandbox / ".tokspur/adoption.json")
+    local.check_adoption(alt_receipt)
+    tampered = json.loads(json.dumps(alt_receipt))
+    tampered["target"]["assets"][0]["sha256"] = primary_specs[0]["sha256"]
+    with pytest.raises(
+        ValueError, match="Asset manifest differs from the pinned profile"
+    ):
+        local.check_adoption(tampered)
+
+    # Ambiguous directory matching multiple variants is refused.
+    both_dir = tmp_path / "both"
+    both_dir.mkdir()
+    for src in list(primary_dir.iterdir()) + list(pack_dir.iterdir()):
+        dst = both_dir / src.name
+        dst.write_bytes(src.read_bytes())
+    with pytest.raises(ValueError, match="Ambiguous target asset variants"):
+        cli.adopt(both_dir, draft_dir)

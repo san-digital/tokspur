@@ -189,6 +189,41 @@ void q8_iq4_multiblock() {
             rejected([&] { tokspur::dequantize(type, encoded, decoded); });
         }
     }
+    // Exhaustive 0-ULP verification across all 63,488 finite FP16 scale bit patterns and signed codes.
+    {
+        Bytes q8_block(34), iq4_block(18);
+        std::vector<float> q8_out(32), iq4_out(32);
+        for (int i = 0; i < 16; ++i) iq4_block[2 + i] = std::byte(i | ((15 - i) << 4));
+        for (uint32_t bits = 0; bits < 65536; ++bits) {
+            if ((bits & 0x7c00u) == 0x7c00u) continue;
+            const int exponent = (bits >> 10) & 31, fraction = bits & 1023;
+            const double scale = (bits & 0x8000u ? -1.0 : 1.0) *
+                (exponent ? std::ldexp(1 + fraction / 1024.0, exponent - 15) : std::ldexp(fraction, -24));
+            put(q8_block, 0, bits, 2);
+            const int q_base = int((bits * 8) & 224) - 128;
+            for (int i = 0; i < 32; ++i) {
+                const int q = std::max(-128, std::min(127, q_base + i));
+                q8_block[2 + i] = std::byte(uint8_t(int8_t(q)));
+            }
+            tokspur::dequantize(8, q8_block, q8_out);
+            for (int i = 0; i < 32; ++i) {
+                const int q = std::max(-128, std::min(127, q_base + i));
+                const float ref = static_cast<float>(scale * double(q));
+                if (std::bit_cast<uint32_t>(q8_out[i]) != std::bit_cast<uint32_t>(ref))
+                    throw std::runtime_error("exhaustive Q8_0 0-ULP check failed");
+            }
+            put(iq4_block, 0, bits, 2);
+            tokspur::dequantize(20, iq4_block, iq4_out);
+            for (int i = 0; i < 16; ++i) {
+                const float ref_lo = static_cast<float>(scale * double(alphabet[i]));
+                const float ref_hi = static_cast<float>(scale * double(alphabet[15 - i]));
+                if (std::bit_cast<uint32_t>(iq4_out[i]) != std::bit_cast<uint32_t>(ref_lo) ||
+                    std::bit_cast<uint32_t>(iq4_out[i + 16]) != std::bit_cast<uint32_t>(ref_hi))
+                    throw std::runtime_error("exhaustive IQ4_NL 0-ULP check failed");
+            }
+        }
+        ++checks;
+    }
 }
 } // namespace
 

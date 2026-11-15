@@ -25,7 +25,8 @@ void validate(MtpHeadShape s, MtpHeadPolicy p) {
         s.query_heads && s.query_heads <= 64 && s.kv_heads && s.kv_heads <= s.query_heads &&
         s.query_heads % s.kv_heads == 0 && s.head_width && s.head_width <= 256 && s.head_width % 2 == 0 &&
         s.rotary_width && s.rotary_width <= s.head_width && s.rotary_width % 2 == 0 &&
-        s.vocabulary && s.vocabulary <= (1u << 20) && s.capacity && s.capacity <= 65536,
+        s.vocabulary && s.vocabulary <= (1u << 20) && s.capacity && s.capacity <= 131072 &&
+        s.max_positions && s.max_positions <= 131072 && s.capacity <= s.max_positions,
         "unsupported MTP head geometry");
     require(uint32_t(p.query_packing) <= 1 && uint32_t(p.rotary_pairs) <= 1 && uint32_t(p.router) <= 1 &&
         uint32_t(p.draft_attention) <= 2 &&
@@ -80,7 +81,7 @@ struct MtpHead::Impl {
     void import(const MtpSharedBinding& binding, GpuMatrix output, uint32_t capacity, const std::map<std::string, GpuView>* pack_views = nullptr) {
         sidecar = binding.sidecar_source(); target = binding.target_source();
         const auto& metadata = sidecar->shards().front();
-        shape = {{4, 2560, 320}, {2560, 640, 512, 10}, 24, 2, 256, 64, 248320, capacity};
+        shape = {{4, 2560, 320}, {2560, 640, 512, 10}, 24, 2, 256, 64, 248320, capacity, std::max(65536u, capacity)};
         policy.rms_epsilon = float(metadata.floating_value("qwen4exp.attention.layer_norm_rms_epsilon"));
         std::map<std::string, GpuView> adopted_views;
         const bool use_pack = pack_views && pack_views->contains("blk.48.nextn.hnorm.weight");
@@ -124,6 +125,7 @@ struct MtpHead::Impl {
     }
 
     void prepare() {
+        if (!shape.max_positions) shape.max_positions = std::max(65536u, shape.capacity);
         validate(shape, policy); graph.prepare_mtp_head();
         const auto tile_tokens = mtp_draft_attention_tile_tokens(policy.draft_attention);
         if (tile_tokens) graph.prepare_mtp_head_tiled();
@@ -318,7 +320,7 @@ struct MtpHead::Impl {
         const auto count = uint32_t(emb_rows.size() / c);
         if (!count) return;
         require(count <= 4 && position == first + logical_rows() && logical_rows() + count <= shape.capacity &&
-            position + count <= 65536, "MTP deferred priming input/frontier ownership mismatch");
+            position + count <= shape.max_positions, "MTP deferred priming input/frontier ownership mismatch");
         if (hc_gpu) {
             require(hc_gpu->owner && hc_gpu->bytes == checked_mul(checked_mul(count, h), 4), "MTP deferred GPU HC span mismatch");
         } else {
@@ -350,7 +352,7 @@ struct MtpHead::Impl {
     MtpHeadFastResult run_fast(const GpuView* hc_gpu, std::span<const float> hc_host, bool chain_from_final_hc,
                                std::span<const float> embedding, uint32_t position) {
         const uint64_t h = uint64_t(shape.residual.branches) * shape.residual.channels, c = shape.residual.channels;
-        require(!busy && valid && fast_round && position == first + logical_rows() && position < 65536 &&
+        require(!busy && valid && fast_round && position == first + logical_rows() && position < shape.max_positions &&
             logical_rows() < shape.capacity && embedding.size() == c, "MTP fast-round input/prefix ownership mismatch");
         GpuView hc_source{};
         if (chain_from_final_hc) {
@@ -415,7 +417,7 @@ struct MtpHead::Impl {
                                                  uint32_t position, uint32_t depth) {
         const uint64_t h = uint64_t(shape.residual.branches) * shape.residual.channels, c = shape.residual.channels;
         require(!busy && valid && fast_round && greedy_chain_ready && depth >= 2 && depth <= 3 &&
-            position == first + logical_rows() && position <= 65536 - depth &&
+            position == first + logical_rows() && position <= shape.max_positions - depth &&
             logical_rows() <= shape.capacity - depth && anchor_embedding.size() == c,
             "MTP fast greedy chain input/prefix ownership mismatch");
         GpuView hc_source{};
@@ -495,7 +497,7 @@ struct MtpHead::Impl {
         const float inv_temp = (draft_policy.temperature > 0.0 && std::isfinite(draft_policy.temperature))
             ? float(1.0 / draft_policy.temperature) : 0.0f;
         require(!busy && valid && fast_round && greedy_chain_ready && depth >= 2 && depth <= 3 &&
-            position == first + logical_rows() && position <= 65536 - depth &&
+            position == first + logical_rows() && position <= shape.max_positions - depth &&
             logical_rows() <= shape.capacity - depth && anchor_embedding.size() == c &&
             std::isfinite(inv_temp) && inv_temp > 0.0f &&
             std::isfinite(draft_policy.top_p) && draft_policy.top_p > 0.0 && draft_policy.top_p <= 1.0 &&
@@ -589,7 +591,7 @@ struct MtpHead::Impl {
     BatchResult run_gpu(GpuView hc_view, std::span<const float> embedding, uint32_t position, bool full) {
         if (pending_prime_count) static_cast<void>(flush_deferred());
         const uint64_t h = uint64_t(shape.residual.branches) * shape.residual.channels;
-        require(!busy && valid && position == first + rows && position < 65536 && rows < shape.capacity &&
+        require(!busy && valid && position == first + rows && position < shape.max_positions && rows < shape.capacity &&
             hc_view.owner && hc_view.bytes == h * 4 &&
             embedding.size() == shape.residual.channels, "MTP head input/prefix ownership mismatch");
         finite(embedding);
@@ -729,11 +731,11 @@ struct MtpHead::Impl {
         if (pending_prime_count) static_cast<void>(flush_deferred());
         const uint64_t h = uint64_t(shape.residual.branches) * shape.residual.channels, c = shape.residual.channels;
         const uint64_t row_bytes = h * 4;
-        require(!busy && valid && priming_capacity && position == first + rows && position < 65536 &&
+        require(!busy && valid && priming_capacity && position == first + rows && position < shape.max_positions &&
             hc_rows.owner && hc_rows.bytes >= row_bytes && hc_rows.bytes % row_bytes == 0,
             "MTP priming batch GPU input/frontier ownership mismatch");
         const auto count = uint32_t(hc_rows.bytes / row_bytes);
-        require(count <= priming_capacity && count <= shape.capacity - rows && count <= 65536 - position &&
+        require(count <= priming_capacity && count <= shape.capacity - rows && count <= shape.max_positions - position &&
             embedding.size() == checked_mul(count, c),
             "MTP priming batch input/frontier ownership mismatch");
         finite(embedding);
@@ -747,12 +749,12 @@ struct MtpHead::Impl {
         if (pending_prime_count) static_cast<void>(flush_deferred());
         const uint64_t h = uint64_t(shape.residual.branches) * shape.residual.channels, c = shape.residual.channels;
         const uint64_t row_bytes = h * 4;
-        require(!busy && valid && priming_capacity && position == first + rows && position < 65536 &&
+        require(!busy && valid && priming_capacity && position == first + rows && position < shape.max_positions &&
             first_hc.size() == h && (tail_hc.bytes == 0 || (tail_hc.owner && tail_hc.bytes % row_bytes == 0)),
             "MTP priming batch prefix/tail input mismatch");
         const uint32_t tail_count = uint32_t(tail_hc.bytes / row_bytes);
         const uint32_t count = 1u + tail_count;
-        require(count <= priming_capacity && count <= shape.capacity - rows && count <= 65536 - position &&
+        require(count <= priming_capacity && count <= shape.capacity - rows && count <= shape.max_positions - position &&
             embedding.size() == checked_mul(count, c),
             "MTP priming batch input/frontier ownership mismatch");
         finite(first_hc); finite(embedding);
@@ -776,9 +778,9 @@ struct MtpHead::Impl {
     BatchResult run_batch(std::span<const float> hc, std::span<const float> embedding, uint32_t position) {
         if (pending_prime_count) static_cast<void>(flush_deferred());
         const uint64_t h = uint64_t(shape.residual.branches) * shape.residual.channels, c = shape.residual.channels;
-        require(!busy && valid && priming_capacity && position == first + rows && position < 65536 && hc.size() % h == 0 &&
+        require(!busy && valid && priming_capacity && position == first + rows && position < shape.max_positions && hc.size() % h == 0 &&
             hc.size() / h && hc.size() / h <= priming_capacity && hc.size() / h <= shape.capacity - rows &&
-            hc.size() / h <= 65536 - position && embedding.size() == checked_mul(hc.size() / h, c),
+            hc.size() / h <= shape.max_positions - position && embedding.size() == checked_mul(hc.size() / h, c),
             "MTP priming batch input/frontier ownership mismatch");
         finite(hc); finite(embedding);
         if (sidecar) { sidecar->assert_unchanged(); target->assert_unchanged(); }
@@ -804,7 +806,7 @@ MtpHead::MtpHead(MetalGraph& graph, MtpHeadWeights weights, MtpHeadShape shape, 
 }
 MtpHead::~MtpHead() = default;
 void MtpHead::reset(uint32_t first) {
-    auto& p = *impl_; require(!p.busy && first < 65536, "invalid MTP reset position");
+    auto& p = *impl_; require(!p.busy && first < p.shape.max_positions, "invalid MTP reset position");
     p.first = first; p.rows = 0; p.pending_prime_count = 0; p.pending_prime_pos = 0;
     p.valid = true; p.logits_valid = p.hidden_valid = p.hidden_gpu_valid = false;
 }
@@ -839,7 +841,7 @@ BatchResult MtpHead::prime_pair(GpuView hc, std::span<const float> embedding, ui
 void MtpHead::prime(std::span<const float> hc, std::span<const float> embedding, uint32_t first) {
     const auto& s = impl_->shape; const uint64_t width = uint64_t(s.residual.branches) * s.residual.channels;
     require(hc.size() % width == 0 && embedding.size() == hc.size() / s.residual.branches &&
-        hc.size() / width <= s.capacity && first < 65536 && hc.size() / width <= 65536 - first,
+        hc.size() / width <= s.capacity && first < s.max_positions && hc.size() / width <= s.max_positions - first,
         "MTP prime pair geometry mismatch");
     finite(hc); finite(embedding); reset(first);
     for (uint32_t i = 0; i < hc.size() / width; ++i)
@@ -1033,6 +1035,7 @@ void MtpHead::defer_prime_batch_host(std::span<const float> hc_rows, std::span<c
 BatchResult MtpHead::flush_deferred_prime() { return impl_->flush_deferred(); }
 uint32_t MtpHead::deferred_prime_rows() const noexcept { return impl_->pending_prime_count; }
 uint32_t MtpHead::first_absolute_position() const noexcept { return impl_->first; }
+uint32_t MtpHead::max_positions() const noexcept { return impl_->shape.max_positions; }
 uint64_t MtpHead::ssd_cache_bytes(uint32_t cache_rows) const {
     const auto& p = *impl_;
     require(cache_rows <= p.shape.capacity, "MTP SSD cache rows exceed capacity");
@@ -1064,7 +1067,7 @@ bool MtpHead::read_ssd_cache_span(uint64_t offset, std::span<std::byte> target) 
 }
 bool MtpHead::write_ssd_cache_span(uint32_t first_pos, uint32_t cache_rows, uint64_t offset, std::span<const std::byte> source) {
     auto& p = *impl_;
-    if (p.busy || first_pos >= 65536 || cache_rows > p.shape.capacity || cache_rows > 65536 - first_pos) return false;
+    if (p.busy || first_pos >= p.shape.max_positions || cache_rows > p.shape.capacity || cache_rows > p.shape.max_positions - first_pos) return false;
     const uint64_t total = ssd_cache_bytes(cache_rows);
     if (offset > total || source.size() > total - offset) return false;
     if (offset == 0) {

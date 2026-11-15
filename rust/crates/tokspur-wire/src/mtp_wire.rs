@@ -837,6 +837,18 @@ pub struct MtpWireReply<'a> {
     token_words: Vec<u64>,
 }
 
+fn ready_context_limit(ready: &Json) -> Result<u64> {
+    if ready.kind() != Kind::Object {
+        return Ok(65536);
+    }
+    let Some(field) = ready.find("context_length")? else {
+        return Ok(65536);
+    };
+    let ctx = field.unsigned_integer()?;
+    need(ctx == 65536 || ctx == 131072, "MTP context length bound")?;
+    Ok(ctx)
+}
+
 impl<'a> MtpWireReply<'a> {
     pub fn new(ready: &'a Json, previous: &'a Json, job: &'a Json, resync: bool) -> Result<Self> {
         validate_prefill_identity(ready, previous)?;
@@ -926,12 +938,13 @@ impl<'a> MtpWireReply<'a> {
             integer(job, "seed")?;
         }
 
+        let context_limit = ready_context_limit(ready)?;
         let before = if event == b"ready" {
             0
         } else {
             integer(previous, "committed_prefix")?
         };
-        need(before <= 65536, "MTP previous context bound")?;
+        need(before <= context_limit, "MTP previous context bound")?;
         let base = if reset { 0 } else { before as u32 };
         let pending_overflow = if generation.v2 && !generation.begin {
             generation.pending
@@ -952,7 +965,7 @@ impl<'a> MtpWireReply<'a> {
             round_end = base;
         }
         need(
-            u64::from(base) + u64::from(inputs) + u64::from(maximum) <= 65536,
+            u64::from(base) + u64::from(inputs) + u64::from(maximum) <= context_limit,
             "MTP packet exceeds context reservation",
         )?;
 
@@ -1092,7 +1105,7 @@ impl<'a> MtpWireReply<'a> {
             let prime_extra_field = value.find("prime_extra")?;
             need(
                 head_calls_field.is_some() == prime_extra_field.is_some()
-                    && (head_calls_field.is_none() || matches!(self.depth, 2 | 3)),
+                    && (head_calls_field.is_none() || matches!(self.depth, 2 | 3 | 7)),
                 "MTP round lookup-bypass accounting incomplete",
             )?;
             let round_head_calls = match head_calls_field {
@@ -1103,9 +1116,10 @@ impl<'a> MtpWireReply<'a> {
                 Some(v) => v.unsigned_integer()? as u32,
                 None => 0,
             };
+            let expected_bypass_prime_extra = if self.depth == 7 { 0 } else { 1 };
             need(
                 (round_head_calls == proposals && round_prime_extra == 0)
-                    || (round_head_calls == 0 && round_prime_extra == 1),
+                    || (round_head_calls == 0 && round_prime_extra == expected_bypass_prime_extra),
                 "MTP round head/prime bypass accounting invalid",
             )?;
             let count_valid = if self.generation.v2 {
@@ -1418,6 +1432,51 @@ mod tests {
                 )))
                 .is_err(),
                 "malformed bypass pair ({hc}, {pe}) must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn dflash2_lookup_bypass_round_accounting_and_refusals() {
+        let ready = parse(
+            r#"{"event":"ready","native_mtp_depth":7,"native_mtp_carry_scope":"http-generation-v1","native_mtp_generation":{"id":0,"active":false,"remaining":0,"pending":false}}"#,
+        );
+        let prior = parse(
+            r#"{"event":"done","committed_prefix":4,"continuation_allowed":true,"sampling":{"valid":true,"entropy_prefix":4,"entropy_words":0},"native_mtp_generation":{"id":0,"active":false,"remaining":0,"pending":false},"native_mtp_head_calls":0,"native_mtp_prime_calls":4,"native_mtp_rounds":0,"native_mtp_proposed":0,"native_mtp_accepted":0,"native_mtp_recovery_rounds":0,"native_mtp_carried_anchors":0,"native_mtp_discarded_anchors":0}"#,
+        );
+        let job = parse(
+            r#"{"tokens":[],"generate":5,"reset":false,"mtp_generation":{"id":1,"begin":true,"remaining":8}}"#,
+        );
+
+        let mut reply = MtpWireReply::new(&ready, &prior, &job, false).expect("valid job");
+        reply
+            .event(&parse(
+                r#"{"event":"mtp_round","base":4,"committed_prefix":9,"count":5,"accepted":4,"proposed":4,"head_calls":0,"prime_extra":0,"lookahead_anchor":true,"used_carried_anchor":false,"pending_anchor":true}"#,
+            ))
+            .expect("DFlash2 lookup-bypass round admitted");
+        for pos in 0..5u32 {
+            reply
+                .event(&parse(&format!(
+                    r#"{{"event":"token","id":42,"entropy_words":0,"committed_prefix":9,"round_committed_prefix":9,"token_prefix":{}}}"#,
+                    5 + pos
+                )))
+                .expect("batched token admitted");
+        }
+        let done = parse(
+            r#"{"event":"done","committed_prefix":9,"generated_ids":[42,42,42,42,42],"status":"length","continuation_allowed":true,"sampling":{"valid":true,"entropy_prefix":9,"entropy_words":0},"native_mtp_generation":{"id":1,"active":true,"remaining":3,"pending":true},"native_mtp_head_calls":0,"native_mtp_prime_calls":9,"native_mtp_rounds":1,"native_mtp_proposed":4,"native_mtp_accepted":4,"native_mtp_recovery_rounds":0,"native_mtp_carried_anchors":0,"native_mtp_discarded_anchors":0}"#,
+        );
+        reply
+            .finish(&done)
+            .expect("DFlash2 lookup-bypass done admitted");
+
+        for (hc, pe) in [(0, 1), (1, 0), (4, 1)] {
+            let mut bad = MtpWireReply::new(&ready, &prior, &job, false).expect("valid job");
+            assert!(
+                bad.event(&parse(&format!(
+                    r#"{{"event":"mtp_round","base":4,"committed_prefix":9,"count":5,"accepted":4,"proposed":4,"head_calls":{hc},"prime_extra":{pe},"lookahead_anchor":true,"used_carried_anchor":false,"pending_anchor":true}}"#
+                )))
+                .is_err(),
+                "malformed DFlash2 bypass pair ({hc}, {pe}) must be refused"
             );
         }
     }

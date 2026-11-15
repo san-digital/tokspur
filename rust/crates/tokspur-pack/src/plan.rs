@@ -18,7 +18,7 @@ pub const PACK_VERSION: u32 = 2;
 pub const PACK_RECIPE: &str = "tokspur-pack-v2";
 pub const PACK_ARCHITECTURE: &str = "tokspur_pack";
 pub const SOURCE_ARCHITECTURE: &str = "qwen4exp";
-pub const TARGET_REVISION: &str = "766911a6b7369840a91dbcd95f9f997acaab6cd6";
+pub const TARGET_REVISION: &str = "34567a4712bc9766c4449e2e98e4468bfa24d915";
 pub const MTP_SIDECAR_SHA256: &str =
     "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6";
 pub const EXPECTED_GPU_TENSORS: usize = 1254;

@@ -19,6 +19,7 @@ use tokspur_sys::{EAGAIN, EINTR, POLLIN, POLLNVAL, PollFd, SIGKILL};
 use crate::verify8::{Verify8Context, Verify8Error, Verify8Reply};
 
 const LINE_LIMIT: usize = 1024 * 1024;
+const EXTENDED_LINE_LIMIT: usize = 4 * LINE_LIMIT;
 const STDERR_LIMIT: usize = 64 * 1024;
 const POLL_SLICE_MS: i32 = 25;
 
@@ -339,6 +340,7 @@ pub struct WorkerOptions {
     pub host_logit_views: Option<bool>,
     pub logit_topk: Option<bool>,
     pub ple_async_gather: Option<bool>,
+    pub ple_ram_resident: Option<bool>,
     pub mtp_fast_round: Option<bool>,
     pub dflash2_defer_context: Option<bool>,
     pub dflash2_verify_rows: Option<String>,
@@ -348,6 +350,7 @@ pub struct WorkerOptions {
     pub verify_m8_splits: Option<PathBuf>,
     pub dflash2_max_drafts: Option<u32>,
     pub dflash2_vocab_slice: Option<u32>,
+    pub dflash2_vocab_gather: Option<String>,
     pub known_token_capacity: Option<u32>,
     pub checkpoint_ssd: bool,
     pub checkpoint_ssd_budget_bytes: u64,
@@ -361,6 +364,8 @@ pub struct WorkerOptions {
     pub moe_three_union: Option<bool>,
     pub mtp_lookup: Option<String>,
     pub mtp_lookup_match: Option<u32>,
+    pub dflash2_lookup: Option<String>,
+    pub dflash2_lookup_match: Option<u32>,
     pub prefill_m64: Option<String>,
     pub prefill_multiseg: Option<bool>,
     pub prefill_swizzle: Option<bool>,
@@ -369,6 +374,7 @@ pub struct WorkerOptions {
     pub hc_consumer_fused: Option<bool>,
     pub ple_overlap: Option<bool>,
     pub shared_prefix_cache: Option<bool>,
+    pub context_length: u32,
 }
 
 impl Default for WorkerOptions {
@@ -430,6 +436,7 @@ impl Default for WorkerOptions {
             host_logit_views: None,
             logit_topk: None,
             ple_async_gather: None,
+            ple_ram_resident: None,
             mtp_fast_round: None,
             dflash2_defer_context: None,
             dflash2_verify_rows: None,
@@ -439,6 +446,7 @@ impl Default for WorkerOptions {
             verify_m8_splits: None,
             dflash2_max_drafts: None,
             dflash2_vocab_slice: None,
+            dflash2_vocab_gather: None,
             known_token_capacity: None,
             checkpoint_ssd: false,
             checkpoint_ssd_budget_bytes: 8 * (1024 * 1024 * 1024),
@@ -452,6 +460,8 @@ impl Default for WorkerOptions {
             moe_three_union: None,
             mtp_lookup: None,
             mtp_lookup_match: None,
+            dflash2_lookup: None,
+            dflash2_lookup_match: None,
             prefill_m64: None,
             prefill_multiseg: None,
             prefill_swizzle: None,
@@ -460,8 +470,69 @@ impl Default for WorkerOptions {
             hc_consumer_fused: None,
             ple_overlap: None,
             shared_prefix_cache: None,
+            context_length: 65_536,
         }
     }
+}
+
+pub fn validate_dflash2_vocab_gather(
+    value: &str,
+    vocabulary: u32,
+) -> std::result::Result<(), &'static str> {
+    const REFUSAL: &str = "DFlash2 vocab gather must be control32k, cjk48k, cjk64k, cjk80k, or ascending token IDs/ranges such as 0-32734,248044-248076, a multiple of 32 in [256, vocabulary)";
+    if matches!(value, "control32k" | "cjk48k" | "cjk64k" | "cjk80k") {
+        return if vocabulary > 248_076 {
+            Ok(())
+        } else {
+            Err(REFUSAL)
+        };
+    }
+    if value.is_empty() || value.len() > 65_536 || vocabulary == 0 {
+        return Err(REFUSAL);
+    }
+    let bytes = value.as_bytes();
+    let mut at = 0usize;
+    let mut prev_last: Option<u32> = None;
+    let mut count: u64 = 0;
+    let parse_num = |pos: &mut usize| -> std::result::Result<u32, &'static str> {
+        let begin = *pos;
+        let mut parsed = 0u64;
+        while *pos < bytes.len() && bytes[*pos].is_ascii_digit() {
+            parsed = parsed * 10 + u64::from(bytes[*pos] - b'0');
+            if parsed >= u64::from(vocabulary) {
+                return Err(REFUSAL);
+            }
+            *pos += 1;
+        }
+        if *pos == begin || (bytes[begin] == b'0' && *pos - begin > 1) {
+            return Err(REFUSAL);
+        }
+        Ok(parsed as u32)
+    };
+    loop {
+        let first = parse_num(&mut at)?;
+        let mut last = first;
+        if at < bytes.len() && bytes[at] == b'-' {
+            at += 1;
+            last = parse_num(&mut at)?;
+        }
+        if last < first || prev_last.is_some_and(|p| first <= p) {
+            return Err(REFUSAL);
+        }
+        count += u64::from(last - first) + 1;
+        prev_last = Some(last);
+        if at == bytes.len() {
+            break;
+        }
+        if bytes[at] != b',' {
+            return Err(REFUSAL);
+        }
+        at += 1;
+    }
+    if count < 256 || count >= u64::from(vocabulary) || !count.is_multiple_of(32) {
+        return Err(REFUSAL);
+    }
+    Ok(())
 }
 
 pub fn scalar_channel_transport(options: &WorkerOptions) -> bool {
@@ -652,6 +723,7 @@ struct Io {
     notice_bytes: Vec<u8>,
     step_timeout: Duration,
     drain_timeout: Duration,
+    line_limit: usize,
     startup_cancelled: Option<Box<dyn Fn() -> bool + Send>>,
 }
 
@@ -764,7 +836,7 @@ impl Io {
                     .position(|&c| c == b'\n')
                     .unwrap_or(self.pending.len());
                 require(
-                    line <= LINE_LIMIT && self.pending.len() <= LINE_LIMIT + 65536,
+                    line <= self.line_limit && self.pending.len() <= self.line_limit + 65536,
                     "owned worker output framing limit exceeded",
                 )?;
             } else if !standard_output {
@@ -871,11 +943,11 @@ impl Io {
             )?;
             if let Some(newline) = self.pending.iter().position(|&c| c == b'\n') {
                 require(
-                    newline != 0 && newline <= LINE_LIMIT,
+                    newline != 0 && newline <= self.line_limit,
                     "owned worker emitted an empty/oversized line",
                 )?;
                 let line: Vec<u8> = self.pending.drain(..=newline).take(newline).collect();
-                return parse_json_limited(&line, JsonLimits::new(LINE_LIMIT, 300_000, 12))
+                return parse_json_limited(&line, JsonLimits::new(self.line_limit, 300_000, 12))
                     .map_err(WorkerError::MalformedReply);
             }
             require(
@@ -1174,6 +1246,11 @@ impl OwnedWorker {
             notice_bytes: Vec::new(),
             step_timeout: options.step_timeout,
             drain_timeout: options.drain_timeout,
+            line_limit: if options.context_length > 65_536 {
+                EXTENDED_LINE_LIMIT
+            } else {
+                LINE_LIMIT
+            },
             startup_cancelled: options.startup_cancelled.take(),
         };
         let mut worker = Self {
@@ -1298,6 +1375,17 @@ impl OwnedWorker {
                 &o.stack_execution,
             ],
         );
+        if let Some(ref pack) = o.derived_pack {
+            text(&mut words, &["--derived-pack"]);
+            words.push(path(pack));
+            if let Some(workers) = o.derived_pack_auth_workers {
+                let workers_str = workers.to_string();
+                text(&mut words, &["--derived-pack-auth-workers", &workers_str]);
+            }
+            if let Some(ref mode) = o.derived_pack_trust_mode {
+                text(&mut words, &["--derived-pack-trust-mode", mode]);
+            }
+        }
         #[cfg(feature = "verify8")]
         if o.verify8 {
             #[cfg(feature = "qsa-stage-v8")]
@@ -1426,6 +1514,13 @@ impl OwnedWorker {
             let match_str = match_width.to_string();
             text(&mut words, &["--mtp-lookup-match", &match_str]);
         }
+        if let Some(ref lookup) = o.dflash2_lookup {
+            text(&mut words, &["--dflash2-lookup", lookup]);
+        }
+        if let Some(match_width) = o.dflash2_lookup_match {
+            let match_str = match_width.to_string();
+            text(&mut words, &["--dflash2-lookup-match", &match_str]);
+        }
         if let Some(ref m64) = o.prefill_m64 {
             text(&mut words, &["--prefill-m64", m64]);
         }
@@ -1463,6 +1558,7 @@ impl OwnedWorker {
             ("--native-host-logit-views", o.host_logit_views),
             ("--native-logit-topk", o.logit_topk),
             ("--native-ple-async-gather", o.ple_async_gather),
+            ("--native-ple-ram-resident", o.ple_ram_resident),
             ("--native-mtp-fast-round", o.mtp_fast_round),
             ("--native-prefill-router-fast", o.prefill_router_fast),
             ("--native-dflash2-defer-context", o.dflash2_defer_context),
@@ -1552,6 +1648,9 @@ impl OwnedWorker {
                     if let Some(vocab_slice) = o.dflash2_vocab_slice {
                         let s = vocab_slice.to_string();
                         text(&mut words, &["--dflash2-vocab-slice", &s]);
+                    }
+                    if let Some(ref vocab_gather) = o.dflash2_vocab_gather {
+                        text(&mut words, &["--dflash2-vocab-gather", vocab_gather]);
                     }
                 } else {
                     words.push(b"--mtp-sidecar".to_vec());
@@ -1688,16 +1787,10 @@ impl OwnedWorker {
                 }
             }
         }
-        if let Some(ref pack) = o.derived_pack {
-            text(&mut words, &["--derived-pack"]);
-            words.push(path(pack));
-            if let Some(workers) = o.derived_pack_auth_workers {
-                let workers_str = workers.to_string();
-                text(&mut words, &["--derived-pack-auth-workers", &workers_str]);
-            }
-            if let Some(ref mode) = o.derived_pack_trust_mode {
-                text(&mut words, &["--derived-pack-trust-mode", mode]);
-            }
+
+        if o.context_length != 65_536 {
+            let ctx_str = o.context_length.to_string();
+            text(&mut words, &["--context-length", &ctx_str]);
         }
 
         for shard in &o.shards {
@@ -1716,6 +1809,10 @@ impl OwnedWorker {
         require(
             o.stack_execution == "direct" || o.stack_execution == "recurrent-replay",
             "unsupported owned startup execution mode",
+        )?;
+        require(
+            o.context_length == 65_536 || o.context_length == 131_072,
+            "unsupported owned worker context length",
         )?;
         require(
             o.checkpoint_slots <= 4
@@ -1751,6 +1848,15 @@ impl OwnedWorker {
                 "dflash2 precision requires --dflash2-dir and q8_0 or bf16",
             )?;
         }
+        if let Some(ref gather) = self.options.dflash2_vocab_gather {
+            require(
+                !self.options.dflash2_dir.as_os_str().is_empty()
+                    && self.options.dflash2_vocab_slice.is_none(),
+                "dflash2 vocab gather requires --dflash2-dir and replaces --dflash2-vocab-slice",
+            )?;
+            validate_dflash2_vocab_gather(gather, 248_320)
+                .map_err(|msg| StartError::Worker(WorkerError::Refused(msg)))?;
+        }
         if !self.options.mtp_sidecar.as_os_str().is_empty() {
             self.options.mtp_sidecar = fixed_file(&self.options.mtp_sidecar)?;
         }
@@ -1758,7 +1864,8 @@ impl OwnedWorker {
             self.options.dflash2_dir = fixed_dir(&self.options.dflash2_dir)?;
         }
         require(
-            self.options.shards.len() == 4,
+            self.options.shards.len() == 4
+                || (self.options.shards.len() == 1 && self.options.derived_pack.is_some()),
             "owned target requires four fixed shards",
         )?;
         let mut distinct = BTreeSet::new();
@@ -1873,6 +1980,18 @@ impl OwnedWorker {
             self.ready_value.kind() == Kind::Object && event_is(&self.ready_value, "ready")?,
             "owned target did not emit a single ready event",
         )?;
+        if self.options.context_length != 65_536 {
+            require(
+                worker_integer(&self.ready_value, "context_length")?
+                    == u64::from(self.options.context_length),
+                "owned worker context length readiness differs",
+            )?;
+        } else if let Some(ctx) = self.ready_value.find("context_length")? {
+            require(
+                ctx.unsigned_integer()? == 65_536,
+                "owned worker context length readiness differs",
+            )?;
+        }
         #[cfg(feature = "verify8")]
         if self.options.verify8 {
             #[cfg(feature = "branch8")]
@@ -2008,6 +2127,7 @@ impl OwnedWorker {
             ("native_host_logit_views", self.options.host_logit_views),
             ("native_logit_topk", self.options.logit_topk),
             ("native_ple_async_gather", self.options.ple_async_gather),
+            ("native_ple_ram_resident", self.options.ple_ram_resident),
             ("native_mtp_fast_round", self.options.mtp_fast_round),
             (
                 "native_prefill_router_fast",
@@ -2043,6 +2163,19 @@ impl OwnedWorker {
                     "owned DFlash2 numeric readiness does not match requested option",
                 )?;
             }
+        }
+        if let Some(ref gather) = self.options.dflash2_vocab_gather {
+            require(
+                worker_field(&self.ready_value, "native_dflash2_vocab_gather")?.string()?
+                    == gather.as_bytes(),
+                "owned DFlash2 vocab gather readiness does not match requested option",
+            )?;
+            let gather_rows =
+                worker_integer(&self.ready_value, "native_dflash2_vocab_gather_rows")?;
+            require(
+                (256..248_320).contains(&gather_rows) && gather_rows.is_multiple_of(32),
+                "owned DFlash2 vocab gather row count readiness invalid",
+            )?;
         }
         if self.options.checkpoint_slots != 0 {
             require(
@@ -2326,7 +2459,7 @@ impl OwnedWorker {
             }
             wire = Json::Object(fields);
         }
-        let mut bytes = wire.dump_limited(LINE_LIMIT - 1)?;
+        let mut bytes = wire.dump_limited(self.io.line_limit - 1)?;
         bytes.push(b'\n');
         let submission = Submission {
             body,
@@ -2398,7 +2531,7 @@ impl OwnedWorker {
                 )?;
                 let prompt = worker_field(body, "prompt_ids")?.array()?;
                 require(
-                    !prompt.is_empty() && prompt.len() <= 65536,
+                    !prompt.is_empty() && prompt.len() <= self.options.context_length as usize,
                     "owned broker future prompt bound",
                 )?;
                 for token in prompt {
@@ -2781,7 +2914,7 @@ impl OwnedWorker {
                     self.broker_storage(&value)?;
                     let position = worker_integer(&value, "committed_prefix")?;
                     require(
-                        position <= 65536
+                        position <= u64::from(self.options.context_length)
                             && worker_integer(&value, "checkpoint_retained")?
                                 <= u64::from(self.options.checkpoint_slots),
                         "owned broker prefix/retention bound",

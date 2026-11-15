@@ -2383,6 +2383,54 @@ kernel void nax_verify_bf16_m8(device const ushort* weights [[buffer(0)]], devic
     }
 }
 
+namespace nax_verify_detail {
+
+template <uint T>
+static inline void verify_gdn_gates_accum_f32(device const float* wr, device const float* input, device float* dst,
+    uint cols, uint heads, uint head, ushort tid, ushort sg, ushort lane, threadgroup float (*sg_sum)[8], device atomic_uint* error) {
+    float sums[T];
+    #pragma unroll
+    for (uint t = 0u; t < T; ++t) sums[t] = 0.0f;
+    uint bad = 0u;
+    const uint vec_cols = cols & ~3u;
+    for (uint k = uint(tid) * 4u; k < vec_cols; k += 512u) {
+        const float4 w4 = float4(*reinterpret_cast<device const packed_float4*>(wr + k));
+        bad |= nax_detail::nonfinite_bit(w4.x) | nax_detail::nonfinite_bit(w4.y) |
+               nax_detail::nonfinite_bit(w4.z) | nax_detail::nonfinite_bit(w4.w);
+        #pragma unroll
+        for (uint t = 0u; t < T; ++t) {
+            const float4 x4 = float4(*reinterpret_cast<device const packed_float4*>(input + ulong(t) * cols + k));
+            bad |= nax_detail::nonfinite_bit(x4.x) | nax_detail::nonfinite_bit(x4.y) |
+                   nax_detail::nonfinite_bit(x4.z) | nax_detail::nonfinite_bit(x4.w);
+            sums[t] += dot(w4, x4);
+        }
+    }
+    for (uint k = vec_cols + uint(tid); k < cols; k += 128u) {
+        const float wv = wr[k];
+        bad |= nax_detail::nonfinite_bit(wv);
+        #pragma unroll
+        for (uint t = 0u; t < T; ++t) {
+            const float xv = input[ulong(t) * cols + k];
+            bad |= nax_detail::nonfinite_bit(xv);
+            sums[t] += wv * xv;
+        }
+    }
+    #pragma unroll
+    for (uint t = 0u; t < T; ++t) {
+        const float s = simd_sum(sums[t]);
+        if (!lane) sg_sum[sg][t] = s;
+    }
+    if (bad) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0u && lane < T) {
+        const float tot = sg_sum[0][lane] + sg_sum[1][lane] + sg_sum[2][lane] + sg_sum[3][lane];
+        if (nax_detail::nonfinite_bit(tot)) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
+        dst[ulong(lane) * heads + head] = tot;
+    }
+}
+
+} // namespace nax_verify_detail
+
 // Fused multi-core FP32 alpha+beta projection for GDN verify (one 128-thread group per output row across 2 * heads groups).
 kernel void nax_verify_gdn_gates_f32(device const float* alpha_w [[buffer(0)]], device const float* beta_w [[buffer(1)]],
     device const float* input [[buffer(2)]], device float* alpha_out [[buffer(3)]], device float* beta_out [[buffer(4)]],
@@ -2401,46 +2449,15 @@ kernel void nax_verify_gdn_gates_f32(device const float* alpha_w [[buffer(0)]], 
     const uint head = is_beta ? (group - heads) : group;
     device const float* wr = (is_beta ? beta_w : alpha_w) + ulong(head) * cols;
     device float* dst = is_beta ? beta_out : alpha_out;
-    float sums[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    uint bad = 0u;
-    const uint vec_cols = cols & ~3u;
-    for (uint k = uint(tid) * 4u; k < vec_cols; k += 512u) {
-        const float4 w4 = float4(*reinterpret_cast<device const packed_float4*>(wr + k));
-        bad |= nax_detail::nonfinite_bit(w4.x) | nax_detail::nonfinite_bit(w4.y) |
-               nax_detail::nonfinite_bit(w4.z) | nax_detail::nonfinite_bit(w4.w);
-        #pragma unroll
-        for (uint t = 0u; t < 8u; ++t) {
-            if (t < steps) {
-                const float4 x4 = float4(*reinterpret_cast<device const packed_float4*>(input + ulong(t) * cols + k));
-                bad |= nax_detail::nonfinite_bit(x4.x) | nax_detail::nonfinite_bit(x4.y) |
-                       nax_detail::nonfinite_bit(x4.z) | nax_detail::nonfinite_bit(x4.w);
-                sums[t] += dot(w4, x4);
-            }
-        }
-    }
-    for (uint k = vec_cols + uint(tid); k < cols; k += 128u) {
-        const float wv = wr[k];
-        bad |= nax_detail::nonfinite_bit(wv);
-        #pragma unroll
-        for (uint t = 0u; t < 8u; ++t) {
-            if (t < steps) {
-                const float xv = input[ulong(t) * cols + k];
-                bad |= nax_detail::nonfinite_bit(xv);
-                sums[t] += wv * xv;
-            }
-        }
-    }
-    #pragma unroll
-    for (uint t = 0u; t < 8u; ++t) {
-        const float s = simd_sum(sums[t]);
-        if (!lane) sg_sum[sg][t] = s;
-    }
-    if (bad) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0u && lane < steps) {
-        const float tot = sg_sum[0][lane] + sg_sum[1][lane] + sg_sum[2][lane] + sg_sum[3][lane];
-        if (nax_detail::nonfinite_bit(tot)) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
-        dst[ulong(lane) * heads + head] = tot;
+    switch (steps) {
+        case 1u: nax_verify_detail::verify_gdn_gates_accum_f32<1>(wr, input, dst, cols, heads, head, tid, sg, lane, sg_sum, error); break;
+        case 2u: nax_verify_detail::verify_gdn_gates_accum_f32<2>(wr, input, dst, cols, heads, head, tid, sg, lane, sg_sum, error); break;
+        case 3u: nax_verify_detail::verify_gdn_gates_accum_f32<3>(wr, input, dst, cols, heads, head, tid, sg, lane, sg_sum, error); break;
+        case 4u: nax_verify_detail::verify_gdn_gates_accum_f32<4>(wr, input, dst, cols, heads, head, tid, sg, lane, sg_sum, error); break;
+        case 5u: nax_verify_detail::verify_gdn_gates_accum_f32<5>(wr, input, dst, cols, heads, head, tid, sg, lane, sg_sum, error); break;
+        case 6u: nax_verify_detail::verify_gdn_gates_accum_f32<6>(wr, input, dst, cols, heads, head, tid, sg, lane, sg_sum, error); break;
+        case 7u: nax_verify_detail::verify_gdn_gates_accum_f32<7>(wr, input, dst, cols, heads, head, tid, sg, lane, sg_sum, error); break;
+        default: nax_verify_detail::verify_gdn_gates_accum_f32<8>(wr, input, dst, cols, heads, head, tid, sg, lane, sg_sum, error); break;
     }
 }
 
@@ -5244,89 +5261,107 @@ kernel void nax_qsa_build_tile_lists(device const uint* ids [[buffer(0)]], devic
     const uint first_row = group * 8u;
     if (first_row >= p.rows) return;
     const uint active_rows = min(8u, p.rows - first_row);
-    const uint history_blocks = (p.base + first_row + active_rows + 3u) >> 2;
-    if (history_blocks > 16384u) {
+    const ulong history_blocks_ul = (ulong(p.base) + ulong(first_row) + ulong(active_rows) + 3ul) >> 2;
+    if (history_blocks_ul > 32768ul) {
         if (!tid) {
             atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
             tile_counts[group] = 0x80000000u;
         }
         return;
     }
-    const uint num_words = (history_blocks + 3u) >> 2;
-    for (uint w = tid; w < num_words; w += 256u) {
-        atomic_store_explicit(&mask_words[w], 0u, memory_order_relaxed);
-    }
-    if (!tid) atomic_store_explicit(&tile_bad, 0u, memory_order_relaxed);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint history_blocks = uint(history_blocks_ul);
+    device uint* out_list = tile_lists + ulong(group) * p.list_stride;
+    uint running_total = 0u;
 
-    for (uint r = 0u; r < active_rows; ++r) {
-        const uint row = first_row + r;
-        const uint prefix = p.base + row + 1u;
-        const uint blocks = prefix >> 2;
-        const uint rem = prefix & 3u;
-        const uint bit = 1u << r;
-        if (blocks <= p.block_budget) {
-            for (uint b = tid; b < blocks; b += 256u) {
-                atomic_fetch_or_explicit(&mask_words[b >> 2], bit << ((b & 3u) * 8u), memory_order_relaxed);
+    for (uint win_base = 0u; win_base < history_blocks; win_base += 16384u) {
+        if (win_base > 0u) threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint win_blocks = min(16384u, history_blocks - win_base);
+        const uint win_end = win_base + win_blocks;
+        const uint num_words = (win_blocks + 3u) >> 2;
+        for (uint w = tid; w < num_words; w += 256u) {
+            atomic_store_explicit(&mask_words[w], 0u, memory_order_relaxed);
+        }
+        if (win_base == 0u && !tid) atomic_store_explicit(&tile_bad, 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint r = 0u; r < active_rows; ++r) {
+            const uint row = first_row + r;
+            const uint prefix = p.base + row + 1u;
+            const uint blocks = prefix >> 2;
+            const uint rem = prefix & 3u;
+            const uint bit = 1u << r;
+            if (blocks <= p.block_budget) {
+                if (blocks > win_base) {
+                    const uint dense_blocks = min(blocks, win_end) - win_base;
+                    for (uint lb = tid; lb < dense_blocks; lb += 256u) {
+                        atomic_fetch_or_explicit(&mask_words[lb >> 2], bit << ((lb & 3u) * 8u), memory_order_relaxed);
+                    }
+                }
+            } else {
+                device const uint* row_ids = ids + ulong(row) * p.id_stride;
+                for (uint s = tid; s < p.block_budget; s += 256u) {
+                    const uint b = row_ids[s];
+                    if (win_base == 0u && (b >= blocks || (s > 0u && b <= row_ids[s - 1u]))) {
+                        atomic_fetch_or_explicit(&tile_bad, 4u, memory_order_relaxed);
+                    } else if (b >= win_base && b < win_end) {
+                        const uint lb = b - win_base;
+                        atomic_fetch_or_explicit(&mask_words[lb >> 2], bit << ((lb & 3u) * 8u), memory_order_relaxed);
+                    }
+                }
             }
-        } else {
-            device const uint* row_ids = ids + ulong(row) * p.id_stride;
-            for (uint s = tid; s < p.block_budget; s += 256u) {
-                const uint b = row_ids[s];
-                if (b >= blocks || (s > 0u && b <= row_ids[s - 1u])) {
-                    atomic_fetch_or_explicit(&tile_bad, 4u, memory_order_relaxed);
-                } else {
-                    atomic_fetch_or_explicit(&mask_words[b >> 2], bit << ((b & 3u) * 8u), memory_order_relaxed);
+            if (rem && blocks >= win_base && blocks < win_end && tid == r) {
+                const uint lb = blocks - win_base;
+                atomic_fetch_or_explicit(&mask_words[lb >> 2], bit << ((lb & 3u) * 8u), memory_order_relaxed);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (win_base == 0u) {
+            const uint bad_bits = atomic_load_explicit(&tile_bad, memory_order_relaxed);
+            if (bad_bits) {
+                if (!tid) {
+                    atomic_fetch_or_explicit(error, bad_bits, memory_order_relaxed);
+                    tile_counts[group] = 0x80000000u;
+                }
+                return;
+            }
+        }
+
+        const uint words_per_thread = (num_words + 255u) >> 8;
+        const uint w0 = min(uint(tid) * words_per_thread, num_words);
+        const uint w1 = min(w0 + words_per_thread, num_words);
+        uint my_count = 0u;
+        for (uint w = w0; w < w1; ++w) {
+            const uint word = atomic_load_explicit(&mask_words[w], memory_order_relaxed);
+            my_count += uint((word & 0xffu) != 0u) + uint(((word >> 8) & 0xffu) != 0u) +
+                        uint(((word >> 16) & 0xffu) != 0u) + uint(((word >> 24) & 0xffu) != 0u);
+        }
+        const uint sg_incl = simd_prefix_inclusive_sum(my_count);
+        if (lane == 31u) sg_totals[sg] = sg_incl;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint offset = running_total + (sg_incl - my_count);
+        for (ushort g = 0u; g < sg; ++g) offset += sg_totals[g];
+        for (uint w = w0; w < w1; ++w) {
+            const uint word = atomic_load_explicit(&mask_words[w], memory_order_relaxed);
+            if (!word) continue;
+            #pragma unroll
+            for (uint byte_idx = 0u; byte_idx < 4u; ++byte_idx) {
+                const uint row_mask = (word >> (byte_idx * 8u)) & 0xffu;
+                if (row_mask) {
+                    const uint b = win_base + w * 4u + byte_idx;
+                    if (offset < p.list_stride) out_list[offset] = (b << 8u) | row_mask;
+                    ++offset;
                 }
             }
         }
-        if (rem && tid == r) {
-            atomic_fetch_or_explicit(&mask_words[blocks >> 2], bit << ((blocks & 3u) * 8u), memory_order_relaxed);
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint bad_bits = atomic_load_explicit(&tile_bad, memory_order_relaxed);
-    if (bad_bits) {
-        if (!tid) {
-            atomic_fetch_or_explicit(error, bad_bits, memory_order_relaxed);
-            tile_counts[group] = 0x80000000u;
-        }
-        return;
-    }
-
-    const uint words_per_thread = (num_words + 255u) >> 8;
-    const uint w0 = min(uint(tid) * words_per_thread, num_words);
-    const uint w1 = min(w0 + words_per_thread, num_words);
-    uint my_count = 0u;
-    for (uint w = w0; w < w1; ++w) {
-        const uint word = atomic_load_explicit(&mask_words[w], memory_order_relaxed);
-        my_count += uint((word & 0xffu) != 0u) + uint(((word >> 8) & 0xffu) != 0u) +
-                    uint(((word >> 16) & 0xffu) != 0u) + uint(((word >> 24) & 0xffu) != 0u);
-    }
-    const uint sg_incl = simd_prefix_inclusive_sum(my_count);
-    if (lane == 31u) sg_totals[sg] = sg_incl;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint offset = sg_incl - my_count;
-    for (ushort g = 0u; g < sg; ++g) offset += sg_totals[g];
-    device uint* out_list = tile_lists + ulong(group) * p.list_stride;
-    for (uint w = w0; w < w1; ++w) {
-        const uint word = atomic_load_explicit(&mask_words[w], memory_order_relaxed);
-        if (!word) continue;
-        #pragma unroll
-        for (uint byte_idx = 0u; byte_idx < 4u; ++byte_idx) {
-            const uint row_mask = (word >> (byte_idx * 8u)) & 0xffu;
-            if (row_mask) {
-                const uint b = w * 4u + byte_idx;
-                if (offset < p.list_stride) out_list[offset] = (b << 8u) | row_mask;
-                ++offset;
-            }
-        }
+        uint win_total = 0u;
+        for (ushort g = 0u; g < 8u; ++g) win_total += sg_totals[g];
+        running_total += win_total;
     }
     if (tid == 255u) {
-        if (offset > p.list_stride) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
-        tile_counts[group] = min(offset, p.list_stride);
+        if (running_total > p.list_stride) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
+        tile_counts[group] = min(running_total, p.list_stride);
     }
 }
 
@@ -5596,89 +5631,107 @@ kernel void nax_qsa_build_tile_lists_r4(device const uint* ids [[buffer(0)]], de
     const uint first_row = group * 4u;
     if (first_row >= p.rows) return;
     const uint active_rows = min(4u, p.rows - first_row);
-    const uint history_blocks = (p.base + first_row + active_rows + 3u) >> 2;
-    if (history_blocks > 16384u) {
+    const ulong history_blocks_ul = (ulong(p.base) + ulong(first_row) + ulong(active_rows) + 3ul) >> 2;
+    if (history_blocks_ul > 32768ul) {
         if (!tid) {
             atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
             tile_counts[group] = 0x80000000u;
         }
         return;
     }
-    const uint num_words = (history_blocks + 3u) >> 2;
-    for (uint w = tid; w < num_words; w += 256u) {
-        atomic_store_explicit(&mask_words[w], 0u, memory_order_relaxed);
-    }
-    if (!tid) atomic_store_explicit(&tile_bad, 0u, memory_order_relaxed);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint history_blocks = uint(history_blocks_ul);
+    device uint* out_list = tile_lists + ulong(group) * p.list_stride;
+    uint running_total = 0u;
 
-    for (uint r = 0u; r < active_rows; ++r) {
-        const uint row = first_row + r;
-        const uint prefix = p.base + row + 1u;
-        const uint blocks = prefix >> 2;
-        const uint rem = prefix & 3u;
-        const uint bit = 1u << r;
-        if (blocks <= p.block_budget) {
-            for (uint b = tid; b < blocks; b += 256u) {
-                atomic_fetch_or_explicit(&mask_words[b >> 2], bit << ((b & 3u) * 8u), memory_order_relaxed);
+    for (uint win_base = 0u; win_base < history_blocks; win_base += 16384u) {
+        if (win_base > 0u) threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint win_blocks = min(16384u, history_blocks - win_base);
+        const uint win_end = win_base + win_blocks;
+        const uint num_words = (win_blocks + 3u) >> 2;
+        for (uint w = tid; w < num_words; w += 256u) {
+            atomic_store_explicit(&mask_words[w], 0u, memory_order_relaxed);
+        }
+        if (win_base == 0u && !tid) atomic_store_explicit(&tile_bad, 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint r = 0u; r < active_rows; ++r) {
+            const uint row = first_row + r;
+            const uint prefix = p.base + row + 1u;
+            const uint blocks = prefix >> 2;
+            const uint rem = prefix & 3u;
+            const uint bit = 1u << r;
+            if (blocks <= p.block_budget) {
+                if (blocks > win_base) {
+                    const uint dense_blocks = min(blocks, win_end) - win_base;
+                    for (uint lb = tid; lb < dense_blocks; lb += 256u) {
+                        atomic_fetch_or_explicit(&mask_words[lb >> 2], bit << ((lb & 3u) * 8u), memory_order_relaxed);
+                    }
+                }
+            } else {
+                device const uint* row_ids = ids + ulong(row) * p.id_stride;
+                for (uint s = tid; s < p.block_budget; s += 256u) {
+                    const uint b = row_ids[s];
+                    if (win_base == 0u && (b >= blocks || (s > 0u && b <= row_ids[s - 1u]))) {
+                        atomic_fetch_or_explicit(&tile_bad, 4u, memory_order_relaxed);
+                    } else if (b >= win_base && b < win_end) {
+                        const uint lb = b - win_base;
+                        atomic_fetch_or_explicit(&mask_words[lb >> 2], bit << ((lb & 3u) * 8u), memory_order_relaxed);
+                    }
+                }
             }
-        } else {
-            device const uint* row_ids = ids + ulong(row) * p.id_stride;
-            for (uint s = tid; s < p.block_budget; s += 256u) {
-                const uint b = row_ids[s];
-                if (b >= blocks || (s > 0u && b <= row_ids[s - 1u])) {
-                    atomic_fetch_or_explicit(&tile_bad, 4u, memory_order_relaxed);
-                } else {
-                    atomic_fetch_or_explicit(&mask_words[b >> 2], bit << ((b & 3u) * 8u), memory_order_relaxed);
+            if (rem && blocks >= win_base && blocks < win_end && tid == r) {
+                const uint lb = blocks - win_base;
+                atomic_fetch_or_explicit(&mask_words[lb >> 2], bit << ((lb & 3u) * 8u), memory_order_relaxed);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (win_base == 0u) {
+            const uint bad_bits = atomic_load_explicit(&tile_bad, memory_order_relaxed);
+            if (bad_bits) {
+                if (!tid) {
+                    atomic_fetch_or_explicit(error, bad_bits, memory_order_relaxed);
+                    tile_counts[group] = 0x80000000u;
+                }
+                return;
+            }
+        }
+
+        const uint words_per_thread = (num_words + 255u) >> 8;
+        const uint w0 = min(uint(tid) * words_per_thread, num_words);
+        const uint w1 = min(w0 + words_per_thread, num_words);
+        uint my_count = 0u;
+        for (uint w = w0; w < w1; ++w) {
+            const uint word = atomic_load_explicit(&mask_words[w], memory_order_relaxed);
+            my_count += uint((word & 0xffu) != 0u) + uint(((word >> 8) & 0xffu) != 0u) +
+                        uint(((word >> 16) & 0xffu) != 0u) + uint(((word >> 24) & 0xffu) != 0u);
+        }
+        const uint sg_incl = simd_prefix_inclusive_sum(my_count);
+        if (lane == 31u) sg_totals[sg] = sg_incl;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint offset = running_total + (sg_incl - my_count);
+        for (ushort g = 0u; g < sg; ++g) offset += sg_totals[g];
+        for (uint w = w0; w < w1; ++w) {
+            const uint word = atomic_load_explicit(&mask_words[w], memory_order_relaxed);
+            if (!word) continue;
+            #pragma unroll
+            for (uint byte_idx = 0u; byte_idx < 4u; ++byte_idx) {
+                const uint row_mask = (word >> (byte_idx * 8u)) & 0xffu;
+                if (row_mask) {
+                    const uint b = win_base + w * 4u + byte_idx;
+                    if (offset < p.list_stride) out_list[offset] = (b << 8u) | row_mask;
+                    ++offset;
                 }
             }
         }
-        if (rem && tid == r) {
-            atomic_fetch_or_explicit(&mask_words[blocks >> 2], bit << ((blocks & 3u) * 8u), memory_order_relaxed);
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint bad_bits = atomic_load_explicit(&tile_bad, memory_order_relaxed);
-    if (bad_bits) {
-        if (!tid) {
-            atomic_fetch_or_explicit(error, bad_bits, memory_order_relaxed);
-            tile_counts[group] = 0x80000000u;
-        }
-        return;
-    }
-
-    const uint words_per_thread = (num_words + 255u) >> 8;
-    const uint w0 = min(uint(tid) * words_per_thread, num_words);
-    const uint w1 = min(w0 + words_per_thread, num_words);
-    uint my_count = 0u;
-    for (uint w = w0; w < w1; ++w) {
-        const uint word = atomic_load_explicit(&mask_words[w], memory_order_relaxed);
-        my_count += uint((word & 0xffu) != 0u) + uint(((word >> 8) & 0xffu) != 0u) +
-                    uint(((word >> 16) & 0xffu) != 0u) + uint(((word >> 24) & 0xffu) != 0u);
-    }
-    const uint sg_incl = simd_prefix_inclusive_sum(my_count);
-    if (lane == 31u) sg_totals[sg] = sg_incl;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint offset = sg_incl - my_count;
-    for (ushort g = 0u; g < sg; ++g) offset += sg_totals[g];
-    device uint* out_list = tile_lists + ulong(group) * p.list_stride;
-    for (uint w = w0; w < w1; ++w) {
-        const uint word = atomic_load_explicit(&mask_words[w], memory_order_relaxed);
-        if (!word) continue;
-        #pragma unroll
-        for (uint byte_idx = 0u; byte_idx < 4u; ++byte_idx) {
-            const uint row_mask = (word >> (byte_idx * 8u)) & 0xffu;
-            if (row_mask) {
-                const uint b = w * 4u + byte_idx;
-                if (offset < p.list_stride) out_list[offset] = (b << 8u) | row_mask;
-                ++offset;
-            }
-        }
+        uint win_total = 0u;
+        for (ushort g = 0u; g < 8u; ++g) win_total += sg_totals[g];
+        running_total += win_total;
     }
     if (tid == 255u) {
-        if (offset > p.list_stride) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
-        tile_counts[group] = min(offset, p.list_stride);
+        if (running_total > p.list_stride) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
+        tile_counts[group] = min(running_total, p.list_stride);
     }
 }
 
@@ -7002,18 +7055,15 @@ kernel void nax_m8_dense_q8_swiglu_t64(device const uchar* gate_plane0 [[buffer(
         const bool col_live = col_out < a.rows;
         const ulong p_stride = ulong((a.rows + 31u) & ~31u);
         if (col_live) {
-            #pragma unroll
-            for (ushort r = 0; r < 8; ++r) {
-                if (r < a.tokens) {
-                    partials[((ulong(split) * 2ul + ulong(sg)) * 8ul + ulong(r)) * p_stride + col_out] = epi[sg][r][lane];
-                }
+            for (ushort r = 0; r < ushort(a.tokens); ++r) {
+                partials[((ulong(split) * 2ul + ulong(sg)) * 8ul + ulong(r)) * p_stride + col_out] = epi[sg][r][lane];
             }
         }
         if (nax_m8_split_detail::split_arrive_last(counters + group.x, splits, tid, &arrival)) {
             if (col_live) {
                 #pragma unroll
                 for (ushort r_sub = 0; r_sub < 4; ++r_sub) {
-                    const uint r = uint(sg) * 4u + uint(r_sub);
+                    const uint r = uint(r_sub) * 2u + uint(sg);
                     if (r < a.tokens) {
                         float gs = 0.0f, us = 0.0f;
                         for (uint s = 0u; s < splits; ++s) {

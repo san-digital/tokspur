@@ -56,6 +56,8 @@ PACK_AUTH_RECLAIM ?= 1
 CACHE_PRESSURE_RECLAIM ?= 0
 MEMORY_PLAN_REPORT ?= 0
 SHARED_PREFIX_EVICTION_COUNTERS ?= 0
+# Private diagnostic: write the drafter's target taps to TOKSPUR_DFLASH2_TAP_DUMP_DIR for offline drafter training.
+DFLASH2_TAP_DUMP ?= 0
 # Optional host PLE row-cache limit; 0 preserves 512 MiB (256 MiB in the M5 screen).
 PLE_CACHE_MIB ?= 0
 # Optional duplicate Q8 Tile64 storage; original-layout consumers remain available.
@@ -127,6 +129,11 @@ ifeq ($(MEMORY_PLAN_REPORT),1)
 override CXXFLAGS += -DTOKSPUR_PRIVATE_MEMORY_PLAN_REPORT=1
 else ifneq ($(MEMORY_PLAN_REPORT),0)
 $(error MEMORY_PLAN_REPORT must be 0 or 1)
+endif
+ifeq ($(DFLASH2_TAP_DUMP),1)
+override CXXFLAGS += -DTOKSPUR_PRIVATE_DFLASH2_TAP_DUMP=1
+else ifneq ($(DFLASH2_TAP_DUMP),0)
+$(error DFLASH2_TAP_DUMP must be 0 or 1)
 endif
 ifeq ($(PLE_CACHE_MIB),0)
 else ifeq ($(PLE_CACHE_MIB),256)
@@ -606,7 +613,7 @@ test-metal: $(GPU_TEST_BINS) $(METAL_LIBRARY)
 	"$(BUILD)/test-hc_q8_gemv" "$(METAL_LIBRARY)"
 	"$(BUILD)/test-q8_split_gemv" "$(METAL_LIBRARY)"
 
-CARRIER_GPU_TEST_BINS = $(addprefix $(BUILD)/test-,gdn_ported qsa_sparse_attention qsa_verify_rows_core qsa_prefill chunked_stack prefill_residual hc_rows moe_mm_many_gpu gdn_chunk_gpu q8_three_rows_graph q8_three_rows_stack empirical_challenger_m2_prefill challenger_m2_3 concurrent_dispatch_startup nax_prefill_metal exact_candidates_batch_a exact_candidates_batch_b concurrent_abba_benchmark m4_s3_abba_benchmark challenger_m4_2 challenger_m4_cs64 challenger_m4_3 challenger_m5_2 sampled_stack mtp_head dflash2_context_stage planar_pack_v3 planar_union_profile logit_topk verify_hc_gdn_fused dflash2_shortlist)
+CARRIER_GPU_TEST_BINS = $(addprefix $(BUILD)/test-,gdn_ported qsa_sparse_attention qsa_verify_rows_core qsa_prefill chunked_stack prefill_residual hc_rows moe_mm_many_gpu gdn_chunk_gpu q8_three_rows_graph q8_three_rows_stack empirical_challenger_m2_prefill challenger_m2_3 concurrent_dispatch_startup nax_prefill_metal exact_candidates_batch_a exact_candidates_batch_b concurrent_abba_benchmark m4_s3_abba_benchmark challenger_m4_2 challenger_m4_cs64 challenger_m4_3 challenger_m5_2 sampled_stack mtp_head dflash2_context_stage planar_pack_v3 planar_union_profile logit_topk verify_hc_gdn_fused dflash2_shortlist dflash2_gather)
 ifeq ($(NATIVE_CONFIG),carrier-diagnostic)
 CARRIER_GPU_TEST_BINS += $(BUILD)/test-carrier_diagnostic_gpu
 endif
@@ -648,6 +655,7 @@ carrier-test-metal: $(CARRIER_GPU_TEST_BINS) $(BUILD)/test-planar_union_metadata
 	"$(BUILD)/test-dflash2_context_stage" "$(METAL_LIBRARY)"
 	"$(BUILD)/test-verify_hc_gdn_fused" "$(METAL_LIBRARY)"
 	"$(BUILD)/test-dflash2_shortlist" "$(METAL_LIBRARY)"
+	"$(BUILD)/test-dflash2_gather" "$(METAL_LIBRARY)" --correctness-only
 
 test-challenger_m4_3: $(BUILD)/test-challenger_m4_3 $(METAL_LIBRARY)
 	"$(BUILD)/test-challenger_m4_3" "$(METAL_LIBRARY)"

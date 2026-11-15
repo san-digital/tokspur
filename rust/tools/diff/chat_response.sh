@@ -26,7 +26,7 @@ flags="-std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -I$root/native/include"
 set -- --driver "$out/text-driver" --cli "$out/response-cli" --out "$out"
 template=${TOKSPUR_PINNED_TEMPLATE:-}
 if [ -n "$template" ]; then
-    expected=12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce
+    expected=c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041
     actual=$(shasum -a 256 "$template" | cut -d ' ' -f 1)
     if [ "$actual" != "$expected" ]; then
         echo "pinned template SHA-256 $actual differs from $expected" >&2

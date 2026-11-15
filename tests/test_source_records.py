@@ -30,6 +30,7 @@ def reviewed_tree(tmp_path, checker):
     manifest = json.loads((ROOT / checker.MANIFEST).read_text())
     paths = [checker.MANIFEST]
     paths.extend(row["path"] for row in manifest["native_files"])
+    paths.extend(row["path"] for row in manifest.get("rust_files", []))
     paths.extend(row["licence_file"] for row in manifest["projects"])
     paths.extend([manifest["model_licence"]["file"], "profiles/flash-next-assets.json"])
     paths.extend(
@@ -91,6 +92,30 @@ def test_a_changed_native_file_requires_another_review(checker, reviewed_tree):
     path = root / manifest["native_files"][0]["path"]
     path.write_bytes(path.read_bytes() + b"\n// Changed implementation.\n")
     with pytest.raises(ValueError, match="review has drifted"):
+        checker.validate(root)
+
+
+def test_a_changed_rust_file_requires_another_review(checker, reviewed_tree):
+    root, manifest = reviewed_tree
+    path = root / manifest["rust_files"][0]["path"]
+    path.write_bytes(path.read_bytes() + b"\n// Changed implementation.\n")
+    with pytest.raises(ValueError, match="Rust source review has drifted"):
+        checker.validate(root)
+
+
+def test_omitted_credited_rust_source_is_refused(checker, reviewed_tree):
+    root, manifest = reviewed_tree
+    manifest["rust_files"] = manifest["rust_files"][1:]
+    save(root, checker, manifest)
+    with pytest.raises(ValueError, match="credited Rust source is unrecorded"):
+        checker.validate(root)
+
+
+def test_rust_records_must_stay_under_the_rust_tree(checker, reviewed_tree):
+    root, manifest = reviewed_tree
+    manifest["rust_files"][0]["path"] = manifest["native_files"][1]["path"]
+    save(root, checker, manifest)
+    with pytest.raises(ValueError, match="Rust source path required"):
         checker.validate(root)
 
 

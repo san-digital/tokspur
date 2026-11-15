@@ -352,15 +352,10 @@ kernel void verify_fused_hc_inject_partials(
     if (splits == 1u) {
         if (sg != 0u) return;
         float sum = 0.0f;
-        uint bad = 0u;
         #pragma unroll 4
         for (uint col = uint(lane); col < columns; col += 32u) {
-            const float w = w_row[col];
-            const float xv = x_row[col];
-            if (!isfinite(w) || !isfinite(xv)) bad = 1u;
-            sum += w * xv;
+            sum += w_row[col] * x_row[col];
         }
-        if (simd_or(bad) && !lane) verify_fused_detail::flag_nonfinite(error);
         const float inj = simd_sum(sum);
         if (!lane) {
             verify_fused_detail::checked_write(inject_logits, out_idx, inj, error);
@@ -372,17 +367,13 @@ kernel void verify_fused_hc_inject_partials(
     }
 
     const uint width = ((columns + splits * 32u - 1u) / (splits * 32u)) * 32u;
-    uint bad = 0u;
     for (uint sp = uint(sg); sp < splits; sp += 8u) {
         const uint begin = sp * width;
         const uint end = begin < columns ? min(begin + width, columns) : columns;
         float sum = 0.0f;
         #pragma unroll 4
         for (uint col = begin + uint(lane); col < end; col += 32u) {
-            const float w = w_row[col];
-            const float xv = x_row[col];
-            if (!isfinite(w) || !isfinite(xv)) bad = 1u;
-            sum += w * xv;
+            sum += w_row[col] * x_row[col];
         }
         const float part = simd_sum(sum);
         if (!lane) {
@@ -390,7 +381,6 @@ kernel void verify_fused_hc_inject_partials(
             s_part[sp] = part;
         }
     }
-    if (simd_or(bad) && !lane) verify_fused_detail::flag_nonfinite(error);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (tid == 0u) {
@@ -532,7 +522,7 @@ kernel void verify_fused_hc_read_rows(
     }
 }
 
-// Coalesced 1-float-per-thread multi-row gated_mix (256 threads/TG).
+// Coalesced vectorised multi-row gated_mix (4 floats/thread, 128 threads/TG).
 kernel void verify_fused_hc_gated_mix_rows(
     device const float* normalized [[buffer(0)]],
     device const float* scores [[buffer(1)]],
@@ -547,26 +537,56 @@ kernel void verify_fused_hc_gated_mix_rows(
         if (!index) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
         return;
     }
-    const uint token = index / channels;
-    const uint channel = index % channels;
+    const uint quads = (channels + 3u) >> 2u;
+    const uint token = index / quads;
+    const uint col4 = (index % quads) << 2u;
     if (token >= tokens) return;
 
-    float total = 0.0f;
-    bool lane_ok = true;
-    if (branches == 4u) {
-        #pragma unroll
-        for (uint b = 0u; b < 4u; ++b) {
-            const ulong at = (ulong(token) * 4ul + b) * channels + channel;
-            const float n = normalized[at];
-            const float s = scores[at];
-            if (!isfinite(n) || !isfinite(s)) {
-                verify_fused_detail::flag_nonfinite(error);
-                lane_ok = false;
-                break;
+    if ((channels & 3u) == 0u) {
+        float4 total = float4(0.0f);
+        bool4 ok = bool4(true);
+        if (branches == 4u) {
+            #pragma unroll
+            for (uint b = 0u; b < 4u; ++b) {
+                const ulong at = (ulong(token) * 4ul + b) * channels + col4;
+                const float4 n = float4(*reinterpret_cast<device const packed_float4*>(normalized + at));
+                const float4 s = float4(*reinterpret_cast<device const packed_float4*>(scores + at));
+                ok = ok && isfinite(n) && isfinite(s);
+                total.x += n.x * verify_fused_detail::sigmoid_fused(s.x);
+                total.y += n.y * verify_fused_detail::sigmoid_fused(s.y);
+                total.z += n.z * verify_fused_detail::sigmoid_fused(s.z);
+                total.w += n.w * verify_fused_detail::sigmoid_fused(s.w);
             }
-            total += n * verify_fused_detail::sigmoid_fused(s);
+        } else {
+            for (uint b = 0u; b < branches; ++b) {
+                const ulong at = (ulong(token) * branches + b) * channels + col4;
+                const float4 n = float4(*reinterpret_cast<device const packed_float4*>(normalized + at));
+                const float4 s = float4(*reinterpret_cast<device const packed_float4*>(scores + at));
+                ok = ok && isfinite(n) && isfinite(s);
+                total.x += n.x * verify_fused_detail::sigmoid_fused(s.x);
+                total.y += n.y * verify_fused_detail::sigmoid_fused(s.y);
+                total.z += n.z * verify_fused_detail::sigmoid_fused(s.z);
+                total.w += n.w * verify_fused_detail::sigmoid_fused(s.w);
+            }
         }
-    } else {
+        const float4 out4 = total / float(branches);
+        const ulong out_base = ulong(token) * channels + col4;
+        if (all(ok) && all(isfinite(out4))) {
+            *reinterpret_cast<device packed_float4*>(output + out_base) = packed_float4(out4);
+        } else {
+            verify_fused_detail::flag_nonfinite(error);
+            for (uint k = 0u; k < 4u; ++k) {
+                if (ok[k]) verify_fused_detail::checked_write(output, out_base + k, out4[k], error);
+            }
+        }
+        return;
+    }
+
+    const uint cnt = min(4u, channels - col4);
+    for (uint k = 0u; k < cnt; ++k) {
+        const uint channel = col4 + k;
+        float total = 0.0f;
+        bool lane_ok = true;
         for (uint b = 0u; b < branches; ++b) {
             const ulong at = (ulong(token) * branches + b) * channels + channel;
             const float n = normalized[at];
@@ -578,9 +598,9 @@ kernel void verify_fused_hc_gated_mix_rows(
             }
             total += n * verify_fused_detail::sigmoid_fused(s);
         }
-    }
-    if (lane_ok) {
-        verify_fused_detail::checked_write(output, ulong(token) * channels + channel, total / float(branches), error);
+        if (lane_ok) {
+            verify_fused_detail::checked_write(output, ulong(token) * channels + channel, total / float(branches), error);
+        }
     }
 }
 
@@ -660,7 +680,7 @@ kernel void verify_fused_hc_write_rms_rows(
         return;
     }
 
-    threadgroup float sram_v[80][32];
+    alignas(16) threadgroup float sram_v[2560];
     threadgroup uint sg_bad[8];
     threadgroup float shared_inv;
     threadgroup uint shared_abort;
@@ -680,16 +700,34 @@ kernel void verify_fused_hc_write_rms_rows(
         }
         const uint steps32 = channels >> 5u;
         uint bad = isfinite(sc) ? 0u : 1u;
+        float4 rv0 = float4(0.0f);
+        float4 rv1 = float4(0.0f);
+        float4 rv2 = float4(0.0f);
         if (channels == 2560u) {
-            #pragma unroll
-            for (uint m = 0u; m < 10u; ++m) {
-                const uint idx = m * 256u + uint(tid);
-                const float st = streams[base + idx];
-                const float xv = input[x_base + idx];
-                const float v = st + sc * xv;
-                if (!isfinite(st) || !isfinite(xv) || !isfinite(v)) bad = 1u;
-                output[base + idx] = v;
-                sram_v[m * 8u + uint(sg)][lane] = v;
+            const uint col0 = uint(tid) << 2u;
+            const uint col1 = 1024u + col0;
+            const float4 st0 = float4(*reinterpret_cast<device const packed_float4*>(streams + base + col0));
+            const float4 xv0 = float4(*reinterpret_cast<device const packed_float4*>(input + x_base + col0));
+            rv0 = float4(st0.x + sc * xv0.x, st0.y + sc * xv0.y, st0.z + sc * xv0.z, st0.w + sc * xv0.w);
+            if (!all(isfinite(st0)) || !all(isfinite(xv0)) || !all(isfinite(rv0))) bad = 1u;
+            *reinterpret_cast<device packed_float4*>(output + base + col0) = packed_float4(rv0);
+            *reinterpret_cast<threadgroup packed_float4*>(sram_v + col0) = packed_float4(rv0);
+
+            const float4 st1 = float4(*reinterpret_cast<device const packed_float4*>(streams + base + col1));
+            const float4 xv1 = float4(*reinterpret_cast<device const packed_float4*>(input + x_base + col1));
+            rv1 = float4(st1.x + sc * xv1.x, st1.y + sc * xv1.y, st1.z + sc * xv1.z, st1.w + sc * xv1.w);
+            if (!all(isfinite(st1)) || !all(isfinite(xv1)) || !all(isfinite(rv1))) bad = 1u;
+            *reinterpret_cast<device packed_float4*>(output + base + col1) = packed_float4(rv1);
+            *reinterpret_cast<threadgroup packed_float4*>(sram_v + col1) = packed_float4(rv1);
+
+            if (tid < 128u) {
+                const uint col2 = 2048u + col0;
+                const float4 st2 = float4(*reinterpret_cast<device const packed_float4*>(streams + base + col2));
+                const float4 xv2 = float4(*reinterpret_cast<device const packed_float4*>(input + x_base + col2));
+                rv2 = float4(st2.x + sc * xv2.x, st2.y + sc * xv2.y, st2.z + sc * xv2.z, st2.w + sc * xv2.w);
+                if (!all(isfinite(st2)) || !all(isfinite(xv2)) || !all(isfinite(rv2))) bad = 1u;
+                *reinterpret_cast<device packed_float4*>(output + base + col2) = packed_float4(rv2);
+                *reinterpret_cast<threadgroup packed_float4*>(sram_v + col2) = packed_float4(rv2);
             }
         } else {
             for (uint k = uint(sg); k < steps32; k += 8u) {
@@ -699,7 +737,7 @@ kernel void verify_fused_hc_write_rms_rows(
                 const float v = st + sc * xv;
                 if (!isfinite(st) || !isfinite(xv) || !isfinite(v)) bad = 1u;
                 output[base + idx] = v;
-                sram_v[k][lane] = v;
+                sram_v[idx] = v;
             }
         }
         const uint sbad = simd_or(bad);
@@ -710,7 +748,7 @@ kernel void verify_fused_hc_write_rms_rows(
             float sum = 0.0f;
             #pragma unroll 4
             for (uint k = 0u; k < steps32; ++k) {
-                const float vm = sram_v[k][lane];
+                const float vm = sram_v[k * 32u + uint(lane)];
                 sum += vm * vm;
             }
             sum = simd_sum(sum);
@@ -731,19 +769,29 @@ kernel void verify_fused_hc_write_rms_rows(
         const ulong gain_base = shared_gains ? 0ul : ulong(branch) * channels;
         uint bad2 = 0u;
         if (channels == 2560u) {
-            #pragma unroll
-            for (uint m = 0u; m < 10u; ++m) {
-                const uint idx = m * 256u + uint(tid);
-                const float rv = sram_v[m * 8u + uint(sg)][lane];
-                const float g = gains[gain_base + idx];
-                const float n = (rv * inv) * g;
-                if (!isfinite(g) || !isfinite(n)) bad2 = 1u;
-                normalized[base + idx] = n;
+            const uint col0 = uint(tid) << 2u;
+            const uint col1 = 1024u + col0;
+            const float4 g0 = float4(*reinterpret_cast<device const packed_float4*>(gains + gain_base + col0));
+            const float4 n0 = float4((rv0.x * inv) * g0.x, (rv0.y * inv) * g0.y, (rv0.z * inv) * g0.z, (rv0.w * inv) * g0.w);
+            if (!all(isfinite(g0)) || !all(isfinite(n0))) bad2 = 1u;
+            *reinterpret_cast<device packed_float4*>(normalized + base + col0) = packed_float4(n0);
+
+            const float4 g1 = float4(*reinterpret_cast<device const packed_float4*>(gains + gain_base + col1));
+            const float4 n1 = float4((rv1.x * inv) * g1.x, (rv1.y * inv) * g1.y, (rv1.z * inv) * g1.z, (rv1.w * inv) * g1.w);
+            if (!all(isfinite(g1)) || !all(isfinite(n1))) bad2 = 1u;
+            *reinterpret_cast<device packed_float4*>(normalized + base + col1) = packed_float4(n1);
+
+            if (tid < 128u) {
+                const uint col2 = 2048u + col0;
+                const float4 g2 = float4(*reinterpret_cast<device const packed_float4*>(gains + gain_base + col2));
+                const float4 n2 = float4((rv2.x * inv) * g2.x, (rv2.y * inv) * g2.y, (rv2.z * inv) * g2.z, (rv2.w * inv) * g2.w);
+                if (!all(isfinite(g2)) || !all(isfinite(n2))) bad2 = 1u;
+                *reinterpret_cast<device packed_float4*>(normalized + base + col2) = packed_float4(n2);
             }
         } else {
             for (uint k = uint(sg); k < steps32; k += 8u) {
                 const uint idx = k * 32u + uint(lane);
-                const float rv = sram_v[k][lane];
+                const float rv = sram_v[idx];
                 const float g = gains[gain_base + idx];
                 const float n = (rv * inv) * g;
                 if (!isfinite(g) || !isfinite(n)) bad2 = 1u;
@@ -781,6 +829,87 @@ kernel void verify_fused_hc_write_rms_rows(
     }
 }
 
+namespace verify_fused_detail {
+
+template <uint T>
+static inline void gdn_alpha_beta_accum_f32(
+    device const float* w_row,
+    device const uchar* input_bytes,
+    device uchar* out_base,
+    uint first,
+    uint columns,
+    uint out,
+    ulong input_stride_bytes,
+    ulong out_stride,
+    ushort lane,
+    device atomic_uint* error) {
+    device const float* x_ptr[T];
+    float s[T];
+    #pragma unroll
+    for (uint j = 0u; j < T; ++j) {
+        x_ptr[j] = reinterpret_cast<device const float*>(input_bytes + ulong(first + j) * input_stride_bytes);
+        s[j] = 0.0f;
+    }
+
+    #pragma unroll 4
+    for (uint k = uint(lane); k < columns; k += 32u) {
+        const float w = w_row[k];
+        #pragma unroll
+        for (uint j = 0u; j < T; ++j) {
+            s[j] += w * x_ptr[j][k];
+        }
+    }
+
+    #pragma unroll
+    for (uint j = 0u; j < T; ++j) {
+        const float total = simd_sum(s[j]);
+        if (!lane) {
+            device float* y_row = reinterpret_cast<device float*>(out_base + ulong(first + j) * out_stride);
+            checked_write(y_row, out, total, error);
+        }
+    }
+}
+
+template <uint T>
+static inline void expert_gate_accum_f32(
+    device const float* w_row,
+    device const uchar* input_bytes,
+    device uchar* output_bytes,
+    uint columns,
+    uint out,
+    ulong input_stride_bytes,
+    ulong output_stride_bytes,
+    ushort lane,
+    device atomic_uint* error) {
+    device const float* x_ptr[T];
+    float s[T];
+    #pragma unroll
+    for (uint m = 0u; m < T; ++m) {
+        x_ptr[m] = reinterpret_cast<device const float*>(input_bytes + ulong(m) * input_stride_bytes);
+        s[m] = 0.0f;
+    }
+
+    #pragma unroll 4
+    for (uint k = uint(lane); k < columns; k += 32u) {
+        const float w = w_row[k];
+        #pragma unroll
+        for (uint m = 0u; m < T; ++m) {
+            s[m] += w * x_ptr[m][k];
+        }
+    }
+
+    #pragma unroll
+    for (uint m = 0u; m < T; ++m) {
+        const float total = simd_sum(s[m]);
+        if (!lane) {
+            device float* y_row = reinterpret_cast<device float*>(output_bytes + ulong(m) * output_stride_bytes);
+            checked_write(y_row, out, total, error);
+        }
+    }
+}
+
+} // namespace verify_fused_detail
+
 // Single-dispatch GDN alpha + beta FP32 gate projections (2560 -> 16) with pure scalar accumulators.
 kernel void verify_fused_gdn_alpha_beta_f32(
     device const float* w_alpha [[buffer(0)]],
@@ -815,44 +944,15 @@ kernel void verify_fused_gdn_alpha_beta_f32(
     device uchar* out_base = is_beta ? beta_bytes : alpha_bytes;
     const ulong out_stride = is_beta ? a.beta_stride_bytes : a.alpha_stride_bytes;
 
-    device const float* x0_ptr = reinterpret_cast<device const float*>(input_bytes + ulong(first) * a.input_stride_bytes);
-    device const float* x1_ptr = reinterpret_cast<device const float*>(input_bytes + ulong(min(first + 1u, a.rows - 1u)) * a.input_stride_bytes);
-    device const float* x2_ptr = reinterpret_cast<device const float*>(input_bytes + ulong(min(first + 2u, a.rows - 1u)) * a.input_stride_bytes);
-    device const float* x3_ptr = reinterpret_cast<device const float*>(input_bytes + ulong(min(first + 3u, a.rows - 1u)) * a.input_stride_bytes);
-
-    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
-    uint bad = 0u;
-
-    #pragma unroll 4
-    for (uint k = uint(lane); k < a.columns; k += 32u) {
-        const float w = w_row[k];
-        const float x0 = x0_ptr[k];
-        const float x1 = x1_ptr[k];
-        const float x2 = x2_ptr[k];
-        const float x3 = x3_ptr[k];
-        if (!isfinite(w) || !isfinite(x0) || !isfinite(x1) || !isfinite(x2) || !isfinite(x3)) bad = 1u;
-        s0 += w * x0;
-        s1 += w * x1;
-        s2 += w * x2;
-        s3 += w * x3;
+    switch (nt) {
+        case 1u: verify_fused_detail::gdn_alpha_beta_accum_f32<1>(w_row, input_bytes, out_base, first, a.columns, out, a.input_stride_bytes, out_stride, lane, error); break;
+        case 2u: verify_fused_detail::gdn_alpha_beta_accum_f32<2>(w_row, input_bytes, out_base, first, a.columns, out, a.input_stride_bytes, out_stride, lane, error); break;
+        case 3u: verify_fused_detail::gdn_alpha_beta_accum_f32<3>(w_row, input_bytes, out_base, first, a.columns, out, a.input_stride_bytes, out_stride, lane, error); break;
+        default: verify_fused_detail::gdn_alpha_beta_accum_f32<4>(w_row, input_bytes, out_base, first, a.columns, out, a.input_stride_bytes, out_stride, lane, error); break;
     }
-
-    if (simd_or(bad) && !lane) verify_fused_detail::flag_nonfinite(error);
-
-    const auto emit_row = [&](uint j, float sm) {
-        const float total = simd_sum(sm);
-        if (!lane) {
-            device float* y_row = reinterpret_cast<device float*>(out_base + ulong(first + j) * out_stride);
-            verify_fused_detail::checked_write(y_row, out, total, error);
-        }
-    };
-    emit_row(0u, s0);
-    if (nt > 1u) emit_row(1u, s1);
-    if (nt > 2u) emit_row(2u, s2);
-    if (nt > 3u) emit_row(3u, s3);
 }
 
-// Single-dispatch multi-row FP32 expert-gate projection (pure scalar accumulators across 1..8 tokens, zero stack spill).
+// Single-dispatch multi-row FP32 expert-gate projection (pure scalar accumulators across 1..8 tokens, zero barriers, zero stack spill).
 kernel void verify_fused_expert_gate_f32(
     device const float* weights [[buffer(0)]],
     device const uchar* input_bytes [[buffer(1)]],
@@ -872,65 +972,17 @@ kernel void verify_fused_expert_gate_f32(
     const uint out = group * 4u + uint(sg);
     if (out >= a.outputs) return;
 
-    const uint nt = a.tokens;
     device const float* w_row = weights + ulong(out) * a.columns;
-    device const float* x0_ptr = reinterpret_cast<device const float*>(input_bytes);
-    device const float* x1_ptr = reinterpret_cast<device const float*>(input_bytes + ulong(min(1u, nt - 1u)) * a.input_stride_bytes);
-    device const float* x2_ptr = reinterpret_cast<device const float*>(input_bytes + ulong(min(2u, nt - 1u)) * a.input_stride_bytes);
-    device const float* x3_ptr = reinterpret_cast<device const float*>(input_bytes + ulong(min(3u, nt - 1u)) * a.input_stride_bytes);
-    device const float* x4_ptr = reinterpret_cast<device const float*>(input_bytes + ulong(min(4u, nt - 1u)) * a.input_stride_bytes);
-    device const float* x5_ptr = reinterpret_cast<device const float*>(input_bytes + ulong(min(5u, nt - 1u)) * a.input_stride_bytes);
-    device const float* x6_ptr = reinterpret_cast<device const float*>(input_bytes + ulong(min(6u, nt - 1u)) * a.input_stride_bytes);
-    device const float* x7_ptr = reinterpret_cast<device const float*>(input_bytes + ulong(min(7u, nt - 1u)) * a.input_stride_bytes);
-
-    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f, s4 = 0.0f, s5 = 0.0f, s6 = 0.0f, s7 = 0.0f;
-    uint bad = 0u;
-
-    if (nt == 8u) {
-        #pragma unroll 4
-        for (uint k = uint(lane); k < a.columns; k += 32u) {
-            const float w = w_row[k];
-            const float x0 = x0_ptr[k], x1 = x1_ptr[k], x2 = x2_ptr[k], x3 = x3_ptr[k];
-            const float x4 = x4_ptr[k], x5 = x5_ptr[k], x6 = x6_ptr[k], x7 = x7_ptr[k];
-            if (!isfinite(w) || !isfinite(x0) || !isfinite(x1) || !isfinite(x2) || !isfinite(x3) ||
-                !isfinite(x4) || !isfinite(x5) || !isfinite(x6) || !isfinite(x7)) {
-                bad = 1u;
-            }
-            s0 += w * x0; s1 += w * x1; s2 += w * x2; s3 += w * x3;
-            s4 += w * x4; s5 += w * x5; s6 += w * x6; s7 += w * x7;
-        }
-    } else {
-        #pragma unroll 4
-        for (uint k = uint(lane); k < a.columns; k += 32u) {
-            const float w = w_row[k];
-            const float x0 = x0_ptr[k], x1 = x1_ptr[k], x2 = x2_ptr[k], x3 = x3_ptr[k];
-            const float x4 = x4_ptr[k], x5 = x5_ptr[k], x6 = x6_ptr[k];
-            if (!isfinite(w) || !isfinite(x0) || !isfinite(x1) || !isfinite(x2) || !isfinite(x3) ||
-                !isfinite(x4) || !isfinite(x5) || !isfinite(x6)) {
-                bad = 1u;
-            }
-            s0 += w * x0; s1 += w * x1; s2 += w * x2; s3 += w * x3;
-            s4 += w * x4; s5 += w * x5; s6 += w * x6;
-        }
+    switch (a.tokens) {
+        case 1u: verify_fused_detail::expert_gate_accum_f32<1>(w_row, input_bytes, output_bytes, a.columns, out, a.input_stride_bytes, a.output_stride_bytes, lane, error); break;
+        case 2u: verify_fused_detail::expert_gate_accum_f32<2>(w_row, input_bytes, output_bytes, a.columns, out, a.input_stride_bytes, a.output_stride_bytes, lane, error); break;
+        case 3u: verify_fused_detail::expert_gate_accum_f32<3>(w_row, input_bytes, output_bytes, a.columns, out, a.input_stride_bytes, a.output_stride_bytes, lane, error); break;
+        case 4u: verify_fused_detail::expert_gate_accum_f32<4>(w_row, input_bytes, output_bytes, a.columns, out, a.input_stride_bytes, a.output_stride_bytes, lane, error); break;
+        case 5u: verify_fused_detail::expert_gate_accum_f32<5>(w_row, input_bytes, output_bytes, a.columns, out, a.input_stride_bytes, a.output_stride_bytes, lane, error); break;
+        case 6u: verify_fused_detail::expert_gate_accum_f32<6>(w_row, input_bytes, output_bytes, a.columns, out, a.input_stride_bytes, a.output_stride_bytes, lane, error); break;
+        case 7u: verify_fused_detail::expert_gate_accum_f32<7>(w_row, input_bytes, output_bytes, a.columns, out, a.input_stride_bytes, a.output_stride_bytes, lane, error); break;
+        default: verify_fused_detail::expert_gate_accum_f32<8>(w_row, input_bytes, output_bytes, a.columns, out, a.input_stride_bytes, a.output_stride_bytes, lane, error); break;
     }
-
-    if (simd_or(bad) && !lane) verify_fused_detail::flag_nonfinite(error);
-
-    const auto emit_tok = [&](uint m, float sm) {
-        const float total = simd_sum(sm);
-        if (!lane) {
-            device float* y_row = reinterpret_cast<device float*>(output_bytes + ulong(m) * a.output_stride_bytes);
-            verify_fused_detail::checked_write(y_row, out, total, error);
-        }
-    };
-    emit_tok(0u, s0);
-    if (nt > 1u) emit_tok(1u, s1);
-    if (nt > 2u) emit_tok(2u, s2);
-    if (nt > 3u) emit_tok(3u, s3);
-    if (nt > 4u) emit_tok(4u, s4);
-    if (nt > 5u) emit_tok(5u, s5);
-    if (nt > 6u) emit_tok(6u, s6);
-    if (nt > 7u) emit_tok(7u, s7);
 }
 
 // Multi-threadgroup (1 TG of 256 threads per token) FP32 shared-expert scalar gate projection with exact split-partial reduction.
@@ -960,32 +1012,23 @@ kernel void verify_fused_shared_logit_f32(
     if (a.splits <= 1u) {
         if (sg != 0u) return;
         float sum = 0.0f;
-        uint bad = 0u;
         #pragma unroll 4
         for (uint k = uint(lane); k < a.columns; k += 32u) {
-            const float w = weights[k];
-            const float xv = x_row[k];
-            if (!isfinite(w) || !isfinite(xv)) bad = 1u;
-            sum += w * xv;
+            sum += weights[k] * x_row[k];
         }
-        if (simd_or(bad) && !lane) verify_fused_detail::flag_nonfinite(error);
         const float total = simd_sum(sum);
         if (!lane) verify_fused_detail::checked_write(y_row, 0u, total, error);
         return;
     }
 
     const uint width = ((a.columns + a.splits * 32u - 1u) / (a.splits * 32u)) * 32u;
-    uint bad = 0u;
     for (uint sp = uint(sg); sp < a.splits; sp += 8u) {
         const uint begin = sp * width;
         const uint end = begin < a.columns ? min(begin + width, a.columns) : a.columns;
         float sum = 0.0f;
         #pragma unroll 4
         for (uint k = begin + uint(lane); k < end; k += 32u) {
-            const float w = weights[k];
-            const float xv = x_row[k];
-            if (!isfinite(w) || !isfinite(xv)) bad = 1u;
-            sum += w * xv;
+            sum += weights[k] * x_row[k];
         }
         const float part = simd_sum(sum);
         if (!lane) {
@@ -993,7 +1036,6 @@ kernel void verify_fused_shared_logit_f32(
             s_part[sp] = part;
         }
     }
-    if (simd_or(bad) && !lane) verify_fused_detail::flag_nonfinite(error);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (tid == 0u) {
@@ -1003,4 +1045,151 @@ kernel void verify_fused_shared_logit_f32(
         }
         verify_fused_detail::checked_write(y_row, 0u, total, error);
     }
+}
+
+// Windowed multi-row FP32 router projection (2..2048 tokens) preserving exact lane-strided FMA and simd_sum order of graph_quantized_gemv.
+kernel void prefill_exact_router_f32_batch(
+    device const float* weights [[buffer(0)]],
+    device const uchar* input_bytes [[buffer(1)]],
+    device uchar* output_bytes [[buffer(2)]],
+    constant verify_fused_detail::VerifyFusedRowsF32Args& a [[buffer(3)]],
+    device atomic_uint* error [[buffer(7)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    ushort tid [[thread_index_in_threadgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr ushort W_TOK = 32u, TILE_K = 128u;
+    threadgroup float sx[W_TOK][TILE_K];
+
+    if (!a.tokens || a.tokens > 2048u || a.columns < 32u || a.columns > 65536u || (a.columns % 32u) != 0u ||
+        a.outputs <= 64u || a.outputs > 4096u ||
+        (a.input_stride_bytes % 4u) != 0u || (a.output_stride_bytes % 4u) != 0u ||
+        a.input_stride_bytes < ulong(a.columns) * 4ul || a.output_stride_bytes < ulong(a.outputs) * 4ul) {
+        if (!group.x && !group.y && !tid) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
+        return;
+    }
+
+    const uint tok_base = group.y * uint(W_TOK);
+    if (tok_base >= a.tokens) return;
+    const uint count = min(uint(W_TOK), a.tokens - tok_base);
+    const uint out = group.x * 4u + uint(sg);
+    device const float* w_row = (out < a.outputs) ? (weights + ulong(out) * a.columns) : nullptr;
+
+    float sums[W_TOK];
+    #pragma unroll
+    for (ushort m = 0u; m < W_TOK; ++m) sums[m] = 0.0f;
+
+    for (uint base = 0u; base < a.columns; base += uint(TILE_K)) {
+        const uint tile_cols = min(uint(TILE_K), a.columns - base);
+        if (count == uint(W_TOK) && tile_cols == uint(TILE_K)) {
+            #pragma unroll
+            for (ushort idx = tid; idx < W_TOK * TILE_K; idx += 128u) {
+                const ushort m = idx / TILE_K, c = idx % TILE_K;
+                device const float* x_row = reinterpret_cast<device const float*>(input_bytes + ulong(tok_base + m) * a.input_stride_bytes);
+                sx[m][c] = x_row[base + c];
+            }
+        } else {
+            for (ushort idx = tid; idx < W_TOK * TILE_K; idx += 128u) {
+                const ushort m = idx / TILE_K, c = idx % TILE_K;
+                if (m < count && c < tile_cols) {
+                    device const float* x_row = reinterpret_cast<device const float*>(input_bytes + ulong(tok_base + m) * a.input_stride_bytes);
+                    sx[m][c] = x_row[base + c];
+                } else {
+                    sx[m][c] = 0.0f;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (out < a.outputs) {
+            if (count == uint(W_TOK) && tile_cols == uint(TILE_K)) {
+                #pragma unroll
+                for (ushort c = lane; c < TILE_K; c += 32u) {
+                    const float w = w_row[base + c];
+                    #pragma unroll
+                    for (ushort m = 0u; m < W_TOK; ++m) {
+                        sums[m] += w * sx[m][c];
+                    }
+                }
+            } else {
+                for (uint c = uint(lane); c < tile_cols; c += 32u) {
+                    const float w = w_row[base + c];
+                    for (uint m = 0u; m < count; ++m) {
+                        sums[m] += w * sx[m][c];
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (out < a.outputs) {
+        for (uint m = 0u; m < count; ++m) {
+            const float total = simd_sum(sums[m]);
+            if (!lane) {
+                device float* y_row = reinterpret_cast<device float*>(output_bytes + ulong(tok_base + m) * a.output_stride_bytes);
+                verify_fused_detail::checked_write(y_row, out, total, error);
+            }
+        }
+    }
+}
+
+// Threadgroup-staged multi-row FP32 shared-expert scalar gate projection (2..2048 tokens) preserving exact split-partial reduction.
+kernel void prefill_exact_shared_logit_f32_batch(
+    device const float* weights [[buffer(0)]],
+    device const uchar* input_bytes [[buffer(1)]],
+    device uchar* output_bytes [[buffer(2)]],
+    constant verify_fused_detail::VerifyFusedRowsF32Args& a [[buffer(3)]],
+    device atomic_uint* error [[buffer(7)]],
+    uint group [[threadgroup_position_in_grid]],
+    ushort tid [[thread_index_in_threadgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup float sw[2560];
+    if (!a.tokens || a.tokens > 2048u ||
+        a.columns < 32u || a.columns > 2560u || (a.columns % 32u) != 0u ||
+        a.outputs != 1u || !a.splits || a.splits > 64u ||
+        (a.input_stride_bytes % 4u) != 0u || (a.output_stride_bytes % 4u) != 0u ||
+        a.input_stride_bytes < ulong(a.columns) * 4ul || a.output_stride_bytes < 4ul) {
+        if (!group && !tid) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
+        return;
+    }
+
+    for (uint k = uint(tid); k < a.columns; k += 256u) {
+        sw[k] = weights[k];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint tok = group * 8u + uint(sg);
+    if (tok >= a.tokens) return;
+
+    device const float* x_row = reinterpret_cast<device const float*>(input_bytes + ulong(tok) * a.input_stride_bytes);
+    device float* y_row = reinterpret_cast<device float*>(output_bytes + ulong(tok) * a.output_stride_bytes);
+
+    if (a.splits <= 1u || a.columns < 1024u) {
+        float sum = 0.0f;
+        for (uint k = uint(lane); k < a.columns; k += 32u) {
+            sum += sw[k] * x_row[k];
+        }
+        const float total = simd_sum(sum);
+        if (!lane) verify_fused_detail::checked_write(y_row, 0u, total, error);
+        return;
+    }
+
+    const uint width = ((a.columns + a.splits * 32u - 1u) / (a.splits * 32u)) * 32u;
+    float total = 0.0f;
+    for (uint sp = 0u; sp < a.splits; ++sp) {
+        const uint begin = sp * width;
+        const uint end = begin < a.columns ? min(begin + width, a.columns) : a.columns;
+        float sum = 0.0f;
+        for (uint k = begin + uint(lane); k < end; k += 32u) {
+            sum += sw[k] * x_row[k];
+        }
+        const float part = simd_sum(sum);
+        if (!lane) {
+            if (!isfinite(part)) verify_fused_detail::flag_nonfinite(error);
+            total += part;
+        }
+    }
+    if (!lane) verify_fused_detail::checked_write(y_row, 0u, total, error);
 }

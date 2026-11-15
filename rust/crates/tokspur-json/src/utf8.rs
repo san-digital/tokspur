@@ -70,6 +70,19 @@ pub fn unicode_scalars(utf8: &[u8]) -> Result<Vec<u32>, UnicodeError> {
     Ok(output)
 }
 
+/// `unicode_scalars` as a check, without building the scalars: the same refusals and messages, as text.
+///
+/// Both accept exactly well-formed UTF-8 (Unicode Table 3-7: no overlong forms, surrogates or values above U+10FFFF), so the standard check decides and the decoder only names a refusal; `scalar_str_refuses_exactly_what_decoding_refuses` pins the equivalence.
+pub fn scalar_str(utf8: &[u8]) -> Result<&str, UnicodeError> {
+    if utf8.len() > WORK_LIMIT {
+        return Err(UnicodeError::Decode("Unicode input exceeds limit"));
+    }
+    std::str::from_utf8(utf8).map_err(|_| match unicode_scalars(utf8) {
+        Err(error) => error,
+        Ok(_) => UnicodeError::Decode("invalid UTF-8 input"),
+    })
+}
+
 /// Encodes one scalar as UTF-8.
 pub fn scalar_utf8(point: u32) -> Result<Vec<u8>, UnicodeError> {
     let mut output = Vec::with_capacity(4);
@@ -143,5 +156,55 @@ mod tests {
             unicode_scalars(&input),
             Err(UnicodeError::Decode("Unicode input exceeds limit"))
         );
+        assert_eq!(
+            scalar_str(&input),
+            Err(UnicodeError::Decode("Unicode input exceeds limit"))
+        );
+        assert!(scalar_str(&input[1..]).is_ok());
+    }
+
+    fn same_verdict(bytes: &[u8]) {
+        let decoded = unicode_scalars(bytes).map(drop);
+        let checked = scalar_str(bytes).map(drop);
+        assert_eq!(checked, decoded, "{bytes:02x?}");
+        if let Ok(text) = scalar_str(bytes) {
+            assert_eq!(text.as_bytes(), bytes);
+        }
+    }
+
+    #[test]
+    fn scalar_str_refuses_exactly_what_decoding_refuses() {
+        for first in 0..=255u8 {
+            same_verdict(&[first]);
+            for second in 0..=255u8 {
+                same_verdict(&[first, second]);
+                same_verdict(&[b'a', first, second, b'z']);
+            }
+        }
+        // Every lead byte that takes a tail, against every second byte and the boundary third and fourth bytes.
+        let edges = [
+            0x00, 0x41, 0x7f, 0x80, 0x8f, 0x90, 0x9f, 0xa0, 0xbf, 0xc0, 0xff,
+        ];
+        for first in 0xc0..=0xffu8 {
+            for second in 0..=255u8 {
+                for third in edges {
+                    same_verdict(&[first, second, third]);
+                    for fourth in edges {
+                        same_verdict(&[first, second, third, fourth]);
+                    }
+                }
+            }
+        }
+        let mut random = tokspur_testkit::Mt19937::new(9);
+        for _ in 0..20_000 {
+            let length = random.next_u32() % 24;
+            let bytes: Vec<u8> = (0..length)
+                .map(|_| match random.next_u32() % 4 {
+                    0 => (random.next_u32() % 128) as u8,
+                    _ => (0x80 + random.next_u32() % 128) as u8,
+                })
+                .collect();
+            same_verdict(&bytes);
+        }
     }
 }

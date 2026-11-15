@@ -42,9 +42,11 @@ void response_arguments(const Json& message, const AdmittedChat& admitted, ToolE
 }
 }
 
-TranscriptReplay::TranscriptReplay(ServeCodec codec, std::string alias, ToolEnumValidation tool_enums)
-    : codec_(std::move(codec)), alias_(std::move(alias)), tool_enums_(tool_enums) {
+TranscriptReplay::TranscriptReplay(ServeCodec codec, std::string alias, ToolEnumValidation tool_enums,
+                                   uint32_t context_length)
+    : codec_(std::move(codec)), alias_(std::move(alias)), tool_enums_(tool_enums), context_length_(context_length) {
     static_cast<void>(tool_enum_validation_name(tool_enums_));
+    need(context_length_ == 65536 || context_length_ == 131072, "unsupported replay context length");
     need(bool(codec_.render) && bool(codec_.encode) && bool(codec_.decode) && !alias_.empty(), "replay requires explicit codec/alias");
 }
 
@@ -68,17 +70,18 @@ Json TranscriptReplay::turn(const Json& record) {
     };
     const auto& wire = field(record, "wire_request");
     out.emplace_back("wire_request_admitted", Json(attempt("wire_request", [&] {
-        const auto admitted_wire = admit_chat(wire, alias_, tool_enums_);
+        const auto admitted_wire = admit_chat(wire, alias_, tool_enums_, ToolArgValidation::strict, context_length_);
         const auto ids = codec_.encode(codec_.render(admitted_wire.render));
         out.emplace_back("wire_native_prompt_tokens", Json::integer(ids.size()));
-        need(!ids.empty() && uint64_t(ids.size()) + admitted_wire.maximum_tokens <= 65536, "wire prompt plus reserved output exceeds 65536");
+        need(!ids.empty() && uint64_t(ids.size()) + admitted_wire.maximum_tokens <= context_length_,
+            context_length_ == 131072 ? "wire prompt plus reserved output exceeds 131072" : "wire prompt plus reserved output exceeds 65536");
     })));
     std::optional<AdmittedChat> admitted; std::vector<uint32_t> prompt, canonical; std::string prompt_bytes;
     RenderedChat rendered_prompt;
     std::optional<uint64_t> canonical_seed;
     const auto effective = with(wire, "messages", field(record, "effective_messages"));
     const bool input_ok = attempt("effective_request", [&] {
-        admitted = admit_chat(effective, alias_, tool_enums_);
+        admitted = admit_chat(effective, alias_, tool_enums_, ToolArgValidation::strict, context_length_);
         rendered_prompt = codec_.render(admitted->render); prompt_bytes = rendered_prompt.prompt; prompt = codec_.encode(rendered_prompt);
         need(!prompt.empty(), "empty replay prompt");
         for (const auto id : prompt) need(id < codec_.admission.vocabulary, "replay prompt token outside vocabulary");
@@ -98,7 +101,8 @@ Json TranscriptReplay::turn(const Json& record) {
         out.emplace_back("canonical_append_candidate", Json(hypothetical));
         out.emplace_back("canonical_append_input_scalar_steps", hypothetical ? Json::integer(prompt.size() - previous_canonical_committed_.size()) : Json());
         canonical_seed = admitted->seed ? admitted->seed : hypothetical ? previous_seed_ : std::nullopt;
-        need(uint64_t(prompt.size()) + admitted->maximum_tokens <= 65536, "replay prompt plus reserved output exceeds 65536");
+        need(uint64_t(prompt.size()) + admitted->maximum_tokens <= context_length_,
+            context_length_ == 131072 ? "replay prompt plus reserved output exceeds 131072" : "replay prompt plus reserved output exceeds 65536");
     });
     out.emplace_back("effective_request_admitted", Json(input_ok));
     previous_prompt_ = prompt; previous_canonical_committed_.clear(); previous_sampling_.clear(); previous_seed_.reset();
