@@ -3,6 +3,7 @@
 #include <CommonCrypto/CommonCrypto.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
@@ -14,9 +15,11 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <vector>
 
 namespace tokspur {
 
@@ -102,6 +105,40 @@ struct Fd {
     ~Fd() { if (value >= 0) ::close(value); }
 };
 
+// Owns a spill temporary until the rename publishes it. Every other exit,
+// including an exception from the chunk reader, closes the descriptor and
+// unlinks the name: the exclusive create would otherwise refuse each later
+// spill of the same checkpoint in this process.
+struct SpillTemporary {
+    int dir_fd;
+    const std::string& name;
+    int fd = -1;
+    bool linked = false;
+    SpillTemporary(int directory, const std::string& temporary) : dir_fd(directory), name(temporary) {}
+    SpillTemporary(const SpillTemporary&) = delete;
+    SpillTemporary& operator=(const SpillTemporary&) = delete;
+    ~SpillTemporary() {
+        close();
+        if (linked) ::unlinkat(dir_fd, name.c_str(), 0);
+    }
+    void close() noexcept {
+        if (fd >= 0) ::close(fd);
+        fd = -1;
+    }
+};
+
+// Brackets one chunk read. The second increment must also run when the reader
+// throws, or the epoch stays odd and reports a read in flight for ever.
+struct ReaderEpochScope {
+    std::atomic<uint64_t>& epoch;
+    explicit ReaderEpochScope(std::atomic<uint64_t>& value) : epoch(value) {
+        epoch.fetch_add(1, std::memory_order_acq_rel);
+    }
+    ReaderEpochScope(const ReaderEpochScope&) = delete;
+    ReaderEpochScope& operator=(const ReaderEpochScope&) = delete;
+    ~ReaderEpochScope() { epoch.fetch_add(1, std::memory_order_acq_rel); }
+};
+
 bool same_file(const struct stat& a, const struct stat& b) noexcept {
     return a.st_dev == b.st_dev && a.st_ino == b.st_ino;
 }
@@ -171,7 +208,65 @@ bool discard_observed_file(int dir_fd, const std::string& filename, const struct
     return discarded;
 }
 
+// A writer names its temporaries with its own PID. Only a PID that no longer
+// exists marks a temporary as abandoned; EPERM means some process still has it.
+bool owner_pid_exited(std::string_view digits) noexcept {
+    if (digits.empty() || digits.size() > 10) return false;
+    uint64_t pid = 0;
+    for (char c : digits) {
+        if (c < '0' || c > '9') return false;
+        pid = pid * 10 + uint64_t(c - '0');
+    }
+    if (pid == 0 || pid > uint64_t(std::numeric_limits<pid_t>::max()) || pid_t(pid) == ::getpid()) return false;
+    return ::kill(pid_t(pid), 0) != 0 && errno == ESRCH;
+}
+
+// ".<name>.ckpt.<pid>.tmp" from spill_checkpoint.
+bool abandoned_spill_temporary(std::string_view name) noexcept {
+    constexpr std::string_view marker = ".ckpt.";
+    constexpr std::string_view suffix = ".tmp";
+    if (!name.starts_with('.') || !name.ends_with(suffix)) return false;
+    const auto stem = name.substr(0, name.size() - suffix.size());
+    const auto at = stem.rfind(marker);
+    if (at == std::string_view::npos || at == 0) return false;
+    return owner_pid_exited(stem.substr(at + marker.size()));
+}
+
+// ".tokspur-discard-<pid>-<random>" from discard_observed_file.
+bool abandoned_discard_directory(std::string_view name) noexcept {
+    constexpr std::string_view prefix = ".tokspur-discard-";
+    if (!name.starts_with(prefix)) return false;
+    const auto rest = name.substr(prefix.size());
+    const auto dash = rest.find('-');
+    if (dash == std::string_view::npos) return false;
+    return owner_pid_exited(rest.substr(0, dash));
+}
+
 } // namespace
+
+std::array<uint8_t, 32> checkpoint_state_digest(
+    const std::array<uint8_t, 32>& execution_digest, std::span<const uint32_t> prefix_tokens,
+    uint64_t stack_bytes, uint64_t mtp_bytes, bool has_logits) {
+    if (prefix_tokens.size() > std::numeric_limits<uint32_t>::max() / sizeof(uint32_t)) {
+        throw std::invalid_argument("checkpoint prefix exceeds identity bound");
+    }
+    CC_SHA256_CTX ctx;
+    CC_SHA256_Init(&ctx);
+    CC_SHA256_Update(&ctx, execution_digest.data(), CC_LONG(execution_digest.size()));
+    const uint32_t prefix = uint32_t(prefix_tokens.size());
+    CC_SHA256_Update(&ctx, &prefix, sizeof(prefix));
+    CC_SHA256_Update(&ctx, &stack_bytes, sizeof(stack_bytes));
+    CC_SHA256_Update(&ctx, &mtp_bytes, sizeof(mtp_bytes));
+    const uint8_t logits = has_logits ? 1u : 0u;
+    CC_SHA256_Update(&ctx, &logits, sizeof(logits));
+    // Appended after the earlier fields: the count above fixes the length.
+    if (!prefix_tokens.empty()) {
+        CC_SHA256_Update(&ctx, prefix_tokens.data(), CC_LONG(prefix_tokens.size_bytes()));
+    }
+    std::array<uint8_t, 32> digest{};
+    CC_SHA256_Final(digest.data(), &ctx);
+    return digest;
+}
 
 SsdCheckpointManager::SsdCheckpointManager(const std::filesystem::path& state_dir,
                                            uint64_t budget_bytes,
@@ -193,6 +288,7 @@ SsdCheckpointManager::SsdCheckpointManager(const std::filesystem::path& state_di
         if (std::filesystem::is_symlink(parent_status)) throw std::runtime_error("checkpoint parent must not be a symlink");
         if (path_error && path_error != std::errc::no_such_file_or_directory) throw std::runtime_error("cannot inspect checkpoint parent");
         open_secure_directory();
+        remove_orphaned_temporaries();
         if (!reconcile_directory(true)) {
             ::close(dir_fd_);
             dir_fd_ = -1;
@@ -265,6 +361,40 @@ void SsdCheckpointManager::open_secure_directory() {
         }
     }
 
+}
+
+// A worker killed mid-spill or mid-discard leaves its temporary behind. The
+// budget scan counts only ".ckpt" files, so remove these before it runs or
+// they would hold disk space that eviction can never reclaim.
+void SsdCheckpointManager::remove_orphaned_temporaries() noexcept try {
+    std::vector<std::string> spills, discards;
+    {
+        const std::unique_ptr<DIR, int (*)(DIR*)> directory(open_directory_scan(dir_fd_), ::closedir);
+        if (!directory) return;
+        while (const auto* entry = ::readdir(directory.get())) {
+            const std::string_view name = entry->d_name;
+            if (abandoned_spill_temporary(name)) spills.emplace_back(name);
+            else if (abandoned_discard_directory(name)) discards.emplace_back(name);
+        }
+    }
+    for (const auto& name : spills) {
+        struct stat st{};
+        if (::fstatat(dir_fd_, name.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0) {
+            discard_observed_file(dir_fd_, name, st);
+        }
+    }
+    for (const auto& name : discards) {
+        const Fd stage{::openat(dir_fd_, name.c_str(), O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW | O_RDONLY)};
+        struct stat stage_stat{}, captured{};
+        if (stage.value < 0 || ::fstat(stage.value, &stage_stat) != 0 || stage_stat.st_uid != ::geteuid()) continue;
+        if (::fstatat(stage.value, "entry", &captured, AT_SYMLINK_NOFOLLOW) == 0 &&
+            S_ISREG(captured.st_mode) && captured.st_uid == ::geteuid()) {
+            ::unlinkat(stage.value, "entry", 0);
+        }
+        ::unlinkat(dir_fd_, name.c_str(), AT_REMOVEDIR);
+    }
+} catch (...) {
+    // Best effort: a temporary left here is retried at the next start.
 }
 
 bool SsdCheckpointManager::reconcile_directory(bool initialise_epoch) noexcept {
@@ -618,15 +748,16 @@ bool SsdCheckpointManager::spill_checkpoint(
     header.metadata_sha256 = sha256_buffer(meta_buf.data(), meta_buf.size());
 
     const std::string tmp_name = "." + filename + "." + std::to_string(::getpid()) + ".tmp";
-    int fd = ::openat(dir_fd_, tmp_name.c_str(), O_CREAT | O_EXCL | O_NOFOLLOW | O_RDWR | O_CLOEXEC, 0600);
-    if (fd < 0) {
+    SpillTemporary temporary(dir_fd_, tmp_name);
+    temporary.fd = ::openat(dir_fd_, tmp_name.c_str(), O_CREAT | O_EXCL | O_NOFOLLOW | O_RDWR | O_CLOEXEC, 0600);
+    if (temporary.fd < 0) {
         return false;
     }
+    temporary.linked = true;
+    const int fd = temporary.fd;
 
     struct stat st{};
     if (::fstat(fd, &st) != 0 || (st.st_mode & 0777) != 0600 || st.st_uid != ::geteuid()) {
-        ::close(fd);
-        ::unlinkat(dir_fd_, tmp_name.c_str(), 0);
         return false;
     }
 
@@ -638,8 +769,6 @@ bool SsdCheckpointManager::spill_checkpoint(
     // Stream 16 MiB chunks from memory to disk under reader_epoch lock
     for (size_t i = 0; i < chunk_count; ++i) {
         if (handshake.cancel_spill.load(std::memory_order_acquire)) {
-            ::close(fd);
-            ::unlinkat(dir_fd_, tmp_name.c_str(), 0);
             return false;
         }
 
@@ -648,13 +777,13 @@ bool SsdCheckpointManager::spill_checkpoint(
         auto slab_slice = staging_slab().subspan(0, this_chunk_bytes);
 
         // Reader epoch handshake
-        handshake.reader_epoch.fetch_add(1, std::memory_order_acq_rel);
-        bool read_ok = read_chunk_fn(i, slab_slice);
-        handshake.reader_epoch.fetch_add(1, std::memory_order_acq_rel);
+        bool read_ok = false;
+        {
+            const ReaderEpochScope reading(handshake.reader_epoch);
+            read_ok = read_chunk_fn(i, slab_slice);
+        }
 
         if (!read_ok) {
-            ::close(fd);
-            ::unlinkat(dir_fd_, tmp_name.c_str(), 0);
             return false;
         }
 
@@ -663,8 +792,6 @@ bool SsdCheckpointManager::spill_checkpoint(
         const off_t target_pos = off_t(payload_offset + i * checkpoint_chunk_bytes);
         ssize_t written = ::pwrite(fd, slab_slice.data(), this_chunk_bytes, target_pos);
         if (written != ssize_t(this_chunk_bytes)) {
-            ::close(fd);
-            ::unlinkat(dir_fd_, tmp_name.c_str(), 0);
             return false;
         }
     }
@@ -675,8 +802,6 @@ bool SsdCheckpointManager::spill_checkpoint(
 
     // Write header, manifest, and metadata
     if (::pwrite(fd, &header, sizeof(header), 0) != sizeof(header)) {
-        ::close(fd);
-        ::unlinkat(dir_fd_, tmp_name.c_str(), 0);
         return false;
     }
 
@@ -684,35 +809,27 @@ bool SsdCheckpointManager::spill_checkpoint(
     if (!manifest.empty()) {
         const size_t manifest_bytes = manifest.size() * 32;
         if (::pwrite(fd, manifest.data(), manifest_bytes, cur_pos) != ssize_t(manifest_bytes)) {
-            ::close(fd);
-            ::unlinkat(dir_fd_, tmp_name.c_str(), 0);
             return false;
         }
         cur_pos += off_t(manifest_bytes);
     }
 
     if (::pwrite(fd, &meta_size, sizeof(meta_size), cur_pos) != sizeof(meta_size)) {
-        ::close(fd);
-        ::unlinkat(dir_fd_, tmp_name.c_str(), 0);
         return false;
     }
     cur_pos += sizeof(meta_size);
 
     if (meta_size > 0) {
         if (::pwrite(fd, meta_buf.data(), meta_size, cur_pos) != ssize_t(meta_size)) {
-            ::close(fd);
-            ::unlinkat(dir_fd_, tmp_name.c_str(), 0);
             return false;
         }
     }
 
     // Two-phase commit durability: fsync(fd) + atomic rename + fsync(dir_fd)
     if (::fsync(fd) != 0) {
-        ::close(fd);
-        ::unlinkat(dir_fd_, tmp_name.c_str(), 0);
         return false;
     }
-    ::close(fd);
+    temporary.close();
 
 #ifdef __APPLE__
     int rename_rc = ::renameatx_np(dir_fd_, tmp_name.c_str(), dir_fd_, filename.c_str(), RENAME_EXCL);
@@ -735,9 +852,9 @@ bool SsdCheckpointManager::spill_checkpoint(
 #endif
 
     if (rename_rc != 0) {
-        ::unlinkat(dir_fd_, tmp_name.c_str(), 0);
         return false;
     }
+    temporary.linked = false;
 
     ::fsync(dir_fd_);
     cached_occupied_bytes_ = saturating_add_u64(cached_occupied_bytes_, total_file_bytes);

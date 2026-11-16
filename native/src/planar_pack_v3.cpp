@@ -1437,6 +1437,8 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
     require(::fstat(fd.value, &before) == 0 && S_ISREG(before.st_mode) && !(before.st_mode & 0222) &&
             before.st_nlink == 1 && before.st_size > 0,
             "pack v3 must be an immutable regular file");
+    // Taken before the file is mapped: the identity a seal must carry to be accepted.
+    const auto identity_before = derived_pack::pack_file_identity(fd.value);
 
     // Metal can materialise private anonymous backing for file mappings made
     // with MAP_PRIVATE. Share only the immutable adopted pack;
@@ -1529,29 +1531,17 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
 
     if (require_full_census) require_full_pack_v3_census(plan);
 
-    bool seal_valid = false;
-    if (trust_mode == derived_pack::TrustMode::local_seal && require_full_census) {
-        const std::string seal_name = std::filesystem::path(location.name).stem().string() + ".seal";
-        const int seal_fd = ::openat(location.directory.value, seal_name.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-        if (seal_fd < 0) {
-            if (errno == ELOOP) throw FormatError("symlink seal path rejected via O_NOFOLLOW: ELOOP");
-        } else {
-            Fd seal_guard(seal_fd);
-            struct stat sstat{};
-            require(::fstat(seal_fd, &sstat) == 0 && S_ISREG(sstat.st_mode) && !(sstat.st_mode & 0222) && sstat.st_nlink == 1,
-                    "invalid or writable pack v3 seal file");
-            if (sstat.st_size > 0 && sstat.st_size <= 4096) {
-                std::string seal_content(static_cast<size_t>(sstat.st_size), '\0');
-                read_into(seal_fd, std::as_writable_bytes(std::span(seal_content)), 0);
-                while (!seal_content.empty() && (seal_content.back() == '\n' || seal_content.back() == '\r' || seal_content.back() == ' ')) {
-                    seal_content.pop_back();
-                }
-                if (seal_content == derived_pack::hash(file.string_value("tokspur_pack.manifest"))) {
-                    seal_valid = true;
-                }
-            }
-        }
-    }
+    // Local-seal mode skips the payload work below only for a seal that names
+    // this manifest and exactly this file. Every other seal state, including
+    // one that cannot be read at all, means full verification.
+    const std::string manifest_sha256 = derived_pack::hash(file.string_value("tokspur_pack.manifest"));
+    const bool seal_consulted = trust_mode == derived_pack::TrustMode::local_seal && require_full_census;
+    // What the full verification below compares the pack with: a tensor is
+    // pack-only (see is_pack_only_tensor) when its source is not in this call.
+    const derived_pack::SealScope scope{!cpu_base_only, mtp_sidecar != nullptr};
+    const bool seal_valid = seal_consulted &&
+        derived_pack::read_local_seal(location.directory.value, location.name,
+                                      manifest_sha256, identity_before, scope).vouches;
 
     // Build authentication tasks (co-located gate+up pairs form a single atomic verification unit).
     std::vector<size_t> units;
@@ -1787,14 +1777,24 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
             before.st_mode == after.st_mode && before.st_nlink == after.st_nlink,
             "pack v3 file identity changed during adoption");
 
-    const std::string manifest_sha256 = derived_pack::hash(file.string_value("tokspur_pack.manifest"));
+    auto seal_use = derived_pack::LocalSealUse::not_consulted;
+    if (seal_valid) {
+        seal_use = derived_pack::LocalSealUse::accepted;
+    } else if (seal_consulted) {
+        // The full verification above has passed for this descriptor.
+        seal_use = derived_pack::refresh_local_seal(location.directory.value, location.name, fd.value,
+                                                    manifest_sha256, identity_before, scope)
+            ? derived_pack::LocalSealUse::refreshed : derived_pack::LocalSealUse::not_refreshed;
+    }
     const std::string_view source_read_mode = !source_read.load(std::memory_order_relaxed) ? "not_read" :
 #if defined(TOKSPUR_PRIVATE_PACK_AUTH_RECLAIM) && TOKSPUR_PRIVATE_PACK_AUTH_RECLAIM
         "bounded_nocache";
 #else
         "mapped";
 #endif
-    return {std::move(model), std::move(plan), manifest_sha256, effective_workers, source_read_mode};
+    return {std::move(model), std::move(plan), manifest_sha256, effective_workers, source_read_mode,
+            seal_use, derived_pack::pack_file_identity(fd.value),
+            seal_valid ? derived_pack::SealScope{} : scope};
 }
 
 void validate_pack_v3_output_name(const std::filesystem::path& output) {
@@ -1821,24 +1821,19 @@ bool entry_exists(int directory, const std::string& name) {
     return false;
 }
 
-void verify_seal(int directory, const std::string& name, const std::string& digest) {
-    Fd seal(::openat(directory, name.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
-    struct stat st{};
-    require(::fstat(seal.value, &st) == 0 && S_ISREG(st.st_mode) && !(st.st_mode & 0222) &&
-            st.st_nlink == 1 && (st.st_size == 64 || st.st_size == 65), "invalid pack v3 seal");
-    std::string content(static_cast<size_t>(st.st_size), '\0');
-    read_into(seal.value, std::as_writable_bytes(std::span(content)), 0);
-    require(content == digest || content == digest + "\n", "existing pack v3 seal does not match");
-}
-
+// The published name must still be the file that was verified, with the
+// identity the seal records for it.
 void verify_published_name(const Location& location, const AdoptedPackV3& verified) {
     verified.model->assert_unchanged();
     const auto* mapping = verified.model->shards().front().backing_mapping();
+    Fd named(::openat(location.directory.value, location.name.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
     struct stat st{};
-    require(mapping && ::fstatat(location.directory.value, location.name.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+    require(mapping && ::fstat(named.value, &st) == 0 &&
             static_cast<uint64_t>(st.st_dev) == mapping->device() &&
             static_cast<uint64_t>(st.st_ino) == mapping->inode() && S_ISREG(st.st_mode) &&
-            !(st.st_mode & 0222) && st.st_nlink == 1, "authenticated pack v3 path changed");
+            !(st.st_mode & 0222) && st.st_nlink == 1 &&
+            derived_pack::pack_file_identity(named.value) == verified.pack_identity,
+            "authenticated pack v3 path changed");
 }
 
 } // namespace
@@ -1857,9 +1852,10 @@ PublishedPackV3 build_or_verify_pack_v3(
     Location location(output);
     const auto dir = location.directory.value;
     require(::flock(dir, LOCK_EX | LOCK_NB) == 0, "pack v3 output directory is busy");
-    const auto seal_name = output.stem().string() + ".seal";
+    const auto seal_name = derived_pack::local_seal_name(location.name);
+    require(seal_name.has_value(), "pack v3 output name leaves no name for its seal");
     const bool existed = entry_exists(dir, location.name);
-    const bool seal_exists = entry_exists(dir, seal_name);
+    const bool seal_exists = entry_exists(dir, *seal_name);
     require(existed || !seal_exists, "orphan pack v3 seal exists without its pack");
     double build_seconds = 0;
     if (!existed) {
@@ -1876,16 +1872,25 @@ PublishedPackV3 build_or_verify_pack_v3(
                                             check_cancelled);
     verify_published_name(location, verified);
     if (check_cancelled) check_cancelled();
+    // The seal names the file the full verification above just read, by the
+    // identity taken from that same descriptor after the last change to it,
+    // and the sources that verification compared it with (here always both).
+    const derived_pack::LocalSeal seal{verified.manifest_sha256, verified.pack_identity, verified.compared};
+    const auto vouches = [&] {
+        return derived_pack::read_local_seal(dir, location.name, seal.manifest_sha256, seal.pack, seal.compared);
+    };
     if (!seal_exists) {
-        TemporaryFile temporary(dir);
-        const auto content = verified.manifest_sha256 + "\n";
-        write_at(temporary.fd, std::as_bytes(std::span(content)), 0);
-        require(::fchmod(temporary.fd, 0444) == 0 && ::fsync(temporary.fd) == 0, "pack v3 seal chmod/fsync failed");
-        require(::renameatx_np(dir, temporary.name.c_str(), dir, seal_name.c_str(), RENAME_EXCL) == 0,
-                "exclusive pack v3 seal publication refused");
-        temporary.published = true;
+        derived_pack::publish_local_seal(dir, location.name, seal, false);
+    } else if (const auto found = vouches(); !found.vouches) {
+        // An existing seal is replaced only when it is a sound seal file for
+        // this same manifest that is no longer current: the earlier format,
+        // another identity of the pack file, or a narrower scope. Anything
+        // else is not ours to overwrite and is refused as before.
+        require(found.trusted_file, "invalid pack v3 seal");
+        require(found.names_manifest, "existing pack v3 seal does not match");
+        derived_pack::publish_local_seal(dir, location.name, seal, true);
     }
-    verify_seal(dir, seal_name, verified.manifest_sha256);
+    require(vouches().vouches, "published pack v3 seal does not vouch for the pack");
     verify_published_name(location, verified);
     require(::fsync(dir) == 0, "directory fsync after pack v3 seal failed");
     return {std::move(verified), existed, build_seconds};

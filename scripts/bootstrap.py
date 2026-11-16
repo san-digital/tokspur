@@ -23,6 +23,11 @@ from tokspur.local import write_json  # noqa: E402
 
 MACHO_MAGICS = (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe")
 MTLB_MAGIC = b"MTLB"
+# The closing message names the commands README.md gives after a build. tests/test_bootstrap_preflight.py compares the two.
+NEXT_STEPS = (
+    "Next: add .venv/bin to your PATH, then run `tokspur doctor`, "
+    "`tokspur pull` and `tokspur serve --speed-preset` as the README describes."
+)
 
 
 def build_env() -> dict[str, str]:
@@ -639,11 +644,7 @@ def main() -> None:
         print(
             "tokspur prepared. No model download, inference or service switch performed."
         )
-        print(
-            "Next: add .venv/bin to your PATH, then run `tokspur doctor`, "
-            "`tokspur adopt`, `tokspur configure` and `tokspur pack build` "
-            "as the README describes."
-        )
+        print(NEXT_STEPS)
         for warning in warnings:
             print(f"bootstrap: warning: {warning}", file=sys.stderr)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:

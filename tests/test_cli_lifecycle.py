@@ -41,6 +41,8 @@ class Harness:
         self.stop_during_popen = False
         self.stop_during_wait = True
         self.repeat_during_cleanup = False
+        self.adopted_dflash2 = None
+        self.fail_verify = False
         self.clock = 0.0
         self.child = types.SimpleNamespace(pid=12345, poll=self.poll, wait=self.wait)
         dummy_server = tmp_path / "build/rust-fast-math/release/tokspur-server"
@@ -56,10 +58,14 @@ class Harness:
         )
         dummy_mtp.parent.mkdir(parents=True, exist_ok=True)
         dummy_mtp.touch()
+        # The adopted target directory is the checkout root in this fixture.
+        (tmp_path / "tokenizer.json").touch()
+        (tmp_path / "chat_template.jinja").touch()
         monkeypatch.setattr(cli, "ROOT", tmp_path)
         monkeypatch.setattr(cli, "private_dir", lambda path: path)
         monkeypatch.setattr(cli, "state_lock", contextlib.nullcontext)
         monkeypatch.setattr(cli, "check_adoption", lambda data: None)
+        monkeypatch.setattr(cli, "_verify_group_directory", self.verify_group)
         monkeypatch.setattr(cli, "port_available", lambda port: True)
         monkeypatch.setattr(cli, "inference_processes", lambda: [])
         monkeypatch.setattr(cli, "isolated_environment", lambda: {})
@@ -80,14 +86,32 @@ class Harness:
             lambda pid: types.SimpleNamespace(children=lambda recursive: []),
         )
 
+    def verify_group(self, specs, profile_group, label, directory, *, out=None):
+        self.events.append(("verify", label, Path(directory)))
+        if self.fail_verify:
+            raise ValueError("Checksum mismatch: model.safetensors")
+        return {"directory": str(Path(directory).resolve(strict=True)), "assets": []}
+
     def read_json(self, path):
         if path.name == "configured.json":
             return {"port": 18081}
         if path.name == "api-key.json":
             return {"api_key": "fixture-not-a-secret"}
+        if path.name == "flash-next-assets.json":
+            return {"dflash2_draft": {"repo": "fixture/dflash2", "files": []}}
         if path.name == "adoption.json":
             return {
                 "schema": 1,
+                **(
+                    {}
+                    if self.adopted_dflash2 is None
+                    else {
+                        "dflash2_draft": {
+                            "directory": str(self.adopted_dflash2),
+                            "assets": [],
+                        }
+                    }
+                ),
                 "verification": "full-sha256",
                 "target": {"directory": str(self.root), "assets": []},
                 "draft": {
@@ -328,6 +352,66 @@ def test_serve_refuses_when_mtp_sidecar_missing_from_adoption(harness, monkeypat
         cli.serve()
 
 
+def test_serve_refuses_when_tokenizer_and_template_are_missing(harness):
+    (harness.root / "tokenizer.json").unlink()
+    with pytest.raises(FileNotFoundError, match="derived-text"):
+        cli.serve()
+    assert harness.launched == 0
+
+
+def test_serve_prefers_the_derived_tokenizer_and_template(harness):
+    harness.stop_during_wait = False
+    derived = harness.root / ".tokspur/state/gguf/derived-text"
+    derived.mkdir(parents=True)
+    (derived / "tokenizer.json").touch()
+    (derived / "chat_template.jinja").touch()
+    with pytest.raises(SystemExit):
+        cli.serve()
+    command = harness.last_command
+    assert command[command.index("--tokenizer") + 1] == str(derived / "tokenizer.json")
+    assert command[command.index("--template") + 1] == str(
+        derived / "chat_template.jinja"
+    )
+
+
+def test_explicit_dflash2_dir_is_verified_before_it_reaches_the_worker(
+    harness, tmp_path
+):
+    harness.stop_during_wait = False
+    recorded = tmp_path / "recorded-dflash2"
+    explicit = tmp_path / "explicit-dflash2"
+    recorded.mkdir()
+    explicit.mkdir()
+    harness.adopted_dflash2 = recorded
+
+    # A directory the adoption does not record must pass the pinned-hash check.
+    harness.fail_verify = True
+    with pytest.raises(ValueError, match="Checksum mismatch"):
+        cli.serve(drafter="dflash2", dflash2_dir=explicit)
+    assert harness.launched == 0
+    assert ("receipt", "adoption.json") not in harness.events
+
+    # Once it passes, it replaces the recorded checkpoint and is forwarded.
+    harness.fail_verify = False
+    harness.events.clear()
+    with pytest.raises(SystemExit):
+        cli.serve(drafter="dflash2", dflash2_dir=explicit)
+    assert ("verify", "dflash2", explicit) in harness.events
+    assert harness.events.index(("receipt", "adoption.json")) < harness.events.index(
+        ("popen",)
+    )
+    command = harness.last_command
+    assert command[command.index("--native-dflash2-dir") + 1] == str(explicit)
+
+    # The recorded directory is covered by the adoption check and is not rehashed.
+    harness.events.clear()
+    with pytest.raises(SystemExit):
+        cli.serve(drafter="dflash2", dflash2_dir=recorded)
+    assert not [event for event in harness.events if event[0] == "verify"]
+    command = harness.last_command
+    assert command[command.index("--native-dflash2-dir") + 1] == str(recorded)
+
+
 def test_serve_passes_checkpoint_ssd_and_overlap_flags(harness):
     harness.stop_during_wait = False
     with pytest.raises(SystemExit):
@@ -365,6 +449,42 @@ def test_serve_passes_m6_checkpoint_and_overlap_flags(harness):
     assert "--checkpoint-policy" in command
     assert "lru" in command
     assert "--overlap-prefill" in command
+
+
+@pytest.mark.parametrize(
+    ("options", "flag"),
+    [
+        ({"checkpoint_dir": "/tmp/test_checkpoints"}, "--checkpoint-dir"),
+        ({"checkpoint_ssd_dir": "/tmp/test_checkpoints"}, "--checkpoint-dir"),
+        ({"checkpoint_policy": "recompute-cost"}, "--checkpoint-policy"),
+        ({"checkpoint_floor_gib": 20.0}, "--checkpoint-floor-gib"),
+        (
+            {"checkpoint_cap_gib": 0.0, "checkpoint_policy": "lru"},
+            "--checkpoint-policy",
+        ),
+    ],
+)
+def test_checkpoint_settings_without_a_positive_capacity_are_refused(
+    harness, options, flag
+):
+    with pytest.raises(
+        ValueError,
+        match=f"{flag} has no effect unless --checkpoint-cap-gib is greater than 0",
+    ):
+        cli.serve(**options)
+    assert harness.launched == 0
+
+
+def test_checkpoint_capacity_alone_uses_the_default_settings(harness):
+    harness.stop_during_wait = False
+    with pytest.raises(SystemExit):
+        cli.serve(checkpoint_cap_gib=4.0)
+    command = harness.last_command
+    assert command[command.index("--checkpoint-floor-gib") + 1] == "20.0"
+    assert command[command.index("--checkpoint-policy") + 1] == "recompute-cost"
+    assert command[command.index("--checkpoint-dir") + 1] == str(
+        harness.root / ".tokspur/state/checkpoints"
+    )
 
 
 def test_serve_default_uses_f32_and_keeps_speed_lead_paths_opt_in(harness):

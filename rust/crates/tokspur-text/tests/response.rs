@@ -27,6 +27,26 @@ impl Checks {
         }
     }
 
+    /// `open_thinking(input, reasoning, thinking)`: three checks. A response that stops with thinking still open ends the thinking there.
+    fn open_thinking(&mut self, input: &[u8], reasoning: &[u8], thinking: bool) {
+        let mut parser = ResponseParser::new(tools(), thinking, ResponseLimits::default()).unwrap();
+        parser.feed(input);
+        self.require(
+            parser.finish() == ResponseStatus::Complete && parser.error().is_empty(),
+            "stop inside open thinking refused",
+        );
+        self.require(
+            text(&parser, ResponseKind::Thinking) == reasoning
+                && text(&parser, ResponseKind::Text).is_empty()
+                && callable(&parser) == 0,
+            "open thinking not ended at the stop",
+        );
+        self.require(
+            parser.feed(b"more") == ResponseStatus::Error,
+            "input accepted after finished response",
+        );
+    }
+
     /// `invalid(input, thinking)`: three checks. Returns the recorded error.
     fn invalid(&mut self, input: &[u8], thinking: bool) -> String {
         let mut parser = ResponseParser::new(tools(), thinking, ResponseLimits::default()).unwrap();
@@ -352,7 +372,6 @@ fn malformed_frames_and_values_are_errors_without_tool_records() {
         ),
         (call("<think>injected</think>"), false, "reserved response marker inside parameter"),
         (b"</think>".to_vec(), false, "unexpected response thinking close"),
-        (b"<think>unclosed".to_vec(), false, "truncated response control frame"),
         (b"reason<|im_end|>".to_vec(), true, "terminal marker inside thinking"),
         (b"answer<|im_end|>suffix".to_vec(), false, "data after response terminal marker"),
         (b"x\0y".to_vec(), false, "NUL byte in response"),
@@ -370,7 +389,8 @@ fn malformed_frames_and_values_are_errors_without_tool_records() {
             String::from_utf8_lossy(input)
         );
     }
-    assert_eq!(checks.0, 3 * (cases.len() + 7 + tail.len()));
+    checks.open_thinking(b"<think>unclosed", b"unclosed", false);
+    assert_eq!(checks.0, 3 * (cases.len() + 7 + tail.len() + 1));
     assert_eq!(checks.0, 90);
 }
 

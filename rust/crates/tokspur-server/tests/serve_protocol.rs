@@ -1062,6 +1062,122 @@ fn literal_marker_serving() {
     }
 }
 
+/// A stop token while reasoning is still open ends the reasoning there: the client gets what was produced with `finish_reason: "stop"`, not an error after its reasoning deltas.
+fn open_thinking_stop_serving() {
+    let reasoning = "weighing the options";
+    for terminal in ["<|im_end|>", "<|endoftext|>"] {
+        for stream in [false, true] {
+            let mut serving = ServeSession::new(codec(), SessionOptions::default()).unwrap();
+            let mut fake = Fake::new();
+            fake.reply(&format!("{reasoning}{terminal}"));
+            let mut call = |job: &Json, event: Event<'_>| fake.call(job, event);
+            let chunks = RefCell::new(Vec::new());
+            let mut push = |value: &Json| {
+                chunks.borrow_mut().push(value.clone());
+                Ok(())
+            };
+            let mut cancelled = || false;
+            let mut new_seed = || 44;
+            let mut sink = ServeSink {
+                chunk: Some(&mut push),
+                cancelled: &mut cancelled,
+                new_seed: &mut new_seed,
+                prefix_trace: None,
+            };
+            let result = serving
+                .complete(
+                    &request("think", stream, true),
+                    b"open-thinking",
+                    &mut call,
+                    &mut sink,
+                )
+                .unwrap();
+            let reply = message(&result);
+            check(
+                reply
+                    .find("reasoning_content")
+                    .unwrap()
+                    .unwrap()
+                    .string()
+                    .unwrap()
+                    == reasoning.as_bytes(),
+            );
+            check(
+                reply
+                    .find("content")
+                    .unwrap()
+                    .unwrap()
+                    .string()
+                    .unwrap()
+                    .is_empty(),
+            );
+            check(reply.find("tool_calls").unwrap().is_none());
+            check(finish(&result).string().unwrap() == b"stop");
+            // The session stays usable for the next turn.
+            check(serving.committed_tokens() > 0);
+            let chunks = chunks.borrow();
+            check(chunks.is_empty() != stream);
+            if !stream {
+                continue;
+            }
+            let mut streamed = Vec::new();
+            for chunk in chunks.iter() {
+                let delta = delta(chunk);
+                check(delta.find("content").unwrap().is_none());
+                if let Some(text) = delta.find("reasoning_content").unwrap() {
+                    streamed.extend_from_slice(text.string().unwrap());
+                }
+            }
+            check(streamed == reasoning.as_bytes());
+            let last = chunks.last().unwrap();
+            check(
+                last.find("choices").unwrap().unwrap().array().unwrap()[0]
+                    .find("finish_reason")
+                    .unwrap()
+                    .unwrap()
+                    .string()
+                    .unwrap()
+                    == b"stop",
+            );
+        }
+    }
+    // A required tool is still required, and a tool call cut off by the stop is still refused.
+    for (job, raw, public_error) in [
+        (
+            with(
+                &with(&request("think", false, true), "tools", tools()),
+                "tool_choice",
+                Json::from("required"),
+            ),
+            "weighing the options<|im_end|>",
+            "required tool was not produced",
+        ),
+        (
+            with(&request("think", false, true), "tools", tools()),
+            "done</think><tool_call><function=read_file><|im_end|>",
+            "incomplete or invalid stopped response",
+        ),
+    ] {
+        let mut serving = ServeSession::new(codec(), SessionOptions::default()).unwrap();
+        let mut fake = Fake::new();
+        fake.reply(raw);
+        let error = serving
+            .complete(
+                &job,
+                b"open-thinking-refused",
+                &mut |job, event| fake.call(job, event),
+                &mut ServeSink {
+                    chunk: None,
+                    cancelled: &mut || false,
+                    new_seed: &mut || 44,
+                    prefix_trace: None,
+                },
+            )
+            .unwrap_err();
+        check(error.to_string() == public_error);
+    }
+}
+
 fn parallel_tool_streams() {
     for valid in [true, false] {
         let mut serving = session("direct", Json::Null).unwrap();
@@ -1166,6 +1282,7 @@ fn main() {
         return;
     }
     parallel_tool_streams();
+    open_thinking_stop_serving();
     // Running totals after each C++ function, to compare with an instrumented copy of test_serve_protocol.cpp.
     let section = |name: &str| {
         if std::env::var_os("TOKSPUR_SERVE_SECTIONS").is_some() {

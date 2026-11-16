@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <cstring>
 #include <fcntl.h>
 #include <exception>
@@ -21,6 +22,7 @@
 #include <set>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <thread>
@@ -298,6 +300,283 @@ void parse_manifest_into_plan(PackPlan& plan, const Gguf& file) {
     }
 }
 } // namespace
+
+namespace {
+
+bool is_manifest_hash(std::string_view text) {
+    return text.size() == 64 && std::all_of(text.begin(), text.end(), [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    });
+}
+
+void append_seal_time(std::string& out, std::string_view key, int64_t seconds, uint32_t nanoseconds) {
+    const auto fraction = std::to_string(nanoseconds);
+    out += key;
+    out += '=';
+    out += std::to_string(seconds);
+    out += '.';
+    out.append(9 - std::min<size_t>(9, fraction.size()), '0');
+    out += fraction;
+    out += '\n';
+}
+
+// Takes "<key>=<value>\n" from the front of text.
+std::optional<std::string_view> take_seal_field(std::string_view& text, std::string_view key) {
+    if (!text.starts_with(key) || text.size() <= key.size() || text[key.size()] != '=') return std::nullopt;
+    const auto end = text.find('\n');
+    if (end == std::string_view::npos) return std::nullopt;
+    const auto value = text.substr(key.size() + 1, end - key.size() - 1);
+    text.remove_prefix(end + 1);
+    return value;
+}
+
+template <typename Number>
+bool parse_seal_number(std::string_view text, Number& out) {
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), out);
+    return !text.empty() && parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
+}
+
+bool parse_seal_time(std::string_view text, int64_t& seconds, uint32_t& nanoseconds) {
+    const auto dot = text.find('.');
+    return dot != std::string_view::npos && text.size() - dot - 1 == 9 &&
+           parse_seal_number(text.substr(0, dot), seconds) &&
+           parse_seal_number(text.substr(dot + 1), nanoseconds);
+}
+
+std::string_view seal_scope_text(SealScope scope) {
+    if (scope.target) return scope.mtp ? "target+mtp" : "target";
+    return scope.mtp ? "mtp" : "none";
+}
+
+std::optional<SealScope> parse_seal_scope(std::string_view text) {
+    for (const auto scope : {SealScope{true, true}, SealScope{true, false}, SealScope{false, true}, SealScope{}}) {
+        if (text == seal_scope_text(scope)) return scope;
+    }
+    return std::nullopt;
+}
+
+PackFileIdentity identity_of(const struct stat& info) {
+    return {
+        uint64_t(info.st_ino), uint64_t(info.st_size),
+        int64_t(info.st_mtimespec.tv_sec), uint32_t(info.st_mtimespec.tv_nsec),
+        int64_t(info.st_ctimespec.tv_sec), uint32_t(info.st_ctimespec.tv_nsec),
+        int64_t(info.st_birthtimespec.tv_sec), uint32_t(info.st_birthtimespec.tv_nsec),
+    };
+}
+
+// A private name for a seal being written. Removed unless it was renamed.
+struct SealTemporary {
+    int directory, fd = -1;
+    std::string name;
+    bool published = false;
+    explicit SealTemporary(int parent) : directory(parent) {
+        for (unsigned tries = 0; tries < 16; ++tries) {
+            std::array<unsigned char, 16> random{};
+            arc4random_buf(random.data(), random.size());
+            constexpr char hex[] = "0123456789abcdef";
+            name = ".tokspur-seal-";
+            for (auto x : random) { name += hex[x >> 4]; name += hex[x & 15]; }
+            name += ".tmp";
+            fd = ::openat(directory, name.c_str(), O_CREAT | O_EXCL | O_NOFOLLOW | O_RDWR | O_CLOEXEC, 0600);
+            if (fd >= 0) return;
+            require(errno == EEXIST, "cannot create exclusive seal temporary");
+        }
+        throw FormatError("cannot reserve seal temporary file");
+    }
+    ~SealTemporary() {
+        if (fd >= 0) ::close(fd);
+        if (!published) ::unlinkat(directory, name.c_str(), 0);
+    }
+    SealTemporary(const SealTemporary&) = delete;
+    SealTemporary& operator=(const SealTemporary&) = delete;
+};
+
+} // namespace
+
+std::string encode_local_seal(const LocalSeal& seal) {
+    std::string out(local_seal_format);
+    out += "\nmanifest_sha256=" + seal.manifest_sha256 + "\n";
+    out += "compared=" + std::string(seal_scope_text(seal.compared)) + "\n";
+    out += "inode=" + std::to_string(seal.pack.inode) + "\n";
+    out += "size=" + std::to_string(seal.pack.size) + "\n";
+    append_seal_time(out, "mtime", seal.pack.mtime_seconds, seal.pack.mtime_nanoseconds);
+    append_seal_time(out, "ctime", seal.pack.ctime_seconds, seal.pack.ctime_nanoseconds);
+    append_seal_time(out, "birthtime", seal.pack.birthtime_seconds, seal.pack.birthtime_nanoseconds);
+    return out;
+}
+
+ParsedLocalSeal parse_local_seal(std::string_view text) {
+    ParsedLocalSeal parsed;
+    if (text.size() > max_local_seal_bytes) return parsed;
+
+    // The earlier form: the manifest hash, then at most trailing line ends or spaces.
+    if (is_manifest_hash(text.substr(0, 64)) &&
+        text.find_first_not_of("\n\r ", 64) == std::string_view::npos) {
+        parsed.form = LocalSealForm::legacy;
+        parsed.seal.manifest_sha256 = std::string(text.substr(0, 64));
+        return parsed;
+    }
+
+    auto rest = text;
+    if (!rest.starts_with(local_seal_format) || rest.size() <= local_seal_format.size() ||
+        rest[local_seal_format.size()] != '\n') {
+        return parsed;
+    }
+    rest.remove_prefix(local_seal_format.size() + 1);
+    LocalSeal seal;
+    const auto manifest = take_seal_field(rest, "manifest_sha256");
+    const auto compared = take_seal_field(rest, "compared");
+    const auto inode = take_seal_field(rest, "inode");
+    const auto size = take_seal_field(rest, "size");
+    const auto mtime = take_seal_field(rest, "mtime");
+    const auto ctime = take_seal_field(rest, "ctime");
+    const auto birthtime = take_seal_field(rest, "birthtime");
+    const auto scope = compared ? parse_seal_scope(*compared) : std::nullopt;
+    if (!manifest || !scope || !inode || !size || !mtime || !ctime || !birthtime || !rest.empty() ||
+        !is_manifest_hash(*manifest) ||
+        !parse_seal_number(*inode, seal.pack.inode) || !parse_seal_number(*size, seal.pack.size) ||
+        !parse_seal_time(*mtime, seal.pack.mtime_seconds, seal.pack.mtime_nanoseconds) ||
+        !parse_seal_time(*ctime, seal.pack.ctime_seconds, seal.pack.ctime_nanoseconds) ||
+        !parse_seal_time(*birthtime, seal.pack.birthtime_seconds, seal.pack.birthtime_nanoseconds)) {
+        return parsed;
+    }
+    seal.manifest_sha256 = std::string(*manifest);
+    seal.compared = *scope;
+    // One spelling only: signs, leading zeros and out-of-range fractions do not survive re-encoding.
+    if (encode_local_seal(seal) != text) return parsed;
+    parsed.form = LocalSealForm::current;
+    parsed.seal = std::move(seal);
+    return parsed;
+}
+
+bool local_seal_vouches(std::string_view seal_text, std::string_view manifest_sha256, const PackFileIdentity& pack,
+                        SealScope needed) {
+    const auto parsed = parse_local_seal(seal_text);
+    return parsed.form == LocalSealForm::current && is_manifest_hash(manifest_sha256) &&
+           parsed.seal.manifest_sha256 == manifest_sha256 && parsed.seal.pack == pack &&
+           parsed.seal.compared.covers(needed);
+}
+
+PackFileIdentity pack_file_identity(int fd) {
+    struct stat info{};
+    require(::fstat(fd, &info) == 0 && S_ISREG(info.st_mode), "cannot read pack file identity");
+    return identity_of(info);
+}
+
+std::optional<std::string> local_seal_name(const std::string& pack_name) {
+    auto name = std::filesystem::path(pack_name).stem().string() + ".seal";
+    // A pack called <x>.seal would be its own seal: writing one would replace the pack.
+    if (name == pack_name) return std::nullopt;
+    return name;
+}
+
+LocalSealReading read_local_seal(int directory_fd, const std::string& pack_name,
+                                 std::string_view manifest_sha256, const PackFileIdentity& pack, SealScope needed) {
+    LocalSealReading reading;
+    const auto derived_name = local_seal_name(pack_name);
+    if (!derived_name) {
+        reading.entry = LocalSealReading::Entry::other;
+        return reading;
+    }
+    const auto& seal_name = *derived_name;
+    struct stat named{};
+    if (::fstatat(directory_fd, seal_name.c_str(), &named, AT_SYMLINK_NOFOLLOW) != 0) {
+        reading.entry = errno == ENOENT ? LocalSealReading::Entry::absent : LocalSealReading::Entry::other;
+        return reading;
+    }
+    // A file too large to be a seal is some other file that happens to have
+    // the seal name. Like a link or a directory there, it is never replaced.
+    if (!S_ISREG(named.st_mode) || uint64_t(named.st_size) > max_local_seal_bytes) {
+        reading.entry = LocalSealReading::Entry::other;
+        return reading;
+    }
+    reading.entry = LocalSealReading::Entry::regular;
+
+    const int seal_fd = ::openat(directory_fd, seal_name.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (seal_fd < 0) return reading;
+    const Fd seal(seal_fd);
+    struct stat opened{};
+    if (::fstat(seal.value, &opened) != 0 || !S_ISREG(opened.st_mode) ||
+        opened.st_dev != named.st_dev || opened.st_ino != named.st_ino ||
+        (opened.st_mode & 0222) || opened.st_nlink != 1 ||
+        (opened.st_uid != ::geteuid() && opened.st_uid != 0) ||
+        opened.st_size <= 0 || uint64_t(opened.st_size) > max_local_seal_bytes) {
+        return reading;
+    }
+    std::string text(size_t(opened.st_size), '\0');
+    for (size_t at = 0; at < text.size();) {
+        const auto got = ::pread(seal.value, text.data() + at, text.size() - at, off_t(at));
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) return reading;
+        at += size_t(got);
+    }
+    reading.trusted_file = true;
+    const auto parsed = parse_local_seal(text);
+    reading.form = parsed.form;
+    reading.names_manifest = parsed.form != LocalSealForm::malformed && is_manifest_hash(manifest_sha256) &&
+                             parsed.seal.manifest_sha256 == manifest_sha256;
+    if (parsed.form == LocalSealForm::current) {
+        reading.compared = parsed.seal.compared;
+        reading.names_file = reading.names_manifest && parsed.seal.pack == pack;
+    }
+    reading.vouches = reading.names_file && reading.compared.covers(needed);
+    return reading;
+}
+
+void publish_local_seal(int directory_fd, const std::string& pack_name, const LocalSeal& seal, bool replace) {
+    const auto derived_name = local_seal_name(pack_name);
+    require(derived_name.has_value(), "a pack whose name ends in .seal cannot be sealed");
+    const auto& seal_name = *derived_name;
+    require(is_manifest_hash(seal.manifest_sha256), "seal manifest hash is malformed");
+    const auto text = encode_local_seal(seal);
+    require(parse_local_seal(text).form == LocalSealForm::current, "seal does not encode");
+    SealTemporary temporary(directory_fd);
+    write_at(temporary.fd, std::as_bytes(std::span(text)), 0);
+    require(::fchmod(temporary.fd, 0444) == 0 && ::fsync(temporary.fd) == 0, "seal chmod/fsync failed");
+    if (replace) {
+        require(::renameat(directory_fd, temporary.name.c_str(), directory_fd, seal_name.c_str()) == 0,
+                "seal replacement refused");
+    } else {
+        require(::renameatx_np(directory_fd, temporary.name.c_str(), directory_fd, seal_name.c_str(),
+                               RENAME_EXCL) == 0,
+                "exclusive seal publication refused");
+    }
+    temporary.published = true;
+    require(::fsync(directory_fd) == 0, "directory fsync after seal publication failed");
+}
+
+bool refresh_local_seal(int directory_fd, const std::string& pack_name, int pack_fd,
+                        std::string_view manifest_sha256, const PackFileIdentity& before, SealScope verified) noexcept {
+    try {
+        if (!local_seal_name(pack_name)) return false;
+        // The seal may only name bytes that were verified: the file must be
+        // the one that was opened, unchanged across the whole verification,
+        // and still the file the pack name refers to.
+        const auto now = pack_file_identity(pack_fd);
+        struct stat named{};
+        if (now != before ||
+            ::fstatat(directory_fd, pack_name.c_str(), &named, AT_SYMLINK_NOFOLLOW) != 0 ||
+            !S_ISREG(named.st_mode) || identity_of(named) != now) {
+            return false;
+        }
+        // A pack publisher holds this lock while it decides about the seal.
+        if (::flock(directory_fd, LOCK_EX | LOCK_NB) != 0) return false;
+        struct Unlock {
+            int fd;
+            ~Unlock() { ::flock(fd, LOCK_UN); }
+        } unlock{directory_fd};
+        const auto found = read_local_seal(directory_fd, pack_name, manifest_sha256, now, verified);
+        if (found.vouches) return true;
+        if (found.entry == LocalSealReading::Entry::other) return false;
+        // Earlier comparisons still hold only for a seal that names this
+        // manifest and exactly this file. Any other seal contributes nothing.
+        const auto compared = found.names_file ? (found.compared | verified) : verified;
+        publish_local_seal(directory_fd, pack_name, {std::string(manifest_sha256), now, compared}, true);
+        return read_local_seal(directory_fd, pack_name, manifest_sha256, now, verified).vouches;
+    } catch (...) {
+        return false;
+    }
+}
 
 bool is_gpu_pack_tensor(std::string_view name) {
     return !is_cpu_pinned_embedding(name);
@@ -618,46 +897,17 @@ AdoptedPack adopt_derived_pack(
         require(verify_gpu_pack_census(plan), "derived pack GPU census verification failed");
     }
 
-    bool seal_valid = false;
-    if (trust_mode == TrustMode::local_seal) {
-        std::string seal_name = std::filesystem::path(location.name).stem().string() + ".seal";
-        int seal_fd = ::openat(location.directory.value, seal_name.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-        if (seal_fd < 0) {
-            if (errno == ELOOP) {
-                throw FormatError("symlink seal path rejected via O_NOFOLLOW: ELOOP");
-            }
-            struct stat lchk{};
-            if (::fstatat(location.directory.value, seal_name.c_str(), &lchk, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(lchk.st_mode)) {
-                throw FormatError("symlink seal path rejected via O_NOFOLLOW: ELOOP");
-            }
-            // Missing seal file triggers graceful fallback to full verification
-        } else {
-            Fd seal_guard(seal_fd);
-            struct stat sstat{};
-            require(::fstat(seal_fd, &sstat) == 0, "cannot stat seal file");
-            if (!S_ISREG(sstat.st_mode)) {
-                throw FormatError("seal file must be a regular file");
-            }
-            if (sstat.st_mode & 0222) {
-                throw FormatError("writable seal file rejected: permissions must be immutable (!(st_mode & 0222))");
-            }
-            if (sstat.st_nlink != 1) {
-                throw FormatError("multi-hardlink seal file rejected: st_nlink > 1");
-            }
-            if (sstat.st_size > 0 && sstat.st_size <= 4096) {
-                std::string seal_content(size_t(sstat.st_size), '\0');
-                read_into(seal_fd, std::as_writable_bytes(std::span(seal_content)), 0);
-                while (!seal_content.empty() && (seal_content.back() == '\n' || seal_content.back() == '\r' || seal_content.back() == ' ')) {
-                    seal_content.pop_back();
-                }
-                auto manifest_sha256 = hash(file.string_value("tokspur_pack.manifest"));
-                if (seal_content == manifest_sha256) {
-                    seal_valid = true;
-                }
-            }
-            // Empty seal or content mismatch triggers graceful fallback to full verification
-        }
-    }
+    // Local-seal mode skips the payload work below only for a seal that names
+    // this manifest and exactly this file. Every other seal state, including
+    // one that cannot be read at all, means full verification.
+    const auto identity_before = identity_of(before);
+    const auto manifest_sha256 = hash(file.string_value("tokspur_pack.manifest"));
+    const bool seal_consulted = trust_mode == TrustMode::local_seal;
+    // What the full verification below compares the pack with. Without the
+    // MTP sidecar the blk.48.* tensors are checked against the manifest only.
+    const SealScope scope{true, mtp_sidecar != nullptr};
+    const bool seal_valid = seal_consulted &&
+        read_local_seal(location.directory.value, location.name, manifest_sha256, identity_before, scope).vouches;
 
     const auto authenticate_tensor = [&](size_t i) {
         const auto& t = plan.tensors[i];
@@ -798,8 +1048,16 @@ AdoptedPack adopt_derived_pack(
             before.st_mode == after.st_mode && before.st_nlink == after.st_nlink,
             "derived pack identity changed during adoption");
 
-    auto manifest_sha256 = hash(file.string_value("tokspur_pack.manifest"));
-    return {std::move(model), std::move(plan), std::move(manifest_sha256), effective_workers};
+    auto seal_use = LocalSealUse::not_consulted;
+    if (seal_valid) {
+        seal_use = LocalSealUse::accepted;
+    } else if (seal_consulted) {
+        // The full verification above has passed for this descriptor.
+        seal_use = refresh_local_seal(location.directory.value, location.name, fd.value, manifest_sha256, identity_before, scope)
+            ? LocalSealUse::refreshed : LocalSealUse::not_refreshed;
+    }
+    return {std::move(model), std::move(plan), manifest_sha256, effective_workers, seal_use, identity_of(after),
+            seal_valid ? SealScope{} : scope};
 }
 
 } // namespace tokspur::derived_pack

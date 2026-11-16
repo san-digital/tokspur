@@ -1,5 +1,5 @@
 // Exact windowed GGUF Q8_0 Hyper-Connections down projection for 10240-to-320 prefill rows.
-// Stages 16 token rows of 512 FP32 columns in 32 KiB threadgroup memory per step while preserving the single-SIMD-group 0..319 block accumulation order and simd_sum reduction of graph_hc_q8_exact_r1_u16 under -fno-fast-math.
+// Stages 16 token rows of 128 FP32 columns in 8 KiB threadgroup memory per step while preserving the single-SIMD-group 0..319 block accumulation order and simd_sum reduction of graph_hc_q8_exact_r1_u16 under -fno-fast-math.
 #include <metal_stdlib>
 using namespace metal;
 
@@ -31,7 +31,7 @@ kernel void graph_hc_down_q8_window(device const uchar* weights [[buffer(0)]], d
         if (!tid) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
         return;
     }
-    constexpr ushort W_TOK = 16, SG_COUNT = 16, R_PER_SG = 2, B_TILE = 16;
+    constexpr ushort W_TOK = 16, SG_COUNT = 8, R_PER_SG = 2, B_TILE = 4;
     constexpr ushort THREADS = SG_COUNT * 32, R_TG = SG_COUNT * R_PER_SG, COLS = B_TILE * 32, COLS4 = COLS / 4;
     const uint first_row = group.x * R_TG + subgroup * R_PER_SG;
     const uint token_base = group.y * W_TOK;
@@ -40,7 +40,6 @@ kernel void graph_hc_down_q8_window(device const uchar* weights [[buffer(0)]], d
     const uint out_stride = uint(p.output_stride_bytes / sizeof(float));
     const uint count = min(uint(W_TOK), p.tokens - token_base);
     device const float* row_in = input + ulong(token_base) * in_stride;
-    const bool aligned_vec4 = ((in_stride & 3u) == 0u) && ((ulong(row_in) & 15ul) == 0ul);
 
     threadgroup float4 shared_x4[(W_TOK * COLS) / 4];
     threadgroup float* shared_x = reinterpret_cast<threadgroup float*>(shared_x4);
@@ -51,65 +50,143 @@ kernel void graph_hc_down_q8_window(device const uchar* weights [[buffer(0)]], d
         #pragma unroll
         for (ushort m = 0; m < W_TOK; ++m) sums[r][m] = 0.0f;
 
-    for (uint base = 0; base < 320; base += B_TILE) {
-        const uint col_base = base * 32;
-        if (aligned_vec4) {
+    const bool full_rows = (first_row + R_PER_SG <= p.rows);
+
+    if (p.reserved == 0u) {
+        for (uint base = 0; base < 320; base += B_TILE) {
+            half sc_pre[R_PER_SG][B_TILE];
+            char q_pre[R_PER_SG][B_TILE];
+            if (full_rows) {
+                #pragma unroll
+                for (ushort r = 0; r < R_PER_SG; ++r) {
+                    device const uchar* rbase = weights + (ulong(first_row + r) * 320ul + base) * 34ul;
+                    #pragma unroll
+                    for (ushort s = 0; s < B_TILE; ++s) {
+                        device const uchar* bp = rbase + ulong(s) * 34ul;
+                        sc_pre[r][s] = *reinterpret_cast<device const half*>(bp);
+                        q_pre[r][s] = *reinterpret_cast<device const char*>(bp + 2ul + lane);
+                    }
+                }
+            }
+
+            const uint col_base = base * 32;
             if (count == W_TOK) {
                 #pragma unroll
                 for (uint idx4 = tid; idx4 < uint(W_TOK) * COLS4; idx4 += THREADS) {
                     const ushort m = idx4 / COLS4, c4 = idx4 % COLS4;
-                    shared_x4[idx4] = *reinterpret_cast<device const float4*>(row_in + ulong(m) * in_stride + col_base + uint(c4) * 4);
+                    shared_x4[idx4] = float4(*reinterpret_cast<device const packed_float4*>(row_in + ulong(m) * in_stride + col_base + uint(c4) * 4));
                 }
             } else {
                 for (uint idx4 = tid; idx4 < uint(W_TOK) * COLS4; idx4 += THREADS) {
                     const ushort m = idx4 / COLS4, c4 = idx4 % COLS4;
                     shared_x4[idx4] = (m < count)
-                        ? *reinterpret_cast<device const float4*>(row_in + ulong(m) * in_stride + col_base + uint(c4) * 4)
+                        ? float4(*reinterpret_cast<device const packed_float4*>(row_in + ulong(m) * in_stride + col_base + uint(c4) * 4))
                         : float4(0.0f);
                 }
             }
-        } else {
-            for (uint idx = tid; idx < uint(W_TOK) * COLS; idx += THREADS) {
-                const ushort m = idx / COLS, c = idx % COLS;
-                shared_x[idx] = (m < count) ? row_in[ulong(m) * in_stride + col_base + c] : 0.0f;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (count == W_TOK) {
-            #pragma unroll
-            for (ushort s = 0; s < B_TILE; ++s) {
-                const ushort c = s * 32 + lane;
-                float w[R_PER_SG];
+            if (count == W_TOK && full_rows) {
                 #pragma unroll
-                for (ushort r = 0; r < R_PER_SG; ++r) {
-                    const uint row = first_row + r;
-                    w[r] = row < p.rows ? hc_down_weight(weights, row, base + s, lane, p.reserved) : 0.0f;
-                }
-                #pragma unroll
-                for (ushort m = 0; m < W_TOK; ++m) {
-                    const float xv = shared_x[m * COLS + c];
+                for (ushort s = 0; s < B_TILE; ++s) {
+                    const ushort c = s * 32 + lane;
+                    float w[R_PER_SG];
                     #pragma unroll
-                    for (ushort r = 0; r < R_PER_SG; ++r) sums[r][m] += w[r] * xv;
+                    for (ushort r = 0; r < R_PER_SG; ++r) {
+                        w[r] = float(sc_pre[r][s]) * float(q_pre[r][s]);
+                    }
+                    #pragma unroll
+                    for (ushort m = 0; m < W_TOK; ++m) {
+                        const float xv = shared_x[m * COLS + c];
+                        #pragma unroll
+                        for (ushort r = 0; r < R_PER_SG; ++r) sums[r][m] += w[r] * xv;
+                    }
+                }
+            } else if (first_row < p.rows) {
+                for (ushort s = 0; s < B_TILE; ++s) {
+                    const ushort c = s * 32 + lane;
+                    float w[R_PER_SG];
+                    #pragma unroll
+                    for (ushort r = 0; r < R_PER_SG; ++r) {
+                        const uint row = first_row + r;
+                        w[r] = row < p.rows ? hc_down_weight(weights, row, base + s, lane, 0u) : 0.0f;
+                    }
+                    for (uint m = 0; m < count; ++m) {
+                        const float xv = shared_x[m * COLS + c];
+                        #pragma unroll
+                        for (ushort r = 0; r < R_PER_SG; ++r) sums[r][m] += w[r] * xv;
+                    }
                 }
             }
-        } else {
-            for (ushort s = 0; s < B_TILE; ++s) {
-                const ushort c = s * 32 + lane;
-                float w[R_PER_SG];
-                #pragma unroll
-                for (ushort r = 0; r < R_PER_SG; ++r) {
-                    const uint row = first_row + r;
-                    w[r] = row < p.rows ? hc_down_weight(weights, row, base + s, lane, p.reserved) : 0.0f;
-                }
-                for (uint m = 0; m < count; ++m) {
-                    const float xv = shared_x[m * COLS + c];
-                    #pragma unroll
-                    for (ushort r = 0; r < R_PER_SG; ++r) sums[r][m] += w[r] * xv;
-                }
-            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        for (uint base = 0; base < 320; base += B_TILE) {
+            half4 sc_pre[R_PER_SG];
+            char4 q_pre[R_PER_SG];
+            if (full_rows) {
+                const uint run = base / 16u;
+                const ulong q_off = 640ul + ulong(run) * 512ul + ulong(lane) * 16ul + ulong(base % 16u);
+                const ulong sc_off = ulong(base) * 2ul;
+                #pragma unroll
+                for (ushort r = 0; r < R_PER_SG; ++r) {
+                    device const uchar* row_ptr = weights + ulong(first_row + r) * 10880ul;
+                    sc_pre[r] = half4(*reinterpret_cast<device const packed_half4*>(row_ptr + sc_off));
+                    q_pre[r] = char4(*reinterpret_cast<device const packed_char4*>(row_ptr + q_off));
+                }
+            }
+
+            const uint col_base = base * 32;
+            if (count == W_TOK) {
+                #pragma unroll
+                for (uint idx4 = tid; idx4 < uint(W_TOK) * COLS4; idx4 += THREADS) {
+                    const ushort m = idx4 / COLS4, c4 = idx4 % COLS4;
+                    shared_x4[idx4] = float4(*reinterpret_cast<device const packed_float4*>(row_in + ulong(m) * in_stride + col_base + uint(c4) * 4));
+                }
+            } else {
+                for (uint idx4 = tid; idx4 < uint(W_TOK) * COLS4; idx4 += THREADS) {
+                    const ushort m = idx4 / COLS4, c4 = idx4 % COLS4;
+                    shared_x4[idx4] = (m < count)
+                        ? float4(*reinterpret_cast<device const packed_float4*>(row_in + ulong(m) * in_stride + col_base + uint(c4) * 4))
+                        : float4(0.0f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (count == W_TOK && full_rows) {
+                #pragma unroll
+                for (ushort s = 0; s < B_TILE; ++s) {
+                    const ushort c = s * 32 + lane;
+                    float w[R_PER_SG];
+                    #pragma unroll
+                    for (ushort r = 0; r < R_PER_SG; ++r) {
+                        w[r] = float(sc_pre[r][s]) * float(q_pre[r][s]);
+                    }
+                    #pragma unroll
+                    for (ushort m = 0; m < W_TOK; ++m) {
+                        const float xv = shared_x[m * COLS + c];
+                        #pragma unroll
+                        for (ushort r = 0; r < R_PER_SG; ++r) sums[r][m] += w[r] * xv;
+                    }
+                }
+            } else if (first_row < p.rows) {
+                for (ushort s = 0; s < B_TILE; ++s) {
+                    const ushort c = s * 32 + lane;
+                    float w[R_PER_SG];
+                    #pragma unroll
+                    for (ushort r = 0; r < R_PER_SG; ++r) {
+                        const uint row = first_row + r;
+                        w[r] = row < p.rows ? hc_down_weight(weights, row, base + s, lane, 1u) : 0.0f;
+                    }
+                    for (uint m = 0; m < count; ++m) {
+                        const float xv = shared_x[m * COLS + c];
+                        #pragma unroll
+                        for (ushort r = 0; r < R_PER_SG; ++r) sums[r][m] += w[r] * xv;
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
 
     #pragma unroll

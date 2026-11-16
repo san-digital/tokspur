@@ -55,6 +55,17 @@ struct CheckpointMetadata {
     std::vector<float> logits;
 };
 
+// The identity a spill records in CheckpointFileHeader::state_digest and a
+// restore recomputes for the prefix it asked for, before any state is
+// published. The file name is derived from the prefix token IDs but nothing
+// authenticates it, so the digest binds the IDs themselves: a file moved to
+// the name of another prefix of equal length no longer validates. Checkpoints
+// written before the IDs were bound hashed a strictly shorter input, so they
+// fail the same comparison and are treated as a miss.
+[[nodiscard]] std::array<uint8_t, 32> checkpoint_state_digest(
+    const std::array<uint8_t, 32>& execution_digest, std::span<const uint32_t> prefix_tokens,
+    uint64_t stack_bytes, uint64_t mtp_bytes, bool has_logits);
+
 struct SlotHandshake {
     std::atomic<uint64_t> reader_epoch{0};
     std::atomic<bool> cancel_spill{false};
@@ -153,6 +164,7 @@ private:
     FreeSpaceQuery free_space_query_{};
 
     void open_secure_directory();
+    void remove_orphaned_temporaries() noexcept;
     [[nodiscard]] bool reconcile_directory(bool initialise_epoch = false) noexcept;
     [[nodiscard]] bool take_access_epoch(uint64_t& value) noexcept;
     [[nodiscard]] bool query_available_space(uint64_t& out_free_bytes) const;

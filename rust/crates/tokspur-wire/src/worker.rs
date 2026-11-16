@@ -1866,7 +1866,7 @@ impl OwnedWorker {
         require(
             self.options.shards.len() == 4
                 || (self.options.shards.len() == 1 && self.options.derived_pack.is_some()),
-            "owned target requires four fixed shards",
+            "owned target requires four fixed shards or one base file with a derived pack",
         )?;
         let mut distinct = BTreeSet::new();
         for i in 0..self.options.shards.len() {

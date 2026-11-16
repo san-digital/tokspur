@@ -703,7 +703,7 @@ struct TextStack::Impl {
 #endif
             ) {
             g.prepare_q8_matvec_many_all();
-            g.prepare_gdn_tiles(128);
+            g.prepare_gdn_tiles(32);
         }
 #ifdef TOKSPUR_PRIVATE_PREFILL_CHUNK
         if (known_capacity == 512
@@ -2368,7 +2368,7 @@ void TextStack::prepare_transient_verification(uint64_t budget) {
             keep(store->recurrent.views());
             store->replay = allocate_gdn_core_replay_scratch(p.g, p.shape.recurrent, 2);
             keep(std::array{store->replay.convolution_output, store->replay.delta_output});
-            p.g.prepare_q8_matvec_many(2); p.g.prepare_gdn_tiles(128);
+            p.g.prepare_q8_matvec_many(2); p.g.prepare_gdn_tiles(32);
         }
         admit();
     } catch (...) {
@@ -3025,7 +3025,7 @@ void TextStack::prepare_transient_verification8(uint64_t budget
             keep(store->recurrent.views());
             store->replay = allocate_gdn_core_replay_scratch(p.g, p.shape.recurrent, 8);
             keep(std::array{store->replay.convolution_output, store->replay.delta_output});
-            p.g.prepare_gdn_tiles(128);
+            p.g.prepare_gdn_tiles(32);
         }
 #ifdef TOKSPUR_PRIVATE_VERIFY_QSA_ROWS
         store->qsa_rows_memory.config = qsa_rows;

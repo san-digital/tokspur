@@ -12,6 +12,9 @@ use tokspur_sys::{EAGAIN, EINTR, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT, Po
 
 pub type Deadline = Instant;
 
+/// The most bytes a JSON response body may have. Responses have their own bound, apart from the request bound (`Limits::body_bytes`): a complete reply is serialised under this bound, and its JSON can be several times the largest request a server admits.
+pub const JSON_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
 /// `http::Limits`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
@@ -19,6 +22,7 @@ pub struct Limits {
     pub header_line_bytes: usize,
     pub header_count: usize,
     pub target_bytes: usize,
+    /// The most bytes a request body may have.
     pub body_bytes: usize,
     pub event_bytes: usize,
 }
@@ -226,7 +230,12 @@ fn trimmed(mut value: &[u8]) -> &[u8] {
 }
 
 fn crlf_only(value: &[u8]) -> Result<()> {
-    for i in 0..value.len() {
+    crlf_only_from(value, 0)
+}
+
+/// `crlf_only` for bytes from `start` on, given that `value[..start]` already passed.
+fn crlf_only_from(value: &[u8], start: usize) -> Result<()> {
+    for i in start..value.len() {
         if value[i] == b'\n' && (i == 0 || value[i - 1] != b'\r') {
             return Err(HttpError::new(400, "Bare LF in HTTP headers", false));
         }
@@ -270,6 +279,20 @@ fn reason(status: i32) -> Result<&'static str> {
             ));
         }
     })
+}
+
+/// The status line and fields of a JSON response whose body is `length` bytes.
+fn json_head(status: i32, length: usize) -> Result<String> {
+    let message = reason(status)?;
+    let extra = match status {
+        405 => "Allow: GET, POST\r\n",
+        401 => "WWW-Authenticate: Bearer realm=\"tokspur\"\r\n",
+        429 | 503 => "Retry-After: 5\r\n",
+        _ => "",
+    };
+    Ok(format!(
+        "HTTP/1.1 {status} {message}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {length}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n{extra}\r\n"
+    ))
 }
 
 fn content_length(value: &[u8], maximum: usize) -> Result<usize> {
@@ -494,6 +517,31 @@ fn parse_headers(head: &[u8], limits: Limits, body_length: &mut usize) -> Result
     Ok(result)
 }
 
+/// Where the one request of a connection stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadState {
+    Fresh,
+    /// `poll_request` has started it; `read_request` no longer applies.
+    Polling,
+    /// Returned or refused.
+    Done,
+}
+
+#[derive(Debug, Default)]
+struct Partial {
+    /// Header bytes received so far, until the header block is complete.
+    wire: Vec<u8>,
+    /// The parsed head with its partly received body, and the declared body length.
+    head: Option<(Request, usize)>,
+}
+
+/// One `recv` worth of progress on the request.
+enum Progress {
+    Blocked,
+    Advanced,
+    Complete(Request),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Response {
     Idle,
@@ -507,7 +555,9 @@ enum Response {
 pub struct Connection {
     fd: Option<OwnedFd>,
     limits: Limits,
-    read_started: bool,
+    read: ReadState,
+    /// The request as received so far. Boxed so that a connection stays small to move.
+    partial: Box<Partial>,
     request_complete: bool,
     poisoned: bool,
     response: Response,
@@ -521,7 +571,8 @@ impl Connection {
         Ok(Self {
             fd: Some(fd),
             limits,
-            read_started: false,
+            read: ReadState::Fresh,
+            partial: Box::default(),
             request_complete: false,
             poisoned: false,
             response: Response::Idle,
@@ -582,6 +633,68 @@ impl Connection {
     }
 
     pub fn read_request(&mut self, deadline: Deadline) -> Result<Request> {
+        if self.fd.is_none() || self.read != ReadState::Fresh || self.response != Response::Idle {
+            return Err(HttpError::new(
+                400,
+                "HTTP connection accepts exactly one request",
+                false,
+            ));
+        }
+        self.read = ReadState::Done;
+        loop {
+            let Some(fd) = self.fd.as_ref() else {
+                return Err(HttpError::new(
+                    400,
+                    "HTTP connection accepts exactly one request",
+                    false,
+                ));
+            };
+            wait_fd(fd, POLLIN, deadline)?;
+            if let Progress::Complete(request) = self.step(Some(deadline))? {
+                return Ok(request);
+            }
+        }
+    }
+
+    /// `read_request` without waiting: takes what has already arrived and returns `None` until the request is whole, or refuses with 408 once `deadline` passes. The refusals are those of `read_request`; the caller waits for input between calls (`Listener::poll_input`). A connection is read through this or through `read_request`, never both.
+    pub fn poll_request(&mut self, deadline: Deadline) -> Result<Option<Request>> {
+        if self.fd.is_none()
+            || !matches!(self.read, ReadState::Fresh | ReadState::Polling)
+            || self.response != Response::Idle
+        {
+            return Err(HttpError::new(
+                400,
+                "HTTP connection accepts exactly one request",
+                false,
+            ));
+        }
+        self.read = ReadState::Polling;
+        loop {
+            match self.step(Some(deadline)) {
+                Ok(Progress::Advanced) => {}
+                Ok(Progress::Blocked) if Instant::now() >= deadline => {
+                    self.read = ReadState::Done;
+                    return Err(HttpError::new(
+                        408,
+                        "HTTP transport deadline exceeded",
+                        false,
+                    ));
+                }
+                Ok(Progress::Blocked) => return Ok(None),
+                Ok(Progress::Complete(request)) => {
+                    self.read = ReadState::Done;
+                    return Ok(Some(request));
+                }
+                Err(error) => {
+                    self.read = ReadState::Done;
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// At most one `recv`, then everything that needs no further input. `deadline` is the blocking reader's, checked once the body is whole.
+    fn step(&mut self, deadline: Option<Deadline>) -> Result<Progress> {
         let Some(fd) = self.fd.as_ref() else {
             return Err(HttpError::new(
                 400,
@@ -589,79 +702,14 @@ impl Connection {
                 false,
             ));
         };
-        if self.read_started || self.response != Response::Idle {
-            return Err(HttpError::new(
-                400,
-                "HTTP connection accepts exactly one request",
-                false,
-            ));
-        }
-        self.read_started = true;
         let mut buffer = [0u8; 8192];
-        let mut wire: Vec<u8> = Vec::new();
-        let mut end = None;
-        while end.is_none() {
-            wait_fd(fd, POLLIN, deadline)?;
-            let count = match sysfd::recv(fd.as_fd(), &mut buffer, 0) {
-                Ok(count) => count,
-                Err(error) => {
-                    if matches!(error.raw_os_error(), Some(EAGAIN | EINTR)) {
-                        continue;
-                    }
-                    return Err(HttpError::system_from("Read HTTP headers", &error, true));
-                }
-            };
-            if count == 0 {
-                let status = if wire.is_empty() { 0 } else { 400 };
-                return Err(HttpError::new(
-                    status,
-                    "HTTP peer closed before complete headers",
-                    true,
-                ));
-            }
-            wire.extend_from_slice(&buffer[..count]);
-            end = find(&wire, b"\r\n\r\n", 0);
-            match end {
-                None => {
-                    crlf_only(&wire)?;
-                    if wire.len() >= self.limits.header_bytes {
-                        return Err(HttpError::new(
-                            431,
-                            "HTTP header byte limit exceeded",
-                            false,
-                        ));
-                    }
-                }
-                Some(at) if at + 4 > self.limits.header_bytes => {
-                    return Err(HttpError::new(
-                        431,
-                        "HTTP header byte limit exceeded",
-                        false,
-                    ));
-                }
-                Some(_) => {}
-            }
-        }
-        let end = end.unwrap_or(0);
-        let mut length = 0;
-        let mut result = parse_headers(&wire[..end], self.limits, &mut length)?;
-        result.body = wire[end + 4..].to_vec();
-        if result.body.len() > length {
-            return Err(HttpError::new(
-                400,
-                "Unexpected bytes after HTTP request body",
-                false,
-            ));
-        }
-        result.body.reserve(length);
-        while result.body.len() < length {
-            wait_fd(fd, POLLIN, deadline)?;
-            let want = buffer.len().min(length - result.body.len());
+        if let Some((request, length)) = self.partial.head.as_mut() {
+            let want = buffer.len().min(*length - request.body.len());
             let count = match sysfd::recv(fd.as_fd(), &mut buffer[..want], 0) {
                 Ok(count) => count,
                 Err(error) => {
                     if matches!(error.raw_os_error(), Some(EAGAIN | EINTR)) {
-                        continue;
+                        return Ok(Progress::Blocked);
                     }
                     return Err(HttpError::system_from("Read HTTP body", &error, true));
                 }
@@ -673,9 +721,72 @@ impl Connection {
                     true,
                 ));
             }
-            result.body.extend_from_slice(&buffer[..count]);
+            request.body.extend_from_slice(&buffer[..count]);
+        } else {
+            let count = match sysfd::recv(fd.as_fd(), &mut buffer, 0) {
+                Ok(count) => count,
+                Err(error) => {
+                    if matches!(error.raw_os_error(), Some(EAGAIN | EINTR)) {
+                        return Ok(Progress::Blocked);
+                    }
+                    return Err(HttpError::system_from("Read HTTP headers", &error, true));
+                }
+            };
+            if count == 0 {
+                let status = if self.partial.wire.is_empty() { 0 } else { 400 };
+                return Err(HttpError::new(
+                    status,
+                    "HTTP peer closed before complete headers",
+                    true,
+                ));
+            }
+            // The terminator can straddle two reads by at most three bytes, and everything before them is already known to hold none.
+            let scanned = self.partial.wire.len().saturating_sub(3);
+            self.partial.wire.extend_from_slice(&buffer[..count]);
+            let end = match find(&self.partial.wire, b"\r\n\r\n", scanned) {
+                None => {
+                    // The last byte seen before may be a CR whose successor has only now arrived.
+                    crlf_only_from(
+                        &self.partial.wire,
+                        (self.partial.wire.len() - count).saturating_sub(1),
+                    )?;
+                    if self.partial.wire.len() >= self.limits.header_bytes {
+                        return Err(HttpError::new(
+                            431,
+                            "HTTP header byte limit exceeded",
+                            false,
+                        ));
+                    }
+                    return Ok(Progress::Advanced);
+                }
+                Some(at) if at + 4 > self.limits.header_bytes => {
+                    return Err(HttpError::new(
+                        431,
+                        "HTTP header byte limit exceeded",
+                        false,
+                    ));
+                }
+                Some(at) => at,
+            };
+            let mut length = 0;
+            let mut request = parse_headers(&self.partial.wire[..end], self.limits, &mut length)?;
+            request.body = self.partial.wire[end + 4..].to_vec();
+            if request.body.len() > length {
+                return Err(HttpError::new(
+                    400,
+                    "Unexpected bytes after HTTP request body",
+                    false,
+                ));
+            }
+            request.body.reserve(length);
+            self.partial.wire = Vec::new();
+            self.partial.head = Some((request, length));
         }
-        if Instant::now() >= deadline {
+        match self.partial.head.as_ref() {
+            Some((request, length)) if request.body.len() >= *length => {}
+            _ => return Ok(Progress::Advanced),
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(HttpError::new(408, "HTTP request deadline exceeded", false));
         }
         let mut extra = [0u8; 1];
@@ -703,8 +814,15 @@ impl Connection {
                 }
             }
         }
+        let Some((request, _)) = self.partial.head.take() else {
+            return Err(HttpError::new(
+                400,
+                "HTTP connection accepts exactly one request",
+                false,
+            ));
+        };
         self.request_complete = true;
-        Ok(result)
+        Ok(Progress::Complete(request))
     }
 
     fn write_all(&mut self, mut data: &[u8], deadline: Deadline) -> Result<()> {
@@ -750,29 +868,45 @@ impl Connection {
         if self.response != Response::Idle {
             return Err(HttpError::new(500, "HTTP response already started", false));
         }
-        if body.len() > self.limits.body_bytes {
+        if body.len() > JSON_RESPONSE_BYTES {
             return Err(HttpError::new(
                 500,
-                "JSON response exceeds configured body limit",
+                "JSON response exceeds response byte limit",
                 false,
             ));
         }
-        let message = reason(status)?;
-        let extra = match status {
-            405 => "Allow: GET, POST\r\n",
-            401 => "WWW-Authenticate: Bearer realm=\"tokspur\"\r\n",
-            429 | 503 => "Retry-After: 5\r\n",
-            _ => "",
-        };
-        let header = format!(
-            "HTTP/1.1 {status} {message}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n{extra}\r\n",
-            body.len()
-        );
+        let header = json_head(status, body.len())?;
         self.response = Response::Json;
         self.write_all(header.as_bytes(), deadline)?;
         self.write_all(body, deadline)?;
         self.response = Response::Finished;
         Ok(())
+    }
+
+    /// `send_json` for a caller that may not wait, such as the accept loop turning a peer away: one `send` and no poll. A response the socket buffer does not take whole is given up with the connection; a small body on a connection that has been sent nothing fits. The request need not have been read.
+    pub fn refuse_json(&mut self, status: i32, body: &[u8]) -> Result<()> {
+        if self.response != Response::Idle {
+            return Err(HttpError::new(500, "HTTP response already started", false));
+        }
+        let mut message = json_head(status, body.len())?.into_bytes();
+        message.extend_from_slice(body);
+        self.response = Response::Finished;
+        let Some(fd) = self.fd.as_ref() else {
+            return Err(HttpError::new(
+                0,
+                "HTTP peer disconnected or sent unexpected bytes",
+                true,
+            ));
+        };
+        match sysfd::send(fd.as_fd(), &message, sysfd::MSG_DONTWAIT) {
+            Ok(count) if count == message.len() => Ok(()),
+            Ok(_) => Err(HttpError::new(
+                0,
+                "HTTP response write made no progress",
+                true,
+            )),
+            Err(error) => Err(HttpError::system_from("Write HTTP response", &error, true)),
+        }
     }
 
     pub fn begin_sse(&mut self, deadline: Deadline) -> Result<()> {
@@ -905,6 +1039,32 @@ impl Listener {
     pub fn close(&mut self) {
         self.fd = None;
         self.port = 0;
+    }
+
+    /// Waits up to `millis` for a connection to accept or for input on any of `handles` (`Connection::native_handle`). Entry 0 answers for the listener and entry `i + 1` for `handles[i]`; a closed or failed peer counts as input, so that reading it reports the failure. An interrupted wait reports nothing ready.
+    pub fn poll_input(&self, handles: &[i32], millis: i32) -> Result<Vec<bool>> {
+        let Some(fd) = self.fd.as_ref() else {
+            return Err(HttpError::new(0, "HTTP listener is closed", false));
+        };
+        let mut items = Vec::with_capacity(handles.len() + 1);
+        items.push(PollFd {
+            fd: fd.as_raw_fd(),
+            events: POLLIN,
+            revents: 0,
+        });
+        items.extend(handles.iter().map(|&handle| PollFd {
+            fd: handle,
+            events: POLLIN,
+            revents: 0,
+        }));
+        match sysfd::poll(&mut items, millis) {
+            Ok(_) => {}
+            Err(error) if error.raw_os_error() == Some(EINTR) => {
+                return Ok(vec![false; items.len()]);
+            }
+            Err(error) => return Err(HttpError::system_from("Poll HTTP socket", &error, true)),
+        }
+        Ok(items.iter().map(|item| item.revents != 0).collect())
     }
 
     /// An idle accept deadline returns status 408 (not disconnected), so a caller can poll briefly for shutdown.

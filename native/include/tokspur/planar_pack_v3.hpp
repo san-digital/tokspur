@@ -132,6 +132,9 @@ struct AdoptedPackV3 {
     uint32_t authentication_workers = 1;
     // Describes completed source reads, not pages released by the OS.
     std::string_view authentication_source_read_mode = "not_read";
+    derived_pack::LocalSealUse local_seal = derived_pack::LocalSealUse::not_consulted;
+    derived_pack::PackFileIdentity pack_identity; // of the descriptor that was adopted, after any verification
+    derived_pack::SealScope compared;             // what this call fully verified the pack against; empty when the seal was accepted
 };
 
 [[nodiscard]] std::vector<std::byte> build_header_v3(const PackPlanV3& plan);
@@ -165,6 +168,12 @@ struct PublishedPackV3 {
 };
 
 // Fully authenticate against the supplied sources before publishing or accepting a seal.
+// The seal (see derived_pack::TrustMode) records the manifest hash and the identity of
+// the verified pack file, with the scope target+mtp since both sources are required
+// here. A missing seal is created. An existing seal that already vouches for the pack
+// is kept. A sound seal for the same manifest that is not current (the earlier
+// manifest-only format, another file identity, or a narrower scope) is replaced by rename.
+// Any other existing seal is refused and left untouched.
 [[nodiscard]] PublishedPackV3 build_or_verify_pack_v3(
     PackPlanV3 plan, std::shared_ptr<const ModelFiles> source,
     std::shared_ptr<const ModelFiles> mtp_sidecar, const std::filesystem::path& output,

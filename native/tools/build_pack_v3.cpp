@@ -94,7 +94,9 @@ int main(int argc, char** argv) {
         const double publish_s = std::chrono::duration<double>(t1 - t0).count();
         const auto& plan = publication.verified.plan;
         const auto& manifest_sha256 = publication.verified.manifest_sha256;
-        const auto seal_path = output_path.parent_path() / (output_path.stem().string() + ".seal");
+        const auto seal_name = tokspur::derived_pack::local_seal_name(output_path.filename().string());
+        require(seal_name.has_value(), "pack v3 output name leaves no name for its seal");
+        const auto seal_path = output_path.parent_path() / *seal_name;
         const auto t2 = std::chrono::steady_clock::now();
         const auto adopted_local = tokspur::planar_v3::adopt_derived_pack_v3(
             source, mtp, output_path, experts_per_chunk, chunk_bytes, 16,
@@ -102,6 +104,9 @@ int main(int argc, char** argv) {
         const auto t3 = std::chrono::steady_clock::now();
         const double local_seal_s = std::chrono::duration<double>(t3 - t2).count();
         require(adopted_local.manifest_sha256 == manifest_sha256, "local-seal manifest_sha256 mismatch");
+        // A fallback to full verification would also pass, minutes later, and hide a seal that does not vouch.
+        require(adopted_local.local_seal == tokspur::derived_pack::LocalSealUse::accepted,
+                "published seal did not vouch for the pack");
 
         const uint64_t free_after = statvfs_avail(output_path.parent_path());
         std::filesystem::create_directories(receipt_path.parent_path());

@@ -75,6 +75,9 @@ impl DrainTimeouts {
     }
 }
 
+const DEFAULT_CHECKPOINT_FLOOR_GIB: f64 = 20.0;
+const DEFAULT_CHECKPOINT_POLICY: &str = "recompute-cost";
+
 /// Runtime, operator and supervision flags for `tokspur serve`, matching `src/tokspur/cli.py`.
 #[derive(Clone, PartialEq)]
 pub struct ServeOptions {
@@ -139,8 +142,10 @@ pub struct ServeOptions {
     pub request_timeout_seconds: u32,
     pub checkpoint_dir: Option<PathBuf>,
     pub checkpoint_cap_gib: Option<f64>,
-    pub checkpoint_floor_gib: f64,
-    pub checkpoint_policy: String,
+    /// `None` until given; the default floor is `DEFAULT_CHECKPOINT_FLOOR_GIB`.
+    pub checkpoint_floor_gib: Option<f64>,
+    /// `None` until given; the default policy is `DEFAULT_CHECKPOINT_POLICY`.
+    pub checkpoint_policy: Option<String>,
     pub overlap_prefill: bool,
     pub timeouts: DrainTimeouts,
 }
@@ -209,8 +214,8 @@ impl Default for ServeOptions {
             request_timeout_seconds: 3600,
             checkpoint_dir: None,
             checkpoint_cap_gib: None,
-            checkpoint_floor_gib: 20.0,
-            checkpoint_policy: "recompute-cost".to_owned(),
+            checkpoint_floor_gib: None,
+            checkpoint_policy: None,
             overlap_prefill: false,
             timeouts: DrainTimeouts::default(),
         }
@@ -533,17 +538,35 @@ pub fn validate_serve_options(opts: &ServeOptions) -> Result<(), CliError> {
             "checkpoint_cap_gib must be between 0.0 and 32.0 GiB".to_owned(),
         ));
     }
-    if !opts.checkpoint_floor_gib.is_finite() || !(0.0..=100.0).contains(&opts.checkpoint_floor_gib)
+    if let Some(gib) = opts.checkpoint_floor_gib
+        && (!gib.is_finite() || !(0.0..=100.0).contains(&gib))
     {
         return Err(CliError::Validation(
             "checkpoint_floor_gib must be between 0.0 and 100.0 GiB".to_owned(),
         ));
     }
-    if !matches!(opts.checkpoint_policy.as_str(), "recompute-cost" | "lru") {
+    if let Some(policy) = opts.checkpoint_policy.as_deref()
+        && !matches!(policy, "recompute-cost" | "lru")
+    {
         return Err(CliError::Validation(format!(
-            "Unsupported checkpoint_policy: {}",
-            opts.checkpoint_policy
+            "Unsupported checkpoint_policy: {policy}"
         )));
+    }
+    // Checkpoints are off until a positive capacity is given, so a checkpoint setting without one would be dropped silently.
+    if opts.checkpoint_cap_gib.unwrap_or(0.0) <= 0.0 {
+        let given = [
+            ("--checkpoint-dir", opts.checkpoint_dir.is_some()),
+            ("--checkpoint-policy", opts.checkpoint_policy.is_some()),
+            (
+                "--checkpoint-floor-gib",
+                opts.checkpoint_floor_gib.is_some(),
+            ),
+        ];
+        if let Some((flag, _)) = given.iter().find(|(_, is_given)| *is_given) {
+            return Err(CliError::Validation(format!(
+                "{flag} has no effect unless --checkpoint-cap-gib is greater than 0"
+            )));
+        }
     }
 
     if let Some(depth) = opts.mtp_depth
@@ -1023,11 +1046,15 @@ pub fn build_carrier_flags(
             "--checkpoint-cap-gib".to_owned(),
             effective_checkpoint_cap.to_string(),
             "--checkpoint-floor-gib".to_owned(),
-            opts.checkpoint_floor_gib.to_string(),
+            opts.checkpoint_floor_gib
+                .unwrap_or(DEFAULT_CHECKPOINT_FLOOR_GIB)
+                .to_string(),
             "--checkpoint-dir".to_owned(),
             ckpt_dir_str.to_owned(),
             "--checkpoint-policy".to_owned(),
-            opts.checkpoint_policy.clone(),
+            opts.checkpoint_policy
+                .clone()
+                .unwrap_or_else(|| DEFAULT_CHECKPOINT_POLICY.to_owned()),
         ]);
     }
     if opts.overlap_prefill {
@@ -1406,24 +1433,25 @@ fn adoption_matches_dirs(
     if !target_ok || !draft_ok {
         return false;
     }
-    if let Some(raw_df) = explicit_dflash2 {
-        let Ok(canon_df) = fs::canonicalize(raw_df) else {
-            return false;
-        };
-        let Some(canon_df_str) = canon_df.to_str() else {
-            return false;
-        };
-        let df_ok = existing
-            .find("dflash2_draft")
-            .ok()
-            .flatten()
-            .and_then(|g| json_str(g, "directory").ok())
-            == Some(canon_df_str);
-        if !df_ok {
-            return false;
-        }
+    if let Some(raw_df) = explicit_dflash2
+        && !adoption_records_dflash2_dir(existing, raw_df)
+    {
+        return false;
     }
     check_adoption(existing, assets_profile).is_ok()
+}
+
+/// Whether `raw_dir` resolves to the directory the adoption records under `dflash2_draft`. The record is only trusted once `check_adoption` has passed on the same adoption.
+fn adoption_records_dflash2_dir(adoption: &Json, raw_dir: &Path) -> bool {
+    let Ok(resolved) = fs::canonicalize(raw_dir) else {
+        return false;
+    };
+    let recorded = adoption
+        .find("dflash2_draft")
+        .ok()
+        .flatten()
+        .and_then(|group| json_str(group, "directory").ok());
+    recorded.is_some() && recorded == resolved.to_str()
 }
 
 fn resolve_serve_config_port(
@@ -1473,7 +1501,7 @@ pub fn serve_foreground(layout: &RuntimeLayout, opts: &ServeOptions) -> Result<i
     let assets_profile = read_json_file(&layout.assets_profile_path())?;
     let adoption_path = tokspur_base.join("adoption.json");
     let mut auto_adopted = false;
-    let adoption = if let Some(raw_dir) = opts.model_dir.as_deref() {
+    let mut adoption = if let Some(raw_dir) = opts.model_dir.as_deref() {
         let resolved_dir = fs::canonicalize(raw_dir).map_err(|source| CliError::Io {
             context: "cannot resolve model directory".to_owned(),
             source,
@@ -1502,8 +1530,24 @@ pub fn serve_foreground(layout: &RuntimeLayout, opts: &ServeOptions) -> Result<i
         }
     } else if adoption_path.is_file() {
         let existing = read_json_file(&adoption_path)?;
-        check_adoption(&existing, &assets_profile)?;
-        existing
+        match opts.dflash2_dir.as_deref() {
+            // An explicit checkpoint the adoption does not record is hashed against the pinned profile and recorded, as the two other branches do. It replaces any checkpoint recorded before.
+            Some(raw_df) if !adoption_records_dflash2_dir(&existing, raw_df) => {
+                let mut stderr = std::io::stderr().lock();
+                record_dflash2_in_adoption(
+                    &tokspur_base,
+                    &assets_profile,
+                    &existing,
+                    raw_df,
+                    &mut stderr,
+                )?
+                .0
+            }
+            _ => {
+                check_adoption(&existing, &assets_profile)?;
+                existing
+            }
+        }
     } else {
         let managed_root = layout.managed_models_dir()?;
         let target_repo = assets_profile
@@ -1589,13 +1633,14 @@ pub fn serve_foreground(layout: &RuntimeLayout, opts: &ServeOptions) -> Result<i
             let candidate_df = managed_root.join(df_leaf);
             if directory_has_candidate_assets(&assets_profile, df_key, &candidate_df)? {
                 let mut stderr = std::io::stderr().lock();
-                let (_updated_adoption, resolved_df) = record_dflash2_in_adoption(
+                let (updated_adoption, resolved_df) = record_dflash2_in_adoption(
                     &tokspur_base,
                     &assets_profile,
                     &adoption,
                     &candidate_df,
                     &mut stderr,
                 )?;
+                adoption = updated_adoption;
                 effective_opts.dflash2_dir = Some(resolved_df);
             }
         }
@@ -1736,6 +1781,13 @@ pub fn serve_foreground(layout: &RuntimeLayout, opts: &ServeOptions) -> Result<i
                 "DFlash2 checkpoint directory not found: {}",
                 speculative_path.display()
             )));
+        }
+        // The native drafter hashes only config.json, so the weights are pinned here: the worker is given a directory only if the checked adoption records it.
+        if !adoption_records_dflash2_dir(&adoption, &speculative_path) {
+            return Err(CliError::Validation(
+                "DFlash2 checkpoint directory is not the verified adoption; re-run 'tokspur adopt' with --dflash2-dir"
+                    .to_owned(),
+            ));
         }
         SpeculativeAsset::DFlash2Dir(&speculative_path)
     } else {

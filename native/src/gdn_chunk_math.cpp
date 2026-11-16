@@ -49,7 +49,7 @@ GdnChunkSpec gdn_chunk_spec(const GdnChunkDispatch& d) {
     case GdnChunkOp::convolution:return {"gdn_chunk_conv",7,24,{ceildiv(uint64_t(p.rows)*p.columns,128),1,1}};
     case GdnChunkOp::prepare:return {"gdn_chunk_prepare",1,14,{ceildiv(uint64_t(p.rows)*p.heads,4),1,1}};
     case GdnChunkOp::gates:return {"gdn_chunk_gates",15,48,{ceildiv(uint64_t(p.rows)*p.heads,128),1,1}};
-    case GdnChunkOp::fused:return {"gdn_chunk_fused",63,320,{ceildiv(uint64_t(p.heads)*p.value_width,4),1,1}};
+    case GdnChunkOp::fused:return {"gdn_chunk_fused",63,320,{ceildiv(uint64_t(p.heads)*((uint64_t(p.value_width)+3u)/4u),4),1,1}};
     case GdnChunkOp::rms_gate:return {"gdn_chunk_rms_gate",7,8,{ceildiv(uint64_t(p.rows)*p.heads,4),1,1}};
     case GdnChunkOp::rms_rows:need(p.value_width!=0,"zero GDN RMS width");return {"gdn_chunk_rms_rows",3,4,{ceildiv(uint64_t(p.rows)*p.columns/p.value_width,4),1,1}};
     case GdnChunkOp::prefix64:return {"gdn_chunk_prefix64",1,2,{ceildiv(p.heads,128),1,1}};

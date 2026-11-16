@@ -361,9 +361,10 @@ def release_body(tag: str, repository: str, digest: str) -> str:
         guide = "https://tokspur.com/get-started/"
     else:
         version = f"the signed {tag} release"
+        # The installer defaults to the upstream repository, so name this one.
         command = (
             f"curl -fsSL https://github.com/{repository}/releases/download/{tag}/install.sh"
-            f" | TOKSPUR_VERSION={tag} sh"
+            f" | TOKSPUR_REPOSITORY={repository} TOKSPUR_VERSION={tag} sh"
         )
         guide = f"https://github.com/{repository}#add-the-model"
 

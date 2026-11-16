@@ -80,11 +80,14 @@ void run() {
         envelope(encode("x<|endoftext|>"), "stop"), envelope(encode("<|im_start|>x<|im_end|>"), "stop"),
         envelope(encode("x<|im_end|>y<|im_end|>"), "stop"),
         envelope(encode(call + "unexpected<|im_end|>"), "stop"),
-        envelope(encode("<think>unfinished<|im_end|>"), "stop"),
         envelope(encode("<tool_call><function=read_file></function></tool_call><|im_end|>"), "stop"),
         envelope(encode("<tool_call><function=unknown></function></tool_call><|im_end|>"), "stop")}) {
         refused([&] { static_cast<void>(parse(invalid)); });
     }
+    // A stop while thinking is still open ends the thinking there: the reasoning is returned with an empty answer.
+    const auto open = parse(envelope(encode("<think>unfinished<|im_end|>"), "stop"));
+    check(open.find("status")->string() == "complete" && open.find("complete")->boolean() && open.find("reasoning_content")->string() == "unfinished" &&
+        open.find("content")->string().empty() && open.find("tool_calls")->array().empty(), "stop inside open thinking refused");
     auto earlier = all; earlier.insert(earlier.begin(), admission.im_end);
     refused([&] { static_cast<void>(parse(envelope(earlier, "stop"))); });
     refused([&] { static_cast<void>(parse(envelope({admission.vocabulary}, "length", false, manifest(), Json()))); });

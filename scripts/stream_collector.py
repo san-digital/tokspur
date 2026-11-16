@@ -26,6 +26,7 @@ What it measures and what it refuses to claim:
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import socket
@@ -59,15 +60,38 @@ def need(condition, message):
         raise CollectorError(message)
 
 
-def _request_bytes(endpoint, body, api_key):
+def _is_loopback(host):
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def local_endpoint(endpoint):
+    """The host and URL parts of a plain-http loopback endpoint.
+
+    The API key travels in clear text, so no other host is accepted.
+    """
     parts = urlsplit(endpoint)
     need(parts.scheme == "http", "only plain http to a local endpoint is supported")
     host = parts.hostname or "127.0.0.1"
+    need(
+        _is_loopback(host),
+        "the endpoint host must be loopback: 127.0.0.0/8, ::1 or localhost",
+    )
+    return host, parts
+
+
+def _request_bytes(endpoint, body, api_key):
+    host, parts = local_endpoint(endpoint)
     port = parts.port or 80
     path = parts.path.rstrip("/") + "/chat/completions"
+    name = f"[{host}]" if ":" in host else host
     lines = [
         f"POST {path} HTTP/1.1",
-        f"Host: {host}:{port}",
+        f"Host: {name}:{port}",
         "Content-Type: application/json",
         "Accept: text/event-stream, application/json",
         f"Content-Length: {len(body)}",
@@ -429,6 +453,7 @@ def main(argv=None):
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--out", required=True, help="receipt JSONL, outside Git")
     args = parser.parse_args(argv)
+    local_endpoint(args.endpoint)
     with open(args.body_file, encoding="utf-8") as handle:
         payload = json.load(handle)
     api_key = _api_key(args)

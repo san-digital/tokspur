@@ -8,6 +8,8 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
     "lifecycle_gates", ROOT / "scripts/lifecycle_gates.py"
@@ -301,6 +303,18 @@ def test_no_exchange_is_inconclusive_not_a_pass(tmp_path):
     finally:
         fake.close()
     assert report["verdict"] == "inconclusive"
+
+
+def test_gates_send_the_api_key_only_to_a_loopback_host(monkeypatch):
+    def no_connection(*_args, **_kwargs):
+        pytest.fail("a refused endpoint must not be contacted")
+
+    monkeypatch.setattr(socket, "create_connection", no_connection)
+    remote = "http://192.0.2.1:8080/v1"
+    with pytest.raises(gates.collector.CollectorError, match="loopback"):
+        gates.cancel_gate(remote, body(), rounds=1, api_key="secret", timeout=1)
+    with pytest.raises(gates.collector.CollectorError, match="loopback"):
+        gates.evict_reference(remote, body(), body(user="other"), "secret", 1)
 
 
 def test_exchange_parser_counts_only_live_aborted_generations(tmp_path):

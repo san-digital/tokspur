@@ -28,7 +28,8 @@ public:
         else literal_ranges.emplace_back(start, value_.size());
     }
     void parameter(std::string_view value) {
-        if (value.find("\n</parameter>") != std::string_view::npos) throw FormatError("raw tool argument contains parameter delimiter");
+        // The caller writes the newline that precedes the value, so a leading </parameter> completes the delimiter too.
+        if (value.starts_with("</parameter>") || value.find("\n</parameter>") != std::string_view::npos) throw FormatError("raw tool argument contains parameter delimiter");
         literal(value);
     }
     std::vector<std::pair<size_t, size_t>> literal_ranges;

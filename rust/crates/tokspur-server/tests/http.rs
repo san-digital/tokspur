@@ -16,7 +16,9 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use tokspur_server::http::{Connection, Deadline, HttpError, Limits, Listener};
+use tokspur_server::http::{
+    Connection, Deadline, HttpError, JSON_RESPONSE_BYTES, Limits, Listener,
+};
 use tokspur_sys::fd as sysfd;
 
 static CHECKS: AtomicUsize = AtomicUsize::new(0);
@@ -192,6 +194,69 @@ fn fragmented_bytes() {
         connection.read_request(soon()).unwrap().body == binary,
         "Transport changed raw body NUL/UTF-8 before caller JSON validation",
     );
+}
+
+/// `poll_request` never waits, and over any delivery returns what `read_request` returns.
+fn polled_requests() {
+    let body = b"{\"text\":\"\xf0\x9f\xa7\xa0\"}".to_vec();
+    let wire = post(&body);
+    // A byte at a time: nothing is returned, and nothing refused, until the last byte is in.
+    let mut pair = Pair::new();
+    let mut connection = Connection::new(pair.take(), Limits::default()).unwrap();
+    need(
+        connection.poll_request(soon()).unwrap().is_none(),
+        "Polling a silent HTTP peer returned a request",
+    );
+    for (index, byte) in wire.iter().enumerate() {
+        put(pair.peer(), std::slice::from_ref(byte));
+        let polled = connection.poll_request(soon()).unwrap();
+        if index + 1 < wire.len() {
+            need(polled.is_none(), "Partial HTTP request was returned");
+            continue;
+        }
+        let request = polled.expect("Whole HTTP request was not returned");
+        need(
+            request.method == "POST"
+                && request.path == "/v1/chat/completions"
+                && request.header("authorization") == "Bearer fixture-only"
+                && request.body == body,
+            "Polled HTTP request differs from the blocking read",
+        );
+    }
+    rejects(connection.poll_request(soon()), 400, false);
+    rejects(connection.read_request(soon()), 400, false);
+    // The refusals of the blocking read, on the same bytes.
+    for (wire, status) in [
+        (&b"GET / HTTP/1.1\nHost: a\r\n\r\n"[..], 400),
+        (&b"GET / HTTP/1.0\r\nHost: a\r\n\r\n"[..], 505),
+        (&b"POST / HTTP/1.1\r\nHost: a\r\n\r\n"[..], 411),
+        (&b"GET /health HTTP/1.1\r\nHost: a\r\n\r\nGET"[..], 400),
+    ] {
+        let mut pair = Pair::new();
+        let mut connection = Connection::new(pair.take(), Limits::default()).unwrap();
+        put(pair.peer(), wire);
+        rejects(connection.poll_request(soon()), status, false);
+        rejects(connection.poll_request(soon()), 400, false);
+    }
+    // A stalled peer is refused at the deadline, and a closed one is reported as gone.
+    let mut pair = Pair::new();
+    let mut connection = Connection::new(pair.take(), Limits::default()).unwrap();
+    put(pair.peer(), b"GET / HTTP/1.1\r\n");
+    rejects(connection.poll_request(Instant::now()), 408, false);
+    let mut pair = Pair::new();
+    let mut connection = Connection::new(pair.take(), Limits::default()).unwrap();
+    put(pair.peer(), b"GET / HTTP/1.1\r\n");
+    need(
+        connection.poll_request(soon()).unwrap().is_none(),
+        "Partial HTTP request was returned",
+    );
+    pair.peer = None;
+    rejects(connection.poll_request(soon()), 400, true);
+    // Starting with the blocking read rules polling out.
+    let mut pair = Pair::new();
+    let mut connection = Connection::new(pair.take(), Limits::default()).unwrap();
+    rejects(connection.read_request(Instant::now()), 408, false);
+    rejects(connection.poll_request(soon()), 400, false);
 }
 
 fn malformed_requests() {
@@ -397,6 +462,67 @@ fn response_wire() {
         );
     }
     {
+        // A response is not bounded by the request body limit: a reply may be larger than any request the server admits.
+        let mut pair = Pair::new();
+        let limits = Limits {
+            body_bytes: 16,
+            ..Limits::default()
+        };
+        let mut connection = Connection::new(pair.take(), limits).unwrap();
+        put(pair.peer(), GET_REQUEST);
+        connection.read_request(soon()).unwrap();
+        let body = vec![b'x'; 4096];
+        connection.send_json(200, &body, soon()).unwrap();
+        connection.close();
+        let raw = get_all_fd(pair.peer().as_raw_fd());
+        need(
+            contains(&raw, b"\r\nContent-Length: 4096\r\n").is_some() && raw.ends_with(&body),
+            "JSON response was cut to the request body limit",
+        );
+        // The response bound is its own, and refusing by it leaves the connection free to send the error.
+        let mut pair = Pair::new();
+        let mut connection = Connection::new(pair.take(), limits).unwrap();
+        let oversized = vec![b'x'; JSON_RESPONSE_BYTES + 1];
+        rejects(connection.send_json(200, &oversized, soon()), 500, false);
+        connection.send_json(502, b"{}", soon()).unwrap();
+        connection.close();
+        need(
+            get_all_fd(pair.peer().as_raw_fd()).starts_with(b"HTTP/1.1 502 Bad Gateway\r\n"),
+            "Oversized JSON response was partly written",
+        );
+    }
+    {
+        // A refusal goes out whole without the request having been read, and is the connection's one response.
+        let mut pair = Pair::new();
+        let mut connection = Connection::new(pair.take(), Limits::default()).unwrap();
+        put(pair.peer(), b"GET /health HTTP/1.1\r\nHost: loc");
+        let body = b"{\"error\":\"busy\"}";
+        connection.refuse_json(503, body).unwrap();
+        rejects(connection.refuse_json(503, body), 500, false);
+        rejects(connection.send_json(200, b"{}", soon()), 500, false);
+        rejects(connection.poll_request(soon()), 400, false);
+        connection.close();
+        let raw = get_all_fd(pair.peer().as_raw_fd());
+        let end = contains(&raw, b"\r\n\r\n");
+        need(
+            raw.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n")
+                && contains(&raw, b"\r\nRetry-After: 5\r\n").is_some()
+                && contains(&raw, b"\r\nConnection: close\r\n").is_some()
+                && end.is_some_and(|end| &raw[end + 4..] == body),
+            "Unwaited JSON refusal status/framing/body differs",
+        );
+        // A peer that has gone is reported, not waited for.
+        let mut pair = Pair::new();
+        let mut connection = Connection::new(pair.take(), Limits::default()).unwrap();
+        pair.close_peer();
+        rejects(connection.refuse_json(503, body), 0, true);
+        // An unregistered status is refused before anything is written.
+        let mut pair = Pair::new();
+        let mut connection = Connection::new(pair.take(), Limits::default()).unwrap();
+        rejects(connection.refuse_json(599, body), 500, false);
+        connection.send_json(200, b"{}", soon()).unwrap();
+    }
+    {
         let mut pair = Pair::new();
         let mut connection = Connection::new(pair.take(), Limits::default()).unwrap();
         put(pair.peer(), GET_REQUEST);
@@ -596,6 +722,7 @@ fn main() {
         }
     };
     fragmented_bytes();
+    polled_requests();
     section("s1");
     malformed_requests();
     section("s2");

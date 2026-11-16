@@ -459,6 +459,18 @@ public:
     static TargetSampler restore_stochastic_branch(TargetSampling options, uint32_t prefix, const SamplingRng& rng, uint32_t context_length = 65536) {
         return restore_branch(options, prefix, rng, context_length);
     }
+    // The sampler a prefix-cache hit (SSD checkpoint or shared-prefix anchor)
+    // publishes at prefix. An append packet passes its live stream and keeps
+    // it: entropy belongs to the session, so a hit must leave the stream where
+    // a miss would, never rewound to word 0 or swapped for the saved one. A
+    // reset continues the saved stream for the same stochastic seed and
+    // otherwise starts its own.
+    static TargetSampler restore_cached_prefix(TargetSampling options, uint32_t prefix, const SamplingRng& saved,
+                                               const SamplingRng* inherited, uint32_t context_length = 65536) {
+        if (inherited) return restore_branch(options, prefix, *inherited, context_length);
+        if (options.policy.temperature > 0 && options.seed == saved.seed()) return restore_branch(options, prefix, saved, context_length);
+        return restore_branch(options, prefix, SamplingRng(options.seed), context_length);
+    }
     [[nodiscard]] bool matches(uint32_t prefix) const noexcept { return valid_ && prefix_ == prefix; }
     [[nodiscard]] bool valid() const noexcept { return valid_; }
     [[nodiscard]] uint32_t prefix() const noexcept { return prefix_; }
@@ -748,9 +760,13 @@ public:
             "current logits cannot preserve bounded branch transfer storage");
         for (auto value : retained.get(used_).logits) require(std::isfinite(value), "nonfinite current branch logits");
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
-        auto replacement = (record.has_rng && options.policy.temperature > 0 && options.seed == record.rng.seed())
-            ? TargetSampler::restore_branch(options, prefix, record.rng, context_length_)
-            : TargetSampler::fresh_branch(options, prefix, context_length_);
+        // This build admits stochastic branch requests. One whose seed differs
+        // from the record's, or whose record holds no stream, starts its own
+        // stream at the restored prefix, as a cold prefill of the same tokens
+        // would: fresh_branch is greedy-only and refused it on every retry.
+        auto replacement = TargetSampler::restore_branch(options, prefix,
+            record.has_rng && options.policy.temperature > 0 && options.seed == record.rng.seed()
+                ? record.rng : SamplingRng(options.seed), context_length_);
 #else
         auto replacement = TargetSampler::fresh_branch(options, prefix, context_length_);
 #endif
@@ -5599,7 +5615,7 @@ int target_cli(int argc, char** argv) {
             const auto* hc_down_window_event=value.find("event");
             if(operator_hc_down_window.has_value()&&hc_down_window_event&&(hc_down_window_event->string()=="ready"||hc_down_window_event->string()=="done")){
                 fields.emplace_back("operator_prefill_hc_down_window_schema",Json::integer(1));fields.emplace_back("operator_prefill_hc_down_window_route",Json(gpu.prefill_hc_down_window()?"window16-q8-simd32-exact":"scalar-hc-exact"));
-                fields.emplace_back("operator_prefill_hc_down_window_threadgroup_bytes",Json::integer(gpu.prefill_hc_down_window()?32768:0));
+                fields.emplace_back("operator_prefill_hc_down_window_threadgroup_bytes",Json::integer(gpu.prefill_hc_down_window()?8192:0));
                 fields.emplace_back("operator_prefill_hc_down_window_encoded",Json::integer(gpu.hc_down_window_encoded()));
             }
 #endif
@@ -6249,21 +6265,6 @@ int target_cli(int argc, char** argv) {
 #include "sampled_verification_cost_probe.inc"
 #endif
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
-    const auto compute_ssd_state_digest = [&](const std::array<uint8_t, 32>& exec_digest,
-                                              uint32_t pfx, uint64_t stack_bytes,
-                                              uint64_t mtp_bytes, bool has_logits) -> std::array<uint8_t, 32> {
-        CC_SHA256_CTX ctx;
-        CC_SHA256_Init(&ctx);
-        CC_SHA256_Update(&ctx, exec_digest.data(), sizeof(exec_digest));
-        CC_SHA256_Update(&ctx, &pfx, sizeof(pfx));
-        CC_SHA256_Update(&ctx, &stack_bytes, sizeof(stack_bytes));
-        CC_SHA256_Update(&ctx, &mtp_bytes, sizeof(mtp_bytes));
-        const uint8_t hl = has_logits ? 1u : 0u;
-        CC_SHA256_Update(&ctx, &hl, sizeof(hl));
-        std::array<uint8_t, 32> digest{};
-        CC_SHA256_Final(digest.data(), &ctx);
-        return digest;
-    };
     const auto ssd_filename_for_digest = [&](std::span<const uint32_t> prefix_tokens, bool has_logits,
                                              const std::array<uint8_t, 32>& exec_digest) -> std::string {
         CC_SHA256_CTX ctx;
@@ -6312,7 +6313,7 @@ int target_cli(int argc, char** argv) {
         hdr.prefix_tokens = pfx;
         hdr.total_payload_bytes = checked_add(stack_bytes, mtp_bytes);
         hdr.is_system_anchor = is_system_anchor ? 1 : 0;
-        hdr.state_digest = compute_ssd_state_digest(exec_digest, pfx, stack_bytes, mtp_bytes, has_logits);
+        hdr.state_digest = checkpoint_state_digest(exec_digest, prefix_tokens, stack_bytes, mtp_bytes, has_logits);
         CheckpointMetadata meta{};
         meta.rng = sampler.random();
         meta.controller_state = has_speculative ? mtp_generation.controller_state() : StageAControllerState{};
@@ -6346,7 +6347,8 @@ int target_cli(int argc, char** argv) {
     };
     const auto restore_from_ssd_with_digest = [&](std::span<const uint32_t> prefix_tokens, bool expect_logits,
                                                   const TargetSampling& sampling_opts,
-                                                  const std::array<uint8_t, 32>& exec_digest) -> bool {
+                                                  const std::array<uint8_t, 32>& exec_digest,
+                                                  const SamplingRng* inherited_stream = nullptr) -> bool {
         if (!ssd_manager || !ssd_manager->enabled() || prefix_tokens.empty()) return false;
         const uint32_t target_pfx = uint32_t(prefix_tokens.size());
         if (target_pfx > shape.attention.capacity) return false;
@@ -6417,7 +6419,8 @@ int target_cli(int argc, char** argv) {
                         return false;
                     }
                     if (hdr.total_payload_bytes != stack_bytes + expected_mtp) return false;
-                    if (hdr.state_digest != compute_ssd_state_digest(exec_digest, target_pfx, stack_bytes, expected_mtp, expect_logits)) {
+                    // Binds the requested token IDs: the file name alone is not proof of the prefix.
+                    if (hdr.state_digest != checkpoint_state_digest(exec_digest, prefix_tokens, stack_bytes, expected_mtp, expect_logits)) {
                         return false;
                     }
                     if (expect_logits) {
@@ -6442,15 +6445,7 @@ int target_cli(int argc, char** argv) {
         restored_res.logits_available = expect_logits;
         if (expect_logits) restored_res.logits = std::move(out_meta.logits);
         retained.commit(std::move(restored_res), target_pfx, expect_logits);
-        if (sampling_opts.policy.temperature > 0 && sampling_opts.seed == out_meta.rng.seed()) {
-            sampler = TargetSampler::restore_branch(sampling_opts, target_pfx, out_meta.rng, target_context_length);
-        } else {
-            TargetSampler fresh(sampling_opts, target_context_length);
-            for (uint32_t p = 1; p <= target_pfx; ++p) {
-                require(fresh.committed_input(p), "SSD checkpoint sampler prefix restore failed");
-            }
-            sampler = std::move(fresh);
-        }
+        sampler = TargetSampler::restore_cached_prefix(sampling_opts, target_pfx, out_meta.rng, inherited_stream, target_context_length);
         if (has_speculative) {
             mtp_generation.controller_state() = restore_controller_policy(out_meta.controller_state, mtp_generation.controller_policy(), mtp_generation.controller_policy() != default_controller_policy_digest);
         }
@@ -6465,10 +6460,11 @@ int target_cli(int argc, char** argv) {
         ssd_restored_tokens += target_pfx;
         return true;
     };
-    const auto restore_from_ssd = [&](std::span<const uint32_t> prefix_tokens, bool expect_logits, const TargetSampling& sampling_opts) -> bool {
+    const auto restore_from_ssd = [&](std::span<const uint32_t> prefix_tokens, bool expect_logits, const TargetSampling& sampling_opts,
+                                      const SamplingRng* inherited_stream = nullptr) -> bool {
         const auto exec_digest =
             ssd_execution_digest_for(uint32_t(stack.execution()), stack.known_residual_reuse(), gpu.kernel_policy());
-        return restore_from_ssd_with_digest(prefix_tokens, expect_logits, sampling_opts, exec_digest);
+        return restore_from_ssd_with_digest(prefix_tokens, expect_logits, sampling_opts, exec_digest, inherited_stream);
     };
 #endif
     const auto current_chunk_mode_byte = [&]() -> uint8_t {
@@ -6599,7 +6595,8 @@ int target_cli(int argc, char** argv) {
         ++shared_prefix_cache.captures;
         return true;
     };
-    const auto restore_shared_prefix_anchor = [&](SharedPrefixAnchor& anchor, bool expect_logits, const TargetSampling& sampling_opts) -> bool {
+    const auto restore_shared_prefix_anchor = [&](SharedPrefixAnchor& anchor, bool expect_logits, const TargetSampling& sampling_opts,
+                                                  const SamplingRng* inherited_stream) -> bool {
         if (!shared_prefix_cache_enabled || anchor.tokens.empty()) return false;
         if (anchor.kernel_policy != gpu.kernel_policy() || anchor.chunk_mode != current_chunk_mode_byte() || anchor.has_mtp != has_active_mtp()) {
             return false;
@@ -6627,15 +6624,7 @@ int target_cli(int argc, char** argv) {
         restored_res.logits_available = expect_logits;
         if (expect_logits) restored_res.logits = anchor.logits;
         retained.commit(std::move(restored_res), target_pfx, expect_logits);
-        if (sampling_opts.policy.temperature > 0 && sampling_opts.seed == anchor.rng.seed()) {
-            sampler = TargetSampler::restore_branch(sampling_opts, target_pfx, anchor.rng, target_context_length);
-        } else {
-            TargetSampler fresh(sampling_opts, target_context_length);
-            for (uint32_t p = 1; p <= target_pfx; ++p) {
-                require(fresh.committed_input(p), "shared prefix cache sampler prefix restore failed");
-            }
-            sampler = std::move(fresh);
-        }
+        sampler = TargetSampler::restore_cached_prefix(sampling_opts, target_pfx, anchor.rng, inherited_stream, target_context_length);
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
         if (has_speculative) {
             mtp_generation.controller_state() = restore_controller_policy(anchor.controller_state, mtp_generation.controller_policy(), mtp_generation.controller_policy() != default_controller_policy_digest);
@@ -7327,6 +7316,9 @@ int target_cli(int argc, char** argv) {
                     ;
                 const auto restore_started = Clock::now();
                 const auto opts = job.reset ? job.sampling : sampler.options();
+                // Copied before any restore: an append keeps this exact stream.
+                const SamplingRng live_stream = sampler.random();
+                const SamplingRng* const inherited_stream = job.reset ? nullptr : &live_stream;
                 const auto original_prefix = stack.position();
                 auto entries = ssd_manager->list_entries();
                 std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) { return a.prefix_tokens > b.prefix_tokens; });
@@ -7337,7 +7329,7 @@ int target_cli(int argc, char** argv) {
                     bool restored = false;
                     for (const bool logits : {true, false}) {
                         if ((!logits && needs_logits) || entry.filename != ssd_filename_for(prefix, logits)) continue;
-                        restored = restore_from_ssd(prefix, logits, opts);
+                        restored = restore_from_ssd(prefix, logits, opts, inherited_stream);
                         if (restored) break;
                     }
                     if (!restored) continue;
@@ -7384,7 +7376,9 @@ int target_cli(int argc, char** argv) {
                     const bool full_packet_restore = best_anchor->tokens.size() == candidate_history.size();
                     const bool expect_logits = full_packet_restore ? (packet_emits_logits || job.generate > 0) : false;
                     const auto opts = job.reset ? job.sampling : sampler.options();
-                    if (restore_shared_prefix_anchor(*best_anchor, expect_logits, opts)) {
+                    // Copied before the restore: an append keeps this exact stream.
+                    const SamplingRng live_stream = sampler.random();
+                    if (restore_shared_prefix_anchor(*best_anchor, expect_logits, opts, job.reset ? nullptr : &live_stream)) {
                         const size_t restored_in_job = best_anchor->tokens.size() - before_pos;
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
                         if (mtp || dflash2) {

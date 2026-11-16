@@ -3,12 +3,12 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -241,12 +241,15 @@ fn dump_json(value: &Json) -> Vec<u8> {
     out
 }
 
+// The fake server takes its controls from `TOKSPUR_FAKE_*` variables: `tokspur serve` forwards only an allowlist of variables to the server, and `TOKSPUR_*` is on it.
 const FAKE_SERVER_C: &str = r#"
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+extern char **environ;
 
 static volatile sig_atomic_t got_stop = 0;
 
@@ -318,7 +321,7 @@ static int pack_command(int argc, char **argv) {
 int main(int argc, char **argv) {
     if (argc > 1 && (!strcmp(argv[1], "pack-v3-plan") || !strcmp(argv[1], "pack-v3-build")))
         return pack_command(argc, argv);
-    const char *argv_out = getenv("FAKE_SERVER_ARGV_FILE");
+    const char *argv_out = getenv("TOKSPUR_FAKE_SERVER_ARGV_FILE");
     if (argv_out && argv_out[0]) {
         FILE *af = fopen(argv_out, "w");
         if (af) {
@@ -326,21 +329,29 @@ int main(int argc, char **argv) {
             fclose(af);
         }
     }
-    const char *mode = getenv("FAKE_SERVER_MODE");
+    const char *env_out = getenv("TOKSPUR_FAKE_SERVER_ENV_FILE");
+    if (env_out && env_out[0]) {
+        FILE *ef = fopen(env_out, "w");
+        if (ef) {
+            for (char **entry = environ; *entry; ++entry) fprintf(ef, "%s\n", *entry);
+            fclose(ef);
+        }
+    }
+    const char *mode = getenv("TOKSPUR_FAKE_SERVER_MODE");
     if (!mode) {
         mode = "sleep_sigterm";
     }
 
     if (strcmp(mode, "exit_code") == 0) {
-        write_pid_file("FAKE_SERVER_PID_FILE", getpid());
-        const char *code_s = getenv("FAKE_EXIT_CODE");
+        write_pid_file("TOKSPUR_FAKE_SERVER_PID_FILE", getpid());
+        const char *code_s = getenv("TOKSPUR_FAKE_EXIT_CODE");
         return code_s ? atoi(code_s) : 0;
     }
 
     if (strcmp(mode, "ignore_sigterm") == 0) {
         signal(SIGTERM, SIG_IGN);
         signal(SIGINT, SIG_IGN);
-        write_pid_file("FAKE_SERVER_PID_FILE", getpid());
+        write_pid_file("TOKSPUR_FAKE_SERVER_PID_FILE", getpid());
         for (int i = 0; i < 300; ++i) {
             usleep(100000);
         }
@@ -353,7 +364,7 @@ int main(int argc, char **argv) {
             setsid();
             signal(SIGTERM, on_stop);
             signal(SIGINT, on_stop);
-            write_pid_file("FAKE_DESCENDANT_PID_FILE", getpid());
+            write_pid_file("TOKSPUR_FAKE_DESCENDANT_PID_FILE", getpid());
             while (!got_stop) {
                 usleep(20000);
             }
@@ -367,7 +378,7 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
 
-    write_pid_file("FAKE_SERVER_PID_FILE", getpid());
+    write_pid_file("TOKSPUR_FAKE_SERVER_PID_FILE", getpid());
     while (!got_stop) {
         usleep(20000);
     }
@@ -446,18 +457,18 @@ impl SyntheticCheckout {
         let mtp_sha = sha256_bytes(mtp_bytes);
         fs::write(draft_dir.join(mtp_rel), mtp_bytes).unwrap();
 
-        let legacy_cfg = b"{\"architectures\":[\"DFlash2\"]}\n";
-        let legacy_st = b"synthetic-legacy-safetensors\n";
-        let legacy_files = Json::Array(vec![
+        let dflash2_cfg = b"{\"architectures\":[\"DFlash2\"]}\n";
+        let dflash2_st = b"synthetic-legacy-safetensors\n";
+        let dflash2_files = Json::Array(vec![
             Json::new_object([
                 ("name", Json::from("config.json")),
-                ("size", Json::integer(legacy_cfg.len() as u64)),
-                ("sha256", Json::from(sha256_bytes(legacy_cfg))),
+                ("size", Json::integer(dflash2_cfg.len() as u64)),
+                ("sha256", Json::from(sha256_bytes(dflash2_cfg))),
             ]),
             Json::new_object([
                 ("name", Json::from("model.safetensors")),
-                ("size", Json::integer(legacy_st.len() as u64)),
-                ("sha256", Json::from(sha256_bytes(legacy_st))),
+                ("size", Json::integer(dflash2_st.len() as u64)),
+                ("sha256", Json::from(sha256_bytes(dflash2_st))),
             ]),
         ]);
 
@@ -494,14 +505,14 @@ impl SyntheticCheckout {
                 ]),
             ),
             (
-                "legacy_dflash2_draft",
+                "dflash2_draft",
                 Json::new_object([
                     ("repo", Json::from("incoai/Qwen3.8-Flash-Next-DFlash2")),
                     (
                         "revision",
                         Json::from("a22a1744e85c17364dcc54a6a420af7135d4c7f6"),
                     ),
-                    ("files", legacy_files),
+                    ("files", dflash2_files),
                 ]),
             ),
         ]);
@@ -1044,7 +1055,7 @@ fn checkout_doctor_plan_adopt_legacy_compat_and_configure_succeed() {
         String::from_utf8_lossy(&cfg_out.stderr)
     );
 
-    // Verify legacy_dflash2_draft 2-file adoption receipt compatibility
+    // A receipt whose draft group is the DFlash2 checkpoint pinned under `dflash2_draft` passes the adoption check; serve then needs `--drafter dflash2`.
     let legacy_dir = fixture._tmp.path().join("weights/legacy-draft");
     fs::create_dir_all(&legacy_dir).unwrap();
     let cfg_bytes = b"{\"architectures\":[\"DFlash2\"]}\n";
@@ -1104,7 +1115,7 @@ fn checkout_doctor_plan_adopt_legacy_compat_and_configure_succeed() {
         .unwrap();
     assert!(
         legacy_check.status.success(),
-        "legacy_dflash2_draft check failed: {}",
+        "dflash2_draft receipt check failed: {}",
         String::from_utf8_lossy(&legacy_check.stderr)
     );
     let missing_mtp = Command::new(fixture.cli_bin())
@@ -1115,6 +1126,39 @@ fn checkout_doctor_plan_adopt_legacy_compat_and_configure_succeed() {
     assert!(
         String::from_utf8_lossy(&missing_mtp.stderr).contains("adopted draft missing MTP sidecar")
     );
+}
+
+#[test]
+fn state_commands_run_from_an_unreadable_or_deleted_working_directory() {
+    let fixture = SyntheticCheckout::create("lost-cwd");
+    let adoption = fixture.root.join(".tokspur/adoption.json");
+
+    // The shell takes its own working directory away, then becomes the CLI.
+    for (name, prelude) in [("unreadable", "chmod 000 ."), ("deleted", "rmdir \"$PWD\"")] {
+        let cwd = fixture._tmp.path().join(format!("{name}-cwd"));
+        fs::create_dir(&cwd).unwrap();
+        let _ignored = fs::remove_file(&adoption);
+        let adopt_out = Command::new("/bin/sh")
+            .current_dir(&cwd)
+            .arg("-c")
+            .arg(format!(
+                "{prelude} && exec \"$0\" adopt --target \"$1\" --draft \"$2\""
+            ))
+            .arg(fixture.cli_bin())
+            .arg(&fixture.target_dir)
+            .arg(&fixture.draft_dir)
+            .output()
+            .unwrap();
+        assert!(
+            adopt_out.status.success(),
+            "adopt from the {name} working directory failed: {}",
+            String::from_utf8_lossy(&adopt_out.stderr)
+        );
+        assert!(adoption.is_file());
+        if cwd.exists() {
+            fs::set_permissions(&cwd, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
 }
 
 #[test]
@@ -1626,8 +1670,8 @@ fn serve_subprocess_lifecycle_signals_escalation_receipt_failure_descendants_and
                     "--drain-timeouts-ms",
                     "400,400,400,400",
                 ])
-                .env("FAKE_SERVER_MODE", "sleep_sigterm")
-                .env("FAKE_SERVER_PID_FILE", &server_pid_file);
+                .env("TOKSPUR_FAKE_SERVER_MODE", "sleep_sigterm")
+                .env("TOKSPUR_FAKE_SERVER_PID_FILE", &server_pid_file);
                 cmd
             },
             &server_pid_file,
@@ -1659,8 +1703,8 @@ fn serve_subprocess_lifecycle_signals_escalation_receipt_failure_descendants_and
                     "--drain-timeouts-ms",
                     "400,400,400,400",
                 ])
-                .env("FAKE_SERVER_MODE", "sleep_sigterm")
-                .env("FAKE_SERVER_PID_FILE", &server_pid_file);
+                .env("TOKSPUR_FAKE_SERVER_MODE", "sleep_sigterm")
+                .env("TOKSPUR_FAKE_SERVER_PID_FILE", &server_pid_file);
                 cmd
             },
             &server_pid_file,
@@ -1688,8 +1732,8 @@ fn serve_subprocess_lifecycle_signals_escalation_receipt_failure_descendants_and
                     "--drain-timeouts-ms",
                     "250,500,250,250",
                 ])
-                .env("FAKE_SERVER_MODE", "ignore_sigterm")
-                .env("FAKE_SERVER_PID_FILE", &server_pid_file);
+                .env("TOKSPUR_FAKE_SERVER_MODE", "ignore_sigterm")
+                .env("TOKSPUR_FAKE_SERVER_PID_FILE", &server_pid_file);
                 cmd
             },
             &server_pid_file,
@@ -1715,8 +1759,8 @@ fn serve_subprocess_lifecycle_signals_escalation_receipt_failure_descendants_and
                     "--drain-timeouts-ms",
                     "300,300,300,300",
                 ])
-                .env("FAKE_SERVER_MODE", "sleep_sigterm")
-                .env("FAKE_SERVER_PID_FILE", &server_pid_file);
+                .env("TOKSPUR_FAKE_SERVER_MODE", "sleep_sigterm")
+                .env("TOKSPUR_FAKE_SERVER_PID_FILE", &server_pid_file);
                 cmd
             },
             Duration::from_secs(15),
@@ -1748,9 +1792,9 @@ fn serve_subprocess_lifecycle_signals_escalation_receipt_failure_descendants_and
                     "--drain-timeouts-ms",
                     "300,300,300,300",
                 ])
-                .env("FAKE_SERVER_MODE", "spawn_detached")
-                .env("FAKE_SERVER_PID_FILE", &server_pid_file)
-                .env("FAKE_DESCENDANT_PID_FILE", &desc_pid_file);
+                .env("TOKSPUR_FAKE_SERVER_MODE", "spawn_detached")
+                .env("TOKSPUR_FAKE_SERVER_PID_FILE", &server_pid_file)
+                .env("TOKSPUR_FAKE_DESCENDANT_PID_FILE", &desc_pid_file);
                 cmd
             },
             &server_pid_file,
@@ -1779,9 +1823,9 @@ fn serve_subprocess_lifecycle_signals_escalation_receipt_failure_descendants_and
                     "--drain-timeouts-ms",
                     "300,300,300,300",
                 ])
-                .env("FAKE_SERVER_MODE", "exit_code")
-                .env("FAKE_EXIT_CODE", "7")
-                .env("FAKE_SERVER_PID_FILE", &server_pid_file);
+                .env("TOKSPUR_FAKE_SERVER_MODE", "exit_code")
+                .env("TOKSPUR_FAKE_EXIT_CODE", "7")
+                .env("TOKSPUR_FAKE_SERVER_PID_FILE", &server_pid_file);
                 cmd
             },
             Duration::from_secs(15),
@@ -1877,9 +1921,9 @@ fn serve_subprocess_lifecycle_signals_escalation_receipt_failure_descendants_and
                     "--drain-timeouts-ms",
                     "300,300,300,300",
                 ])
-                .env("FAKE_SERVER_MODE", "exit_code")
-                .env("FAKE_EXIT_CODE", "0")
-                .env("FAKE_SERVER_PID_FILE", &server_pid_file);
+                .env("TOKSPUR_FAKE_SERVER_MODE", "exit_code")
+                .env("TOKSPUR_FAKE_EXIT_CODE", "0")
+                .env("TOKSPUR_FAKE_SERVER_PID_FILE", &server_pid_file);
                 cmd
             },
             Duration::from_secs(15),
@@ -1892,6 +1936,205 @@ fn serve_subprocess_lifecycle_signals_escalation_receipt_failure_descendants_and
         );
         assert!(!process_receipt.exists());
     }
+}
+
+#[test]
+fn serve_verifies_an_explicit_dflash2_dir_against_an_existing_adoption() {
+    let _serial = SERVE_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fixture = SyntheticCheckout::create("serve-dflash2-dir");
+    let adopt = Command::new(fixture.cli_bin())
+        .args(["adopt", "--target"])
+        .arg(&fixture.target_dir)
+        .arg("--draft")
+        .arg(&fixture.draft_dir)
+        .status()
+        .unwrap();
+    assert!(adopt.success());
+    let port = free_loopback_port();
+    let cfg = Command::new(fixture.cli_bin())
+        .args(["configure", "--port", &port.to_string()])
+        .status()
+        .unwrap();
+    assert!(cfg.success());
+
+    // Both checkpoints carry the pinned config.json, the only file the native drafter hashes; the tampered one has other weights of the pinned size.
+    let checkpoint = |name: &str, weights: &[u8]| -> PathBuf {
+        let dir = fixture._tmp.path().join("weights").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("config.json"),
+            b"{\"architectures\":[\"DFlash2\"]}\n",
+        )
+        .unwrap();
+        fs::write(dir.join("model.safetensors"), weights).unwrap();
+        fs::canonicalize(dir).unwrap()
+    };
+    let genuine = checkpoint("dflash2-genuine", b"synthetic-legacy-safetensors\n");
+    let tampered = checkpoint("dflash2-tampered", b"synthetic-forged-safetensors\n");
+
+    let adoption_path = fixture.root.join(".tokspur/adoption.json");
+    let recorded_dir = || -> Option<PathBuf> {
+        let adoption = parse_json(&fs::read(&adoption_path).unwrap()).unwrap();
+        let group = adoption.find("dflash2_draft").unwrap()?;
+        let dir = group.find("directory").unwrap().unwrap().string().unwrap();
+        Some(PathBuf::from(std::str::from_utf8(dir).unwrap()))
+    };
+    let serve = |dflash2_dir: &Path, tag: &str| -> (Output, PathBuf) {
+        let argv_file = fixture._tmp.path().join(format!("srv-{tag}.argv"));
+        let out = output_serve_retrying_transient_workers(
+            || {
+                let mut cmd = Command::new(fixture.cli_bin());
+                cmd.args([
+                    "serve",
+                    "--raw-gguf",
+                    "--drafter",
+                    "dflash2",
+                    "--dflash2-dir",
+                ])
+                .arg(dflash2_dir)
+                .args(["--drain-timeouts-ms", "300,300,300,300"])
+                .env("TOKSPUR_FAKE_SERVER_MODE", "exit_code")
+                .env("TOKSPUR_FAKE_EXIT_CODE", "0")
+                .env("TOKSPUR_FAKE_SERVER_ARGV_FILE", &argv_file);
+                cmd
+            },
+            Duration::from_secs(15),
+        );
+        (out, argv_file)
+    };
+    let assert_refused = |tag: &str| {
+        let (out, argv_file) = serve(&tampered, tag);
+        assert_eq!(out.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("Checksum mismatch: model.safetensors"),
+            "stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!argv_file.exists(), "the server was launched");
+    };
+
+    // 1. The adoption records no checkpoint: the tampered directory is hashed and refused.
+    assert_refused("tampered-first");
+    assert_eq!(recorded_dir(), None);
+
+    // 2. The genuine directory passes, is recorded and is the one forwarded.
+    let (ok, argv_file) = serve(&genuine, "genuine");
+    assert_eq!(
+        ok.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    let argv: Vec<String> = fs::read_to_string(&argv_file)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        argv.windows(2)
+            .any(|w| w[0] == "--native-dflash2-dir" && Path::new(&w[1]) == genuine),
+        "missing --native-dflash2-dir in {argv:?}"
+    );
+    assert_eq!(recorded_dir(), Some(genuine.clone()));
+
+    // 3. A recorded checkpoint elsewhere does not vouch for another explicit directory.
+    assert_refused("tampered-second");
+    assert_eq!(recorded_dir(), Some(genuine));
+}
+
+#[test]
+fn serve_gives_the_server_an_allowlisted_environment() {
+    let _serial = SERVE_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fixture = SyntheticCheckout::create("serve-environment");
+    let adopt = Command::new(fixture.cli_bin())
+        .args(["adopt", "--target"])
+        .arg(&fixture.target_dir)
+        .arg("--draft")
+        .arg(&fixture.draft_dir)
+        .status()
+        .unwrap();
+    assert!(adopt.success());
+    let port = free_loopback_port();
+    let cfg = Command::new(fixture.cli_bin())
+        .args(["configure", "--port", &port.to_string()])
+        .status()
+        .unwrap();
+    assert!(cfg.success());
+
+    let env_file = fixture._tmp.path().join("srv.env");
+    let out = output_serve_retrying_transient_workers(
+        || {
+            let mut cmd = Command::new(fixture.cli_bin());
+            cmd.args([
+                "serve",
+                "--raw-gguf",
+                "--drain-timeouts-ms",
+                "300,300,300,300",
+            ])
+            .env("TOKSPUR_FAKE_SERVER_MODE", "exit_code")
+            .env("TOKSPUR_FAKE_EXIT_CODE", "0")
+            .env("TOKSPUR_FAKE_SERVER_ENV_FILE", &env_file)
+            .env("LC_CTYPE", "en_GB.UTF-8")
+            .env("TZ", "Europe/London")
+            // Loader overrides, credentials and tool settings must not reach the server.
+            .env("DYLD_FRAMEWORK_PATH", "/do-not-inherit")
+            .env("DYLD_FALLBACK_LIBRARY_PATH", "/do-not-inherit")
+            .env("AWS_SECRET_ACCESS_KEY", "do-not-inherit")
+            .env("OPENAI_API_KEY", "do-not-inherit")
+            .env("HF_TOKEN", "do-not-inherit")
+            .env("PYTHONPATH", "/do-not-inherit")
+            .env("SSH_AUTH_SOCK", "/do-not-inherit")
+            .env("HTTPS_PROXY", "http://do-not-inherit.invalid")
+            .env("TMPDIR", "/do-not-inherit");
+            cmd
+        },
+        Duration::from_secs(15),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let dumped = fs::read_to_string(&env_file).unwrap();
+    assert!(!dumped.contains("do-not-inherit"), "leaked: {dumped}");
+    let env: BTreeMap<&str, &str> = dumped
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    for (name, value) in &env {
+        let allowed = matches!(
+            *name,
+            "PATH"
+                | "HOME"
+                | "USER"
+                | "LOGNAME"
+                | "SHELL"
+                | "LANG"
+                | "TZ"
+                | "TERM"
+                | "TMPDIR"
+                | "NO_PROXY"
+                | "DO_NOT_TRACK"
+                | "HF_HOME"
+                | "HF_HUB_OFFLINE"
+                | "HF_HUB_DISABLE_IMPLICIT_TOKEN"
+                | "HF_HUB_DISABLE_TELEMETRY"
+        ) || name.starts_with("LC_")
+            || name.starts_with("TOKSPUR_");
+        assert!(allowed, "unexpected server variable {name}={value}");
+    }
+    assert_eq!(env.get("LC_CTYPE"), Some(&"en_GB.UTF-8"));
+    assert_eq!(env.get("TZ"), Some(&"Europe/London"));
+    assert_eq!(env.get("HF_HUB_OFFLINE"), Some(&"1"));
+    let state_tmp = fs::canonicalize(fixture.root.join(".tokspur/state/tmp")).unwrap();
+    assert_eq!(env.get("TMPDIR").map(Path::new), Some(state_tmp.as_path()));
+    assert!(env.contains_key("PATH"));
 }
 
 #[test]
@@ -2210,8 +2453,8 @@ fn staged_layout_invoked_from_unrelated_working_directory() {
             let mut cmd = Command::new(&staged_cli);
             cmd.current_dir(&ext_cwd)
                 .env("TOKSPUR_STATE_ROOT", &ext_state)
-                .env("FAKE_SERVER_MODE", "sleep_sigterm")
-                .env("FAKE_SERVER_PID_FILE", &staged_pid_file)
+                .env("TOKSPUR_FAKE_SERVER_MODE", "sleep_sigterm")
+                .env("TOKSPUR_FAKE_SERVER_PID_FILE", &staged_pid_file)
                 .args([
                     "serve",
                     "--raw-gguf",
@@ -2431,10 +2674,10 @@ fn pack_only_variant_adoption_seals_pack_and_refuses_raw_gguf_and_repack() {
         || {
             let mut cmd = Command::new(fixture.cli_bin());
             cmd.args(["serve", "--drain-timeouts-ms", "300,300,300,300"])
-                .env("FAKE_SERVER_MODE", "exit_code")
-                .env("FAKE_EXIT_CODE", "0")
-                .env("FAKE_SERVER_PID_FILE", &pid_file)
-                .env("FAKE_SERVER_ARGV_FILE", &argv_file);
+                .env("TOKSPUR_FAKE_SERVER_MODE", "exit_code")
+                .env("TOKSPUR_FAKE_EXIT_CODE", "0")
+                .env("TOKSPUR_FAKE_SERVER_PID_FILE", &pid_file)
+                .env("TOKSPUR_FAKE_SERVER_ARGV_FILE", &argv_file);
             cmd
         },
         Duration::from_secs(15),
@@ -2472,8 +2715,6 @@ fn pack_only_variant_adoption_seals_pack_and_refuses_raw_gguf_and_repack() {
 
 #[test]
 fn pull_downloads_seals_pack_autoadopts_dflash2_and_serve_dir_autoconfigures() {
-    use std::sync::Arc;
-
     let _serial = SERVE_TEST_MUTEX
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2760,10 +3001,10 @@ fn pull_downloads_seals_pack_autoadopts_dflash2_and_serve_dir_autoconfigures() {
                 "--drain-timeouts-ms",
                 "300,300,300,300",
             ])
-            .env("FAKE_SERVER_MODE", "exit_code")
-            .env("FAKE_EXIT_CODE", "0")
-            .env("FAKE_SERVER_PID_FILE", &df_pid_file)
-            .env("FAKE_SERVER_ARGV_FILE", &df_argv_file);
+            .env("TOKSPUR_FAKE_SERVER_MODE", "exit_code")
+            .env("TOKSPUR_FAKE_EXIT_CODE", "0")
+            .env("TOKSPUR_FAKE_SERVER_PID_FILE", &df_pid_file)
+            .env("TOKSPUR_FAKE_SERVER_ARGV_FILE", &df_argv_file);
             cmd
         },
         Duration::from_secs(15),
@@ -2813,10 +3054,10 @@ fn pull_downloads_seals_pack_autoadopts_dflash2_and_serve_dir_autoconfigures() {
                     "--drain-timeouts-ms",
                     "300,300,300,300",
                 ])
-                .env("FAKE_SERVER_MODE", "exit_code")
-                .env("FAKE_EXIT_CODE", "0")
-                .env("FAKE_SERVER_PID_FILE", &dir_pid_file)
-                .env("FAKE_SERVER_ARGV_FILE", &dir_argv_file);
+                .env("TOKSPUR_FAKE_SERVER_MODE", "exit_code")
+                .env("TOKSPUR_FAKE_EXIT_CODE", "0")
+                .env("TOKSPUR_FAKE_SERVER_PID_FILE", &dir_pid_file)
+                .env("TOKSPUR_FAKE_SERVER_ARGV_FILE", &dir_argv_file);
             cmd
         },
         Duration::from_secs(15),
@@ -2846,4 +3087,566 @@ fn pull_downloads_seals_pack_autoadopts_dflash2_and_serve_dir_autoconfigures() {
         String::from_utf8_lossy(&single_adopt.stderr)
     );
     assert!(adopt_state.join(".tokspur/adoption.json").is_file());
+}
+
+/// How the loopback asset server answers a request for one path.
+enum Reply {
+    /// The body with a Content-Length.
+    Sized(Vec<u8>),
+    /// The body with no Content-Length, ended by closing the connection.
+    Unsized(Vec<u8>),
+    /// A Content-Length for the whole body, half of it sent, then nothing until the client hangs up.
+    Stall(Vec<u8>),
+    /// A 302 to another path of this server, with a body of the given length as the model host sends.
+    Redirect(&'static str, usize),
+}
+
+/// A loopback stand-in for the model host. A `Range: bytes=N-` request is answered with the rest of the body as a 206.
+struct AssetServer {
+    base_url: String,
+    requests: Arc<Mutex<Vec<String>>>,
+    /// Set once the client of a stalled transfer has closed its connection.
+    stalled_client_gone: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl AssetServer {
+    fn start(routes: BTreeMap<String, Reply>) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let routes = Arc::new(routes);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stalled_client_gone = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (requests_bg, stop_bg) = (Arc::clone(&requests), Arc::clone(&stop));
+        let gone_bg = Arc::clone(&stalled_client_gone);
+        let thread = thread::spawn(move || {
+            let mut connections = Vec::new();
+            while !stop_bg.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let routes = Arc::clone(&routes);
+                        let requests = Arc::clone(&requests_bg);
+                        let (gone, stop) = (Arc::clone(&gone_bg), Arc::clone(&stop_bg));
+                        connections.push(thread::spawn(move || {
+                            answer_asset_request(stream, &routes, &requests, &gone, &stop);
+                        }));
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+            for connection in connections {
+                let _ignored = connection.join();
+            }
+        });
+        Self {
+            base_url,
+            requests,
+            stalled_client_gone,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// The request heads received so far, in arrival order.
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl Drop for AssetServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ignored = thread.join();
+        }
+    }
+}
+
+fn answer_asset_request(
+    mut stream: TcpStream,
+    routes: &BTreeMap<String, Reply>,
+    requests: &Mutex<Vec<String>>,
+    stalled_client_gone: &AtomicBool,
+    stop: &AtomicBool,
+) {
+    stream.set_nonblocking(false).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut buf = [0u8; 4096];
+    let n = stream.read(&mut buf).unwrap_or(0);
+    let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+    let path = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("")
+        .to_owned();
+    let range_start = head.lines().find_map(|line| {
+        let line = line.to_ascii_lowercase();
+        let start = line.strip_prefix("range: bytes=")?.trim_end_matches('-');
+        start.parse::<usize>().ok()
+    });
+    requests.lock().unwrap().push(head);
+    let Some(reply) = routes.get(&path) else {
+        let _ignored = stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return;
+    };
+    let rest = |body: &[u8]| body[range_start.unwrap_or(0).min(body.len())..].to_vec();
+    let status = |body: &[u8]| match range_start {
+        Some(start) => format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{}/{}\r\n",
+            body.len().saturating_sub(1),
+            body.len()
+        ),
+        None => "HTTP/1.1 200 OK\r\n".to_owned(),
+    };
+    match reply {
+        Reply::Sized(body) => {
+            let rest = rest(body);
+            let head = format!(
+                "{}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                status(body),
+                rest.len()
+            );
+            let _ignored = stream.write_all(head.as_bytes());
+            let _ignored = stream.write_all(&rest);
+        }
+        Reply::Unsized(body) => {
+            let head = format!("{}Connection: close\r\n\r\n", status(body));
+            let _ignored = stream.write_all(head.as_bytes());
+            let _ignored = stream.write_all(&rest(body));
+        }
+        Reply::Redirect(location, body_len) => {
+            let head = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Type: text/html\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n"
+            );
+            let _ignored = stream.write_all(head.as_bytes());
+            let _ignored = stream.write_all(&vec![b'r'; *body_len]);
+        }
+        Reply::Stall(body) => {
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ignored = stream.write_all(head.as_bytes());
+            let _ignored = stream.write_all(&body[..body.len() / 2]);
+            stream
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .unwrap();
+            while !stop.load(Ordering::Relaxed) {
+                match stream.read(&mut buf) {
+                    Ok(0) => {
+                        stalled_client_gone.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(_) => {
+                        stalled_client_gone.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+const PULL_REPO: &str = "fixture-org/Fixture-Pull-GGUF";
+const PULL_REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// One file of the pinned pull profile.
+struct PinnedFile {
+    name: &'static str,
+    size: u64,
+    sha256: String,
+}
+
+impl PinnedFile {
+    fn of(name: &'static str, bytes: &[u8]) -> Self {
+        Self {
+            name,
+            size: bytes.len() as u64,
+            sha256: sha256_bytes(bytes),
+        }
+    }
+
+    /// The path the asset server sees for this file.
+    fn route(&self) -> String {
+        format!("/{PULL_REPO}/resolve/{PULL_REVISION}/{}", self.name)
+    }
+}
+
+/// Pins a one-shard target and a one-file draft in the fixture's asset profile and returns the managed directory `tokspur pull` downloads them into.
+fn pin_pull_profile(
+    fixture: &SyntheticCheckout,
+    target: &PinnedFile,
+    draft: &PinnedFile,
+) -> PathBuf {
+    let group = |file: &PinnedFile| {
+        Json::new_object([
+            ("repo", Json::from(PULL_REPO)),
+            ("revision", Json::from(PULL_REVISION)),
+            (
+                "files",
+                Json::Array(vec![Json::new_object([
+                    ("name", Json::from(file.name)),
+                    ("size", Json::integer(file.size)),
+                    ("sha256", Json::from(file.sha256.clone())),
+                ])]),
+            ),
+        ])
+    };
+    let profile = Json::new_object([
+        ("schema", Json::integer(1)),
+        ("target", group(target)),
+        ("draft", group(draft)),
+    ]);
+    write_mode(
+        &fixture.root.join("profiles/flash-next-assets.json"),
+        &dump_json(&profile),
+        0o644,
+    );
+    fixture.root.join(".tokspur/models/Fixture-Pull-GGUF")
+}
+
+#[test]
+fn pull_ignores_the_callers_curlrc() {
+    let fixture = SyntheticCheckout::create("pull-curlrc");
+    let target_bytes = b"synthetic-pull-target\n";
+    let draft_bytes = b"synthetic-pull-draft\n";
+    let target = PinnedFile::of("target.gguf", target_bytes);
+    let draft = PinnedFile::of("draft.gguf", draft_bytes);
+    pin_pull_profile(&fixture, &target, &draft);
+    let server = AssetServer::start(BTreeMap::from([
+        (target.route(), Reply::Sized(target_bytes.to_vec())),
+        (draft.route(), Reply::Sized(draft_bytes.to_vec())),
+    ]));
+
+    // A curlrc that would mark every request it applies to.
+    let home = fixture._tmp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    fs::write(
+        home.join(".curlrc"),
+        "header = \"X-Curlrc-Leak: 1\"\nuser-agent = \"curlrc-leak\"\n",
+    )
+    .unwrap();
+
+    let out = Command::new(fixture.cli_bin())
+        .env("TOKSPUR_HF_BASE_URL", &server.base_url)
+        .env("HOME", &home)
+        .env_remove("CURL_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .arg("pull")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "pull failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    for request in requests {
+        assert!(
+            !request.to_ascii_lowercase().contains("curlrc-leak"),
+            "~/.curlrc applied to the download: {request}"
+        );
+    }
+}
+
+#[test]
+fn pull_caps_each_transfer_at_the_pinned_size() {
+    let fixture = SyntheticCheckout::create("pull-size-cap");
+    // Larger than the least cap curl is given, so the caps below are the pin itself.
+    let target_bytes: Vec<u8> = (0..128u32 << 10).map(|i| (i % 251) as u8).collect();
+    let draft_bytes = b"synthetic-pull-draft\n";
+    let target = PinnedFile::of("target.gguf", &target_bytes);
+    let draft = PinnedFile::of("draft.gguf", draft_bytes);
+    let managed = pin_pull_profile(&fixture, &target, &draft);
+    let part = managed.join("target.gguf.part");
+    let pinned_size = target_bytes.len() as u64;
+    // Far more than the pin, and not the pinned content.
+    let oversized = vec![b'x'; target_bytes.len() + (256 << 10)];
+
+    let pull = |target_reply: Reply| -> (Output, Vec<String>) {
+        let server = AssetServer::start(BTreeMap::from([
+            (target.route(), target_reply),
+            (draft.route(), Reply::Sized(draft_bytes.to_vec())),
+        ]));
+        let out = Command::new(fixture.cli_bin())
+            .env("TOKSPUR_HF_BASE_URL", &server.base_url)
+            .arg("pull")
+            .output()
+            .unwrap();
+        (out, server.requests())
+    };
+    let assert_refused = |out: &Output| {
+        assert_eq!(out.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("more than the pinned 131072 bytes"),
+            "stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!managed.join("target.gguf").exists());
+        assert!(!fixture.root.join(".tokspur/adoption.json").exists());
+    };
+    let part_len = || fs::metadata(&part).map_or(0, |meta| meta.len());
+
+    // 1. A declared length above the pin is refused before a byte is written.
+    let (out, _) = pull(Reply::Sized(oversized.clone()));
+    assert_refused(&out);
+    assert_eq!(part_len(), 0);
+
+    // 2. With no declared length the transfer stops at the pin.
+    let (out, _) = pull(Reply::Unsized(oversized.clone()));
+    assert_refused(&out);
+    assert!(part_len() <= pinned_size, "kept {} bytes", part_len());
+    fs::remove_file(&part).unwrap();
+
+    // 3. On a resume the cap is what the partial file still lacks.
+    fs::write(&part, &target_bytes[..1024]).unwrap();
+    let (out, requests) = pull(Reply::Unsized(oversized));
+    assert_refused(&out);
+    assert!(requests[0].contains("Range: bytes=1024-"), "{requests:?}");
+    assert!(part_len() <= pinned_size, "kept {} bytes", part_len());
+
+    // 4. A resume that stays within the pin completes.
+    fs::write(&part, &target_bytes[..1024]).unwrap();
+    let (out, requests) = pull(Reply::Sized(target_bytes.clone()));
+    assert!(
+        out.status.success(),
+        "resume failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(requests[0].contains("Range: bytes=1024-"), "{requests:?}");
+    assert_eq!(fs::read(managed.join("target.gguf")).unwrap(), target_bytes);
+    assert!(!part.exists());
+}
+
+#[test]
+fn pull_follows_a_redirect_whose_body_exceeds_what_the_file_lacks() {
+    let fixture = SyntheticCheckout::create("pull-redirect-body");
+    // The size of the pinned DFlash2 config.json, which is smaller than the redirect body in front of it.
+    let target_bytes: Vec<u8> = (0..1015u32).map(|i| (i % 251) as u8).collect();
+    let draft_bytes = b"synthetic-pull-draft\n";
+    let target = PinnedFile::of("target.gguf", &target_bytes);
+    let draft = PinnedFile::of("draft.gguf", draft_bytes);
+    let managed = pin_pull_profile(&fixture, &target, &draft);
+    let part = managed.join("target.gguf.part");
+
+    let pull = |stored: Reply| -> (Output, Vec<String>) {
+        let server = AssetServer::start(BTreeMap::from([
+            (target.route(), Reply::Redirect("/stored/target", 2048)),
+            ("/stored/target".to_owned(), stored),
+            (draft.route(), Reply::Redirect("/stored/draft", 2048)),
+            (
+                "/stored/draft".to_owned(),
+                Reply::Sized(draft_bytes.to_vec()),
+            ),
+        ]));
+        let out = Command::new(fixture.cli_bin())
+            .env("TOKSPUR_HF_BASE_URL", &server.base_url)
+            .arg("pull")
+            .output()
+            .unwrap();
+        (out, server.requests())
+    };
+    let assert_pulled = |out: &Output| {
+        assert!(
+            out.status.success(),
+            "pull failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(fs::read(managed.join("target.gguf")).unwrap(), target_bytes);
+        assert!(!part.exists());
+        assert!(fixture.root.join(".tokspur/adoption.json").is_file());
+    };
+    let reset = || {
+        fs::remove_file(managed.join("target.gguf")).unwrap();
+        fs::remove_file(managed.join("draft.gguf")).unwrap();
+        fs::remove_file(fixture.root.join(".tokspur/adoption.json")).unwrap();
+    };
+
+    // 1. A file smaller than the redirect body in front of it.
+    let (out, requests) = pull(Reply::Sized(target_bytes.clone()));
+    assert_pulled(&out);
+    assert_eq!(requests.len(), 4, "{requests:?}");
+    reset();
+
+    // 2. A resume with less left than the redirect body.
+    fs::write(&part, &target_bytes[..915]).unwrap();
+    let (out, requests) = pull(Reply::Sized(target_bytes.clone()));
+    assert_pulled(&out);
+    assert!(requests[0].contains("Range: bytes=915-"), "{requests:?}");
+    assert!(requests[1].contains("Range: bytes=915-"), "{requests:?}");
+    reset();
+
+    // 3. The room left for the redirect does not loosen the pin: more than the pinned size is refused and not kept, with or without a declared length.
+    let oversized = vec![b'x'; 4096];
+    for stored in [
+        Reply::Sized(oversized.clone()),
+        Reply::Unsized(oversized.clone()),
+    ] {
+        let (out, _) = pull(stored);
+        assert_eq!(out.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("more than the pinned 1015 bytes"),
+            "stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!part.exists());
+        assert!(!managed.join("target.gguf").exists());
+        assert!(!fixture.root.join(".tokspur/adoption.json").exists());
+    }
+}
+
+/// Waits for a child to exit, killing it and failing the test if it outlives the deadline.
+fn wait_with_deadline(
+    child: &mut Child,
+    timeout: Duration,
+    what: &str,
+) -> std::process::ExitStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let _ignored = child.kill();
+            let _ignored = child.wait();
+            panic!("{what} was still running after {timeout:?}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn pull_interrupted_during_a_transfer_stops_curl_and_adopts_nothing() {
+    let fixture = SyntheticCheckout::create("pull-stop-transfer");
+    let target_bytes = vec![b't'; 64 << 10];
+    let draft_bytes = b"synthetic-pull-draft\n";
+    let target = PinnedFile::of("target.gguf", &target_bytes);
+    let draft = PinnedFile::of("draft.gguf", draft_bytes);
+    pin_pull_profile(&fixture, &target, &draft);
+
+    // SIGTERM reaches only the CLI. SIGINT is sent the same way, as `kill -INT` would; a terminal Ctrl-C also reaches curl directly.
+    for signal in [SIGTERM, SIGINT] {
+        let server = AssetServer::start(BTreeMap::from([
+            (target.route(), Reply::Stall(target_bytes.clone())),
+            (draft.route(), Reply::Sized(draft_bytes.to_vec())),
+        ]));
+        let mut child = Command::new(fixture.cli_bin())
+            .env("TOKSPUR_HF_BASE_URL", &server.base_url)
+            .arg("pull")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while server.requests().is_empty() {
+            assert!(Instant::now() < deadline, "curl never asked for the asset");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        kill(child.id() as i32, signal).unwrap();
+        let status = wait_with_deadline(&mut child, Duration::from_secs(5), "interrupted pull");
+        assert_eq!(status.code(), Some(1));
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(stderr.contains("Download interrupted"), "stderr={stderr}");
+
+        // curl was told to stop, so the stalled connection closes.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !server.stalled_client_gone.load(Ordering::Relaxed) {
+            assert!(
+                Instant::now() < deadline,
+                "curl outlived the interrupted pull"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!fixture.root.join(".tokspur/adoption.json").exists());
+        assert!(!fixture.root.join(".tokspur/configured.json").exists());
+    }
+}
+
+#[test]
+fn pull_interrupted_while_verifying_adopts_and_configures_nothing() {
+    // SHA-256 of 64 MiB of zero bytes: long enough to hash that a signal sent on "Verifying:" lands mid-hash, and sparse on disk.
+    const ZEROS_LEN: u64 = 64 << 20;
+    const ZEROS_SHA256: &str = "3b6a07d0d404fab4e23b6d34bc6696a6a312dd92821332385e5af7c01c421351";
+
+    let fixture = SyntheticCheckout::create("pull-stop-verify");
+    let target_bytes = b"synthetic-pull-target\n";
+    let target = PinnedFile::of("target.gguf", target_bytes);
+    let draft = PinnedFile {
+        name: "draft.gguf",
+        size: ZEROS_LEN,
+        sha256: ZEROS_SHA256.to_owned(),
+    };
+    let managed = pin_pull_profile(&fixture, &target, &draft);
+
+    // Both files are already on disk, so pull goes straight to hashing: the target as a finished file, the last asset as a complete partial download.
+    fs::create_dir_all(&managed).unwrap();
+    fs::write(managed.join("target.gguf"), target_bytes).unwrap();
+    let part = managed.join("draft.gguf.part");
+    fs::File::create(&part).unwrap().set_len(ZEROS_LEN).unwrap();
+
+    let mut child = Command::new(fixture.cli_bin())
+        // Nothing listens here; no request is expected.
+        .env("TOKSPUR_HF_BASE_URL", "http://127.0.0.1:9")
+        .arg("pull")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut seen = String::new();
+    loop {
+        let mut line = String::new();
+        let read = std::io::BufRead::read_line(&mut stdout, &mut line).unwrap();
+        assert!(
+            read > 0,
+            "pull ended before verifying the last asset: {seen}"
+        );
+        seen.push_str(&line);
+        if line.starts_with("Verifying: draft.gguf") {
+            break;
+        }
+    }
+    kill(child.id() as i32, SIGINT).unwrap();
+
+    let status = wait_with_deadline(&mut child, Duration::from_secs(60), "interrupted pull");
+    stdout.read_to_string(&mut seen).unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(status.code(), Some(1), "stdout={seen} stderr={stderr}");
+    assert!(stderr.contains("interrupted"), "stderr={stderr}");
+    assert!(!seen.contains("Ready."), "stdout={seen}");
+    assert!(!fixture.root.join(".tokspur/adoption.json").exists());
+    assert!(!fixture.root.join(".tokspur/configured.json").exists());
+    // The complete partial download is kept for the next run.
+    assert_eq!(fs::metadata(&part).unwrap().len(), ZEROS_LEN);
+    assert!(!managed.join("draft.gguf").exists());
 }

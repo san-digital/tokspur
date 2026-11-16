@@ -36,6 +36,14 @@ std::string text(const tokspur::ResponseParser& parser, ResponseKind kind) {
     for (const auto& record : parser.records()) if (record.kind == kind) out += record.text;
     return out;
 }
+// A response that stops with thinking still open: the thinking ends there. Three checks, as invalid().
+void open_thinking(std::string_view input, std::string_view reasoning, bool thinking = false) {
+    tokspur::ResponseParser parser(tools(), thinking);
+    static_cast<void>(parser.feed(input));
+    require(parser.finish() == ResponseStatus::complete && parser.error().empty(), "stop inside open thinking refused");
+    require(text(parser, ResponseKind::thinking) == reasoning && text(parser, ResponseKind::text).empty() && callable(parser) == 0, "open thinking not ended at the stop");
+    require(parser.feed("more") == ResponseStatus::error, "input accepted after finished response");
+}
 void invalid(std::string_view input, bool thinking = false) {
     tokspur::ResponseParser parser(tools(), thinking);
     static_cast<void>(parser.feed(input));
@@ -116,7 +124,7 @@ int main() {
         }
         invalid("<tool_call><function=edit.file><parameter=path>\nx\n</parameter><parameter=meta>\n{\"x\":1e999}\n</parameter></function></tool_call>");
         invalid(call("<think>injected</think>"));
-        invalid("</think>"); invalid("<think>unclosed"); invalid("reason<|im_end|>", true);
+        invalid("</think>"); open_thinking("<think>unclosed", "unclosed"); invalid("reason<|im_end|>", true);
         invalid("answer<|im_end|>suffix");
         invalid(std::string("x\0y", 3));
         for (const auto& bad : {std::string("\xc0\x80", 2), std::string("\xed\xa0\x80", 3),

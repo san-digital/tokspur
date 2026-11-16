@@ -372,7 +372,10 @@ def test_publish_creates_a_draft_and_uploads_every_asset(release, tmp_path):
     assert json.loads(create.data)["tag_name"] == TAG
     notes = json.loads(create.data)["body"]
     digest = (dist / f"tokspur-{TAG}-macos-arm64.tar.gz.sha256").read_text().split()[0]
-    assert f"releases/download/{TAG}/install.sh | TOKSPUR_VERSION={TAG} sh" in notes
+    assert (
+        f"curl -fsSL https://github.com/owner/repo/releases/download/{TAG}/install.sh"
+        f" | TOKSPUR_REPOSITORY=owner/repo TOKSPUR_VERSION={TAG} sh\n"
+    ) in notes
     assert digest in notes
     assert create.get_header("Authorization") == "Bearer t"
     uploads = [r.full_url for r in requests[1:]]
@@ -385,6 +388,19 @@ def test_publish_creates_a_draft_and_uploads_every_asset(release, tmp_path):
         f"tokspur-{TAG}-macos-arm64.tar.gz.sha256",
         "install.sh",
     ]
+
+
+def test_release_notes_install_from_the_publishing_repository(release):
+    # The installer reads the repository to install from in this variable.
+    installer = (ROOT / "scripts/install.sh").read_text()
+    assert 'repository="${TOKSPUR_REPOSITORY:-san-digital/tokspur}"' in installer
+
+    fork = release.release_body(TAG, "owner/repo", "0" * 64)
+    assert f" | TOKSPUR_REPOSITORY=owner/repo TOKSPUR_VERSION={TAG} sh\n" in fork
+    for upstream in ("san-digital/tokspur", "San-Digital/Tokspur"):
+        notes = release.release_body(TAG, upstream, "0" * 64)
+        assert "```sh\ncurl -fsSL https://tokspur.com/install.sh | sh\n" in notes
+        assert "TOKSPUR_REPOSITORY" not in notes
 
 
 def test_publish_refuses_an_archive_that_does_not_match_its_checksum(release, tmp_path):

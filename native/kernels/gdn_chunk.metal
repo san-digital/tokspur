@@ -92,17 +92,136 @@ kernel void gdn_chunk_gates(device const float* alpha[[buffer(0)]],device const 
     if(id>=p.rows*p.heads)return;const uint t=id/p.heads,h=id%p.heads;const float a=checked_gdn(grow(alpha,t,p.gate_stride)[h],e),b=checked_gdn(grow(beta_logits,t,p.gate_stride)[h],e),r=checked_gdn(rate[h],e),d=checked_gdn(bias[h],e),sum=a+d;
     if(r>0||!isfinite(sum)){bad_gdn(e);return;}put_gdn(grow(logg,t,p.gate_stride),h,r*softplus_gdn(sum),e);put_gdn(grow(beta,t,p.gate_stride),h,sigmoid_gdn(b),e);
 }
-// Four value columns per threadgroup, one SIMD group per column. Token order is serial inside this fused kernel. There is no per-token state tape.
+// Four value columns per SIMD group (sixteen per threadgroup) within each head. Token order is serial inside this fused kernel. There is no per-token state tape.
 kernel void gdn_chunk_fused(device const float* accepted[[buffer(0)]],device const float* q[[buffer(1)]],device const float* k[[buffer(2)]],device const float* v[[buffer(3)]],device const float* logg[[buffer(4)]],device const float* beta[[buffer(5)]],device float* next[[buffer(6)]],device float* y[[buffer(8)]],constant GdnChunkParams& p[[buffer(14)]],device atomic_uint* e[[buffer(7)]],uint g[[threadgroup_position_in_grid]],ushort sg[[simdgroup_index_in_threadgroup]],ushort lane[[thread_index_in_simdgroup]]){
-    const uint id=g*4+sg;if(id>=p.heads*p.value_width)return;if(p.mode>1||((p.mode!=0)&&(!p.key_heads||(p.heads%p.key_heads)!=0))){bad_gdn(e);return;}
-    const uint h=id/p.value_width,col=id%p.value_width,qk_h=p.mode?(h%p.key_heads):h;float state[4];
-    for(uint j=0;j<4;++j)state[j]=checked_gdn(accepted[(ulong(h)*128+lane*4+j)*p.value_width+col],e);
-    for(uint t=0;t<p.rows;++t){const float exponent=checked_gdn(grow(logg,t,p.gate_stride)[h],e),b=checked_gdn(grow(beta,t,p.gate_stride)[h],e);if(exponent>0||b<0||b>1){bad_gdn(e);return;}const float a=exp(exponent);float prediction=0;
-        for(uint j=0;j<4;++j){const uint at=qk_h*128+lane*4+j;state[j]*=a;prediction+=state[j]*checked_gdn(grow(k,t,p.input_stride)[at],e);}
-        prediction=simd_sum(prediction);const float delta=(checked_gdn(grow(v,t,p.auxiliary_stride)[id],e)-prediction)*b;float out=0;
-        for(uint j=0;j<4;++j){const uint at=qk_h*128+lane*4+j;state[j]+=grow(k,t,p.input_stride)[at]*delta;checked_gdn(state[j],e);out+=state[j]*checked_gdn(grow(q,t,p.input_stride)[at],e);}out=simd_sum(out);if(!lane)put_gdn(grow(y,t,p.output_stride),id,out,e);
+    constexpr uint C=4u;
+    if(!p.value_width)return;
+    const uint tiles_per_head=(p.value_width+C-1u)/C;
+    const uint sg_tile=g*4u+uint(sg);
+    if(sg_tile>=p.heads*tiles_per_head)return;
+    if(p.mode>1||((p.mode!=0)&&(!p.key_heads||(p.heads%p.key_heads)!=0))){bad_gdn(e);return;}
+
+    const uint h=sg_tile/tiles_per_head;
+    const uint col0=(sg_tile%tiles_per_head)*C;
+    const uint c_cnt=min(C,p.value_width-col0);
+    const uint qk_h=p.mode?(h%p.key_heads):h;
+    const uint qk_off=qk_h*128u+uint(lane)*4u;
+    const uint v_base=h*p.value_width+col0;
+
+    float state[C][4];
+    uint bad=0u;
+    if(c_cnt==C){
+        #pragma unroll
+        for(uint j=0;j<4;++j){
+            device const float* a_ptr=accepted+(ulong(h)*128ul+ulong(lane)*4ul+j)*p.value_width+col0;
+            const float4 sv=float4(*reinterpret_cast<device const packed_float4*>(a_ptr));
+            bad|=nonfin_gdn(sv.x)|nonfin_gdn(sv.y)|nonfin_gdn(sv.z)|nonfin_gdn(sv.w);
+            state[0][j]=sv.x;state[1][j]=sv.y;state[2][j]=sv.z;state[3][j]=sv.w;
+        }
+        for(uint t=0;t<p.rows;++t){
+            const float exponent=grow(logg,t,p.gate_stride)[h],b=grow(beta,t,p.gate_stride)[h];
+            if(nonfin_gdn(exponent)||nonfin_gdn(b)||exponent>0.0f||b<0.0f||b>1.0f){bad_gdn(e);return;}
+            const float a=exp(exponent);
+            const float4 kv4=float4(*reinterpret_cast<device const packed_float4*>(grow(k,t,p.input_stride)+qk_off));
+            const float4 qv4=float4(*reinterpret_cast<device const packed_float4*>(grow(q,t,p.input_stride)+qk_off));
+            bad|=nonfin_gdn(kv4.x)|nonfin_gdn(kv4.y)|nonfin_gdn(kv4.z)|nonfin_gdn(kv4.w)|
+                 nonfin_gdn(qv4.x)|nonfin_gdn(qv4.y)|nonfin_gdn(qv4.z)|nonfin_gdn(qv4.w);
+            const float kv[4]={kv4.x,kv4.y,kv4.z,kv4.w};
+            const float qv[4]={qv4.x,qv4.y,qv4.z,qv4.w};
+
+            device const float* v_ptr=grow(v,t,p.auxiliary_stride)+v_base;
+            const float v_lane=(lane<C)?v_ptr[lane]:0.0f;
+            if(lane<C)bad|=nonfin_gdn(v_lane);
+
+            float my_out=0.0f;
+            #pragma unroll
+            for(uint c=0;c<C;++c){
+                float prediction=0.0f;
+                #pragma unroll
+                for(uint j=0;j<4;++j){
+                    state[c][j]*=a;
+                    prediction+=state[c][j]*kv[j];
+                }
+                prediction=simd_sum(prediction);
+                const float vc=simd_broadcast(v_lane,ushort(c));
+                const float delta=(vc-prediction)*b;
+                float out=0.0f;
+                #pragma unroll
+                for(uint j=0;j<4;++j){
+                    state[c][j]+=kv[j]*delta;
+                    bad|=nonfin_gdn(state[c][j]);
+                    out+=state[c][j]*qv[j];
+                }
+                out=simd_sum(out);
+                if(lane==c)my_out=out;
+            }
+            if(lane<C){
+                bad|=nonfin_gdn(my_out);
+                grow(y,t,p.output_stride)[v_base+lane]=my_out;
+            }
+        }
+        #pragma unroll
+        for(uint j=0;j<4;++j){
+            device float* n_ptr=next+(ulong(h)*128ul+ulong(lane)*4ul+j)*p.value_width+col0;
+            const float4 sv(state[0][j],state[1][j],state[2][j],state[3][j]);
+            bad|=nonfin_gdn(sv.x)|nonfin_gdn(sv.y)|nonfin_gdn(sv.z)|nonfin_gdn(sv.w);
+            *reinterpret_cast<device packed_float4*>(n_ptr)=sv;
+        }
+    }else{
+        for(uint c=0;c<c_cnt;++c){
+            #pragma unroll
+            for(uint j=0;j<4;++j){
+                const float sv=accepted[(ulong(h)*128ul+ulong(lane)*4ul+j)*p.value_width+col0+c];
+                bad|=nonfin_gdn(sv);
+                state[c][j]=sv;
+            }
+        }
+        for(uint t=0;t<p.rows;++t){
+            const float exponent=grow(logg,t,p.gate_stride)[h],b=grow(beta,t,p.gate_stride)[h];
+            if(nonfin_gdn(exponent)||nonfin_gdn(b)||exponent>0.0f||b<0.0f||b>1.0f){bad_gdn(e);return;}
+            const float a=exp(exponent);
+            const float4 kv4=float4(*reinterpret_cast<device const packed_float4*>(grow(k,t,p.input_stride)+qk_off));
+            const float4 qv4=float4(*reinterpret_cast<device const packed_float4*>(grow(q,t,p.input_stride)+qk_off));
+            bad|=nonfin_gdn(kv4.x)|nonfin_gdn(kv4.y)|nonfin_gdn(kv4.z)|nonfin_gdn(kv4.w)|
+                 nonfin_gdn(qv4.x)|nonfin_gdn(qv4.y)|nonfin_gdn(qv4.z)|nonfin_gdn(qv4.w);
+            const float kv[4]={kv4.x,kv4.y,kv4.z,kv4.w};
+            const float qv[4]={qv4.x,qv4.y,qv4.z,qv4.w};
+            device const float* v_ptr=grow(v,t,p.auxiliary_stride)+v_base;
+            device float* y_ptr=grow(y,t,p.output_stride)+v_base;
+            for(uint c=0;c<c_cnt;++c){
+                float prediction=0.0f;
+                #pragma unroll
+                for(uint j=0;j<4;++j){
+                    state[c][j]*=a;
+                    prediction+=state[c][j]*kv[j];
+                }
+                prediction=simd_sum(prediction);
+                const float vc=v_ptr[c];
+                bad|=nonfin_gdn(vc);
+                const float delta=(vc-prediction)*b;
+                float out=0.0f;
+                #pragma unroll
+                for(uint j=0;j<4;++j){
+                    state[c][j]+=kv[j]*delta;
+                    bad|=nonfin_gdn(state[c][j]);
+                    out+=state[c][j]*qv[j];
+                }
+                out=simd_sum(out);
+                if(!lane){bad|=nonfin_gdn(out);y_ptr[c]=out;}
+            }
+        }
+        for(uint c=0;c<c_cnt;++c){
+            #pragma unroll
+            for(uint j=0;j<4;++j){
+                const float sv=state[c][j];
+                bad|=nonfin_gdn(sv);
+                next[(ulong(h)*128ul+ulong(lane)*4ul+j)*p.value_width+col0+c]=sv;
+            }
+        }
     }
-    for(uint j=0;j<4;++j)put_gdn(next,(ulong(h)*128+lane*4+j)*p.value_width+col,state[j],e);
+    if(simd_or(bad)){
+        if(!lane)bad_gdn(e);
+    }
 }
 
 inline float gdn_conv4_silu_channel(device const float* history,device const float* x,device const float* w,device float* next,uint rows,uint raw_cols,ulong in_stride,uint t,uint c,device atomic_uint* e){

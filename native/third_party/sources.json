@@ -227,7 +227,7 @@
       "id": "m5-max-kernels",
       "repository": "https://github.com/9Tempest/m5-max-kernels",
       "revision": "a6d92a3bdd7c784fde2e3e86b303d533354f4603",
-      "pin_kind": "comparison-only",
+      "pin_kind": "recorded-source",
       "licence": "MIT",
       "licence_file": "native/third_party/m5-max-kernels/LICENSE",
       "licence_sha256": "c38444751c5236f608ae5993815ea4294cd8048bd98f80a6935285c576295db3",
@@ -293,7 +293,8 @@
         "m5-max-kernels"
       ],
       "routines": [
-        "kernel_mul_mm_id tile and quantisation adaptation"
+        "kernel_mul_mm_id tile and quantisation adaptation",
+        "grid band ordering after the m5-max-kernels GEMM pattern"
       ],
       "status": "recorded-adaptation",
       "lines": 256
@@ -324,7 +325,7 @@
     },
     {
       "path": "native/kernels/nax_prefill.metal",
-      "sha256": "af8551d80a68cd78293b7016aea248cccd61c475ac2f0e83b843b6836d3a4681",
+      "sha256": "963f665b279544596800c76e03200842294a22f2612c0489dccd6b9272950f32",
       "sources": [
         "llama.cpp",
         "Splash"
@@ -335,7 +336,7 @@
         "shared/gguf_float.metal three-part BF16 weight split and plane matmul"
       ],
       "status": "recorded-adaptation",
-      "lines": 7699
+      "lines": 7667
     },
     {
       "path": "native/kernels/raw_decode.metal",
@@ -363,7 +364,7 @@
     },
     {
       "path": "native/kernels/gdn_chunk.metal",
-      "sha256": "6f72f64989b78ee3ce6de55a0ef2afa018f5a613aea2e363e3bb650af9d210b8",
+      "sha256": "1f41cecc7a341490edbd765025af4a1bf51d182ec7a4705d06fb2734351e03d3",
       "sources": [
         "llama.cpp"
       ],
@@ -371,11 +372,11 @@
         "CS64 delta-net algebra from src/models/delta-net-base.cpp"
       ],
       "status": "recorded-adaptation",
-      "lines": 433
+      "lines": 552
     },
     {
       "path": "native/src/gdn_chunk_math.cpp",
-      "sha256": "41b67442b0b2a608076d89723473124afd220df4466174898d93e0f498bb8e1b",
+      "sha256": "7ba237afb80807ba2e6e76a911403c10a7e755e09c9c69a17307e48267b29a07",
       "sources": [
         "llama.cpp"
       ],

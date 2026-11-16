@@ -110,6 +110,7 @@ private:
 
 // Explicit HTTP-generation lifetime, separate from the legacy packet-local
 // algorithm. Invisible terminals retain their original RNG draw and score.
+// Frozen bytes: the SHA-256 of the cost table as first recorded, with k3 extrapolated to 90498. Checkpoint names and the wire default carry them, so they do not follow profiles/cost-table.json, which records the compiled costs below.
 inline constexpr std::array<uint8_t, 32> default_controller_policy_digest = {
     0xa9, 0x72, 0x87, 0x4d, 0x5a, 0xdb, 0x82, 0xb0,
     0x2e, 0xea, 0x0d, 0x7d, 0xa5, 0xd5, 0x24, 0x2a,
@@ -225,7 +226,7 @@ inline void stage_a_step_ordinary(StageAControllerState& state, uint32_t context
         state.consecutive_ordinary_steps = 0;
         return;
     }
-    if (state.consecutive_ordinary_steps + 1 < StageACostTable::probe_interval) {
+    if (uint32_t(state.consecutive_ordinary_steps) + 1 < StageACostTable::probe_interval) {
         state.consecutive_ordinary_steps += 1;
     }
 }

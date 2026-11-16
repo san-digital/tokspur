@@ -11,7 +11,9 @@
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -290,6 +292,720 @@ int run_cli_verify(int argc, char** argv) {
         return 1;
     }
 }
+// ---- Local seal: format, acceptance rule, files, adoption ----
+
+std::string read_text(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("cannot read test file");
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+void put_text(const std::filesystem::path& path, std::string_view text, mode_t mode = 0444) {
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+    Bytes bytes(text.size());
+    std::memcpy(bytes.data(), text.data(), text.size());
+    write_file_bytes(path, bytes, mode);
+}
+
+struct DirFd {
+    int fd;
+    explicit DirFd(const std::filesystem::path& dir) : fd(::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)) {
+        if (fd < 0) throw std::runtime_error("cannot open test directory");
+    }
+    ~DirFd() { ::close(fd); }
+    DirFd(const DirFd&) = delete;
+    DirFd& operator=(const DirFd&) = delete;
+};
+
+struct FileFd {
+    int fd;
+    explicit FileFd(const std::filesystem::path& path, int flags = O_RDONLY) : fd(::open(path.c_str(), flags | O_CLOEXEC)) {
+        if (fd < 0) throw std::runtime_error("cannot open test file");
+    }
+    ~FileFd() { ::close(fd); }
+    FileFd(const FileFd&) = delete;
+    FileFd& operator=(const FileFd&) = delete;
+};
+
+PackFileIdentity identity_at(const std::filesystem::path& path) {
+    const FileFd file(path);
+    return pack_file_identity(file.fd);
+}
+
+// Rewrites one byte of a read-only file in place and makes it read-only again.
+void flip_byte(const std::filesystem::path& path, uint64_t offset) {
+    if (::chmod(path.c_str(), 0600) != 0) throw std::runtime_error("cannot unseal test pack");
+    const FileFd file(path, O_RDWR);
+    std::byte byte{};
+    if (::pread(file.fd, &byte, 1, off_t(offset)) != 1) throw std::runtime_error("cannot read test byte");
+    byte ^= std::byte{1};
+    if (::pwrite(file.fd, &byte, 1, off_t(offset)) != 1 || ::fchmod(file.fd, 0444) != 0) {
+        throw std::runtime_error("cannot alter test byte");
+    }
+}
+
+void set_mtime(const std::filesystem::path& path, const PackFileIdentity& to) {
+    const struct timespec times[2] = {{0, UTIME_OMIT}, {time_t(to.mtime_seconds), long(to.mtime_nanoseconds)}};
+    if (::utimensat(AT_FDCWD, path.c_str(), times, 0) != 0) throw std::runtime_error("cannot set test mtime");
+}
+
+constexpr SealScope scope_none{}, scope_target{true, false}, scope_mtp{false, true}, scope_both{true, true};
+static_assert(scope_both.covers(scope_both) && !scope_target.covers(scope_both) && scope_none.covers(scope_none) &&
+              (scope_target | scope_mtp) == scope_both && (scope_none | scope_none) == scope_none);
+
+// Every entry of a directory with what a write to it would change.
+std::string directory_state(const std::filesystem::path& dir) {
+    std::vector<std::string> entries;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        struct stat st{};
+        if (::lstat(entry.path().c_str(), &st) != 0) throw std::runtime_error("cannot stat test entry");
+        entries.push_back(entry.path().filename().string() + ":" + std::to_string(st.st_ino) + ":" + std::to_string(st.st_mode) +
+                          ":" + std::to_string(st.st_size) + ":" + std::to_string(st.st_mtimespec.tv_sec) + "." +
+                          std::to_string(st.st_mtimespec.tv_nsec) + ":" + std::to_string(st.st_ctimespec.tv_sec) + "." +
+                          std::to_string(st.st_ctimespec.tv_nsec));
+    }
+    std::sort(entries.begin(), entries.end());
+    std::string out;
+    for (const auto& entry : entries) out += entry + "\n";
+    return out;
+}
+
+struct SealChange {
+    const char* field;
+    void (*apply)(LocalSeal&);
+};
+// Every field a seal carries, each changed alone.
+const std::array<SealChange, 9> seal_changes{{
+    {"manifest", [](LocalSeal& s) { s.manifest_sha256[0] = s.manifest_sha256[0] == '0' ? '1' : '0'; }},
+    {"inode", [](LocalSeal& s) { ++s.pack.inode; }},
+    {"size", [](LocalSeal& s) { ++s.pack.size; }},
+    {"mtime seconds", [](LocalSeal& s) { --s.pack.mtime_seconds; }},
+    {"mtime nanoseconds", [](LocalSeal& s) { s.pack.mtime_nanoseconds ^= 1; }},
+    {"ctime seconds", [](LocalSeal& s) { --s.pack.ctime_seconds; }},
+    {"ctime nanoseconds", [](LocalSeal& s) { s.pack.ctime_nanoseconds ^= 1; }},
+    {"birth time seconds", [](LocalSeal& s) { --s.pack.birthtime_seconds; }},
+    {"birth time nanoseconds", [](LocalSeal& s) { s.pack.birthtime_nanoseconds ^= 1; }},
+}};
+
+std::string replaced(std::string text, std::string_view from, std::string_view to) {
+    const auto at = text.find(from);
+    if (at == std::string::npos) throw std::runtime_error("test seal text lacks the part to replace");
+    return text.replace(at, from.size(), to);
+}
+
+void test_local_seal_format() {
+    const std::string manifest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const LocalSeal seal{manifest, {556103930, 85889703936, 1794827906, 979446023, 1794827907, 62585214, 1794827906, 5}, scope_both};
+    const auto text = encode_local_seal(seal);
+    const std::string identity_lines = "inode=556103930\nsize=85889703936\nmtime=1794827906.979446023\n"
+                                       "ctime=1794827907.062585214\nbirthtime=1794827906.000000005\n";
+    require(text == "tokspur-local-seal-v2\nmanifest_sha256=" + manifest + "\ncompared=target+mtp\n" + identity_lines,
+            "seal encoding is the documented eight lines");
+    const auto parsed = parse_local_seal(text);
+    require(parsed.form == LocalSealForm::current && parsed.seal == seal, "seal survives a round trip");
+    const std::array<std::pair<SealScope, const char*>, 4> scopes{{
+        {scope_none, "none"}, {scope_target, "target"}, {scope_mtp, "mtp"}, {scope_both, "target+mtp"}}};
+    for (const auto& [scope, spelling] : scopes) {
+        auto scoped = seal;
+        scoped.compared = scope;
+        const auto encoded = encode_local_seal(scoped);
+        const auto back = parse_local_seal(encoded);
+        require(encoded == replaced(text, "compared=target+mtp\n", std::string("compared=") + spelling + "\n") &&
+                back.form == LocalSealForm::current && back.seal == scoped && back.seal.compared == scope,
+                "each scope has one spelling and survives a round trip");
+    }
+    constexpr auto u64 = std::numeric_limits<uint64_t>::max();
+    constexpr auto i64 = std::numeric_limits<int64_t>::max();
+    for (const auto& pack : {PackFileIdentity{}, PackFileIdentity{u64, u64, i64, 999999999, std::numeric_limits<int64_t>::min(), 0, -1, 1}}) {
+        const LocalSeal extreme{manifest, pack, scope_mtp};
+        const auto encoded = encode_local_seal(extreme);
+        const auto back = parse_local_seal(encoded);
+        require(encoded.size() <= max_local_seal_bytes && back.form == LocalSealForm::current && back.seal == extreme,
+                "extreme identity survives a round trip");
+    }
+
+    // The earlier form is recognised, so it can be replaced, but it binds no file and never vouches.
+    for (const auto* tail : {"", "\n", "\r\n", " \n\n"}) {
+        const auto legacy = parse_local_seal(manifest + tail);
+        require(legacy.form == LocalSealForm::legacy && legacy.seal.manifest_sha256 == manifest &&
+                legacy.seal.pack == PackFileIdentity{}, "manifest-only seal is the earlier form, not current");
+        require(!local_seal_vouches(manifest + tail, manifest, seal.pack, scope_none) &&
+                !local_seal_vouches(manifest + tail, manifest, PackFileIdentity{}, scope_none),
+                "manifest-only seal never vouches");
+    }
+
+    for (size_t length = 0; length < text.size(); ++length) {
+        const auto cut = text.substr(0, length);
+        require(parse_local_seal(cut).form == LocalSealForm::malformed && !local_seal_vouches(cut, manifest, seal.pack, scope_none),
+                "truncated seal is not current");
+    }
+    std::string upper = manifest;
+    upper[10] = 'A';
+    std::string crlf;
+    for (const char c : text) crlf += c == '\n' ? std::string("\r\n") : std::string(1, c);
+    const std::vector<std::string> garbage{
+        "", "garbage", std::string(1, '\0'), manifest + "x", manifest.substr(1), upper, std::string(5000, 'a'),
+        text + "\n", text + " ", " " + text, text + text, crlf,
+        text + std::string(max_local_seal_bytes, '\n'),
+        replaced(text, "seal-v2", "seal-v1"), replaced(text, "seal-v2", "seal-v3"),
+        replaced(text, manifest, upper), replaced(text, manifest, manifest.substr(1)),
+        replaced(text, "inode=556103930", "inode=0556103930"), replaced(text, "inode=556103930", "inode=+556103930"),
+        replaced(text, "inode=556103930", "inode=-1"), replaced(text, "inode=556103930", "inode="),
+        replaced(text, "inode=556103930", "inode=18446744073709551616"),
+        replaced(text, "size=", "bytes="), replaced(text, "size=85889703936\n", ""),
+        replaced(text, "size=85889703936\n", "size=85889703936\nsize=85889703936\n"),
+        replaced(text, "inode=556103930\nsize=85889703936\n", "size=85889703936\ninode=556103930\n"),
+        replaced(text, ".979446023", ".97944602"), replaced(text, ".979446023", ".9794460230"),
+        replaced(text, ".979446023", ""), replaced(text, ".979446023", ".-79446023"),
+        replaced(text, "mtime=1794827906", "mtime=01794827906"), replaced(text, "mtime=1794827906", "mtime=-0"),
+        replaced(text, "birthtime=1794827906.000000005\n", "birthtime=1794827906.000000005\nextra=1\n"),
+        // The scope line: four spellings, once, directly after the manifest.
+        "tokspur-local-seal-v2\nmanifest_sha256=" + manifest + "\n" + identity_lines,
+        replaced(text, "compared=target+mtp\n", ""),
+        replaced(text, "compared=target+mtp\n", "compared=target+mtp\ncompared=target+mtp\n"),
+        replaced(text, "compared=target+mtp\n", "compared=target\ncompared=mtp\n"),
+        replaced(text, "compared=target+mtp\ninode=556103930\n", "inode=556103930\ncompared=target+mtp\n"),
+        replaced(text, "compared=target+mtp", "compared=mtp+target"), replaced(text, "compared=target+mtp", "compared=target+mtp+"),
+        replaced(text, "compared=target+mtp", "compared=target,mtp"), replaced(text, "compared=target+mtp", "compared=target+target"),
+        replaced(text, "compared=target+mtp", "compared=TARGET+MTP"), replaced(text, "compared=target+mtp", "compared= target"),
+        replaced(text, "compared=target+mtp", "compared=target "), replaced(text, "compared=target+mtp", "compared="),
+        replaced(text, "compared=target+mtp", "compared=both"), replaced(text, "compared=target+mtp", "compared=all"),
+        replaced(text, "compared=target+mtp", "compared=1"), replaced(text, "compared=target+mtp", "compared"),
+        replaced(text, "compared=target+mtp", "scope=target+mtp"),
+    };
+    for (const auto& bad : garbage) {
+        require(parse_local_seal(bad).form == LocalSealForm::malformed && !local_seal_vouches(bad, manifest, seal.pack, scope_none),
+                "malformed seal is not current");
+    }
+
+    // The acceptance rule: the manifest and every identity field, exactly.
+    require(local_seal_vouches(text, manifest, seal.pack, scope_both), "exact seal vouches");
+    for (const auto& change : seal_changes) {
+        auto other = seal;
+        change.apply(other);
+        require(other != seal && !local_seal_vouches(encode_local_seal(other), seal.manifest_sha256, seal.pack, scope_none) &&
+                !local_seal_vouches(text, other.manifest_sha256, other.pack, scope_none),
+                change.field);
+    }
+    require(!local_seal_vouches(text, "", seal.pack, scope_none) && !local_seal_vouches(text, upper, seal.pack, scope_none),
+            "malformed expected manifest never vouches");
+
+    // The scope rule: a seal vouches only for a start with no source beyond the ones it was compared with.
+    //                          needed: none   target mtp    target+mtp
+    const bool expected[4][4] = {{true, false, false, false},  // compared=none
+                                 {true, true, false, false},   // compared=target
+                                 {true, false, true, false},   // compared=mtp
+                                 {true, true, true, true}};    // compared=target+mtp
+    for (size_t have = 0; have < 4; ++have) {
+        auto scoped = seal;
+        scoped.compared = scopes[have].first;
+        for (size_t need = 0; need < 4; ++need) {
+            require(local_seal_vouches(encode_local_seal(scoped), manifest, seal.pack, scopes[need].first) == expected[have][need] &&
+                    scopes[have].first.covers(scopes[need].first) == expected[have][need],
+                    "seal scope must cover the sources this start would compare");
+            const auto both = scopes[have].first | scopes[need].first;
+            require(both.covers(scopes[have].first) && both.covers(scopes[need].first) &&
+                    both.target == (scopes[have].first.target || scopes[need].first.target) &&
+                    both.mtp == (scopes[have].first.mtp || scopes[need].first.mtp), "scope union holds exactly both");
+        }
+    }
+}
+
+void test_local_seal_files(const std::filesystem::path& dir) {
+    std::filesystem::create_directory(dir);
+    const std::string manifest(64, 'c');
+    const auto pack = dir / "p.asa.gguf", seal = dir / "p.asa.seal";
+    put_text(pack, std::string(4096, 'p'));
+    require(local_seal_name("p.asa.gguf") == "p.asa.seal" && local_seal_name("tokspur-pack-v3.asa.gguf") == "tokspur-pack-v3.asa.seal" &&
+            local_seal_name("blob") == "blob.seal" && local_seal_name(".seal") == ".seal.seal",
+            "seal name is the pack stem plus .seal");
+    require(!local_seal_name("p.seal") && !local_seal_name("p.asa.seal") && !local_seal_name("blob.seal"),
+            "pack that would be its own seal has no seal name");
+    const DirFd d(dir);
+    const FileFd pack_fd(pack);
+    const auto identity = pack_file_identity(pack_fd.fd);
+    struct stat pack_st{};
+    require(::fstat(pack_fd.fd, &pack_st) == 0 &&
+            identity == PackFileIdentity{uint64_t(pack_st.st_ino), uint64_t(pack_st.st_size),
+                                         int64_t(pack_st.st_mtimespec.tv_sec), uint32_t(pack_st.st_mtimespec.tv_nsec),
+                                         int64_t(pack_st.st_ctimespec.tv_sec), uint32_t(pack_st.st_ctimespec.tv_nsec),
+                                         int64_t(pack_st.st_birthtimespec.tv_sec), uint32_t(pack_st.st_birthtimespec.tv_nsec)},
+            "identity is fstat of the descriptor at full timestamp resolution");
+    refuses([&] { static_cast<void>(pack_file_identity(d.fd)); }, "identity of a directory refused");
+    const auto reading = [&](SealScope needed = scope_both) {
+        return read_local_seal(d.fd, "p.asa.gguf", manifest, identity, needed);
+    };
+    using Entry = LocalSealReading::Entry;
+
+    require(reading().entry == Entry::absent && !reading().vouches, "absent seal does not vouch");
+    refuses([&] { publish_local_seal(d.fd, "p.asa.gguf", {"not a hash", identity, scope_both}, false); }, "malformed manifest is never sealed");
+    publish_local_seal(d.fd, "p.asa.gguf", {manifest, identity, scope_both}, false);
+    struct stat st{};
+    require(::lstat(seal.c_str(), &st) == 0 && S_ISREG(st.st_mode) && (st.st_mode & 0777) == 0444 && st.st_nlink == 1 &&
+            count_entries(dir) == 2, "published seal is a read-only single-link file and no temporary remains");
+    require(read_text(seal) == encode_local_seal({manifest, identity, scope_both}), "published seal is the exact encoding");
+    auto found = reading();
+    require(found.entry == Entry::regular && found.trusted_file && found.form == LocalSealForm::current &&
+            found.names_manifest && found.names_file && found.compared == scope_both && found.vouches,
+            "published seal vouches for the file it names");
+    refuses([&] { publish_local_seal(d.fd, "p.asa.gguf", {manifest, {}, scope_both}, false); }, "exclusive publication never replaces");
+    require(reading().vouches && count_entries(dir) == 2, "refused publication left the seal and no temporary");
+
+    // A sound seal file that does not match exactly.
+    for (const auto& change : seal_changes) {
+        LocalSeal other{manifest, identity, scope_both};
+        change.apply(other);
+        publish_local_seal(d.fd, "p.asa.gguf", other, true);
+        found = reading();
+        require(found.trusted_file && found.form == LocalSealForm::current && !found.vouches && !found.names_file &&
+                found.names_manifest == (other.manifest_sha256 == manifest), change.field);
+        require(!reading(scope_none).vouches, change.field);
+    }
+    // A sound seal for exactly this file with a narrower scope: it names the file, and vouches only for what it covers.
+    for (const auto scope : {scope_none, scope_target, scope_mtp, scope_both}) {
+        publish_local_seal(d.fd, "p.asa.gguf", {manifest, identity, scope}, true);
+        for (const auto needed : {scope_none, scope_target, scope_mtp, scope_both}) {
+            found = reading(needed);
+            require(found.trusted_file && found.names_manifest && found.names_file && found.compared == scope &&
+                    found.vouches == scope.covers(needed), "seal file vouches only within its scope");
+        }
+    }
+    put_text(seal, manifest + "\n");
+    found = reading();
+    require(found.trusted_file && found.form == LocalSealForm::legacy && found.names_manifest && !found.vouches,
+            "earlier-format seal file does not vouch");
+    require(!found.names_file && found.compared == scope_none, "earlier-format seal names no file and no scope");
+    put_text(seal, encode_local_seal({manifest, identity, scope_both}).substr(0, 40));
+    found = reading();
+    require(found.trusted_file && found.form == LocalSealForm::malformed && !found.names_manifest && !found.vouches,
+            "truncated seal file does not vouch");
+
+    // A seal file that fails the file checks is not read at all, whatever it says.
+    const auto good = encode_local_seal({manifest, identity, scope_both});
+    put_text(seal, good, 0644);
+    found = reading();
+    require(found.entry == Entry::regular && !found.trusted_file && !found.names_file && found.compared == scope_none &&
+            !found.vouches && !reading(scope_none).vouches, "writable seal does not vouch");
+    put_text(seal, good);
+    require(reading().vouches && ::link(seal.c_str(), (dir / "alias").c_str()) == 0, "link a second name to the seal");
+    require(!reading().trusted_file && !reading().vouches, "multiply linked seal does not vouch");
+    require(std::filesystem::remove(dir / "alias") && reading().vouches, "single link restored");
+    put_text(seal, good + std::string(max_local_seal_bytes, '\n'));
+    found = reading();
+    require(found.entry == Entry::other && !found.trusted_file && !found.vouches, "oversized seal does not vouch");
+    put_text(seal, std::string(max_local_seal_bytes, 's'));
+    require(reading().entry == Entry::regular && !reading().vouches, "largest seal-sized file is still a seal candidate");
+    put_text(seal, "");
+    require(!reading().trusted_file && !reading().vouches, "empty seal does not vouch");
+    put_text(dir / "real", good);
+    require(std::filesystem::remove(seal) && ::symlink("real", seal.c_str()) == 0, "point a symlink at a good seal");
+    found = reading();
+    require(found.entry == Entry::other && !found.trusted_file && !found.vouches, "symlinked seal does not vouch");
+
+    // Refresh after a full verification of pack_fd.
+    const auto refresh = [&](const PackFileIdentity& before = PackFileIdentity{}, const char* name = "p.asa.gguf",
+                             SealScope verified = scope_both) {
+        return refresh_local_seal(d.fd, name, pack_fd.fd, manifest, before == PackFileIdentity{} ? identity : before, verified);
+    };
+    require(!refresh() && std::filesystem::is_symlink(seal) && read_text(dir / "real") == good,
+            "symlinked seal name is neither replaced nor followed");
+    require(std::filesystem::remove(seal) && std::filesystem::create_directory(seal) && !refresh() &&
+            std::filesystem::is_directory(seal) && std::filesystem::remove(seal), "directory at the seal name is left alone");
+    {
+        // Another file that merely has the seal name, such as a pack called p.asa.seal.
+        const std::string bystander(max_local_seal_bytes + 1, 'b');
+        for (const mode_t mode : {mode_t(0444), mode_t(0644)}) {
+            put_text(seal, bystander, mode);
+            const auto before = identity_at(seal);
+            require(!refresh() && read_text(seal) == bystander && identity_at(seal) == before,
+                    "file too large to be a seal is not replaced");
+            refuses([&] { publish_local_seal(d.fd, "p.asa.gguf", {manifest, identity, scope_both}, false); },
+                    "exclusive publication does not replace it either");
+            require(read_text(seal) == bystander && identity_at(seal) == before && std::filesystem::remove(seal),
+                    "bystander file is intact");
+        }
+    }
+    for (const auto& change : seal_changes) {
+        LocalSeal before{manifest, identity, scope_both};
+        change.apply(before);
+        if (before.pack == identity) continue;
+        require(!refresh(before.pack) && !std::filesystem::exists(seal), "file that changed during verification is not sealed");
+    }
+    put_text(dir / "q.asa.gguf", std::string(4096, 'q'));
+    require(!refresh({}, "q.asa.gguf") && !refresh({}, "missing.gguf") && !std::filesystem::exists(dir / "q.asa.seal"),
+            "name that is not the verified file is not sealed");
+    {
+        const DirFd other(dir);
+        require(::flock(other.fd, LOCK_EX | LOCK_NB) == 0 && !refresh() && !std::filesystem::exists(seal),
+                "directory held by a publisher is not written");
+    }
+    if (::geteuid() != 0) {
+        require(::chmod(dir.c_str(), 0555) == 0 && !refresh() && ::chmod(dir.c_str(), 0700) == 0 &&
+                !std::filesystem::exists(seal), "unwritable directory yields no seal and no error");
+    }
+    require(refresh() && reading().vouches && read_text(seal) == good, "missing seal is created");
+    require(::stat(seal.c_str(), &st) == 0, "stat created seal");
+    const auto kept = st.st_ino;
+    require(refresh() && ::stat(seal.c_str(), &st) == 0 && st.st_ino == kept, "current seal is kept, not rewritten");
+    for (const auto* stale : {"garbage", "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\n"}) {
+        put_text(seal, stale);
+        require(refresh() && reading().vouches, "stale regular seal is replaced");
+    }
+    put_text(seal, good, 0644);
+    require(refresh() && reading().vouches && ::stat(seal.c_str(), &st) == 0 && (st.st_mode & 0777) == 0444,
+            "writable seal is replaced by a read-only one");
+
+    // Scope on refresh. A seal that names this manifest and exactly this file
+    // keeps what it compared and gains what was just verified.
+    const auto sealed_as = [&](SealScope scope) { return read_text(seal) == encode_local_seal({manifest, identity, scope}); };
+    const auto verified = [&](SealScope scope) { return refresh({}, "p.asa.gguf", scope); };
+    for (const auto have : {scope_none, scope_target, scope_mtp, scope_both}) {
+        for (const auto add : {scope_none, scope_target, scope_mtp, scope_both}) {
+            publish_local_seal(d.fd, "p.asa.gguf", {manifest, identity, have}, true);
+            require(::stat(seal.c_str(), &st) == 0, "stat seal before refresh");
+            const auto before_inode = st.st_ino;
+            require(verified(add) && sealed_as(have | add) && ::stat(seal.c_str(), &st) == 0 &&
+                    (st.st_ino == before_inode) == have.covers(add),
+                    "seal for the same file is widened to the union, and kept when it already covers");
+        }
+    }
+    // Any other seal contributes nothing: the new seal carries the verified scope alone.
+    LocalSeal elsewhere{manifest, identity, scope_both};
+    ++elsewhere.pack.inode;
+    put_text(seal, encode_local_seal(elsewhere));
+    require(verified(scope_mtp) && sealed_as(scope_mtp), "seal for another file identity is not widened");
+    put_text(seal, encode_local_seal({std::string(64, 'd'), identity, scope_both}));
+    require(verified(scope_target) && sealed_as(scope_target), "seal for another manifest is not widened");
+    put_text(seal, manifest + "\n");
+    require(verified(scope_none) && sealed_as(scope_none), "earlier-format seal is not widened");
+    put_text(seal, good, 0644);
+    require(verified(scope_target) && sealed_as(scope_target), "seal that fails the file checks is not widened");
+    put_text(seal, good);
+    require(::link(seal.c_str(), (dir / "alias").c_str()) == 0 && verified(scope_mtp) && sealed_as(scope_mtp) &&
+            std::filesystem::remove(dir / "alias"), "multiply linked seal is not widened");
+    require(verified(scope_both) && sealed_as(scope_both), "seal is back to both sources");
+
+    // A pack whose name is its own seal name: never read as a seal, never sealed, never written.
+    const auto own = dir / "own-seal";
+    std::filesystem::create_directory(own);
+    for (const auto* name : {"p.seal", "tokspur-pack-v2.asa.seal"}) {
+        put_text(own / name, std::string(300, 's'));
+        const DirFd own_dir(own);
+        const FileFd own_fd(own / name);
+        const auto own_identity = pack_file_identity(own_fd.fd);
+        const auto state = directory_state(own);
+        const auto bytes = read_text(own / name);
+        const auto own_reading = read_local_seal(own_dir.fd, name, manifest, own_identity, scope_none);
+        require(own_reading.entry == Entry::other && !own_reading.trusted_file && !own_reading.names_manifest &&
+                !own_reading.names_file && !own_reading.vouches, "pack that is its own seal name is never read as a seal");
+        for (const bool replace : {false, true}) {
+            refuses([&] { publish_local_seal(own_dir.fd, name, {manifest, own_identity, scope_both}, replace); },
+                    "pack that is its own seal name is never sealed");
+        }
+        require(!refresh_local_seal(own_dir.fd, name, own_fd.fd, manifest, own_identity, scope_both),
+                "pack that is its own seal name is not refreshed");
+        require(directory_state(own) == state && read_text(own / name) == bytes && pack_file_identity(own_fd.fd) == own_identity &&
+                count_entries(own) == 1, "pack that is its own seal name is untouched");
+        require(std::filesystem::remove(own / name), "remove own-seal fixture");
+    }
+
+    // What changes the identity of the sealed file.
+    const auto vouches_for = [&](const std::filesystem::path& file) {
+        return read_local_seal(d.fd, "p.asa.gguf", manifest, identity_at(file), scope_both).vouches;
+    };
+    require(vouches_for(pack), "reading the pack again changes nothing");
+    flip_byte(pack, 100);
+    auto now = identity_at(pack);
+    require(now.inode == identity.inode && now.size == identity.size && now.birthtime_seconds == identity.birthtime_seconds &&
+            (now.ctime_seconds != identity.ctime_seconds || now.ctime_nanoseconds != identity.ctime_nanoseconds) &&
+            !vouches_for(pack), "payload rewritten in place is not vouched for");
+    set_mtime(pack, identity);
+    now = identity_at(pack);
+    require(now.mtime_seconds == identity.mtime_seconds && now.mtime_nanoseconds == identity.mtime_nanoseconds &&
+            !vouches_for(pack), "restoring the modification time does not restore the seal");
+    std::filesystem::create_directory(dir / "copy");
+    std::filesystem::copy_file(pack, dir / "copy" / "p.asa.gguf");
+    require(identity_at(dir / "copy" / "p.asa.gguf").inode != identity.inode && !vouches_for(dir / "copy" / "p.asa.gguf"),
+            "copied pack is not vouched for");
+    require(refresh_local_seal(d.fd, "p.asa.gguf", pack_fd.fd, manifest, identity_at(pack), scope_both) && vouches_for(pack),
+            "seal follows the file after a new verification");
+    std::filesystem::rename(pack, dir / "moved.asa.gguf");
+    require(!vouches_for(dir / "moved.asa.gguf"), "renamed pack is not vouched for");
+}
+
+// The smallest source and sidecar that satisfy the full v2 census: 1,222 target tensors and 32 blk.48 tensors.
+struct SealedPackFixture {
+    std::shared_ptr<const ModelFiles> source, changed_source, mtp, changed_mtp;
+    std::filesystem::path pack, seal;
+    PackPlan built;
+};
+
+SealedPackFixture build_sealed_pack_fixture(const std::filesystem::path& dir) {
+    std::filesystem::create_directory(dir);
+    std::vector<SyntheticTensorSpec> target{{"token_embd.weight", 0, {8}, make_f32_bytes(8, 1)}};
+    for (const auto* name : {"output.weight", "output_hc_norm.weight", "blk.0.ssm_a", "blk.3.attn_q.weight", "blk.1.ple_key.weight"}) {
+        target.push_back({name, 0, {8}, make_f32_bytes(8, uint8_t(target.size()))});
+    }
+    while (target.size() < 1 + expected_gpu_tensors - 32) {
+        const auto i = target.size();
+        target.push_back({"blk." + std::to_string(i % 48) + ".seal_fixture_" + std::to_string(i) + ".weight", 0, {8},
+                          make_f32_bytes(8, uint8_t(i))});
+    }
+    std::vector<SyntheticTensorSpec> sidecar;
+    for (size_t i = 0; i < 32; ++i) {
+        sidecar.push_back({"blk.48.seal_fixture_" + std::to_string(i) + ".weight", 0, {8}, make_f32_bytes(8, uint8_t(i + 3))});
+    }
+    auto changed = target;
+    changed[700].payload.back() ^= std::byte{1};
+    write_gguf_shard(dir / "source.gguf", "qwen4exp", target);
+    write_gguf_shard(dir / "changed-source.gguf", "qwen4exp", changed);
+    write_gguf_shard(dir / "mtp.gguf", "qwen4exp", sidecar);
+    auto changed_sidecar = sidecar;
+    changed_sidecar[17].payload.back() ^= std::byte{1};
+    write_gguf_shard(dir / "changed-mtp.gguf", "qwen4exp", changed_sidecar);
+    SealedPackFixture fixture;
+    fixture.source = std::make_shared<const ModelFiles>(std::vector<std::filesystem::path>{dir / "source.gguf"});
+    fixture.changed_source = std::make_shared<const ModelFiles>(std::vector<std::filesystem::path>{dir / "changed-source.gguf"});
+    fixture.mtp = std::make_shared<const ModelFiles>(std::vector<std::filesystem::path>{dir / "mtp.gguf"});
+    fixture.changed_mtp = std::make_shared<const ModelFiles>(std::vector<std::filesystem::path>{dir / "changed-mtp.gguf"});
+    std::filesystem::create_directory(dir / "derived");
+    fixture.pack = dir / "derived" / "tokspur-pack-v2.asa.gguf";
+    fixture.seal = dir / "derived" / "tokspur-pack-v2.asa.seal";
+    fixture.built = build_derived_pack(fixture.source, fixture.mtp, fixture.pack, 1ULL << 20, 32'768);
+    require(verify_gpu_pack_census(fixture.built), "seal fixture satisfies the full v2 census");
+    return fixture;
+}
+
+void test_local_seal_adoption(const std::filesystem::path& dir) {
+    const auto fixture = build_sealed_pack_fixture(dir);
+    auto pack = fixture.pack, seal = fixture.seal;
+    const auto adopt = [&](const std::shared_ptr<const ModelFiles>& origin, TrustMode mode) {
+        return adopt_derived_pack(origin, fixture.mtp, pack, 32'768, 4, mode);
+    };
+    const auto manifest = adopt(fixture.source, TrustMode::full).manifest_sha256;
+    const auto current = [&] { return LocalSeal{manifest, identity_at(pack), scope_both}; };
+    // Everything observable about the seal name, to show a refused start left it alone.
+    const auto seal_state = [&]() -> std::string {
+        struct stat st{};
+        if (::lstat(seal.c_str(), &st) != 0) return "absent";
+        if (!S_ISREG(st.st_mode)) return "not a file";
+        return std::to_string(st.st_ino) + ":" + std::to_string(st.st_mode) + ":" + std::to_string(st.st_nlink) + ":" + read_text(seal);
+    };
+    // The changed source has the same tensor list and one different payload
+    // byte, so it is adopted only when the payload comparison does not run.
+    const auto falls_back = [&](const char* what) {
+        const auto state = seal_state();
+        refuses([&] { static_cast<void>(adopt(fixture.changed_source, TrustMode::local_seal)); }, what);
+        require(seal_state() == state, "failed full verification wrote no seal");
+    };
+    const auto accepts = [&](const char* what) {
+        const auto state = seal_state();
+        const auto adopted = adopt(fixture.changed_source, TrustMode::local_seal);
+        require(adopted.local_seal == LocalSealUse::accepted && adopted.authentication_workers == 1 && adopted.compared == scope_none &&
+                adopted.manifest_sha256 == manifest && adopted.pack_identity == identity_at(pack) && seal_state() == state, what);
+    };
+    const auto refreshes = [&](const char* what) {
+        const auto adopted = adopt(fixture.source, TrustMode::local_seal);
+        struct stat st{};
+        require(adopted.local_seal == LocalSealUse::refreshed && adopted.authentication_workers == 4 && adopted.compared == scope_both &&
+                adopted.pack_identity == identity_at(pack) && ::lstat(seal.c_str(), &st) == 0 && S_ISREG(st.st_mode) &&
+                (st.st_mode & 0777) == 0444 && st.st_nlink == 1 && read_text(seal) == encode_local_seal(current()), what);
+    };
+    const auto leaves_no_seal = [&](const char* what) {
+        const auto state = seal_state();
+        const auto adopted = adopt(fixture.source, TrustMode::local_seal);
+        require(adopted.local_seal == LocalSealUse::not_refreshed && adopted.authentication_workers == 4 &&
+                adopted.compared == scope_both && seal_state() == state, what);
+    };
+
+    // Full mode neither reads nor writes a seal.
+    require(adopt(fixture.source, TrustMode::full).local_seal == LocalSealUse::not_consulted &&
+            adopt(fixture.source, TrustMode::full).compared == scope_both && seal_state() == "absent",
+            "full mode writes no seal");
+    falls_back("missing seal falls back to full verification");
+    refreshes("full verification in local-seal mode leaves a current seal");
+    accepts("current seal is accepted without comparing the payload");
+    refuses([&] { static_cast<void>(adopt(fixture.changed_source, TrustMode::full)); }, "full mode ignores a valid seal");
+    require(count_entries(pack.parent_path()) == 2, "no seal temporary remains");
+
+    for (const auto& change : seal_changes) {
+        auto other = current();
+        change.apply(other);
+        put_text(seal, encode_local_seal(other));
+        falls_back(change.field);
+        refreshes(change.field);
+        accepts(change.field);
+    }
+
+    put_text(seal, "garbage\n");
+    const auto garbage_state = seal_state();
+    require(adopt(fixture.source, TrustMode::full).local_seal == LocalSealUse::not_consulted && seal_state() == garbage_state,
+            "full mode leaves an unusable seal alone");
+    falls_back("malformed seal falls back");
+    refreshes("malformed seal is replaced after full verification");
+    put_text(seal, manifest + "\n");
+    falls_back("earlier-format seal falls back");
+    refreshes("earlier-format seal is replaced after full verification");
+    const auto good = encode_local_seal(current());
+    put_text(seal, good.substr(0, good.size() - 1));
+    falls_back("truncated seal falls back");
+    refreshes("truncated seal is replaced after full verification");
+    put_text(seal, good, 0644);
+    falls_back("writable seal falls back");
+    refreshes("writable seal is replaced after full verification");
+    const auto alias = seal.parent_path() / "alias";
+    require(::link(seal.c_str(), alias.c_str()) == 0, "link a second name to the seal");
+    falls_back("multiply linked seal falls back");
+    refreshes("multiply linked seal is replaced after full verification");
+    require(read_text(alias) == good && std::filesystem::remove(alias), "other link kept its own file");
+    const auto real = seal.parent_path() / "real";
+    std::filesystem::rename(seal, real);
+    require(::symlink("real", seal.c_str()) == 0, "point a symlink at a good seal");
+    falls_back("symlinked seal falls back");
+    leaves_no_seal("symlinked seal name is never replaced");
+    require(std::filesystem::is_symlink(seal) && read_text(real) == good && std::filesystem::remove(seal) &&
+            std::filesystem::remove(real) && std::filesystem::create_directory(seal), "replace the symlink with a directory");
+    falls_back("directory at the seal name falls back");
+    leaves_no_seal("directory at the seal name is never replaced");
+    require(std::filesystem::remove(seal), "remove directory at the seal name");
+    {
+        const DirFd other(pack.parent_path());
+        require(::flock(other.fd, LOCK_EX | LOCK_NB) == 0, "hold the pack directory as a publisher does");
+        leaves_no_seal("directory held by a publisher is not written");
+    }
+    if (::geteuid() != 0) {
+        require(::chmod(pack.parent_path().c_str(), 0555) == 0, "make the pack directory unwritable");
+        leaves_no_seal("unwritable directory costs a full verification, not an error");
+        require(::chmod(pack.parent_path().c_str(), 0700) == 0, "restore the pack directory");
+    }
+    refreshes("seal is written once the directory allows it");
+    accepts("refreshed seal is accepted");
+
+    // The seal records which sources the pack was compared with. Without the
+    // MTP sidecar the blk.48.* tensors are checked against the manifest only,
+    // so that seal must not be accepted by a start that has the sidecar.
+    const auto adopt_with = [&](const std::shared_ptr<const ModelFiles>& origin, const std::shared_ptr<const ModelFiles>& sidecar,
+                                TrustMode mode = TrustMode::local_seal) {
+        return adopt_derived_pack(origin, sidecar, pack, 32'768, 4, mode);
+    };
+    const auto sealed_as = [&](SealScope scope) {
+        return read_text(seal) == encode_local_seal({manifest, identity_at(pack), scope});
+    };
+    require(adopt_with(fixture.source, nullptr, TrustMode::full).compared == scope_target && sealed_as(scope_both),
+            "full mode without the sidecar compares the target only and leaves the seal alone");
+    refuses([&] { static_cast<void>(adopt_with(fixture.source, fixture.changed_mtp, TrustMode::full)); },
+            "full mode compares the sidecar");
+    require(std::filesystem::remove(seal), "remove the seal for the scope sequence");
+    auto scoped = adopt_with(fixture.source, nullptr);
+    require(scoped.local_seal == LocalSealUse::refreshed && scoped.authentication_workers == 4 && scoped.compared == scope_target &&
+            sealed_as(scope_target), "start without the sidecar seals the target comparison only");
+    scoped = adopt_with(fixture.changed_source, nullptr);
+    require(scoped.local_seal == LocalSealUse::accepted && scoped.authentication_workers == 1 && scoped.compared == scope_none &&
+            sealed_as(scope_target), "start without the sidecar accepts the target-only seal");
+    auto scope_state = seal_state();
+    refuses([&] { static_cast<void>(adopt_with(fixture.source, fixture.changed_mtp)); },
+            "start with the sidecar does not accept a target-only seal: the sidecar is compared");
+    refuses([&] { static_cast<void>(adopt_with(fixture.changed_source, fixture.mtp)); },
+            "start with the sidecar does not accept a target-only seal: the target is compared again");
+    require(seal_state() == scope_state, "refused starts left the target-only seal alone");
+    scoped = adopt_with(fixture.source, fixture.mtp);
+    require(scoped.local_seal == LocalSealUse::refreshed && scoped.authentication_workers == 4 && scoped.compared == scope_both &&
+            sealed_as(scope_both), "start with the sidecar widens the seal to both sources");
+    scope_state = seal_state();
+    for (const auto& origin : {fixture.source, fixture.changed_source}) {
+        for (const auto& sidecar : {fixture.mtp, fixture.changed_mtp, std::shared_ptr<const ModelFiles>{}}) {
+            scoped = adopt_with(origin, sidecar);
+            require(scoped.local_seal == LocalSealUse::accepted && scoped.authentication_workers == 1 &&
+                    scoped.compared == scope_none && seal_state() == scope_state,
+                    "seal for both sources is accepted with or without the sidecar, and neither source is read");
+        }
+    }
+    // A narrower seal for another identity of the file contributes nothing to the new one.
+    LocalSeal elsewhere{manifest, identity_at(pack), scope_both};
+    ++elsewhere.pack.inode;
+    put_text(seal, encode_local_seal(elsewhere));
+    scoped = adopt_with(fixture.source, nullptr);
+    require(scoped.local_seal == LocalSealUse::refreshed && scoped.compared == scope_target && sealed_as(scope_target),
+            "seal for another file identity is replaced by the verified scope alone");
+    refreshes("seal is widened back to both sources");
+
+    // A pack whose own name ends in .seal has no seal name. It is fully
+    // verified on every start and nothing in its directory is written.
+    {
+        const auto own = dir / "own-seal";
+        std::filesystem::create_directory(own);
+        const auto named = own / "tokspur-pack-v2.seal";
+        std::filesystem::copy_file(pack, named);
+        require(::chmod(named.c_str(), 0444) == 0, "make the .seal-named pack read-only");
+        const auto bytes = read_text(named);
+        const auto identity = identity_at(named);
+        const auto state = directory_state(own);
+        require(bytes == read_text(pack) && bytes.size() == fixture.built.file_bytes, "the .seal-named pack is a copy of the fixture pack");
+        for (int start = 0; start < 2; ++start) {
+            refuses([&] { static_cast<void>(adopt_derived_pack(fixture.changed_source, fixture.mtp, named, 32'768, 4, TrustMode::local_seal)); },
+                    "the .seal-named pack is fully verified on every start");
+            const auto adopted = adopt_derived_pack(fixture.source, fixture.mtp, named, 32'768, 4, TrustMode::local_seal);
+            struct stat st{};
+            require(adopted.local_seal == LocalSealUse::not_refreshed && adopted.authentication_workers == 4 &&
+                    adopted.compared == scope_both && adopted.manifest_sha256 == manifest && adopted.pack_identity == identity,
+                    "the .seal-named pack is adopted after full verification with no seal");
+            require(::lstat(named.c_str(), &st) == 0 && S_ISREG(st.st_mode) && (st.st_mode & 0777) == 0444 &&
+                    identity_at(named) == identity && read_text(named) == bytes && directory_state(own) == state &&
+                    count_entries(own) == 1, "the .seal-named pack is byte-identical and nothing was added beside it");
+        }
+    }
+
+    // Payload bytes altered in place: the seal no longer matches, and full verification refuses the pack.
+    const auto sealed = current();
+    const auto sealed_state = seal_state();
+    const auto payload = fixture.built.data_offset + fixture.built.tensors[5].offset;
+    flip_byte(pack, payload);
+    auto now = identity_at(pack);
+    require(now.inode == sealed.pack.inode && now.size == sealed.pack.size && now != sealed.pack,
+            "in-place write keeps the inode and size and changes the times");
+    refuses([&] { static_cast<void>(adopt(fixture.source, TrustMode::local_seal)); },
+            "altered payload falls back and fails full verification");
+    set_mtime(pack, sealed.pack);
+    now = identity_at(pack);
+    require(now.mtime_seconds == sealed.pack.mtime_seconds && now.mtime_nanoseconds == sealed.pack.mtime_nanoseconds &&
+            now != sealed.pack, "restored modification time leaves the change time different");
+    refuses([&] { static_cast<void>(adopt(fixture.source, TrustMode::local_seal)); },
+            "altered payload with a restored modification time still fails");
+    require(seal_state() == sealed_state, "no seal is issued for altered bytes");
+    flip_byte(pack, payload);
+    falls_back("restored payload is a changed file: it falls back");
+    refreshes("restored payload is sealed again after full verification");
+
+    // The pack and its seal copied elsewhere: a new file, so one full verification.
+    const auto original_pack = pack, original_seal = seal;
+    const auto copies = dir / "copied";
+    std::filesystem::create_directory(copies);
+    std::filesystem::copy_file(pack, copies / pack.filename());
+    put_text(copies / seal.filename(), read_text(seal));
+    set_mtime(copies / pack.filename(), identity_at(pack));
+    pack = copies / pack.filename();
+    seal = copies / seal.filename();
+    require(::chmod(pack.c_str(), 0444) == 0 && identity_at(pack).inode != identity_at(original_pack).inode &&
+            identity_at(pack).size == identity_at(original_pack).size, "copy is another file of the same size");
+    falls_back("copied pack and seal fall back");
+    refreshes("copied pack is sealed after full verification");
+    accepts("copied pack is then accepted");
+
+    // Renamed: the same inode, but the change time moves.
+    const auto renamed = copies / "renamed.asa.gguf";
+    std::filesystem::rename(pack, renamed);
+    std::filesystem::rename(seal, copies / "renamed.asa.seal");
+    pack = renamed;
+    seal = copies / "renamed.asa.seal";
+    falls_back("renamed pack and seal fall back");
+    refreshes("renamed pack is sealed after full verification");
+
+    pack = original_pack;
+    seal = original_seal;
+    accepts("original pack and seal are unaffected by the copy");
+}
+
 void test_v3_authentication_sources(const std::filesystem::path& dir) {
     using namespace tokspur::planar_v3;
     std::filesystem::create_directory(dir);
@@ -394,6 +1110,31 @@ void test_v3_authentication_sources(const std::filesystem::path& dir) {
             static_cast<void>(adopt_derived_pack_v3(cpu_base_source, mtp, rev_pack_path, 2, 32768, 2, TrustMode::full, false));
         }, "CPU-base-only v3 adoption enforces full 1,254-tensor census");
     }
+    {
+        // Local-seal mode covers full-census packs only. For any other v3 pack
+        // a seal is neither read nor written, even one that would vouch.
+        const DirFd pack_dir(dir);
+        const auto pack_name = pack_path.filename().string();
+        const auto seal_name = local_seal_name(pack_name).value();
+        const auto partial = [&](std::shared_ptr<const ModelFiles> origin) {
+            return adopt_derived_pack_v3(std::move(origin), mtp, pack_path, 2, 32768, 4, TrustMode::local_seal, false);
+        };
+        require(partial(source).local_seal == LocalSealUse::not_consulted && !std::filesystem::exists(dir / seal_name),
+                "partial v3 pack is fully verified and gets no seal");
+        publish_local_seal(pack_dir.fd, pack_name, {single.manifest_sha256, identity_at(pack_path), scope_both}, false);
+        require(single.compared == scope_both && parallel.compared == scope_both,
+                "v3 adoption with the target shards and the sidecar compares both");
+        require(read_local_seal(pack_dir.fd, pack_name, single.manifest_sha256, identity_at(pack_path), scope_both).vouches &&
+                single.pack_identity == identity_at(pack_path), "vouching seal placed beside a partial v3 pack");
+        auto changed = tensors;
+        changed[2].payload.back() ^= std::byte{1};
+        write_gguf_shard(dir / "seal-changed.gguf", "qwen35moe", changed);
+        const auto origin = std::make_shared<const ModelFiles>(std::vector<std::filesystem::path>{dir / "seal-changed.gguf"});
+        refuses([&] { static_cast<void>(partial(origin)); }, "partial v3 pack ignores a vouching seal");
+        const auto adopted = partial(source);
+        require(adopted.local_seal == LocalSealUse::not_consulted && adopted.authentication_workers == 4 &&
+                std::filesystem::remove(dir / seal_name), "partial v3 pack never consults a seal");
+    }
 #if defined(TOKSPUR_PRIVATE_PACK_AUTH_RECLAIM) && TOKSPUR_PRIVATE_PACK_AUTH_RECLAIM
     // The bounded descriptor must bind the same file as the retained mapping.
     std::filesystem::rename(source_path, dir / "original-source.gguf");
@@ -448,6 +1189,17 @@ void test_v3_publication(const std::filesystem::path& dir, std::shared_ptr<const
             std::filesystem::remove(output), "incompatible pack never replaced or sealed");
     const auto built = publish();
     require(!built.existed && built.verified.manifest_sha256.size() == 64, "built and fully authenticated new v3 pack");
+    // The seal names the published file by the identity it has after the read-only chmod and the rename.
+    const DirFd pack_dir(dir);
+    const auto& manifest = built.verified.manifest_sha256;
+    const auto sealed = [&](SealScope needed = scope_both) {
+        return read_local_seal(pack_dir.fd, "block.asa.gguf", manifest, identity_at(output), needed);
+    };
+    require(built.verified.local_seal == LocalSealUse::not_consulted && built.verified.pack_identity == identity_at(output) &&
+            built.verified.compared == scope_both &&
+            read_text(seal) == encode_local_seal({manifest, identity_at(output), scope_both}) && sealed().vouches &&
+            sealed(scope_target).vouches && sealed(scope_mtp).vouches && sealed(scope_none).vouches,
+            "published v3 seal records the verified pack file and both sources");
     struct stat pack_st{}, seal_st{};
     require(::stat(output.c_str(), &pack_st) == 0 && ::stat(seal.c_str(), &seal_st) == 0 &&
             (pack_st.st_mode & 0777) == 0444 && (seal_st.st_mode & 0777) == 0444, "v3 pack and seal immutable");
@@ -459,6 +1211,35 @@ void test_v3_publication(const std::filesystem::path& dir, std::shared_ptr<const
     const auto repaired = publish();
     require(repaired.existed && repaired.verified.manifest_sha256 == built.verified.manifest_sha256 &&
             ::stat(output.c_str(), &same) == 0 && same.st_ino == pack_st.st_ino, "missing v3 seal repaired in place");
+
+    // A sound seal for this manifest that is not current is replaced, after the full verification.
+    for (const auto& stale : {manifest + "\n", manifest, encode_local_seal({manifest, {}, scope_both}),
+                              // The right file, compared with fewer sources than the publisher just compared.
+                              encode_local_seal({manifest, identity_at(output), scope_target}),
+                              encode_local_seal({manifest, identity_at(output), scope_mtp}),
+                              encode_local_seal({manifest, identity_at(output), scope_none})}) {
+        put_text(seal, stale);
+        require(::stat(seal.c_str(), &seal_st) == 0 && !sealed().vouches && sealed().names_manifest, "stale seal for this manifest");
+        const auto resealed = publish();
+        require(resealed.existed && sealed().vouches && ::stat(seal.c_str(), &same) == 0 && same.st_ino != seal_st.st_ino &&
+                (same.st_mode & 0777) == 0444 && count_entries(dir) == 2 && resealed.verified.compared == scope_both &&
+                read_text(seal) == encode_local_seal({manifest, identity_at(output), scope_both}),
+                "stale seal for this manifest is replaced by a current one for both sources");
+    }
+    // Anything else at the seal name is refused and left exactly as it was.
+    const std::string other_manifest(64, '0');
+    for (const auto& foreign : {encode_local_seal({other_manifest, identity_at(output), scope_both}), std::string("garbage\n")}) {
+        put_text(seal, foreign);
+        require(::stat(seal.c_str(), &seal_st) == 0, "stat foreign seal");
+        refuses([&] { static_cast<void>(publish()); }, "seal for another manifest refused");
+        require(::stat(seal.c_str(), &same) == 0 && same.st_ino == seal_st.st_ino && read_text(seal) == foreign,
+                "seal for another manifest never replaced");
+    }
+    put_text(seal, encode_local_seal({manifest, identity_at(output), scope_both}), 0644);
+    require(::stat(seal.c_str(), &seal_st) == 0, "stat writable seal");
+    refuses([&] { static_cast<void>(publish()); }, "writable v3 seal refused");
+    require(::stat(seal.c_str(), &same) == 0 && same.st_ino == seal_st.st_ino && (same.st_mode & 0777) == 0644,
+            "writable seal never replaced");
 
     require(std::filesystem::remove(seal), "remove valid seal for mismatch test");
     write_file_bytes(seal, Bytes(64, std::byte{'0'}), 0444);
@@ -527,6 +1308,9 @@ int main(int argc, char** argv) {
         auto source = std::make_shared<const ModelFiles>(std::vector<std::filesystem::path>{shard0_path, shard1_path});
         auto mtp = std::make_shared<const ModelFiles>(std::vector<std::filesystem::path>{mtp_path});
 
+        test_local_seal_format();
+        test_local_seal_files(root.path / "seal-files");
+        test_local_seal_adoption(root.path / "seal-adoption");
         test_v3_publication(root.path / "v3", source, mtp);
         test_v3_authentication_sources(root.path / "v3-auth");
 

@@ -163,7 +163,9 @@ void ResponseParser::parse_call(std::string_view body) {
         require(stop != std::string_view::npos, "incomplete response parameter value");
         const auto framed = body.substr(0, stop);
         const auto raw = framed;
+        // Token framing lets a value spell the markers, except a leading </parameter>: after the template newline that is the delimiter, and the renderer could not write the value back into history.
         if (!token_framing_) validate_response_parameter_markers(framed);
+        else require(!framed.starts_with("</parameter>"), "reserved response marker inside parameter");
         Json value;
         if (spec != tool->parameters.end() && spec->type == ParameterType::raw_string) value = Json(std::string(raw));
         else if (spec != tool->parameters.end() && spec->type == ParameterType::json_value) {
@@ -315,7 +317,8 @@ void ResponseParser::process_token_framed(bool final) {
         else if (token == "<think>") { mode_ = Mode::thinking; thought_ = true; }
         else { mode_ = Mode::possible_call; call_search_ = 0; }
     }
-    if (final) require(mode_ != Mode::call && mode_ != Mode::thinking, "truncated response control frame");
+    // A tool call still open at the end is truncation. Thinking still open is not: the model stopped while reasoning, so the reasoning ends there and the response has no answer.
+    if (final) { require(mode_ != Mode::call, "truncated response control frame"); if (mode_ == Mode::thinking) mode_ = Mode::text; }
 }
 
 void ResponseParser::process(bool final) {
@@ -360,7 +363,8 @@ void ResponseParser::process(bool final) {
         else if (token == "<|im_end|>") { require(mode_ != Mode::thinking, "terminal marker inside thinking"); mode_ = Mode::ended; }
         else throw FormatError("unexpected response control marker");
     }
-    if (final) require(mode_ != Mode::call && mode_ != Mode::thinking, "truncated response control frame");
+    // As in process_token_framed: an open tool call is truncation, open thinking ends here.
+    if (final) { require(mode_ != Mode::call, "truncated response control frame"); if (mode_ == Mode::thinking) mode_ = Mode::text; }
 }
 
 ResponseStatus ResponseParser::feed(std::string_view bytes) {

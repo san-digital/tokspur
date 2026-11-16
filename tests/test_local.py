@@ -177,6 +177,43 @@ def test_inference_processes_include_owned_native_worker(monkeypatch):
     }
 
 
+def test_inference_processes_match_the_executable_not_its_operands(monkeypatch):
+    from types import SimpleNamespace
+
+    import psutil
+
+    cases = [
+        # A worker name as an operand of another program is not a worker.
+        (220, "tail", ["tail", "-f", "logs/llama-server"], False),
+        (221, "vim", ["/usr/bin/vim", "splash"], False),
+        (222, "less", ["less", "/x/build/owned-native/tokspur-native"], False),
+        (223, "cat", ["cat", "mlx_lm.server"], False),
+        (224, "grep", ["grep", "-r", "ollama", "runner"], False),
+        # An interpreter runs the script or module named by a later word.
+        (225, "python3.12", ["/venv/bin/python3.12", "/venv/bin/omlx", "serve"], True),
+        (
+            226,
+            "Python",
+            ["/Frameworks/Python", "/venv/bin/mlx_lm.server", "--model"],
+            True,
+        ),
+        (227, "bash", ["bash", "/opt/bin/llama-server", "--port"], True),
+        (228, "python3", ["python3", "train.py", "--epochs"], False),
+        (229, "llama-server", ["/opt/bin/llama-server", "--port"], True),
+        (230, "python3", ["python3", "-m", "mlx_lm.server"], True),
+        (231, "ollama", ["ollama", "runner"], True),
+        (232, "ollama", ["ollama", "list"], False),
+    ]
+    fakes = [
+        SimpleNamespace(pid=pid, info={"name": name, "cmdline": argv})
+        for pid, name, argv, _expected in cases
+    ]
+    monkeypatch.setattr(psutil, "process_iter", lambda attrs=None: iter(fakes))
+    assert {row["pid"] for row in local.inference_processes()} == {
+        pid for pid, _name, _argv, expected in cases if expected
+    }
+
+
 def test_scalar_identity_full_argv_unreadable_name_and_exact_darwin_alias(monkeypatch):
     from types import SimpleNamespace
 
@@ -229,18 +266,49 @@ def test_scalar_identity_retains_permission_and_disappearance_handling(monkeypat
     assert local.inference_processes() == []
 
 
-def test_child_environment_drops_tokens_and_global_overrides(sandbox, monkeypatch):
+def test_child_environment_is_an_allowlist(sandbox, monkeypatch):
     for key in (
         "HF_TOKEN",
         "HF_API_TOKEN",
         "HUGGING_FACE_HUB_TOKEN",
         "PYTHONPATH",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "AWS_SECRET_ACCESS_KEY",
+        "GITHUB_TOKEN",
+        "HTTPS_PROXY",
+        "SSH_AUTH_SOCK",
+        "TMPDIR",
+        "LANGUAGE",
     ):
         monkeypatch.setenv(key, "do-not-inherit")
+    inherited = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/fixture",
+        "USER": "fixture",
+        "LOGNAME": "fixture",
+        "SHELL": "/bin/zsh",
+        "LANG": "en_GB.UTF-8",
+        "LC_CTYPE": "en_GB.UTF-8",
+        "TZ": "Europe/London",
+        "TERM": "xterm-256color",
+        "TOKSPUR_STATE_ROOT": "/fixture/state",
+    }
+    for key, value in inherited.items():
+        monkeypatch.setenv(key, value)
     env = local.isolated_environment()
-    assert "HF_TOKEN" not in env and "HUGGING_FACE_HUB_TOKEN" not in env
-    assert env["HF_HUB_OFFLINE"] == "1"
     assert "do-not-inherit" not in env.values()
+    state = sandbox / ".tokspur/state"
+    assert env == {
+        **inherited,
+        "HF_HOME": str(state / "hf-home"),
+        "HF_HUB_OFFLINE": "1",
+        "HF_HUB_DISABLE_IMPLICIT_TOKEN": "1",
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+        "DO_NOT_TRACK": "1",
+        "TMPDIR": str(state / "tmp"),
+        "NO_PROXY": "localhost,127.0.0.1,::1",
+    }
 
 
 def test_state_lock_is_exclusive_and_released(sandbox):
@@ -401,3 +469,17 @@ def test_adoption_variants_and_derived_pack_sealing(sandbox, tmp_path, monkeypat
     uni_receipt = local.read_json(sandbox / ".tokspur/adoption.json")
     assert "dflash2_draft" in uni_receipt
     local.check_adoption(uni_receipt)
+
+
+def test_shipped_profile_has_every_file_set_check_adoption_reads():
+    expected = json.loads((ROOT / "profiles/flash-next-assets.json").read_text())
+    sizes = [
+        len(files)
+        for files in local.candidate_file_specs(
+            expected, "draft", include_dflash2_draft=True
+        )
+    ]
+    # The MTP sidecar, then the DFlash2 checkpoint a receipt may name instead.
+    assert sizes == [1, 2]
+    target = local.candidate_file_specs(expected, "target")
+    assert [len(files) for files in target] == [2]
