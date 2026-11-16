@@ -72,14 +72,20 @@ impl StateLock {
 }
 
 pub fn open_nofollow_dir(path: &Path, label: &str) -> Result<File, CliError> {
-    let cwd = File::open(".").map_err(|source| CliError::Io {
-        context: "cannot open working directory".to_owned(),
+    // An absolute path never consults the base descriptor, so anchor it at `/`: the working directory may have been deleted or made unreadable.
+    let (base_path, base_label) = if path.is_absolute() {
+        ("/", "root directory")
+    } else {
+        (".", "working directory")
+    };
+    let base = File::open(base_path).map_err(|source| CliError::Io {
+        context: format!("cannot open {base_label}"),
         source,
     })?;
     let c_path = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| CliError::Validation(format!("{label} contains a NUL byte")))?;
     openat(
-        cwd.as_fd(),
+        base.as_fd(),
         &c_path,
         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
         0,
@@ -512,7 +518,7 @@ pub(crate) fn optional_asset_role(obj: &Json) -> Result<Option<&str>, CliError> 
 fn group_candidate_file_specs<'a>(
     assets_profile: &'a Json,
     group: &str,
-    include_legacy_draft: bool,
+    include_dflash2_draft: bool,
 ) -> Result<Vec<&'a Vec<Json>>, CliError> {
     let group_obj =
         assets_profile.find(group).ok().flatten().ok_or_else(|| {
@@ -552,16 +558,17 @@ fn group_candidate_file_specs<'a>(
             out.push(v_files);
         }
     }
-    if include_legacy_draft
+    if include_dflash2_draft
         && group == "draft"
-        && let Some(legacy_files) = assets_profile
-            .find("legacy_dflash2_draft")
+        && let Some(profile_key) = dflash2_profile_group_key(assets_profile)
+        && let Some(dflash2_files) = assets_profile
+            .find(profile_key)
             .ok()
             .flatten()
             .and_then(|g| g.find("files").ok().flatten())
             .and_then(|f| f.array().ok())
     {
-        out.push(legacy_files);
+        out.push(dflash2_files);
     }
     Ok(out)
 }
@@ -668,6 +675,16 @@ fn asset_record_json(
     Ok(Json::new_object(record))
 }
 
+/// Stops a hash between chunks once a stop signal has arrived. Only commands that install the stop handlers (`pull`) can see one here; elsewhere the signal still ends the process at once. Hashing a pinned shard takes long enough that waiting for it would make Ctrl-C look ignored.
+fn ensure_hash_not_interrupted(spec_name: &str) -> Result<(), CliError> {
+    if tokspur_sys::stop_requested() {
+        return Err(CliError::Validation(format!(
+            "Verification interrupted: {spec_name}"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn verify_asset(path: &Path, spec: &Json) -> Result<Json, CliError> {
     let spec_name = json_str(spec, "name")?;
     let expected_size = json_u64(spec, "size")?;
@@ -730,6 +747,7 @@ pub(crate) fn verify_asset(path: &Path, spec: &Json) -> Result<Json, CliError> {
     let mut buf = vec![0u8; ASSET_STREAM_CHUNK];
     let mut at = 0u64;
     while at < before.size {
+        ensure_hash_not_interrupted(spec_name)?;
         let take = (before.size - at).min(ASSET_STREAM_CHUNK as u64) as usize;
         pread_exact(file.as_fd(), &mut buf[..take], at).map_err(|source| CliError::Io {
             context: format!("failed reading asset {spec_name}"),
@@ -899,6 +917,7 @@ pub(crate) fn publish_verified_part(
     let mut buf = vec![0u8; ASSET_STREAM_CHUNK];
     let mut at = 0u64;
     while at < opened.size {
+        ensure_hash_not_interrupted(spec_name)?;
         let take = (opened.size - at).min(ASSET_STREAM_CHUNK as u64) as usize;
         pread_exact(file.as_fd(), &mut buf[..take], at).map_err(|source| CliError::Io {
             context: format!("failed reading downloaded {spec_name}"),
@@ -1021,7 +1040,7 @@ pub(crate) fn check_adoption_group(
     assets_profile: &Json,
     adoption_key: &str,
     profile_key: &str,
-    include_legacy_draft: bool,
+    include_dflash2_draft: bool,
 ) -> Result<(), CliError> {
     let group_obj = adoption
         .find(adoption_key)
@@ -1053,7 +1072,7 @@ pub(crate) fn check_adoption_group(
         })?;
 
     let candidate_specs =
-        group_candidate_file_specs(assets_profile, profile_key, include_legacy_draft)?;
+        group_candidate_file_specs(assets_profile, profile_key, include_dflash2_draft)?;
     let same_len: Vec<&Vec<Json>> = candidate_specs
         .into_iter()
         .filter(|spec_files| assets.len() == spec_files.len())
@@ -1575,7 +1594,15 @@ pub fn configure_runtime(
     configure_runtime_locked(layout, &tokspur_base, port, true, out)
 }
 
-/// Pure process-matching predicate ported one to one from `local.py:172-201`.
+/// Whether an executable of this name runs a later argv word as its program: a Python interpreter (a script or a `-m` module) or a POSIX shell (a script).
+fn runs_later_words(executable: &str) -> bool {
+    let lower = executable.to_ascii_lowercase();
+    lower.starts_with("python")
+        || lower.starts_with("pypy")
+        || matches!(executable, "sh" | "bash" | "zsh" | "dash")
+}
+
+/// Pure process-matching predicate kept in step with `local.py:inference_processes`.
 pub fn is_inference_worker_process(snap: &ProcessSnapshot, self_pid: i32) -> bool {
     if snap.pid == self_pid || snap.is_zombie() {
         return false;
@@ -1591,22 +1618,32 @@ pub fn is_inference_worker_process(snap: &ProcessSnapshot, self_pid: i32) -> boo
         SCALAR_WORKER_NAME,
     ];
 
+    fn basename(arg: &std::ffi::OsString) -> Option<&str> {
+        Path::new(arg).file_name().and_then(|s| s.to_str())
+    }
     let args_4 = &snap.argv[..snap.argv.len().min(4)];
+    // What runs is argv[0] and the kernel's short name. A later word is an operand (`tail -f logs/llama-server`), unless an interpreter is running it as a script or module.
     let mut names = BTreeSet::new();
-    for arg in args_4 {
-        if let Some(base) = Path::new(arg).file_name().and_then(|s| s.to_str()) {
-            names.insert(base);
-        }
+    if let Some(executable) = args_4.first().and_then(basename) {
+        names.insert(executable);
     }
     if !snap.comm.is_empty() {
         names.insert(snap.comm.as_str());
     }
+    let launched = if names.iter().any(|name| runs_later_words(name)) {
+        args_4.get(1..).unwrap_or_default()
+    } else {
+        &[]
+    };
 
     let mut is_worker = names.iter().any(|n| WORKER_NAMES.contains(n));
+    is_worker |= launched
+        .iter()
+        .filter_map(basename)
+        .any(|word| WORKER_NAMES.contains(&word) || word == "mlx_lm.server");
     // Darwin p_comm fallback only when foreign/unreadable argv is empty; never match when readable argv disagrees.
     let scalar_short = &SCALAR_WORKER_NAME[..DARWIN_MAXCOMLEN];
     is_worker |= snap.argv.is_empty() && snap.comm == scalar_short;
-    is_worker |= args_4.iter().any(|a| a == "mlx_lm.server");
     is_worker |= names.contains("ollama") && args_4.iter().any(|arg| arg == "runner");
     is_worker
 }
@@ -1628,23 +1665,28 @@ pub fn inference_processes() -> Result<Vec<i32>, CliError> {
     Ok(pids)
 }
 
-/// Builds the sanitised child environment matching `local.py:isolated_environment`.
+/// Whether `tokspur-server` may inherit this variable from the caller. The server reads nothing from its environment, so it gets the usual session basics and this project's own settings. Everything else stays out of the process that holds the API key and the prompts: loader overrides (`DYLD_*`), exported credentials, `HF_*` and Python overrides.
+fn server_environment_allows(name: &str) -> bool {
+    matches!(
+        name,
+        "PATH" | "HOME" | "USER" | "LOGNAME" | "SHELL" | "LANG" | "TZ" | "TERM"
+    ) || name.starts_with("LC_")
+        || name.starts_with("TOKSPUR_")
+}
+
+/// Builds the allowlisted `tokspur-server` environment matching `local.py:isolated_environment`.
 pub fn isolated_environment(tokspur_base: &Path) -> Result<BTreeMap<String, String>, CliError> {
-    const BLOCKED_PREFIXES: &[&str] = &["HF_", "HUGGING_FACE_", "HUGGINGFACE_"];
     let mut env = BTreeMap::new();
     for (key, value) in std::env::vars_os() {
-        let k = key.into_string().map_err(|_| {
-            CliError::Validation("environment variable names must be UTF-8".to_owned())
-        })?;
-        if BLOCKED_PREFIXES.iter().any(|p| k.starts_with(p))
-            || k == "PYTHONPATH"
-            || k == "PYTHONHOME"
-        {
+        let Ok(k) = key.into_string() else {
+            continue;
+        };
+        if !server_environment_allows(&k) {
             continue;
         }
-        let v = value.into_string().map_err(|_| {
-            CliError::Validation("environment variable values must be UTF-8".to_owned())
-        })?;
+        let v = value
+            .into_string()
+            .map_err(|_| CliError::Validation(format!("environment variable {k} must be UTF-8")))?;
         env.insert(k, v);
     }
     let hf_home = private_dir(tokspur_base, Path::new("state/hf-home"))?;
@@ -1679,6 +1721,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_shipped_profile_has_every_file_set_the_adoption_check_reads() {
+        let profile = parse_json_limited(
+            include_bytes!("../../../../profiles/flash-next-assets.json"),
+            JsonLimits::new(MAX_JSON_FILE, 500_000, 64),
+        )
+        .unwrap();
+        let sizes = |group: &str, include_dflash2_draft: bool| -> Vec<usize> {
+            group_candidate_file_specs(&profile, group, include_dflash2_draft)
+                .unwrap()
+                .iter()
+                .map(|files| files.len())
+                .collect()
+        };
+        assert_eq!(sizes("target", true), [2]);
+        assert_eq!(sizes("draft", false), [1]);
+        // The MTP sidecar, then the DFlash2 checkpoint a receipt may name instead.
+        assert_eq!(sizes("draft", true), [1, 2]);
+    }
+
+    #[test]
     fn file_identity_debug_redacts_volume_uuid() {
         let private_uuid = "1234567890abcdef1234567890abcdef";
         let identity = FileIdentity {
@@ -1692,6 +1754,45 @@ mod tests {
         let rendered = format!("{identity:?}");
         assert!(!rendered.contains(private_uuid));
         assert!(rendered.contains("[redacted]"));
+    }
+
+    #[test]
+    fn server_environment_is_an_allowlist() {
+        for name in [
+            "PATH",
+            "HOME",
+            "USER",
+            "LOGNAME",
+            "SHELL",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "TZ",
+            "TERM",
+            "TOKSPUR_STATE_ROOT",
+        ] {
+            assert!(server_environment_allows(name), "{name}");
+        }
+        for name in [
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "LD_PRELOAD",
+            "AWS_SECRET_ACCESS_KEY",
+            "GITHUB_TOKEN",
+            "HF_TOKEN",
+            "HUGGING_FACE_HUB_TOKEN",
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "HTTPS_PROXY",
+            "SSH_AUTH_SOCK",
+            "TMPDIR",
+            "PATHEXT",
+            "LANGUAGE",
+            "tokspur_lowercase",
+            "",
+        ] {
+            assert!(!server_environment_allows(name), "{name}");
+        }
     }
 
     fn snap(pid: i32, comm: &str, argv: &[&str]) -> ProcessSnapshot {
@@ -1752,6 +1853,54 @@ mod tests {
             (snap(214, "ollama", &["ollama", "serve"]), false),
             (
                 snap(213, "python3", &["python3", "-m", "mlx_lm.server"]),
+                true,
+            ),
+            // A worker name as an operand of another program is not a worker.
+            (
+                snap(220, "tail", &["tail", "-f", "logs/llama-server"]),
+                false,
+            ),
+            (snap(221, "vim", &["/usr/bin/vim", "splash"]), false),
+            (
+                snap(
+                    222,
+                    "less",
+                    &["less", "/x/build/owned-native/tokspur-native"],
+                ),
+                false,
+            ),
+            (snap(223, "cat", &["cat", "mlx_lm.server"]), false),
+            (
+                snap(224, "grep", &["grep", "-r", "ollama", "runner"]),
+                false,
+            ),
+            // An interpreter runs the script or module named by a later word.
+            (
+                snap(
+                    225,
+                    "python3.12",
+                    &["/venv/bin/python3.12", "/venv/bin/omlx", "serve"],
+                ),
+                true,
+            ),
+            (
+                snap(
+                    226,
+                    "Python",
+                    &["/Frameworks/Python", "/venv/bin/mlx_lm.server", "--model"],
+                ),
+                true,
+            ),
+            (
+                snap(227, "bash", &["bash", "/opt/bin/llama-server", "--port"]),
+                true,
+            ),
+            (
+                snap(228, "python3", &["python3", "train.py", "--epochs"]),
+                false,
+            ),
+            (
+                snap(229, "llama-server", &["/opt/bin/llama-server", "--port"]),
                 true,
             ),
         ];

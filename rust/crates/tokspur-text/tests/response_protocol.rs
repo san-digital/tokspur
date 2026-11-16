@@ -285,10 +285,6 @@ fn invalid_envelopes_and_frames_are_refused() {
             "invalid response bytes or frames",
         ),
         (
-            envelope(&encode("<think>unfinished<|im_end|>"), "stop"),
-            "incomplete or invalid stopped response",
-        ),
-        (
             envelope(
                 &encode("<tool_call><function=read_file></function></tool_call><|im_end|>"),
                 "stop",
@@ -306,6 +302,16 @@ fn invalid_envelopes_and_frames_are_refused() {
     for (input, message) in &invalid {
         checks.refused(parse(input), message);
     }
+    // A stop while thinking is still open ends the thinking there: the reasoning is returned with an empty answer.
+    let open = parse(&envelope(&encode("<think>unfinished<|im_end|>"), "stop")).unwrap();
+    checks.check(
+        get(&open, "status").string().unwrap() == b"complete"
+            && get(&open, "complete").boolean().unwrap()
+            && get(&open, "reasoning_content").string().unwrap() == b"unfinished"
+            && get(&open, "content").string().unwrap().is_empty()
+            && get(&open, "tool_calls").array().unwrap().is_empty(),
+        "stop inside open thinking refused",
+    );
     let mut earlier = all.clone();
     earlier.insert(0, ADMISSION.im_end);
     checks.refused(

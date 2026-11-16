@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import platform
 import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -272,6 +275,25 @@ def extracted_unit(source: str) -> str:
     return PRELUDE + gatherer + PREFILL_PRELUDE + worker_task + PREFILL_CHECKS + CHECKS
 
 
+def sanitizer_environment() -> dict[str, str]:
+    """The environment the instrumented binary runs in.
+
+    On arm64 Linux, GCC's AddressSanitizer spends about ten microseconds in its
+    stack-use-after-return allocator on every instrumented call, where x86-64
+    and macOS spend nanoseconds. The prefill cases make tens of millions of
+    such calls, so this run of a fifth of a second took minutes there and hit
+    the timeout. Only on that platform, that one check is switched off; every
+    other AddressSanitizer and UndefinedBehaviorSanitizer check stays on.
+    """
+    environment = dict(os.environ)
+    if sys.platform == "linux" and platform.machine() in ("aarch64", "arm64"):
+        earlier = environment.get("ASAN_OPTIONS")
+        environment["ASAN_OPTIONS"] = ":".join(
+            filter(None, (earlier, "detect_stack_use_after_return=0"))
+        )
+    return environment
+
+
 def test_async_ple_gather_wakes_eligible_worker_and_preserves_publication(tmp_path):
     source = tmp_path / "ple_async.cpp"
     executable = tmp_path / "ple_async"
@@ -303,4 +325,6 @@ def test_async_ple_gather_wakes_eligible_worker_and_preserves_publication(tmp_pa
         timeout=120,
     )
     assert compiled.returncode == 0, compiled.stderr
-    subprocess.run([str(executable)], check=True, timeout=60)
+    subprocess.run(
+        [str(executable)], check=True, timeout=60, env=sanitizer_environment()
+    )

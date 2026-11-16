@@ -28,7 +28,7 @@ use crate::admission::{
     tool_arg_validation_policy, tool_enum_validation_name, tool_enum_validation_policy,
     validate_worker_ready,
 };
-use crate::http::{Connection, HttpError, Limits, Listener};
+use crate::http::{Connection, HttpError, JSON_RESPONSE_BYTES, Limits, Listener};
 use crate::native_text::{NativeText, TextError};
 use crate::request_timing::{DeltaKinds, Outcome, RequestTiming, delta_kinds, emits_record};
 use crate::session::{ServeCodec, ServeError, ServeSession, ServeSink, SessionOptions};
@@ -246,7 +246,8 @@ struct PrivateState {
     key: String,
     prefix_trace: Option<File>,
     prefix_trace_bytes: u64,
-    prefix_trace_failed: bool,
+    /// Why the prefix trace takes no more records, once it has refused or failed to persist one. Tracing fails closed: every later request is refused with this reason rather than served untraced.
+    prefix_trace_refusal: Option<&'static str>,
     telemetry_trace: Option<File>,
     telemetry_trace_bytes: u64,
 }
@@ -288,9 +289,19 @@ fn telemetry_trace_has_room(used: u64, record_bytes: usize) -> bool {
         .is_ok_and(|bytes| bytes <= TELEMETRY_TRACE_LIMIT.saturating_sub(used))
 }
 
+/// The most bytes the private prefix trace file may hold.
+const PREFIX_TRACE_LIMIT: u64 = 16 << 20;
+
+/// The refusal once a record no longer fits the private prefix trace. Sent to clients, so it names no path; the startup refusal names the file.
+const PREFIX_TRACE_FULL: &str = "private prefix trace is full (16 MiB bound); no request is served until the server is restarted with a new trace file";
+
+const PREFIX_TRACE_UNAVAILABLE: &str = "private prefix trace is unavailable";
+
 impl PrivateState {
     fn enable_prefix_trace(&mut self) -> Result<()> {
         const PREFIX_REFUSED: &str = "private prefix trace requires a new owned mode 0600 file";
+        // An earlier trace is never appended to or overwritten, so the operator has to move it away. Say which file.
+        const PREFIX_EXISTS: &str = "private prefix trace requires a new file: move or remove prefix-trace.jsonl from the state directory, or start without --private-prefix-trace";
         let file = sysfd::openat(
             self._directory.as_fd(),
             c"prefix-trace.jsonl",
@@ -298,7 +309,11 @@ impl PrivateState {
             0o600,
         )
         .map_err(|error| ServerError::StateIo {
-            reason: PREFIX_REFUSED,
+            reason: if error.kind() == ErrorKind::AlreadyExists {
+                PREFIX_EXISTS
+            } else {
+                PREFIX_REFUSED
+            },
             source: Some(error),
         })?;
         let state = file.metadata().map_err(|error| ServerError::StateIo {
@@ -317,7 +332,7 @@ impl PrivateState {
         })?;
         self.prefix_trace = Some(file);
         self.prefix_trace_bytes = 0;
-        self.prefix_trace_failed = false;
+        self.prefix_trace_refusal = None;
         Ok(())
     }
 
@@ -418,32 +433,27 @@ impl PrivateState {
     }
 
     fn write_prefix_trace(&mut self, record: &Json) -> std::result::Result<(), ServeError> {
-        if self.prefix_trace.is_none() || self.prefix_trace_failed {
-            return Err(ServeError::Admission(AdmissionError::Refused(
-                "private prefix trace is unavailable",
-            )));
+        let refused = |reason| ServeError::Admission(AdmissionError::PrefixTrace(reason));
+        if let Some(reason) = self.prefix_trace_refusal {
+            return Err(refused(reason));
         }
+        let Some(file) = self.prefix_trace.as_mut() else {
+            self.prefix_trace_refusal = Some(PREFIX_TRACE_UNAVAILABLE);
+            return Err(refused(PREFIX_TRACE_UNAVAILABLE));
+        };
         let mut bytes = record
             .dump_limited(4 * 1024 * 1024)
             .map_err(|e| ServeError::Admission(AdmissionError::Json(e)))?;
         bytes.push(b'\n');
-        if bytes.len() as u64 > (16 << 20) - self.prefix_trace_bytes {
-            self.prefix_trace_failed = true;
-            return Err(ServeError::Admission(AdmissionError::Refused(
-                "private prefix trace exceeds 16 MiB bound",
-            )));
+        if bytes.len() as u64 > PREFIX_TRACE_LIMIT - self.prefix_trace_bytes {
+            self.prefix_trace_refusal = Some(PREFIX_TRACE_FULL);
+            return Err(refused(PREFIX_TRACE_FULL));
         }
-        let Some(file) = self.prefix_trace.as_mut() else {
-            self.prefix_trace_failed = true;
-            return Err(ServeError::Admission(AdmissionError::Refused(
-                "private prefix trace is unavailable",
-            )));
-        };
         if let Err(error) = file
             .write_all(&bytes)
             .and_then(|()| sysfd::fsync(file.as_fd()))
         {
-            self.prefix_trace_failed = true;
+            self.prefix_trace_refusal = Some(PREFIX_TRACE_UNAVAILABLE);
             return Err(ServeError::Admission(AdmissionError::TracePersist(
                 Arc::new(error),
             )));
@@ -577,7 +587,7 @@ impl PrivateState {
             key,
             prefix_trace: None,
             prefix_trace_bytes: 0,
-            prefix_trace_failed: false,
+            prefix_trace_refusal: None,
             telemetry_trace: None,
             telemetry_trace_bytes: 0,
         })
@@ -2042,6 +2052,40 @@ impl From<ServerError> for JobError {
     }
 }
 
+/// Whether a job failed on the server's own private prefix trace rather than on the request or the generation.
+fn trace_failure(error: &JobError) -> bool {
+    matches!(
+        error,
+        JobError::Serve(ServeError::Admission(
+            AdmissionError::PrefixTrace(_) | AdmissionError::TracePersist(_)
+        ))
+    )
+}
+
+/// The error type a failed job reports. A trace failure is the server's fault whether or not generation began.
+fn failure_kind(error: &JobError, target_started: bool) -> &'static str {
+    if trace_failure(error) {
+        "server_error"
+    } else if target_started {
+        "generation_failed_no_retry"
+    } else {
+        "invalid_request_error"
+    }
+}
+
+/// The status of a failed job that has not begun streaming. `expired` is whether the request deadline has passed.
+fn failure_status(error: &JobError, expired: bool, target_started: bool) -> i32 {
+    if expired {
+        408
+    } else if trace_failure(error) {
+        500
+    } else if target_started {
+        502
+    } else {
+        400
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_job(
     worker: &mut OwnedWorker,
@@ -2114,7 +2158,7 @@ fn run_job(
         };
         let mut trace_sink = |record: &Json| -> std::result::Result<(), ServeError> {
             let mut state = state.lock().map_err(|_| {
-                ServeError::Admission(AdmissionError::Refused("poisoned private state lock"))
+                ServeError::Admission(AdmissionError::PrefixTrace("poisoned private state lock"))
             })?;
             state.write_prefix_trace(record)
         };
@@ -2148,7 +2192,7 @@ fn run_job(
         } else {
             connection.send_json(
                 200,
-                &result.dump_limited(8 * 1024 * 1024)?,
+                &result.dump_limited(JSON_RESPONSE_BYTES)?,
                 deadline.min(Instant::now() + Duration::from_secs(5)),
             )?;
             if let (Some(timing), Some(start)) = (timing.as_ref(), write_start) {
@@ -2214,11 +2258,7 @@ fn run_job(
         && !tokspur_sys::stop_requested()
     {
         let reply_deadline = Instant::now() + Duration::from_secs(2);
-        let kind = if target_started.get() {
-            "generation_failed_no_retry"
-        } else {
-            "invalid_request_error"
-        };
+        let kind = failure_kind(&error, target_started.get());
         let Ok(payload) = error_json(error.to_string().as_bytes(), kind).dump_limited(8192) else {
             // The C++ builds this payload outside its inner try: std::terminate.
             std::process::abort();
@@ -2228,13 +2268,7 @@ fn run_job(
                 .send_sse_data(&payload, reply_deadline)
                 .and_then(|()| connection.finish_sse(reply_deadline))
         } else {
-            let status = if Instant::now() >= deadline {
-                408
-            } else if target_started.get() {
-                502
-            } else {
-                400
-            };
+            let status = failure_status(&error, Instant::now() >= deadline, target_started.get());
             connection.send_json(status, &payload, reply_deadline)
         };
         if sent.is_err() {
@@ -2253,6 +2287,18 @@ fn ready_field<'a>(ready: &'a Json, name: &str) -> Result<&'a Json> {
         .find(name)?
         .ok_or(ServerError::Refused("missing required API field"))
 }
+
+/// How long a peer has to send its whole request.
+const READ_SECONDS: Duration = Duration::from_secs(5);
+/// Peers that may be partway through sending a request at once.
+const READING_PEERS: usize = 64;
+
+/// A connection with its arrival time and its request, or the refusal reading it produced.
+type Arrival = (
+    Connection,
+    Instant,
+    std::result::Result<crate::http::Request, HttpError>,
+);
 
 /// A routing failure, handled like the C++ inner `catch` clauses.
 enum Failure {
@@ -2282,6 +2328,41 @@ fn answer(connection: &mut Connection, code: i32, body: &Json) -> std::result::R
     let body = body.dump_limited(8192)?;
     connection.send_json(code, &body, Instant::now() + Duration::from_secs(2))?;
     Ok(())
+}
+
+/// Turns away a peer whose request cannot be taken, with a 503 rather than a bare close. Written without waiting: the accept thread calls this, and it reads every other peer.
+fn refuse_busy(mut connection: Connection) {
+    let Ok(body) = error_json(
+        b"server is busy with other connections; retry shortly",
+        "server_busy",
+    )
+    .dump_limited(8192) else {
+        return;
+    };
+    if connection.refuse_json(503, &body).is_err() {
+        // The peer is gone or not reading; there is nobody to tell.
+    }
+}
+
+/// Hands a whole request, or the refusal reading it produced, to the request workers. A full queue answers the peer 503. `false` once the workers are gone.
+fn hand_off(sender: &std::sync::mpsc::SyncSender<Arrival>, arrival: Arrival) -> bool {
+    match sender.try_send(arrival) {
+        Ok(()) => true,
+        Err(std::sync::mpsc::TrySendError::Full((connection, _, _))) => {
+            refuse_busy(connection);
+            true
+        }
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+    }
+}
+
+/// Adds an accepted peer to those still sending their request. A full table gives up its oldest unfinished peer, answering it 503: a client that sends its request at once is read long before it becomes the oldest.
+fn admit_reading(reading: &mut Vec<(Connection, Instant)>, connection: Connection, now: Instant) {
+    if reading.len() >= READING_PEERS {
+        let (oldest, _) = reading.remove(0);
+        refuse_busy(oldest);
+    }
+    reading.push((connection, now));
 }
 
 impl Serving<'_> {
@@ -2484,15 +2565,16 @@ impl Serving<'_> {
         print_line(&self.ready_line()?)?;
         let stopped = AtomicBool::new(false);
         std::thread::scope(|scope| {
-            let (sender, receiver) = std::sync::mpsc::sync_channel::<(Connection, Instant)>(8);
+            // Whole requests, and refusals that still owe an answer. Reading happens on this thread for every peer at once, so a peer that sends nothing, or stalls partway, never occupies a worker.
+            let (sender, receiver) = std::sync::mpsc::sync_channel::<Arrival>(8);
             let receiver = Arc::new(Mutex::new(receiver));
             let (failures, failed) = std::sync::mpsc::channel();
-            let mut readers = Vec::new();
+            let mut workers = Vec::new();
             for _ in 0..4 {
                 let receiver = Arc::clone(&receiver);
                 let failures = failures.clone();
                 let stopped = &stopped;
-                readers.push(scope.spawn(move || {
+                workers.push(scope.spawn(move || {
                     loop {
                         let next = match receiver.lock() {
                             Ok(receiver) => receiver.recv(),
@@ -2500,13 +2582,13 @@ impl Serving<'_> {
                                 return Err(ServerError::Refused("HTTP reader queue is poisoned"));
                             }
                         };
-                        let Ok((connection, arrival)) = next else {
+                        let Ok((connection, arrival, read)) = next else {
                             return Ok(());
                         };
                         if stopped.load(Ordering::SeqCst) || tokspur_sys::stop_requested() {
                             return Ok(());
                         }
-                        if let Err(error) = self.route_connection(connection, arrival) {
+                        if let Err(error) = self.route_connection(connection, arrival, read) {
                             if failures.send(error).is_err() {
                                 return Ok(());
                             }
@@ -2516,7 +2598,17 @@ impl Serving<'_> {
                 }));
             }
             drop(failures);
-            let result = loop {
+            let limits = Limits {
+                body_bytes: if self.context_length > 65_536 {
+                    4 * 1024 * 1024
+                } else {
+                    1024 * 1024
+                },
+                ..Limits::default()
+            };
+            // Peers still sending their request, oldest first.
+            let mut reading: Vec<(Connection, Instant)> = Vec::new();
+            let result = 'serve: loop {
                 if tokspur_sys::stop_requested() {
                     break Ok(());
                 }
@@ -2527,34 +2619,56 @@ impl Serving<'_> {
                         break Err(ServerError::Refused("HTTP readers stopped"));
                     }
                 }
-                let limits = Limits {
-                    body_bytes: if self.context_length > 65_536 {
-                        4 * 1024 * 1024
-                    } else {
-                        1024 * 1024
-                    },
-                    ..Limits::default()
+                let handles: Vec<i32> = reading
+                    .iter()
+                    .map(|(connection, _)| connection.native_handle())
+                    .collect();
+                let ready = match self.listener.poll_input(&handles, 100) {
+                    Ok(ready) => ready,
+                    Err(_) if tokspur_sys::stop_requested() => break Ok(()),
+                    Err(error) => break Err(error.into()),
                 };
+                let now = Instant::now();
+                let mut unfinished = Vec::with_capacity(reading.len());
+                for (index, (mut connection, arrival)) in reading.drain(..).enumerate() {
+                    let deadline = arrival + READ_SECONDS;
+                    if !ready[index + 1] && now < deadline {
+                        unfinished.push((connection, arrival));
+                        continue;
+                    }
+                    let read = match connection.poll_request(deadline) {
+                        Ok(None) => {
+                            unfinished.push((connection, arrival));
+                            continue;
+                        }
+                        Ok(Some(request)) => Ok(request),
+                        // Nobody is left to answer.
+                        Err(error) if error.disconnected() => continue,
+                        Err(error) => Err(error),
+                    };
+                    if !hand_off(&sender, (connection, arrival, read)) {
+                        break 'serve Err(ServerError::Refused("HTTP readers stopped"));
+                    }
+                }
+                reading = unfinished;
+                if !ready[0] {
+                    continue;
+                }
                 let connection = match self
                     .listener
-                    .accept(Instant::now() + Duration::from_millis(100), limits)
+                    .accept(Instant::now() + Duration::from_millis(1), limits)
                 {
                     Ok(connection) => connection,
                     Err(_) if tokspur_sys::stop_requested() => break Ok(()),
                     Err(error) if error.status() == 408 => continue,
                     Err(error) => break Err(error.into()),
                 };
-                match sender.try_send((connection, Instant::now())) {
-                    Ok(()) => {}
-                    Err(std::sync::mpsc::TrySendError::Full((connection, _))) => drop(connection),
-                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                        break Err(ServerError::Refused("HTTP readers stopped"));
-                    }
-                }
+                admit_reading(&mut reading, connection, Instant::now());
             };
+            drop(reading);
             stopped.store(true, Ordering::SeqCst);
             drop(sender);
-            for reader in readers {
+            for reader in workers {
                 match reader.join() {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => return Err(error),
@@ -2565,8 +2679,13 @@ impl Serving<'_> {
         })
     }
 
-    fn route_connection(&self, mut connection: Connection, arrival: Instant) -> Result<()> {
-        let routed = match self.route(&mut connection, arrival) {
+    fn route_connection(
+        &self,
+        mut connection: Connection,
+        arrival: Instant,
+        read: std::result::Result<crate::http::Request, HttpError>,
+    ) -> Result<()> {
+        let routed = match self.route(&mut connection, read) {
             Ok(Some(input)) => self.enqueue(connection, input, arrival),
             Ok(None) => Ok(()),
             Err(failure) => Err((connection, failure)),
@@ -2630,9 +2749,9 @@ impl Serving<'_> {
     fn route(
         &self,
         connection: &mut Connection,
-        arrival: Instant,
+        read: std::result::Result<crate::http::Request, HttpError>,
     ) -> std::result::Result<Option<Json>, Failure> {
-        let request = connection.read_request(arrival + Duration::from_secs(5))?;
+        let request = read?;
         if !equal_secret(
             request.header("authorization").as_bytes(),
             self.authorization.as_bytes(),
@@ -3298,6 +3417,182 @@ mod tests {
             assert_eq!(Json::Object(remaining), without_telemetry);
         }
     }
+
+    /// A fresh private state directory for one test.
+    fn temporary_state(name: &str) -> TemporaryState {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        TemporaryState(
+            std::env::temp_dir().join(format!("tokspur-{name}-{}-{nanos}", std::process::id())),
+        )
+    }
+
+    #[test]
+    fn a_full_prefix_trace_is_a_server_error_and_stays_refused() {
+        // Arrange
+        let directory = temporary_state("prefix-trace-full");
+        let mut state = PrivateState::new(&directory.0).unwrap();
+        state.enable_prefix_trace().unwrap();
+        let record = Json::new_object([("event", Json::from("prompt_prefix"))]);
+        state.write_prefix_trace(&record).unwrap();
+        let line = state.prefix_trace_bytes;
+        // One byte short of room for the same record again.
+        state.prefix_trace_bytes = PREFIX_TRACE_LIMIT - line + 1;
+
+        // Act
+        let first = state.write_prefix_trace(&record).unwrap_err();
+        // Tracing fails closed: room found later does not resume it.
+        state.prefix_trace_bytes = line;
+        let later = state.write_prefix_trace(&record).unwrap_err();
+
+        // Assert
+        for error in [first, later] {
+            assert_eq!(error.to_string(), PREFIX_TRACE_FULL);
+            let error = JobError::Serve(error);
+            for target_started in [false, true] {
+                assert_eq!(failure_kind(&error, target_started), "server_error");
+                assert_eq!(failure_status(&error, false, target_started), 500);
+            }
+            assert_eq!(failure_status(&error, true, false), 408);
+        }
+        assert_eq!(
+            std::fs::read(directory.0.join("prefix-trace.jsonl")).unwrap(),
+            b"{\"event\":\"prompt_prefix\"}\n"
+        );
+        // A write failure is the server's fault too.
+        let persist = JobError::Serve(ServeError::Admission(AdmissionError::TracePersist(
+            Arc::new(std::io::Error::other("disk")),
+        )));
+        assert_eq!(failure_kind(&persist, false), "server_error");
+        assert_eq!(failure_status(&persist, false, false), 500);
+        // Request and generation failures keep their classes.
+        let refused = JobError::Serve(ServeError::Admission(AdmissionError::Refused(
+            "missing required API field",
+        )));
+        assert_eq!(failure_kind(&refused, false), "invalid_request_error");
+        assert_eq!(failure_status(&refused, false, false), 400);
+        assert_eq!(failure_kind(&refused, true), "generation_failed_no_retry");
+        assert_eq!(failure_status(&refused, false, true), 502);
+        assert_eq!(failure_status(&refused, true, true), 408);
+    }
+
+    #[test]
+    fn an_existing_prefix_trace_refuses_startup_naming_the_file_and_is_kept() {
+        // Arrange
+        let directory = temporary_state("prefix-trace-exists");
+        let record = Json::new_object([("event", Json::from("prompt_prefix"))]);
+        let mut earlier = PrivateState::new(&directory.0).unwrap();
+        earlier.enable_prefix_trace().unwrap();
+        earlier.write_prefix_trace(&record).unwrap();
+        drop(earlier);
+        let mut restarted = PrivateState::new(&directory.0).unwrap();
+
+        // Act
+        let refusal = restarted.enable_prefix_trace().unwrap_err();
+
+        // Assert
+        assert_eq!(
+            refusal.to_string(),
+            "private prefix trace requires a new file: move or remove prefix-trace.jsonl from the state directory, or start without --private-prefix-trace"
+        );
+        assert_eq!(
+            std::fs::read(directory.0.join("prefix-trace.jsonl")).unwrap(),
+            b"{\"event\":\"prompt_prefix\"}\n"
+        );
+        // Without a trace file nothing is traced, and that too is the server's fault.
+        let unopened = restarted.write_prefix_trace(&record).unwrap_err();
+        assert_eq!(unopened.to_string(), PREFIX_TRACE_UNAVAILABLE);
+        assert_eq!(
+            failure_status(&JobError::Serve(unopened), false, false),
+            500
+        );
+    }
+
+    /// A connection over a socketpair, with the peer's end.
+    fn peered() -> (Connection, std::os::unix::net::UnixStream) {
+        let (server, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let connection = Connection::new(server.into(), Limits::default()).unwrap();
+        (connection, peer)
+    }
+
+    /// Everything the server wrote before closing its end.
+    fn answered(mut peer: std::os::unix::net::UnixStream) -> String {
+        let mut response = String::new();
+        peer.read_to_string(&mut response).unwrap();
+        response
+    }
+
+    fn assert_busy(response: &str) {
+        assert!(
+            response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+            "{response}"
+        );
+        assert!(response.contains("\r\nRetry-After: 5\r\n"), "{response}");
+        assert!(
+            response.ends_with(
+                r#"{"error":{"message":"server is busy with other connections; retry shortly","type":"server_busy","code":"server_busy"}}"#
+            ),
+            "{response}"
+        );
+    }
+
+    #[test]
+    fn a_full_hand_off_queue_answers_503_instead_of_closing() {
+        // Arrange
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Arrival>(1);
+        let (queued, queued_peer) = peered();
+        let (refused, refused_peer) = peered();
+        let request = || Ok(crate::http::Request::default());
+
+        // Act
+        let taken = hand_off(&sender, (queued, Instant::now(), request()));
+        let full = hand_off(&sender, (refused, Instant::now(), request()));
+
+        // Assert
+        assert!(taken && full);
+        assert_busy(&answered(refused_peer));
+        // The queued peer is still waiting for a worker.
+        let (connection, _, _) = receiver.try_recv().unwrap();
+        assert!(receiver.try_recv().is_err());
+        drop(connection);
+        assert_eq!(answered(queued_peer), "");
+        // Stopped workers are reported, not answered.
+        drop(receiver);
+        let (late, _late_peer) = peered();
+        assert!(!hand_off(&sender, (late, Instant::now(), request())));
+    }
+
+    #[test]
+    fn a_full_reading_table_answers_its_oldest_peer_503() {
+        // Arrange
+        let mut reading = Vec::new();
+        let mut peers = Vec::new();
+        for _ in 0..READING_PEERS {
+            let (connection, peer) = peered();
+            admit_reading(&mut reading, connection, Instant::now());
+            peers.push(peer);
+        }
+        let second_handle = reading[1].0.native_handle();
+        let (newest, _newest_peer) = peered();
+        let newest_handle = newest.native_handle();
+
+        // Act
+        admit_reading(&mut reading, newest, Instant::now());
+
+        // Assert
+        assert_eq!(reading.len(), READING_PEERS);
+        assert_eq!(reading[0].0.native_handle(), second_handle);
+        assert_eq!(reading[READING_PEERS - 1].0.native_handle(), newest_handle);
+        assert_busy(&answered(peers.remove(0)));
+        // Every other peer is still being read.
+        drop(reading);
+        for peer in peers {
+            assert_eq!(answered(peer), "");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3318,7 +3613,7 @@ mod readiness_network_tests {
     }
 
     #[test]
-    fn silent_peer_does_not_hold_health_or_shutdown() {
+    fn silent_peers_do_not_hold_health_or_shutdown() {
         if std::env::var_os("TOKSPUR_TEST_HTTP_READERS_CHILD").is_some() {
             assert!(tokspur_sys::install_stop_handlers());
             let _owner_lifetime = monitor_owner_stdin().unwrap();
@@ -3366,7 +3661,7 @@ mod readiness_network_tests {
             Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "serve::readiness_network_tests::silent_peer_does_not_hold_health_or_shutdown",
+                    "serve::readiness_network_tests::silent_peers_do_not_hold_health_or_shutdown",
                     "--nocapture",
                 ])
                 .env("TOKSPUR_TEST_HTTP_READERS_CHILD", "1")
@@ -3389,7 +3684,16 @@ mod readiness_network_tests {
                 break u16::try_from(port.unsigned_integer().unwrap()).unwrap();
             }
         };
-        let quiet = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        // More unauthenticated peers than there are request workers: some never send, some stall partway through their headers.
+        let mut quiet = Vec::new();
+        for index in 0..24 {
+            let mut peer = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            if index % 2 == 1 {
+                peer.write_all(b"GET /health HTTP/1.1\r\nHost: loc")
+                    .unwrap();
+            }
+            quiet.push(peer);
+        }
         std::thread::sleep(Duration::from_millis(30));
         for path in ["/health", "/v1/models"] {
             let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -3408,6 +3712,31 @@ mod readiness_network_tests {
             assert!(!response.contains("native-ready-only"), "{response}");
             assert!(!response.contains("imported_regions"), "{response}");
         }
+        // Enough further silent peers to fill the table of unfinished requests: the peers it gives up are told 503, oldest first, and a request is still served.
+        for _ in quiet.len()..=READING_PEERS + 1 {
+            quiet.push(TcpStream::connect(("127.0.0.1", port)).unwrap());
+        }
+        for mut evicted in quiet.drain(..2) {
+            evicted
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut response = String::new();
+            evicted.read_to_string(&mut response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 503 "), "{response}");
+            assert!(response.contains("server_busy"), "{response}");
+        }
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        write!(
+            client,
+            "GET /health HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         let started = Instant::now();
         drop(child.0.stdin.take());
         loop {

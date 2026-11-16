@@ -1,12 +1,14 @@
 //! Pinned weight downloader (`tokspur pull`) with resumable `.part` transfers, single-pass SHA-256 verification and automatic state configuration.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::io::{IsTerminal, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
+use std::time::Duration;
 
 use tokspur_json::Json;
 
@@ -187,6 +189,94 @@ fn curl_environment() -> Result<BTreeMap<String, String>, CliError> {
     Ok(env)
 }
 
+/// Fails once a stop signal has arrived, so an interrupted pull adopts and configures nothing.
+fn ensure_not_interrupted() -> Result<(), CliError> {
+    if tokspur_sys::stop_requested() {
+        return Err(CliError::Validation(
+            "Download interrupted; re-run 'tokspur pull' to resume".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Runs curl to completion. A stop signal sent only to the CLI (SIGTERM, or SIGINT from another process) does not reach curl, so it is passed on once and the wait continues until curl has gone.
+fn run_curl(cmd: &mut Command) -> Result<ExitStatus, CliError> {
+    let mut child = cmd.spawn().map_err(|source| CliError::Io {
+        context: "cannot execute /usr/bin/curl".to_owned(),
+        source,
+    })?;
+    let mut forwarded = false;
+    loop {
+        if let Some(status) = child.try_wait().map_err(|source| CliError::Io {
+            context: "cannot wait for /usr/bin/curl".to_owned(),
+            source,
+        })? {
+            return Ok(status);
+        }
+        if tokspur_sys::stop_requested() && !forwarded {
+            forwarded = true;
+            if let Err(source) = tokspur_sys::process::kill(child.id() as i32, tokspur_sys::SIGTERM)
+                && source.raw_os_error() != Some(tokspur_sys::ESRCH)
+            {
+                return Err(CliError::Io {
+                    context: "cannot interrupt /usr/bin/curl".to_owned(),
+                    source,
+                });
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// curl's exit status when a transfer would exceed `--max-filesize`.
+const CURL_FILESIZE_EXCEEDED: i32 = 63;
+
+/// The least `--max-filesize` given to curl. Before 8.11.0 curl also counts the cap against the body of each redirect it follows, and the model host answers `/resolve/` with a redirect whose body is a kilobyte or two, so a smaller cap fails the transfer on the redirect (and macOS ships 8.7.1).
+const MIN_TRANSFER_CAP: u64 = 64 << 10;
+
+/// The `--max-filesize` for a transfer into a partial file of `part_len` bytes: what the file still lacks, but never less than a redirect body may need. A file is held to its pin by the size check after the transfer.
+fn transfer_cap(expected_size: u64, part_len: u64) -> u64 {
+    expected_size.saturating_sub(part_len).max(MIN_TRANSFER_CAP)
+}
+
+/// The curl arguments for one asset transfer into `part_path`, of at most `max_transfer` bytes.
+fn curl_arguments(
+    url: &str,
+    part_path: &Path,
+    allow_http: bool,
+    resume: bool,
+    max_transfer: u64,
+    progress_bar: bool,
+) -> Vec<OsString> {
+    // `-q` only works as the first argument. It stops curl reading the caller's ~/.curlrc, whose settings (netrc credentials, extra headers, a proxy, `insecure`) would otherwise apply to a download promised to send no tokens.
+    let mut args: Vec<OsString> = [
+        "-q",
+        "--fail",
+        "--location",
+        "--proto",
+        if allow_http { "=http,https" } else { "=https" },
+        "--retry",
+        "3",
+        "--retry-delay",
+        "2",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    if progress_bar {
+        args.push("--progress-bar".into());
+    } else {
+        args.extend(["--silent".into(), "--show-error".into()]);
+    }
+    if resume {
+        args.extend(["--continue-at".into(), "-".into()]);
+    }
+    // curl counts the cap against the body of each response, so on a resume it is what the partial file still lacks (see `transfer_cap`). A larger declared length is refused before anything is written, and a body with no declared length is cut off at the cap (curl 8.4.0 and later; an older curl only checks a declared length, and the size check after the transfer catches the rest).
+    args.extend(["--max-filesize".into(), max_transfer.to_string().into()]);
+    args.extend(["--output".into(), part_path.into(), "--".into(), url.into()]);
+    args
+}
+
 fn format_bytes(bytes: u64) -> String {
     const GIB: f64 = (1u64 << 30) as f64;
     const MIB: f64 = (1u64 << 20) as f64;
@@ -211,9 +301,7 @@ fn pull_single_asset(
     cache: &mut BTreeMap<PathBuf, Json>,
     out: &mut dyn Write,
 ) -> Result<Json, CliError> {
-    if tokspur_sys::stop_requested() {
-        return Err(CliError::Validation("Download interrupted".to_owned()));
-    }
+    ensure_not_interrupted()?;
     let name = json_str(spec, "name")?;
     let expected_size = json_u64(spec, "size")?;
     let rel = validate_asset_rel_path(name)?;
@@ -332,34 +420,27 @@ fn pull_single_asset(
         })?;
 
         let mut cmd = Command::new("/usr/bin/curl");
-        cmd.env_clear()
-            .envs(env)
-            .arg("--fail")
-            .arg("--location")
-            .arg("--proto")
-            .arg(if allow_http { "=http,https" } else { "=https" })
-            .arg("--retry")
-            .arg("3")
-            .arg("--retry-delay")
-            .arg("2");
-        if std::io::stderr().is_terminal() {
-            cmd.arg("--progress-bar");
-        } else {
-            cmd.arg("--silent").arg("--show-error");
-        }
-        if part_len > 0 {
-            cmd.arg("--continue-at").arg("-");
-        }
-        cmd.arg("--output").arg(&part_path).arg("--").arg(&url);
+        cmd.env_clear().envs(env).args(curl_arguments(
+            &url,
+            &part_path,
+            allow_http,
+            part_len > 0,
+            transfer_cap(expected_size, part_len),
+            std::io::stderr().is_terminal(),
+        ));
 
-        let status = cmd.status().map_err(|source| CliError::Io {
-            context: "cannot execute /usr/bin/curl".to_owned(),
-            source,
-        })?;
-        if tokspur_sys::stop_requested() {
-            return Err(CliError::Validation(
-                "Download interrupted; re-run 'tokspur pull' to resume".to_owned(),
-            ));
+        let status = run_curl(&mut cmd)?;
+        ensure_not_interrupted()?;
+        // The cap can exceed what a small file or a nearly complete one still lacks. Nothing of a partial file past its pin can be resumed, so it goes now rather than on the next run.
+        let oversized = fs::symlink_metadata(&part_path)
+            .is_ok_and(|meta| meta.file_type().is_file() && meta.len() > expected_size);
+        if oversized {
+            let _ignored = fs::remove_file(&part_path);
+        }
+        if oversized || status.code() == Some(CURL_FILESIZE_EXCEEDED) {
+            return Err(CliError::Validation(format!(
+                "Refusing {repo}/{name}: the server offered more than the pinned {expected_size} bytes"
+            )));
         }
         if !status.success() {
             return Err(CliError::Validation(format!(
@@ -602,6 +683,8 @@ pub fn pull_weights(
         fields.push(("dflash2_draft", existing_df));
     }
 
+    // The last point at which a stop signal cancels the pull: once the adoption is written, the short configuration step runs to completion.
+    ensure_not_interrupted()?;
     finalize_and_write_adoption(&tokspur_base, &specs, Json::new_object(fields), out)?;
     let port = resolve_pull_port(layout, &tokspur_base, opts.port)?;
     configure_runtime_locked(layout, &tokspur_base, port, opts.port.is_some(), out)?;
@@ -622,4 +705,64 @@ pub fn pull_weights(
         source,
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn curl_arguments_skip_the_curlrc_and_cap_the_transfer() {
+        for (allow_http, resume, progress_bar) in [(false, false, false), (true, true, true)] {
+            let args = curl_arguments(
+                "https://huggingface.co/owner/repo/resolve/rev/file.gguf",
+                Path::new("/models/file.gguf.part"),
+                allow_http,
+                resume,
+                4096,
+                progress_bar,
+            );
+            assert!(
+                args.windows(2)
+                    .any(|w| w[0] == "--max-filesize" && w[1] == "4096")
+            );
+            // curl honours `-q` only in first position.
+            assert_eq!(args[0], "-q");
+            assert_eq!(args.iter().filter(|arg| *arg == "-q").count(), 1);
+            let protocols = if allow_http { "=http,https" } else { "=https" };
+            assert!(
+                args.windows(2)
+                    .any(|w| w[0] == "--proto" && w[1] == protocols)
+            );
+            assert_eq!(
+                args.windows(2)
+                    .any(|w| w[0] == "--continue-at" && w[1] == "-"),
+                resume
+            );
+            assert_eq!(
+                args[args.len() - 4..],
+                [
+                    "--output",
+                    "/models/file.gguf.part",
+                    "--",
+                    "https://huggingface.co/owner/repo/resolve/rev/file.gguf"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn transfer_cap_is_what_is_left_but_never_below_a_redirect_body() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(transfer_cap(40 * GIB, 0), 40 * GIB);
+        assert_eq!(transfer_cap(40 * GIB, GIB), 39 * GIB);
+        assert_eq!(
+            transfer_cap(40 * GIB, 40 * GIB - MIN_TRANSFER_CAP - 1),
+            MIN_TRANSFER_CAP + 1
+        );
+        // A small file, and a large one with little left, keep room for the redirect.
+        assert_eq!(transfer_cap(1015, 0), MIN_TRANSFER_CAP);
+        assert_eq!(transfer_cap(40 * GIB, 40 * GIB - 100), MIN_TRANSFER_CAP);
+        assert_eq!(transfer_cap(1015, 1015), MIN_TRANSFER_CAP);
+    }
 }

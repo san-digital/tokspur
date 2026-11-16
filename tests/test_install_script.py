@@ -151,7 +151,7 @@ def server():
 
 
 class Host:
-    """A fake Apple silicon Mac: a home with a space in it, uname and codesign shims."""
+    """A fake Apple silicon Mac: a home with a space in it, uname, id and codesign shims."""
 
     def __init__(self, tmp_path, url, shell):
         self.shell = shell
@@ -164,6 +164,10 @@ class Host:
         (shims / "uname").write_text(
             '#!/bin/sh\ncase "$1" in -s) echo "${FAKE_SYSTEM:-Darwin}" ;; '
             '-m) echo "${FAKE_MACHINE:-arm64}" ;; esac\n'
+        )
+        (shims / "id").write_text(
+            '#!/bin/sh\ncase "${1:-}" in -u) echo "${FAKE_UID:-501}" ;; '
+            '*) exec /usr/bin/id "$@" ;; esac\n'
         )
         (shims / "codesign").write_text(FAKE_CODESIGN)
         for shim in shims.iterdir():
@@ -357,6 +361,17 @@ def test_refuses_other_platforms(host):
     assert "Apple silicon" in result.stderr
 
 
+@pytest.mark.parametrize(
+    "arguments", [(), ("--update",), ("--auto",), ("--check",), ("--off",), ("--on",)]
+)
+def test_refuses_to_run_as_root(host, arguments):
+    result = host.install(*arguments, FAKE_UID="0")
+    assert result.returncode == 1
+    assert "without sudo" in result.stderr
+    assert not host.home.exists()
+    assert Releases.latest_checks == 0
+
+
 def test_refuses_a_malformed_version(host):
     result = host.install(TOKSPUR_VERSION="latest; rm")
     assert result.returncode == 1
@@ -434,3 +449,30 @@ def test_noop_preserves_rollback_and_explicit_downgrade_disables_auto_update(hos
     assert host.tokspur("doctor").returncode == 0
     time.sleep(0.2)
     assert Releases.latest_checks == before
+
+
+def test_a_download_that_stops_part_way_runs_nothing(host):
+    """`curl | sh` runs whatever arrived, so only the last line may start the install."""
+    lines = installer_text(TEAM).splitlines(keepends=True)
+    assert lines[-1] == 'main "$@"\n'
+
+    def piped(text):
+        return subprocess.run(
+            [host.shell],
+            input=text,
+            env=host.env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    for received in range(len(lines)):
+        result = piped("".join(lines[:received]))
+        assert result.stdout == "", f"output after {received} lines"
+        assert not host.home.exists(), f"wrote files after {received} lines"
+    assert Releases.latest_checks == 0
+
+    whole = piped("".join(lines))
+    assert whole.returncode == 0, whole.stderr
+    assert host.current() == "v0.1.0"
+    assert host.command.exists()

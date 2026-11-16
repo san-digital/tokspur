@@ -1058,8 +1058,10 @@ kernel void prefill_exact_router_f32_batch(
     ushort tid [[thread_index_in_threadgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]]) {
-    constexpr ushort W_TOK = 32u, TILE_K = 128u;
-    threadgroup float sx[W_TOK][TILE_K];
+    constexpr ushort W_TOK = 8u, R_PER_SG = 4u, SG_COUNT = 4u, TILE_K = 128u;
+    constexpr ushort THREADS = SG_COUNT * 32u, R_TG = SG_COUNT * R_PER_SG, TILE_K4 = TILE_K / 4u;
+    alignas(16) threadgroup float4 sx4[W_TOK * TILE_K4];
+    threadgroup float (*sx)[TILE_K] = reinterpret_cast<threadgroup float (*)[TILE_K]>(sx4);
 
     if (!a.tokens || a.tokens > 2048u || a.columns < 32u || a.columns > 65536u || (a.columns % 32u) != 0u ||
         a.outputs <= 64u || a.outputs > 4096u ||
@@ -1072,50 +1074,68 @@ kernel void prefill_exact_router_f32_batch(
     const uint tok_base = group.y * uint(W_TOK);
     if (tok_base >= a.tokens) return;
     const uint count = min(uint(W_TOK), a.tokens - tok_base);
-    const uint out = group.x * 4u + uint(sg);
-    device const float* w_row = (out < a.outputs) ? (weights + ulong(out) * a.columns) : nullptr;
+    const uint first_out = group.x * uint(R_TG) + uint(sg) * uint(R_PER_SG);
+    const bool full_rows = (first_out + uint(R_PER_SG) <= a.outputs);
 
-    float sums[W_TOK];
+    float sums[R_PER_SG][W_TOK];
     #pragma unroll
-    for (ushort m = 0u; m < W_TOK; ++m) sums[m] = 0.0f;
+    for (ushort r = 0u; r < R_PER_SG; ++r)
+        #pragma unroll
+        for (ushort m = 0u; m < W_TOK; ++m) sums[r][m] = 0.0f;
 
     for (uint base = 0u; base < a.columns; base += uint(TILE_K)) {
         const uint tile_cols = min(uint(TILE_K), a.columns - base);
         if (count == uint(W_TOK) && tile_cols == uint(TILE_K)) {
             #pragma unroll
-            for (ushort idx = tid; idx < W_TOK * TILE_K; idx += 128u) {
-                const ushort m = idx / TILE_K, c = idx % TILE_K;
+            for (ushort idx4 = tid; idx4 < W_TOK * TILE_K4; idx4 += THREADS) {
+                const ushort m = idx4 / TILE_K4, c4 = idx4 % TILE_K4;
                 device const float* x_row = reinterpret_cast<device const float*>(input_bytes + ulong(tok_base + m) * a.input_stride_bytes);
-                sx[m][c] = x_row[base + c];
+                sx4[idx4] = float4(*reinterpret_cast<device const packed_float4*>(x_row + base + uint(c4) * 4u));
             }
         } else {
-            for (ushort idx = tid; idx < W_TOK * TILE_K; idx += 128u) {
-                const ushort m = idx / TILE_K, c = idx % TILE_K;
-                if (m < count && c < tile_cols) {
+            for (ushort idx4 = tid; idx4 < W_TOK * TILE_K4; idx4 += THREADS) {
+                const ushort m = idx4 / TILE_K4, c4 = idx4 % TILE_K4;
+                const uint c0 = uint(c4) * 4u;
+                if (m < count && c0 + 4u <= tile_cols) {
                     device const float* x_row = reinterpret_cast<device const float*>(input_bytes + ulong(tok_base + m) * a.input_stride_bytes);
-                    sx[m][c] = x_row[base + c];
+                    sx4[idx4] = float4(*reinterpret_cast<device const packed_float4*>(x_row + base + c0));
                 } else {
-                    sx[m][c] = 0.0f;
+                    sx4[idx4] = float4(0.0f);
                 }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (out < a.outputs) {
-            if (count == uint(W_TOK) && tile_cols == uint(TILE_K)) {
+        if (count == uint(W_TOK) && tile_cols == uint(TILE_K) && full_rows) {
+            #pragma unroll
+            for (ushort c = lane; c < TILE_K; c += 32u) {
+                float w[R_PER_SG];
                 #pragma unroll
-                for (ushort c = lane; c < TILE_K; c += 32u) {
-                    const float w = w_row[base + c];
+                for (ushort r = 0u; r < R_PER_SG; ++r) {
+                    w[r] = weights[ulong(first_out + r) * a.columns + base + c];
+                }
+                #pragma unroll
+                for (ushort m = 0u; m < W_TOK; ++m) {
+                    const float xv = sx[m][c];
                     #pragma unroll
-                    for (ushort m = 0u; m < W_TOK; ++m) {
-                        sums[m] += w * sx[m][c];
+                    for (ushort r = 0u; r < R_PER_SG; ++r) {
+                        sums[r][m] += w[r] * xv;
                     }
                 }
-            } else {
-                for (uint c = uint(lane); c < tile_cols; c += 32u) {
-                    const float w = w_row[base + c];
-                    for (uint m = 0u; m < count; ++m) {
-                        sums[m] += w * sx[m][c];
+            }
+        } else if (first_out < a.outputs) {
+            for (uint c = uint(lane); c < tile_cols; c += 32u) {
+                float w[R_PER_SG];
+                #pragma unroll
+                for (ushort r = 0u; r < R_PER_SG; ++r) {
+                    const uint out = first_out + r;
+                    w[r] = (out < a.outputs) ? weights[ulong(out) * a.columns + base + c] : 0.0f;
+                }
+                for (uint m = 0u; m < count; ++m) {
+                    const float xv = sx[m][c];
+                    #pragma unroll
+                    for (ushort r = 0u; r < R_PER_SG; ++r) {
+                        sums[r][m] += w[r] * xv;
                     }
                 }
             }
@@ -1123,12 +1143,16 @@ kernel void prefill_exact_router_f32_batch(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    if (out < a.outputs) {
-        for (uint m = 0u; m < count; ++m) {
-            const float total = simd_sum(sums[m]);
-            if (!lane) {
-                device float* y_row = reinterpret_cast<device float*>(output_bytes + ulong(tok_base + m) * a.output_stride_bytes);
-                verify_fused_detail::checked_write(y_row, out, total, error);
+    #pragma unroll
+    for (ushort r = 0u; r < R_PER_SG; ++r) {
+        const uint out = first_out + r;
+        if (out < a.outputs) {
+            for (uint m = 0u; m < count; ++m) {
+                const float total = simd_sum(sums[r][m]);
+                if (!lane) {
+                    device float* y_row = reinterpret_cast<device float*>(output_bytes + ulong(tok_base + m) * a.output_stride_bytes);
+                    verify_fused_detail::checked_write(y_row, out, total, error);
+                }
             }
         }
     }

@@ -119,8 +119,10 @@ impl Builder {
     }
 
     fn parameter(&mut self, value: &[u8]) -> Result<(), ChatError> {
+        // The caller writes the newline that precedes the value, so a value that starts with `</parameter>` completes the delimiter as surely as one that holds it.
         require(
-            !value.windows(13).any(|window| window == b"\n</parameter>"),
+            !value.starts_with(b"</parameter>")
+                && !value.windows(13).any(|window| window == b"\n</parameter>"),
             "raw tool argument contains parameter delimiter",
         )?;
         self.literal(value)

@@ -150,14 +150,16 @@ def _optional_role(entry: dict) -> str | None:
 
 
 def candidate_file_specs(
-    expected: dict, group: str, *, include_legacy_draft: bool = False
+    expected: dict, group: str, *, include_dflash2_draft: bool = False
 ) -> list[list[dict]]:
     group_obj = expected[group]
     specs = [group_obj["files"]]
     for variant in group_obj.get("variants", ()):
         specs.append(variant["files"])
-    if include_legacy_draft and group == "draft" and "legacy_dflash2_draft" in expected:
-        specs.append(expected["legacy_dflash2_draft"]["files"])
+    if include_dflash2_draft and group == "draft":
+        df_key = dflash2_profile_group_key(expected)
+        if df_key is not None:
+            specs.append(expected[df_key]["files"])
     return specs
 
 
@@ -224,13 +226,13 @@ def _check_adoption_group(
     adoption_key: str,
     profile_key: str,
     *,
-    include_legacy_draft: bool,
+    include_dflash2_draft: bool,
 ) -> None:
     assets = data[adoption_key]["assets"]
     same_len = [
         spec_files
         for spec_files in candidate_file_specs(
-            expected, profile_key, include_legacy_draft=include_legacy_draft
+            expected, profile_key, include_dflash2_draft=include_dflash2_draft
         )
         if len(assets) == len(spec_files)
     ]
@@ -282,7 +284,7 @@ def check_adoption(data: dict) -> None:
         raise ValueError("Full asset verification is required")
     expected = read_json(ROOT / "profiles/flash-next-assets.json")
     for group in ("target", "draft"):
-        _check_adoption_group(data, expected, group, group, include_legacy_draft=True)
+        _check_adoption_group(data, expected, group, group, include_dflash2_draft=True)
     if "dflash2_draft" in data:
         profile_key = dflash2_profile_group_key(expected)
         if profile_key is None:
@@ -292,7 +294,7 @@ def check_adoption(data: dict) -> None:
             expected,
             "dflash2_draft",
             profile_key,
-            include_legacy_draft=False,
+            include_dflash2_draft=False,
         )
 
 
@@ -316,6 +318,16 @@ def port_available(port: int) -> bool:
     return False
 
 
+def _runs_later_words(executable: str) -> bool:
+    """A Python interpreter or POSIX shell runs a later argv word as its program."""
+    return executable.lower().startswith(("python", "pypy")) or executable in (
+        "sh",
+        "bash",
+        "zsh",
+        "dash",
+    )
+
+
 def inference_processes() -> list[dict]:
     """Conservative safety check, not a cross-application resource lock."""
     import psutil
@@ -334,11 +346,20 @@ def inference_processes() -> list[dict]:
     for proc in psutil.process_iter(["cmdline", "name"]):
         try:
             args = proc.info["cmdline"] or []
-            names = {Path(a).name for a in args[:4]}
+            # What runs is argv[0] and the short name. A later word is an
+            # operand (`tail -f logs/llama-server`), unless an interpreter is
+            # running it as a script or module.
+            names = {Path(args[0]).name} if args else set()
             # Another user's worker exposes no cmdline; its short name still counts.
             if proc.info["name"]:
                 names.add(proc.info["name"])
+            launched = (
+                {Path(a).name for a in args[1:4]}
+                if any(_runs_later_words(name) for name in names)
+                else set()
+            )
             is_worker = bool(names & worker_names)
+            is_worker |= bool(launched & (worker_names | {"mlx_lm.server"}))
             # p_comm is the fallback only; a readable foreign argv wins over
             # a coincidentally matching short name. Never match a prefix.
             is_worker |= (
@@ -346,7 +367,6 @@ def inference_processes() -> list[dict]:
                 and not args
                 and proc.info["name"] == SCALAR_WORKER_NAME[:DARWIN_MAXCOMLEN]
             )
-            is_worker |= "mlx_lm.server" in args[:4]
             is_worker |= "ollama" in names and "runner" in args[:4]
             if is_worker and proc.pid != os.getpid():
                 found.append({"pid": proc.pid, "runtime": "inference worker"})
@@ -355,12 +375,22 @@ def inference_processes() -> list[dict]:
     return found
 
 
+# What tokspur-server may inherit from the caller. The server reads nothing from
+# its environment, so it gets the usual session basics and this project's own
+# settings. Everything else stays out of the process that holds the API key and
+# the prompts: loader overrides (DYLD_*), exported credentials, HF_* and Python
+# overrides.
+SERVER_ENVIRONMENT_NAMES = frozenset(
+    {"PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TZ", "TERM"}
+)
+SERVER_ENVIRONMENT_PREFIXES = ("LC_", "TOKSPUR_")
+
+
 def isolated_environment() -> dict[str, str]:
-    blocked = ("HF_", "HUGGING_FACE_", "HUGGINGFACE_")
     env = {
         k: v
         for k, v in os.environ.items()
-        if not k.startswith(blocked) and k not in ("PYTHONPATH", "PYTHONHOME")
+        if k in SERVER_ENVIRONMENT_NAMES or k.startswith(SERVER_ENVIRONMENT_PREFIXES)
     }
     state = private_dir(ROOT / ".tokspur/state")
     env.update(

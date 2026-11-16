@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import subprocess
 import tomllib
 from pathlib import Path
@@ -140,3 +141,20 @@ def test_signing_refuses_remaining_home_paths(monkeypatch, bootstrap, tmp_path):
         bootstrap.codesign_executables("test identity", None, {})
     assert len(calls) == 1
     assert "--sign" not in calls[0]
+
+
+def test_closing_message_names_the_commands_the_readme_describes(bootstrap):
+    readme = (ROOT / "README.md").read_text()
+    commands = re.findall(r"`(tokspur [^`]+)`", bootstrap.NEXT_STEPS)
+    assert commands == [
+        "tokspur doctor",
+        "tokspur pull",
+        "tokspur serve --speed-preset",
+    ]
+    for command in commands:
+        line = rf"^(\.venv/bin/)?{re.escape(command)}$"
+        assert re.search(line, readme, re.M), command
+    # The README says setup needs none of these after `tokspur pull`.
+    assert "no extra `adopt`, `configure` or `pack build` step" in readme
+    for retired in ("adopt", "configure", "pack build"):
+        assert retired not in bootstrap.NEXT_STEPS

@@ -133,6 +133,106 @@ kernel void graph_gdn_delta_tile(device const float* accepted [[buffer(0)]],
 // lanes as graph_delta. Partition the 128-key state across 68 unrolled scalar
 // registers and 60 conflict-free threadgroup SRAM slots to avoid stack spills
 // while preserving the exact chronological 0..127 accumulation and update order.
+template <uint KReg, uint KSram, uint MaxThr>
+static inline void gdn_delta_tile_impl(device const float* accepted,
+                                       device const float* query,
+                                       device const float* key,
+                                       device const float* value,
+                                       device const float* decay,
+                                       device const float* beta,
+                                       device float* candidate,
+                                       device atomic_uint* error,
+                                       device float* output,
+                                       constant uint4& s,
+                                       uint steps,
+                                       uint i,
+                                       ushort tid,
+                                       threadgroup float (*state_hi)[MaxThr]) {
+    // s={heads,value_width,capacity,128}; steps may be a strict prefix for replay.
+    if (!s.x || s.x > 48 || !s.y || s.y > 128 || s.w != 128 || !gdn_tile_count(s.z, steps) || tid >= MaxThr) {
+        if (!i) atomic_fetch_or_explicit(error, 2u, memory_order_relaxed); return;
+    }
+    if (i >= s.x * s.y) return;
+    const uint head = i / s.y, column = i % s.y, base = head * 128 * s.y + column;
+    float state_lo[KReg];
+    bool invalid = false;
+    #pragma clang loop unroll(full)
+    for (uint k = 0; k < KReg; ++k) {
+        const float v = accepted[base + k * s.y];
+        state_lo[k] = v;
+        invalid = invalid || !isfinite(v);
+    }
+    #pragma clang loop unroll_count(4)
+    for (uint k = 0; k < KSram; ++k) {
+        const float v = accepted[base + (KReg + k) * s.y];
+        state_hi[k][tid] = v;
+        invalid = invalid || !isfinite(v);
+    }
+    if (invalid) { atomic_fetch_or_explicit(error, 1u, memory_order_relaxed); return; }
+    for (uint step = 0; step < steps; ++step) {
+        const uint gate = step * s.x + head, qbase = gate * 128;
+        const float a = decay[gate], b = beta[gate];
+        if (!isfinite(a) || !isfinite(b) || a < 0 || a > 1 || b < 0 || b > 1) {
+            atomic_fetch_or_explicit(error, 2u, memory_order_relaxed); return;
+        }
+        device const packed_float4* k4_ptr = reinterpret_cast<device const packed_float4*>(key + qbase);
+        device const packed_float4* q4_ptr = reinterpret_cast<device const packed_float4*>(query + qbase);
+        float predicted = 0;
+        #pragma clang loop unroll(full)
+        for (uint k4 = 0; k4 < KReg / 4; ++k4) {
+            const float4 kv = float4(k4_ptr[k4]);
+            predicted += (a * state_lo[k4 * 4 + 0]) * kv.x;
+            predicted += (a * state_lo[k4 * 4 + 1]) * kv.y;
+            predicted += (a * state_lo[k4 * 4 + 2]) * kv.z;
+            predicted += (a * state_lo[k4 * 4 + 3]) * kv.w;
+        }
+        #pragma clang loop unroll_count(2)
+        for (uint k4 = 0; k4 < KSram / 4; ++k4) {
+            const float4 kv = float4(k4_ptr[KReg / 4 + k4]);
+            const uint kh = k4 * 4;
+            predicted += (a * state_hi[kh + 0][tid]) * kv.x;
+            predicted += (a * state_hi[kh + 1][tid]) * kv.y;
+            predicted += (a * state_hi[kh + 2][tid]) * kv.z;
+            predicted += (a * state_hi[kh + 3][tid]) * kv.w;
+        }
+        const float delta = value[ulong(step) * s.x * s.y + i] - predicted;
+        float result = 0;
+        #pragma clang loop unroll(full)
+        for (uint k4 = 0; k4 < KReg / 4; ++k4) {
+            const float4 kv = float4(k4_ptr[k4]);
+            const float4 qv = float4(q4_ptr[k4]);
+            const float u0 = a * state_lo[k4 * 4 + 0] + b * kv.x * delta;
+            const float u1 = a * state_lo[k4 * 4 + 1] + b * kv.y * delta;
+            const float u2 = a * state_lo[k4 * 4 + 2] + b * kv.z * delta;
+            const float u3 = a * state_lo[k4 * 4 + 3] + b * kv.w * delta;
+            state_lo[k4 * 4 + 0] = u0; result += u0 * qv.x;
+            state_lo[k4 * 4 + 1] = u1; result += u1 * qv.y;
+            state_lo[k4 * 4 + 2] = u2; result += u2 * qv.z;
+            state_lo[k4 * 4 + 3] = u3; result += u3 * qv.w;
+        }
+        #pragma clang loop unroll_count(2)
+        for (uint k4 = 0; k4 < KSram / 4; ++k4) {
+            const float4 kv = float4(k4_ptr[KReg / 4 + k4]);
+            const float4 qv = float4(q4_ptr[KReg / 4 + k4]);
+            const uint kh = k4 * 4;
+            const float u0 = a * state_hi[kh + 0][tid] + b * kv.x * delta;
+            const float u1 = a * state_hi[kh + 1][tid] + b * kv.y * delta;
+            const float u2 = a * state_hi[kh + 2][tid] + b * kv.z * delta;
+            const float u3 = a * state_hi[kh + 3][tid] + b * kv.w * delta;
+            state_hi[kh + 0][tid] = u0; result += u0 * qv.x;
+            state_hi[kh + 1][tid] = u1; result += u1 * qv.y;
+            state_hi[kh + 2][tid] = u2; result += u2 * qv.z;
+            state_hi[kh + 3][tid] = u3; result += u3 * qv.w;
+        }
+        if (!isfinite(result)) { atomic_fetch_or_explicit(error, 1u, memory_order_relaxed); return; }
+        output[ulong(step) * s.x * s.y + i] = result;
+    }
+    #pragma clang loop unroll(full)
+    for (uint k = 0; k < KReg; ++k) candidate[base + k * s.y] = state_lo[k];
+    #pragma clang loop unroll_count(4)
+    for (uint k = 0; k < KSram; ++k) candidate[base + (KReg + k) * s.y] = state_hi[k][tid];
+}
+
 kernel void graph_gdn_delta_tile(device const float* accepted [[buffer(0)]],
                                 device const float* query [[buffer(1)]],
                                 device const float* key [[buffer(2)]],
@@ -146,59 +246,24 @@ kernel void graph_gdn_delta_tile(device const float* accepted [[buffer(0)]],
                                 constant uint& steps [[buffer(10)]],
                                 uint i [[thread_position_in_grid]],
                                 ushort tid [[thread_index_in_threadgroup]]) {
+    threadgroup float state_hi[88][32];
+    gdn_delta_tile_impl<40, 88, 32>(accepted, query, key, value, decay, beta, candidate, error, output, s, steps, i, tid, state_hi);
+}
+
+kernel void graph_gdn_delta_tile_w128(device const float* accepted [[buffer(0)]],
+                                      device const float* query [[buffer(1)]],
+                                      device const float* key [[buffer(2)]],
+                                      device const float* value [[buffer(3)]],
+                                      device const float* decay [[buffer(4)]],
+                                      device const float* beta [[buffer(5)]],
+                                      device float* candidate [[buffer(6)]],
+                                      device atomic_uint* error [[buffer(7)]],
+                                      device float* output [[buffer(8)]],
+                                      constant uint4& s [[buffer(9)]],
+                                      constant uint& steps [[buffer(10)]],
+                                      uint i [[thread_position_in_grid]],
+                                      ushort tid [[thread_index_in_threadgroup]]) {
     threadgroup float state_hi[60][128];
-    // s={heads,value_width,capacity,128}; steps may be a strict prefix for replay.
-    if (!s.x || s.x > 48 || !s.y || s.y > 128 || s.w != 128 || !gdn_tile_count(s.z, steps) || tid >= 128u) {
-        if (!i) atomic_fetch_or_explicit(error, 2u, memory_order_relaxed); return;
-    }
-    if (i >= s.x * s.y) return;
-    const uint head = i / s.y, column = i % s.y, base = head * 128 * s.y + column;
-    float state_lo[68];
-    bool invalid = false;
-    #pragma clang loop unroll(full)
-    for (uint k = 0; k < 68; ++k) {
-        const float v = accepted[base + k * s.y];
-        state_lo[k] = v;
-        invalid = invalid || !isfinite(v);
-    }
-    #pragma clang loop unroll_count(4)
-    for (uint k = 0; k < 60; ++k) {
-        const float v = accepted[base + (68u + k) * s.y];
-        state_hi[k][tid] = v;
-        invalid = invalid || !isfinite(v);
-    }
-    if (invalid) { atomic_fetch_or_explicit(error, 1u, memory_order_relaxed); return; }
-    for (uint step = 0; step < steps; ++step) {
-        const uint gate = step * s.x + head, qbase = gate * 128;
-        const float a = decay[gate], b = beta[gate];
-        if (!isfinite(a) || !isfinite(b) || a < 0 || a > 1 || b < 0 || b > 1) {
-            atomic_fetch_or_explicit(error, 2u, memory_order_relaxed); return;
-        }
-        float predicted = 0;
-        #pragma clang loop unroll(full)
-        for (uint k = 0; k < 68; ++k) predicted += (a * state_lo[k]) * key[qbase + k];
-        #pragma clang loop unroll_count(4)
-        for (uint k = 0; k < 60; ++k) predicted += (a * state_hi[k][tid]) * key[qbase + 68u + k];
-        const float delta = value[ulong(step) * s.x * s.y + i] - predicted;
-        float result = 0;
-        #pragma clang loop unroll(full)
-        for (uint k = 0; k < 68; ++k) {
-            const float updated = a * state_lo[k] + b * key[qbase + k] * delta;
-            state_lo[k] = updated;
-            result += updated * query[qbase + k];
-        }
-        #pragma clang loop unroll_count(4)
-        for (uint k = 0; k < 60; ++k) {
-            const float updated = a * state_hi[k][tid] + b * key[qbase + 68u + k] * delta;
-            state_hi[k][tid] = updated;
-            result += updated * query[qbase + 68u + k];
-        }
-        if (!isfinite(result)) { atomic_fetch_or_explicit(error, 1u, memory_order_relaxed); return; }
-        output[ulong(step) * s.x * s.y + i] = result;
-    }
-    #pragma clang loop unroll(full)
-    for (uint k = 0; k < 68; ++k) candidate[base + k * s.y] = state_lo[k];
-    #pragma clang loop unroll_count(4)
-    for (uint k = 0; k < 60; ++k) candidate[base + (68u + k) * s.y] = state_hi[k][tid];
+    gdn_delta_tile_impl<68, 60, 128>(accepted, query, key, value, decay, beta, candidate, error, output, s, steps, i, tid, state_hi);
 }
 #endif

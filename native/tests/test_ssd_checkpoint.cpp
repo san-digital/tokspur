@@ -1,5 +1,6 @@
 #include "tokspur/ssd_checkpoint.hpp"
 
+#include <CommonCrypto/CommonCrypto.h>
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -11,10 +12,12 @@
 #include <future>
 #include <iostream>
 #include <limits>
+#include <stdexcept>
 #include <string_view>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -174,6 +177,75 @@ static void test_spill_cancellation_between_chunks() {
     std::filesystem::remove_all(test_dir);
 }
 
+static int lowest_free_descriptor() {
+    const int probe = ::dup(STDIN_FILENO);
+    assert(probe >= 0);
+    ::close(probe);
+    return probe;
+}
+
+// A chunk reader that throws must not strand the temporary: its exclusive
+// create would refuse every later spill of the same prefix in this process.
+static void test_spill_survives_throwing_chunk_reader() {
+    const std::filesystem::path test_dir = "/tmp/tokspur_test_throw_" + std::to_string(::getpid());
+    std::filesystem::remove_all(test_dir);
+    const auto dir = test_dir / "tokspur-checkpoints-v3";
+    SsdCheckpointManager manager(test_dir, 64ull << 20, 1ull << 20);
+    SlotHandshake handshake;
+    CheckpointFileHeader header;
+    header.prefix_tokens = 512;
+    header.total_payload_bytes = 2 * checkpoint_chunk_bytes;
+    CheckpointMetadata metadata;
+
+    const int free_descriptor = lowest_free_descriptor();
+    size_t reads = 0;
+    bool threw = false;
+    try {
+        static_cast<void>(manager.spill_checkpoint("throwing.ckpt", handshake, header, metadata,
+            [&](size_t index, std::span<std::byte> target) -> bool {
+                ++reads;
+                if (index == 1) throw std::runtime_error("chunk reader failed");
+                std::fill(target.begin(), target.end(), std::byte{0x17});
+                return true;
+            }));
+    } catch (const std::runtime_error& error) {
+        threw = std::string_view(error.what()) == "chunk reader failed";
+    }
+    assert(threw && reads == 2);
+    assert(handshake.reader_epoch.load() == 4); // even: no read is in flight
+    assert(lowest_free_descriptor() == free_descriptor);
+    assert(std::filesystem::is_empty(dir));
+    assert(manager.occupied_bytes() == 0 && !manager.has_checkpoint("throwing.ckpt"));
+
+    assert(manager.spill_checkpoint("throwing.ckpt", handshake, header, metadata,
+        [](size_t index, std::span<std::byte> target) {
+            std::fill(target.begin(), target.end(), std::byte(0x20 + index));
+            return true;
+        }));
+    assert(handshake.reader_epoch.load() == 8);
+    assert(lowest_free_descriptor() == free_descriptor);
+    assert(manager.has_checkpoint("throwing.ckpt"));
+    size_t entries = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        assert(entry.path().filename() == "throwing.ckpt");
+        ++entries;
+    }
+    assert(entries == 1);
+
+    CheckpointFileHeader restored_header;
+    CheckpointMetadata restored_metadata;
+    size_t restored_chunks = 0;
+    assert(manager.restore_checkpoint("throwing.ckpt", restored_header, restored_metadata,
+        [&](size_t index, std::span<const std::byte> source) {
+            ++restored_chunks;
+            return std::all_of(source.begin(), source.end(),
+                [&](std::byte value) { return value == std::byte(0x20 + index); });
+        }));
+    assert(restored_chunks == 2 && restored_header.prefix_tokens == 512);
+    std::filesystem::remove_all(test_dir);
+    std::cout << "PASS spill survives a throwing chunk reader" << std::endl;
+}
+
 static void test_spill_restore_and_sha256_verification() {
     std::filesystem::path test_dir = "/tmp/tokspur_test_sr_" + std::to_string(::getpid());
     std::filesystem::remove_all(test_dir);
@@ -285,6 +357,101 @@ static void test_spill_restore_and_sha256_verification() {
     assert(!std::filesystem::exists(file_path));
 
     std::filesystem::remove_all(test_dir);
+}
+
+// The state digest as it was before the prefix token IDs were bound into it.
+static std::array<uint8_t, 32> unbound_state_digest(const std::array<uint8_t, 32>& execution_digest, uint32_t prefix,
+                                                    uint64_t stack_bytes, uint64_t mtp_bytes, bool has_logits) {
+    CC_SHA256_CTX ctx;
+    CC_SHA256_Init(&ctx);
+    CC_SHA256_Update(&ctx, execution_digest.data(), CC_LONG(execution_digest.size()));
+    CC_SHA256_Update(&ctx, &prefix, sizeof(prefix));
+    CC_SHA256_Update(&ctx, &stack_bytes, sizeof(stack_bytes));
+    CC_SHA256_Update(&ctx, &mtp_bytes, sizeof(mtp_bytes));
+    const uint8_t logits = has_logits ? 1u : 0u;
+    CC_SHA256_Update(&ctx, &logits, sizeof(logits));
+    std::array<uint8_t, 32> digest{};
+    CC_SHA256_Final(digest.data(), &ctx);
+    return digest;
+}
+
+// The file name is computed from the prefix token IDs but is only a name. A
+// checkpoint moved to the name of another prefix of equal length, or one
+// written before the IDs were bound, must be refused before any state is
+// published and left in place as an ordinary miss.
+static void test_state_digest_binds_prefix_token_ids() {
+    std::array<uint8_t, 32> execution{};
+    execution.fill(0x3C);
+    std::array<uint8_t, 32> other_execution = execution;
+    other_execution[31] ^= 1;
+    const std::vector<uint32_t> prefix_a{11, 12, 13, 14};
+    const std::vector<uint32_t> prefix_b{11, 12, 13, 15}; // equal length, last ID differs
+    const std::vector<uint32_t> reordered{12, 11, 13, 14};
+    const uint64_t stack_bytes = checkpoint_chunk_bytes - 64, mtp_bytes = 64;
+
+    const auto digest_a = checkpoint_state_digest(execution, prefix_a, stack_bytes, mtp_bytes, true);
+    assert(digest_a == checkpoint_state_digest(execution, prefix_a, stack_bytes, mtp_bytes, true));
+    assert(digest_a != checkpoint_state_digest(execution, prefix_b, stack_bytes, mtp_bytes, true));
+    assert(digest_a != checkpoint_state_digest(execution, reordered, stack_bytes, mtp_bytes, true));
+    assert(digest_a != checkpoint_state_digest(execution, std::span(prefix_a).first(3), stack_bytes, mtp_bytes, true));
+    assert(digest_a != checkpoint_state_digest(other_execution, prefix_a, stack_bytes, mtp_bytes, true));
+    assert(digest_a != checkpoint_state_digest(execution, prefix_a, stack_bytes + 1, mtp_bytes, true));
+    assert(digest_a != checkpoint_state_digest(execution, prefix_a, stack_bytes, mtp_bytes + 1, true));
+    assert(digest_a != checkpoint_state_digest(execution, prefix_a, stack_bytes, mtp_bytes, false));
+    const auto unbound = unbound_state_digest(execution, uint32_t(prefix_a.size()), stack_bytes, mtp_bytes, true);
+    assert(digest_a != unbound);
+
+    const std::filesystem::path test_dir = "/tmp/tokspur_test_token_identity_" + std::to_string(::getpid());
+    std::filesystem::remove_all(test_dir);
+    const auto dir = test_dir / "tokspur-checkpoints-v3";
+    SsdCheckpointManager manager(test_dir, 128ull << 20, 1ull << 20);
+    manager.set_execution_identity(execution);
+    SlotHandshake handshake;
+    CheckpointMetadata metadata;
+    metadata.logits.assign(8, 0.5f);
+    const auto fill = [](size_t index, std::span<std::byte> bytes) {
+        std::fill(bytes.begin(), bytes.end(), std::byte(0x61 + index));
+        return true;
+    };
+    const auto spill = [&](const char* name, const std::array<uint8_t, 32>& state_digest) {
+        CheckpointFileHeader header;
+        header.prefix_tokens = uint32_t(prefix_a.size());
+        header.total_payload_bytes = stack_bytes + mtp_bytes;
+        header.state_digest = state_digest;
+        assert(manager.spill_checkpoint(name, handshake, header, metadata, fill));
+    };
+    // The check target.cpp makes in its restore validator for the prefix it asked for.
+    const auto restore_as = [&](const char* name, std::span<const uint32_t> requested, size_t& published) {
+        CheckpointFileHeader header;
+        CheckpointMetadata restored;
+        return manager.restore_checkpoint(name, header, restored,
+            [&](size_t, std::span<const std::byte>) { ++published; return true; },
+            [&](const CheckpointFileHeader& found, const CheckpointMetadata&) {
+                return found.prefix_tokens == requested.size() &&
+                    found.state_digest == checkpoint_state_digest(execution, requested, stack_bytes, mtp_bytes, true);
+            });
+    };
+
+    spill("prefix_a.ckpt", digest_a);
+    std::filesystem::rename(dir / "prefix_a.ckpt", dir / "prefix_b.ckpt");
+    size_t published = 0;
+    assert(!restore_as("prefix_b.ckpt", prefix_b, published) && published == 0);
+    assert(manager.has_checkpoint("prefix_b.ckpt")); // refused, not discarded
+    // The same bytes still restore for the tokens they were spilled with.
+    assert(restore_as("prefix_b.ckpt", prefix_a, published) && published == 1);
+
+    // Before the IDs were bound, a renamed checkpoint of equal shape validated.
+    spill("unbound.ckpt", unbound);
+    published = 0;
+    assert(!restore_as("unbound.ckpt", prefix_a, published) && published == 0);
+    assert(!restore_as("unbound.ckpt", prefix_b, published) && published == 0);
+    assert(manager.has_checkpoint("unbound.ckpt"));
+    // A new spill of that prefix replaces the old file and restores.
+    spill("unbound.ckpt", digest_a);
+    assert(restore_as("unbound.ckpt", prefix_a, published) && published == 1);
+
+    std::filesystem::remove_all(test_dir);
+    std::cout << "PASS state digest binds the prefix token IDs" << std::endl;
 }
 
 static void test_execution_identity_binding_and_stale_eviction() {
@@ -848,6 +1015,50 @@ static void test_eviction_preserves_substituted_checkpoint(std::string_view poli
     std::filesystem::remove_all(parent);
 }
 
+static pid_t exited_pid() {
+    const pid_t child = ::fork();
+    assert(child >= 0);
+    if (child == 0) ::_exit(0);
+    int status = 0;
+    assert(::waitpid(child, &status, 0) == child);
+    return child;
+}
+
+static void test_orphaned_temporaries_removed_at_start() {
+    const std::filesystem::path test_dir = "/tmp/tokspur_test_orphans_" + std::to_string(::getpid());
+    std::filesystem::remove_all(test_dir);
+    const auto dir = test_dir / "tokspur-checkpoints-v3";
+    std::filesystem::create_directories(dir);
+    assert(::chmod(dir.c_str(), 0700) == 0);
+    const auto dead = std::to_string(exited_pid());
+    const auto self = std::to_string(::getpid());
+    const auto write = [](const std::filesystem::path& path) { std::ofstream file(path); file << std::string(4096, 'x'); };
+    const auto dead_spill = dir / (".pfx_a.ckpt." + dead + ".tmp");
+    const auto live_spill = dir / (".pfx_b.ckpt." + self + ".tmp");
+    const auto other_user_spill = dir / ".pfx_c.ckpt.1.tmp"; // launchd: alive, EPERM
+    const auto malformed = dir / ".pfx_d.ckpt.12ab.tmp";
+    const auto kept_checkpoint = dir / "kept.ckpt";
+    const auto dead_discard = dir / (".tokspur-discard-" + dead + "-7");
+    const auto live_discard = dir / (".tokspur-discard-" + self + "-7");
+    for (const auto& path : {dead_spill, live_spill, other_user_spill, malformed, kept_checkpoint}) write(path);
+    std::filesystem::create_directory(dead_discard);
+    write(dead_discard / "entry");
+    std::filesystem::create_directory(live_discard);
+
+    {
+        SsdCheckpointManager mgr(test_dir, 64ull << 20, 0);
+        assert(mgr.enabled());
+        assert(mgr.occupied_bytes() == 4096); // only kept.ckpt is counted
+    }
+    assert(!std::filesystem::exists(dead_spill));
+    assert(!std::filesystem::exists(dead_discard));
+    for (const auto& path : {live_spill, other_user_spill, malformed, kept_checkpoint, live_discard}) {
+        assert(std::filesystem::exists(path));
+    }
+    std::filesystem::remove_all(test_dir);
+    std::cout << "PASS orphaned checkpoint temporaries removed at start" << std::endl;
+}
+
 int main() {
     test_late_restore_refusal_preserves_valid_checkpoints("lru");
     test_late_restore_refusal_preserves_valid_checkpoints("recompute-cost");
@@ -858,10 +1069,13 @@ int main() {
     test_metadata_corruption_precedes_publication();
     std::cout << "Running SSD Checkpoint unit tests..." << std::endl;
     test_storage_security();
+    test_orphaned_temporaries_removed_at_start();
     test_staging_slab_and_budgets();
     test_eviction_scoring_and_system_tools_anchor();
     test_spill_cancellation_between_chunks();
+    test_spill_survives_throwing_chunk_reader();
     test_spill_restore_and_sha256_verification();
+    test_state_digest_binds_prefix_token_ids();
     test_execution_identity_binding_and_stale_eviction();
     test_restore_atomicity_on_later_chunk_failures();
     test_free_space_floor_reservation_and_eviction();

@@ -7,8 +7,10 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import secrets
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -40,11 +42,76 @@ QWEN_LICENCE_URL = (
 )
 
 
+_PATH_COMPONENT = re.compile(r"[A-Za-z0-9._-]+")
+
+
 def _repo_leaf_name(repo: str) -> str:
     parts = repo.split("/")
-    if len(parts) != 2 or any(not part or part in (".", "..") for part in parts):
+    if len(parts) != 2 or any(
+        part in (".", "..") or not _PATH_COMPONENT.fullmatch(part) for part in parts
+    ):
         raise ValueError(f"invalid repository identifier '{repo}'")
     return parts[1]
+
+
+def _validate_asset_rel_path(name: str) -> Path:
+    """A pinned asset name is a relative path of plain components (`pull.rs`)."""
+    if not name:
+        raise ValueError("asset filename must not be empty")
+    if name.startswith("/"):
+        raise ValueError("asset filename must be a relative path")
+    for part in name.split("/"):
+        if part in ("", ".", ".."):
+            raise ValueError(f"asset filename must not traverse directories: {name}")
+        if not _PATH_COMPONENT.fullmatch(part):
+            raise ValueError(f"invalid asset filename component '{part}'")
+    return Path(name)
+
+
+def _ensure_no_symlink_components(path: Path, label: str) -> None:
+    """No existing ancestor or leaf of `path` may be a symlink (`layout.rs`)."""
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"{label} must be a clean absolute path")
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            raise ValueError(f"{label} must not traverse symlinks")
+        if not current.exists():
+            break
+
+
+# The least `--max-filesize` given to curl. Before 8.11.0 curl also counts the
+# cap against the body of each redirect it follows, and the model host answers
+# `/resolve/` with a redirect whose body is a kilobyte or two, so a smaller cap
+# fails the transfer on the redirect. The size check after the transfer still
+# holds a file to its pin.
+_MIN_TRANSFER_CAP = 64 << 10
+
+
+def _partial_download_size(part_path: Path, name: str) -> int:
+    """The bytes a resumable `.part` holds; curl is never pointed at anything but a plain file."""
+    try:
+        found = part_path.lstat()
+    except FileNotFoundError:
+        return 0
+    if not stat.S_ISREG(found.st_mode):
+        raise ValueError(f"Partial download path must be a regular file: {name}.part")
+    if found.st_nlink != 1:
+        raise ValueError(
+            f"Partial download file must not have multiple hard links: {name}.part"
+        )
+    return found.st_size
+
+
+def _preserved_dflash2_group(result: dict) -> dict | None:
+    """The DFlash2 checkpoint the current adoption records, if it still checks out beside `result`."""
+    with contextlib.suppress(FileNotFoundError, KeyError, ValueError):
+        existing = read_json(ROOT / ".tokspur/adoption.json")
+        if "dflash2_draft" in existing:
+            check_adoption({**result, "dflash2_draft": existing["dflash2_draft"]})
+            return existing["dflash2_draft"]
+    return None
 
 
 def _directory_has_candidate_assets(specs: dict, group: str, directory: Path) -> bool:
@@ -104,11 +171,9 @@ def adopt(
             specs, df_key, "dflash2", dflash2_dir, out=stream
         )
     else:
-        with contextlib.suppress(FileNotFoundError, KeyError, ValueError):
-            existing = read_json(ROOT / ".tokspur/adoption.json")
-            if "dflash2_draft" in existing:
-                check_adoption({**result, "dflash2_draft": existing["dflash2_draft"]})
-                result["dflash2_draft"] = existing["dflash2_draft"]
+        preserved = _preserved_dflash2_group(result)
+        if preserved is not None:
+            result["dflash2_draft"] = preserved
     write_json(ROOT / ".tokspur/adoption.json", result)
     print(
         "Existing weights verified in place. No model files copied or downloaded.",
@@ -240,8 +305,9 @@ def pull(
         managed_root = private_dir(ROOT / ".tokspur/models")
         target_repo = specs["target"]["repo"]
         draft_repo = specs["draft"]["repo"]
+        # Not resolved: a symlinked destination is refused, not followed.
         target_dest = (
-            directory.resolve()
+            Path(directory).absolute()
             if directory is not None
             else (managed_root / _repo_leaf_name(target_repo))
         )
@@ -273,15 +339,19 @@ def pull(
                 raise ValueError(
                     f"asset profile requires a 40-character lowercase hex revision, found '{revision}'"
                 )
+            _ensure_no_symlink_components(dest, "model destination directory")
             dest.mkdir(parents=True, exist_ok=True)
             verified_assets = []
             for spec in group_obj["files"]:
                 name = spec["name"]
-                dest_path = dest / name
+                dest_path = dest / _validate_asset_rel_path(name)
                 if dest_path in cache:
                     verified_assets.append(cache[dest_path])
                     continue
+                # Checked again once it exists: curl writes through this path.
+                _ensure_no_symlink_components(dest_path.parent, "download directory")
                 dest_path.parent.mkdir(parents=True, exist_ok=True)
+                _ensure_no_symlink_components(dest_path.parent, "download directory")
                 part_path = dest_path.parent / f"{dest_path.name}.part"
                 if dest_path.is_symlink():
                     raise ValueError(f"Refusing symlink asset path: {name}")
@@ -293,15 +363,19 @@ def pull(
                     verified_assets.append(rec)
                     continue
                 expected_size = spec["size"]
-                part_len = part_path.stat().st_size if part_path.is_file() else 0
+                part_len = _partial_download_size(part_path, name)
                 if part_len > expected_size:
                     part_path.unlink()
                     part_len = 0
                 if part_len < expected_size:
                     url = f"{base_url}/{repo}/resolve/{revision}/{name}"
                     print(f"Downloading {repo}/{name}...", flush=True)
+                    # `-q` only works as the first argument: it keeps the
+                    # caller's ~/.curlrc (netrc, headers, proxy, insecure) out
+                    # of a download promised to send no tokens.
                     cmd = [
                         "/usr/bin/curl",
+                        "-q",
                         "--fail",
                         "--location",
                         "--proto",
@@ -315,6 +389,10 @@ def pull(
                     ]
                     if part_len > 0:
                         cmd.extend(["--continue-at", "-"])
+                    # curl counts the cap against the body of this response,
+                    # so on a resume it is what the partial file still lacks.
+                    cap = max(expected_size - part_len, _MIN_TRANSFER_CAP)
+                    cmd.extend(["--max-filesize", str(cap)])
                     cmd.extend(["--output", str(part_path), "--", url])
                     subprocess.run(cmd, check=True, env=curl_env)
                 print(f"Verifying: {name}", flush=True)
@@ -343,11 +421,16 @@ def pull(
             if df_key is None:
                 raise ValueError("flash-next-assets.json missing dflash2_draft")
             df_dest = (
-                dflash2_dir.resolve()
+                Path(dflash2_dir).absolute()
                 if dflash2_dir is not None
                 else (managed_root / _repo_leaf_name(specs[df_key]["repo"]))
             )
             result["dflash2_draft"] = _pull_group(df_key, df_dest)
+        else:
+            # A plain pull keeps the checkpoint an earlier pull or adopt recorded.
+            preserved = _preserved_dflash2_group(result)
+            if preserved is not None:
+                result["dflash2_draft"] = preserved
         write_json(ROOT / ".tokspur/adoption.json", result)
 
         resolved_port = port
@@ -481,7 +564,7 @@ def serve(
     checkpoint_dir: Path | str | None = None,
     checkpoint_cap_gib: float | None = None,
     checkpoint_floor_gib: float | None = None,
-    checkpoint_policy: str = "recompute-cost",
+    checkpoint_policy: str | None = None,
     checkpoint_ssd: bool | None = None,
     checkpoint_ssd_budget_gib: float | None = None,
     checkpoint_ssd_floor_gib: float = 20.0,
@@ -714,7 +797,7 @@ def serve(
         )
     if tool_arg_validation not in ("strict", "executor"):
         raise ValueError(f"Unsupported tool_arg_validation mode: {tool_arg_validation}")
-    if checkpoint_policy not in ("recompute-cost", "lru"):
+    if checkpoint_policy not in (None, "recompute-cost", "lru"):
         raise ValueError(f"Unsupported checkpoint_policy: {checkpoint_policy}")
     if drafter == "dflash2":
         if mtp_depth is not None:
@@ -755,6 +838,21 @@ def serve(
         raise ValueError("checkpoint_cap_gib must be between 0.0 and 32.0 GiB")
     if not (0.0 <= effective_checkpoint_floor_gib <= 100.0):
         raise ValueError("checkpoint_floor_gib must be between 0.0 and 100.0 GiB")
+    # Checkpoints are off until a positive capacity is given, so a checkpoint
+    # setting without one would be dropped silently.
+    if effective_checkpoint_cap_gib <= 0.0:
+        for flag, given in (
+            (
+                "--checkpoint-dir",
+                checkpoint_dir is not None or checkpoint_ssd_dir is not None,
+            ),
+            ("--checkpoint-policy", checkpoint_policy is not None),
+            ("--checkpoint-floor-gib", checkpoint_floor_gib is not None),
+        ):
+            if given:
+                raise ValueError(
+                    f"{flag} has no effect unless --checkpoint-cap-gib is greater than 0"
+                )
     effective_shared_prefix = (
         (drafter == "mtp") if shared_prefix_cache is None else bool(shared_prefix_cache)
     )
@@ -824,6 +922,25 @@ def serve(
                     raise ValueError(
                         "No adopted model weights found. Run 'tokspur pull' or 'tokspur serve /path/to/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF'."
                     ) from None
+            else:
+                if dflash2_dir is not None and adoption.get("dflash2_draft", {}).get(
+                    "directory"
+                ) != str(Path(dflash2_dir).resolve(strict=True)):
+                    # An explicit checkpoint the adoption does not record is
+                    # hashed against the pinned profile and recorded, as the
+                    # two other branches do. It replaces any recorded before.
+                    specs = read_json(ROOT / "profiles/flash-next-assets.json")
+                    df_key = dflash2_profile_group_key(specs)
+                    if df_key is None:
+                        raise ValueError("flash-next-assets.json missing dflash2_draft")
+                    adoption = {
+                        **adoption,
+                        "dflash2_draft": _verify_group_directory(
+                            specs, df_key, "dflash2", Path(dflash2_dir), out=sys.stderr
+                        ),
+                    }
+                    check_adoption(adoption)
+                    write_json(ROOT / ".tokspur/adoption.json", adoption)
         check_adoption(adoption)
 
         if port is not None or model_dir is not None or auto_adopted:
@@ -917,8 +1034,14 @@ def serve(
 
         target_info = adoption.get("target", {})
         target_dir = Path(target_info.get("directory", ""))
-        tokenizer = target_dir / "tokenizer.json"
-        template = target_dir / "chat_template.jinja"
+        # The pair the Rust CLI derives from the verified GGUF metadata comes
+        # first, as in `serve.rs`.
+        derived_text = state / "gguf" / "derived-text"
+        tokenizer = derived_text / "tokenizer.json"
+        template = derived_text / "chat_template.jinja"
+        if not tokenizer.is_file() or not template.is_file():
+            tokenizer = target_dir / "tokenizer.json"
+            template = target_dir / "chat_template.jinja"
         if not tokenizer.is_file() or not template.is_file():
             gguf_dir = state / "gguf"
             candidates: list[Path] = []
@@ -944,6 +1067,14 @@ def serve(
                     template = cand_tmpl
                 if tokenizer.is_file() and template.is_file():
                     break
+        if not tokenizer.is_file() or not template.is_file():
+            # This CLI cannot derive the pair, so a pull or adopt done only
+            # here leaves none; the server would be handed a missing path.
+            raise FileNotFoundError(
+                "Tokenizer and chat template not found. The Python reference CLI does not derive them; "
+                "run 'tokspur pull' or 'tokspur adopt' once with the Rust CLI (TOKSPUR_CLI_IMPL unset) "
+                f"to write them to {derived_text}"
+            )
 
         shards = []
         adopted_pack: Path | None = None
@@ -993,6 +1124,13 @@ def serve(
             if not dflash2_path.is_dir():
                 raise FileNotFoundError(
                     f"DFlash2 checkpoint directory not found: {dflash2_path}"
+                )
+            # The native drafter hashes only config.json, so the weights are
+            # pinned here: the worker is given a directory only if the checked
+            # adoption records it.
+            if adoption.get("dflash2_draft", {}).get("directory") != str(dflash2_path):
+                raise ValueError(
+                    "DFlash2 checkpoint directory is not the verified adoption; re-run 'tokspur adopt' with --dflash2-dir"
                 )
             speculative_flags = [
                 "--native-drafter",
@@ -1222,7 +1360,7 @@ def serve(
                     "--checkpoint-dir",
                     str(resolved_ckpt_dir),
                     "--checkpoint-policy",
-                    str(checkpoint_policy),
+                    checkpoint_policy or "recompute-cost",
                 ]
                 if effective_checkpoint_cap_gib > 0.0
                 else []
@@ -1461,7 +1599,17 @@ def main() -> None:
         "--derived-pack-trust-mode",
         choices=["full", "local-seal"],
         default="full",
-        help="Derived pack verification trust mode",
+        help=(
+            "Derived pack verification at start (default: full). full reads and "
+            "checks the whole pack. local-seal skips that when the seal beside the "
+            "pack records this exact file (inode, size and times): the file passed "
+            "full verification and is unchanged since. The seal also records which "
+            "source files the pack was compared with and is accepted only by a start "
+            "that has no source beyond those; otherwise that start does the full "
+            "verification and widens the seal. Any change to the pack file costs one "
+            "full verification. No protection against a process running as the same "
+            "user, which can rewrite both files"
+        ),
     )
     s.add_argument(
         "--output-packet",
@@ -1773,7 +1921,7 @@ def main() -> None:
         dest="checkpoint_dir",
         type=Path,
         default=None,
-        help="Custom SSD checkpoint storage directory (default: .tokspur/state/checkpoints)",
+        help="Custom SSD checkpoint storage directory (default: .tokspur/state/checkpoints; needs a capacity above 0)",
     )
     s.add_argument(
         "--checkpoint-cap-gib",
@@ -1781,7 +1929,7 @@ def main() -> None:
         dest="checkpoint_cap_gib",
         type=float,
         default=None,
-        help="SSD checkpoint capacity budget in GiB (default: 8.0 for mtp, 0 disables, max: 32.0)",
+        help="SSD checkpoint capacity budget in GiB (0.0..32.0, default: 0.0, opt in with 8.0)",
     )
     s.add_argument(
         "--checkpoint-floor-gib",
@@ -1789,13 +1937,13 @@ def main() -> None:
         dest="checkpoint_floor_gib",
         type=float,
         default=None,
-        help="APFS free space floor in GiB (default: 20.0)",
+        help="APFS free space floor in GiB (default: 20.0; needs a capacity above 0)",
     )
     s.add_argument(
         "--checkpoint-policy",
         choices=["recompute-cost", "lru"],
-        default="recompute-cost",
-        help="Eviction priority policy (default: recompute-cost)",
+        default=None,
+        help="Eviction priority policy (default: recompute-cost; needs a capacity above 0)",
     )
     s.add_argument(
         "--overlap-prefill",

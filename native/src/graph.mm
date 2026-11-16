@@ -1296,6 +1296,7 @@ struct MetalGraph::Impl {
     id<MTLComputePipelineState> pipeline(const char* name, uint32_t type = uint32_t(-1), uint32_t minimum_threads = 128, bool indirect = false, uint32_t layout = uint32_t(-1)) {
         require(minimum_threads == 128 || (std::strcmp(name, "graph_gdn_delta_tile") == 0 &&
             (minimum_threads == 32 || minimum_threads == 64))
+            || (std::strcmp(name, "graph_gdn_delta_tile_w128") == 0 && minimum_threads == 64)
 #ifdef TOKSPUR_PRIVATE_HC_EXACT
             || (minimum_threads == 32 && hc_exact_pipeline(name))
 #endif
@@ -1324,7 +1325,7 @@ struct MetalGraph::Impl {
             || (minimum_threads == 32 && (std::strcmp(name, "qsa_prefill_attention_partial128") == 0 || std::strcmp(name, "qsa_prefill_attention_reduce") == 0))
 #endif
 #ifdef TOKSPUR_PRIVATE_HC_DOWN_WINDOW
-            || (minimum_threads == 512 && std::strcmp(name, "graph_hc_down_q8_window") == 0)
+            || (minimum_threads == 256 && std::strcmp(name, "graph_hc_down_q8_window") == 0)
 #endif
 #ifdef TOKSPUR_PRIVATE_QSA_SPARSE
             || ((minimum_threads == 256 || minimum_threads == 512 || minimum_threads == 1024) && std::strncmp(name, "qsa_sparse_attention", 20) == 0)
@@ -2073,7 +2074,8 @@ GpuView MetalGraph::suballocate_draft_output_slice(GpuView output_weight_view, u
 }
 GpuView MetalGraph::gather_draft_output_slice(GpuView output_weight_view, std::span<const uint32_t> token_ids, uint32_t channels) {
     auto& p = *impl_; p.idle();
-    const auto& parent = p.allocation(output_weight_view);
+    // Hold the buffer itself, not a reference into p.allocations: the allocate() below can grow that vector and move its elements.
+    const id<MTLBuffer> parent_buffer = p.allocation(output_weight_view).buffer;
     require(channels >= 32 && channels <= 65536 && channels % 32 == 0, "gathered draft slice requires Q8_0 rows of whole 32-element blocks");
     const uint64_t row_bytes = uint64_t(channels / 32) * 34;
     require(output_weight_view.bytes % row_bytes == 0 && output_weight_view.bytes / row_bytes <= 1'000'000 && !token_ids.empty() &&
@@ -2083,7 +2085,7 @@ GpuView MetalGraph::gather_draft_output_slice(GpuView output_weight_view, std::s
         require(token_ids[i] < parent_rows && (!i || token_ids[i] > token_ids[i - 1]), "gathered draft slice rows must be strictly ascending parent rows");
     require(!p.draft_output_gathered_, "release the gathered draft output slice before choosing another draft slice");
     require(!p.ledger.live_captures && !p.planar_shape(output_weight_view) &&
-        parent.buffer.storageMode == MTLStorageModeShared && parent.buffer.contents, "gathered draft slice requires a CPU-readable row-major or lane-packed parent");
+        parent_buffer.storageMode == MTLStorageModeShared && parent_buffer.contents, "gathered draft slice requires a CPU-readable row-major or lane-packed parent");
     const auto entries = uint32_t(token_ids.size());
     if (const auto registered = p.q8_matrices.find(std::tuple{output_weight_view.slot, output_weight_view.offset, output_weight_view.bytes}); registered != p.q8_matrices.end())
         require(registered->second.columns == channels && registered->second.rows == parent_rows, "gathered draft slice parent differs from its registered Q8_0 identity");
@@ -2103,7 +2105,7 @@ GpuView MetalGraph::gather_draft_output_slice(GpuView output_weight_view, std::s
     // Only a gathered vocabulary uses the remap kernel, so its pipeline is built here, while idle, and other configurations never build it.
     static_cast<void>(p.pipeline("dflash2_remap_top16"));
     const GpuView gathered = p.allocate(checked_mul(row_bytes, entries), "gathered draft output rows", true, nullptr);
-    const auto* source = static_cast<const std::byte*>(parent.buffer.contents) + output_weight_view.offset;
+    const auto* source = static_cast<const std::byte*>(parent_buffer.contents) + output_weight_view.offset;
     auto* destination = static_cast<std::byte*>(p.allocations[gathered.slot].buffer.contents);
     for (size_t first = 0; first < token_ids.size();) {
         size_t last = first + 1;
@@ -6121,7 +6123,7 @@ void MetalGraph::prefill_router_f32_batch(GpuView matrix, GpuRowsF32 input, GpuR
     const PrefillRowsF32Args args{input.rows, input.columns, output.columns, 1u, input.stride_bytes, output.stride_bytes};
     p.select("prefill_exact_router_f32_batch", uint32_t(-1), {input.columns, output.columns, input.rows, 0}, 128);
     p.bind(matrix, 0); p.bind(input.view, 1); p.bind(output.view, 2, true); p.parameter(args, 3);
-    p.dispatch(true, MTLSizeMake((output.columns + 3u) / 4u, (input.rows + 31u) / 32u, 1), MTLSizeMake(128, 1, 1));
+    p.dispatch(true, MTLSizeMake((output.columns + 15u) / 16u, (input.rows + 7u) / 8u, 1), MTLSizeMake(128, 1, 1));
 }
 void MetalGraph::prefill_shared_router_f32_batch(GpuView weights, GpuRowsF32 input, GpuView output) {
     struct PrefillRowsF32Args {
@@ -6176,9 +6178,9 @@ void MetalGraph::prefill_hc_down_batch(GpuView weights, GpuRowsF32 input, GpuRow
     separate(output.view, {weights, input.view});
     const uint32_t layout_flag = (layout == PrefillWeightLayout::q8_lanes_v1) ? 1u : 0u;
     const HcDownWindowArgs args{input.columns, output.columns, input.rows, layout_flag, input.stride_bytes, output.stride_bytes};
-    p.select("graph_hc_down_q8_window", uint32_t(-1), {input.columns, output.columns, input.rows, 0}, 512);
+    p.select("graph_hc_down_q8_window", uint32_t(-1), {input.columns, output.columns, input.rows, 0}, 256);
     p.bind(weights, 0); p.bind(input.view, 1); p.bind(output.view, 2, true); p.parameter(args, 3);
-    p.dispatch(true, MTLSizeMake(10, (input.rows + 15u) / 16u, 1), MTLSizeMake(512, 1, 1));
+    p.dispatch(true, MTLSizeMake(20, (input.rows + 15u) / 16u, 1), MTLSizeMake(256, 1, 1));
 }
 void MetalGraph::record_prefill_moe_chunk(uint32_t rows, bool used_batch_top10, bool top10_fallback, bool used_batch_mixture, bool mixture_fallback) {
     auto& p = *impl_; p.thread_check();
@@ -6242,7 +6244,7 @@ uint64_t MetalGraph::hc_down_window_encoded() const { impl_->thread_check(); ret
 void MetalGraph::prepare_hc_down_window() {
     auto& p = *impl_; p.idle();
     {
-        const auto pipeline = p.pipeline("graph_hc_down_q8_window", uint32_t(-1), 512);
+        const auto pipeline = p.pipeline("graph_hc_down_q8_window", uint32_t(-1), 256);
         require(pipeline.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength, "HC down window threadgroup memory capability");
     }
     if (p.hc_down_window_enabled) {
@@ -6342,9 +6344,9 @@ void MetalGraph::hc_down_q8_window(GpuView weights, GpuRowsF32 input, GpuRowsF32
     }
     const uint32_t layout_flag = (layout == PrefillWeightLayout::q8_lanes_v1) ? 1 : 0;
     const HcDownWindowArgs args{input.columns, output.columns, input.rows, layout_flag, input.stride_bytes, output.stride_bytes};
-    p.select("graph_hc_down_q8_window", uint32_t(-1), {input.columns, output.columns, input.rows, 0}, 512);
+    p.select("graph_hc_down_q8_window", uint32_t(-1), {input.columns, output.columns, input.rows, 0}, 256);
     p.bind(weights, 0); p.bind(input.view, 1); p.bind(output.view, 2, true); p.parameter(args, 3);
-    p.dispatch(true, MTLSizeMake(10, (input.rows + 15) / 16, 1), MTLSizeMake(512, 1, 1));
+    p.dispatch(true, MTLSizeMake(20, (input.rows + 15) / 16, 1), MTLSizeMake(256, 1, 1));
     if (!p.mtp_priming_scope && !p.verify_nax_scope) ++p.hc_down_window_encoded;
 }
 #endif
@@ -7537,7 +7539,8 @@ void MetalGraph::prepare_gdn_tiles(uint32_t threads) {
     auto& p = *impl_; p.idle();
     require(threads == 32 || threads == 64 || threads == 128, "unsupported GDN tile threadgroup");
     static_cast<void>(p.pipeline("graph_gdn_convolution_tile"));
-    static_cast<void>(p.pipeline("graph_gdn_delta_tile", uint32_t(-1), threads));
+    const char* delta_kernel = (!gdn_cooperative4_enabled && threads != 32) ? "graph_gdn_delta_tile_w128" : "graph_gdn_delta_tile";
+    static_cast<void>(p.pipeline(delta_kernel, uint32_t(-1), threads));
 #ifdef TOKSPUR_PRIVATE_VERIFY_GDN_ROW_BATCH
     static_cast<void>(p.pipeline("graph_gdn_prepare_verify_rows"));
     static_cast<void>(p.pipeline("graph_gdn_silu_prepare_verify_rows"));
@@ -7573,7 +7576,8 @@ void MetalGraph::gdn_delta_tile(GpuView state, GpuView query, GpuView key, GpuVi
         "GDN tile delta buffer geometry mismatch");
     const std::array reads{state, query, key, value, decay, beta}; const std::array writes{candidate, output};
     validate_disjoint(reads, writes);
-    p.select("graph_gdn_delta_tile", uint32_t(-1), {heads, width, tile.capacity, tile.steps}, p.gdn_tile_threads);
+    const char* delta_kernel = (!gdn_cooperative4_enabled && p.gdn_tile_threads != 32) ? "graph_gdn_delta_tile_w128" : "graph_gdn_delta_tile";
+    p.select(delta_kernel, uint32_t(-1), {heads, width, tile.capacity, tile.steps}, p.gdn_tile_threads);
     p.bind(state, 0); p.bind(query, 1); p.bind(key, 2); p.bind(value, 3); p.bind(decay, 4); p.bind(beta, 5);
     p.bind(candidate, 6, true); p.bind(output, 8, true);
     p.parameter(std::array<uint32_t, 4>{heads, width, tile.capacity, 128}, 9); p.parameter(tile.steps, 10);

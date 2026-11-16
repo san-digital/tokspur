@@ -14,7 +14,9 @@ Some Metal kernels and host routines in native/ adapt code from other open-sourc
 - m5-max-kernels, Copyright (c) 2026 m5-max-kernels contributors, MIT licence. The grid band ordering in native/kernels/dense_q8_staged_f32.metal follows the GEMM pattern at a6d92a3bdd7c784fde2e3e86b303d533354f4603. The licence is in native/third_party/m5-max-kernels/LICENSE.
 - DFlash (z-lab/dflash), commit 95c8aeca5e4b4c4f9c0c967c05ab89fa3ed24f4c, Copyright (c) 2026 Z Lab, MIT licence. The layer structure, grouped dynamic convolution and candidate selector of the drafter training model in drafter/model.py follow dflash/model.py and dflash/model_mlx.py. The licence is in third_party/dflash/LICENSE.
 
-native/third_party/sources.json records source paths, revisions and hashes. Signed release archives include the source manifest and bundled licences.
+oMLX, commit 09d7e2d9c074e7900025dcf20c46d26c8a6bf9d6, Copyright 2025 oMLX contributors, Apache License 2.0, is pinned for comparison only. No file in native/ or rust/ is recorded as adapting it. The licence is in native/third_party/omlx/LICENSE.
+
+native/third_party/sources.json records source paths, revisions and hashes for these projects, except DFlash. Signed release archives include the source manifest and the licences it names. They do not include drafter/, which is training code, so the DFlash credit and third_party/dflash/LICENSE apply to the source tree only.
 
 The Rust standard library is compiled into the Rust host binaries. The library-specific copyright and dependency licences from the pinned Rust 1.99.1 distribution are retained in third_party/rust/COPYRIGHT-library.html and distributed with staged packages and release archives. The document covers library sources and dependencies across supported platforms, including components beyond this Mac binary. It is retained as supplied. The Rust compiler is not redistributed.
 

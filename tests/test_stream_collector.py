@@ -5,6 +5,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
     "stream_collector", ROOT / "scripts/stream_collector.py"
@@ -330,3 +332,58 @@ def test_main_writes_a_private_receipt(tmp_path, monkeypatch, capsys):
     assert [row.get("index") for row in rows[:2]] == [0, 1]
     assert rows[2]["summary"]["outcomes"]["complete"] == 2
     assert json.loads(capsys.readouterr().out)["sent"] == 2
+
+
+def _no_connection(*_args, **_kwargs):
+    pytest.fail("a refused endpoint must not be contacted")
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "http://192.0.2.1:8080/v1",
+        "http://0.0.0.0:8080/v1",
+        "http://[2001:db8::1]:8080/v1",
+        "http://example.com/v1",
+        "http://localhost.example.com/v1",
+        "http://127.0.0.1@example.com/v1",
+    ],
+)
+def test_the_api_key_is_sent_only_to_a_loopback_host(endpoint, monkeypatch):
+    monkeypatch.setattr(collector.socket, "create_connection", _no_connection)
+    with pytest.raises(collector.CollectorError, match="loopback"):
+        collector.request(endpoint, {"stream": True}, api_key="secret", timeout=1)
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "host", "header"),
+    [
+        ("http://127.0.0.1:8080/v1", "127.0.0.1", b"Host: 127.0.0.1:8080\r\n"),
+        ("http://127.8.9.10:8080/v1", "127.8.9.10", b"Host: 127.8.9.10:8080\r\n"),
+        ("http://localhost:8080/v1", "localhost", b"Host: localhost:8080\r\n"),
+        ("http://[::1]:8080/v1", "::1", b"Host: [::1]:8080\r\n"),
+    ],
+)
+def test_loopback_endpoints_carry_the_api_key(endpoint, host, header):
+    connect_host, port, raw = collector._request_bytes(endpoint, b"{}", "secret")
+    assert (connect_host, port) == (host, 8080)
+    assert raw.startswith(b"POST /v1/chat/completions HTTP/1.1\r\n" + header)
+    assert b"Authorization: Bearer secret\r\n" in raw
+
+
+def test_main_refuses_another_host_before_it_reads_or_writes(tmp_path, monkeypatch):
+    monkeypatch.setattr(collector.socket, "create_connection", _no_connection)
+    monkeypatch.setenv("TOKSPUR_API_KEY", "secret")
+    out = tmp_path / "receipt.jsonl"
+    with pytest.raises(collector.CollectorError, match="loopback"):
+        collector.main(
+            [
+                "--endpoint",
+                "http://192.0.2.1:8080/v1",
+                "--body-file",
+                str(tmp_path / "absent.json"),
+                "--out",
+                str(out),
+            ]
+        )
+    assert not out.exists()

@@ -362,8 +362,8 @@ Json::Object mtp_hc_down_window_fields(uint64_t encoded, uint64_t request) {
         {"native_prefill_hc_down_window_precision", Json("q8-0-simd32-exact")},
         {"native_prefill_hc_down_window_min_rows", Json::integer(2)}, {"native_prefill_hc_down_window_max_rows", Json::integer(512)},
         {"native_prefill_hc_down_window_window_rows", Json::integer(16)}, {"native_prefill_hc_down_window_columns", Json::integer(10240)},
-        {"native_prefill_hc_down_window_rows", Json::integer(320)}, {"native_prefill_hc_down_window_threads", Json::integer(512)},
-        {"native_prefill_hc_down_window_threadgroup_bytes", Json::integer(32768)},
+        {"native_prefill_hc_down_window_rows", Json::integer(320)}, {"native_prefill_hc_down_window_threads", Json::integer(256)},
+        {"native_prefill_hc_down_window_threadgroup_bytes", Json::integer(8192)},
         {"native_prefill_hc_down_window_counter_scope", Json("encoded-hc-down-window-calls-including-aborted-submissions")},
         {mtp_hc_down_window_counter_name, Json::integer(encoded)}, {mtp_hc_down_window_request_name, Json::integer(request)}};
 }

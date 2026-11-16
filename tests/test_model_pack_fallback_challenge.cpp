@@ -408,8 +408,7 @@ int main() {
             std::filesystem::remove(seal_path, ec);
             int sfd = ::open(seal_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0444);
             require(sfd >= 0, "create seal file");
-            const std::string full = content + "\n";
-            pwrite_all(sfd, std::as_bytes(std::span(full.data(), full.size())), 0);
+            pwrite_all(sfd, std::as_bytes(std::span(content.data(), content.size())), 0);
             ::close(sfd);
             ::chmod(seal_path.c_str(), 0444);
         };
@@ -417,7 +416,7 @@ int main() {
         // 6a: Seal mismatch falls back to full verification and throws
         {
             std::cout << "  [6a] Testing seal mismatch fallback..." << std::endl;
-            write_seal("0000000000000000000000000000000000000000000000000000000000000000");
+            write_seal("0000000000000000000000000000000000000000000000000000000000000000\n");
             bool threw = false;
             try {
                 static_cast<void>(adopt_derived_pack(source_ptr, mtp_ptr, adopted_pack_guard->path, default_chunk_bytes, 1, TrustMode::local_seal));
@@ -430,11 +429,32 @@ int main() {
             std::cout << "  [Pass] 6a: Seal mismatch gracefully fell back to full verification and threw." << std::endl;
         }
 
-        // 6b: Valid seal fast-starts with authentication_workers == 1
+        // 6b: Valid seal fast-starts with authentication_workers == 1. A seal vouches only when it
+        // carries the manifest hash and the identity of this pack file. The manifest hash alone,
+        // the earlier seal format, binds no file: it falls back to full verification and throws here.
         {
             std::cout << "  [6b] Testing valid seal fast-start..." << std::endl;
-            write_seal(manifest_sha256);
+            write_seal(manifest_sha256 + "\n");
+            bool threw = false;
+            try {
+                static_cast<void>(adopt_derived_pack(source_ptr, mtp_ptr, adopted_pack_guard->path, default_chunk_bytes, 1, TrustMode::local_seal));
+            } catch (const std::exception&) {
+                threw = true;
+            }
+            require(threw, "manifest-only seal must fall back to full verification");
+            // A seal vouches only for a start with no source beyond the ones the pack was compared
+            // with. This adoption has the MTP sidecar, so a seal for the target alone falls back too.
+            write_seal(encode_local_seal({manifest_sha256, pack_file_identity(adopted_pack_guard->fd), {true, false}}));
+            threw = false;
+            try {
+                static_cast<void>(adopt_derived_pack(source_ptr, mtp_ptr, adopted_pack_guard->path, default_chunk_bytes, 1, TrustMode::local_seal));
+            } catch (const std::exception&) {
+                threw = true;
+            }
+            require(threw, "seal that did not compare the MTP sidecar must fall back to full verification");
+            write_seal(encode_local_seal({manifest_sha256, pack_file_identity(adopted_pack_guard->fd), {true, true}}));
             auto adopted = adopt_derived_pack(source_ptr, mtp_ptr, adopted_pack_guard->path, default_chunk_bytes, 1, TrustMode::local_seal);
+            require(adopted.local_seal == LocalSealUse::accepted, "seal for this manifest and file accepted");
             require(adopted.authentication_workers == 1, "adopted authentication_workers == 1");
             require(adopted.manifest_sha256 == manifest_sha256, "manifest sha256 matched");
             require(adopted.model != nullptr, "adopted model not null");
@@ -444,7 +464,7 @@ int main() {
         // 6c: Backdoor seal (mtp_sidecar_sha256) throws
         {
             std::cout << "  [6c] Testing backdoor seal (mtp_sidecar_sha256) refusal..." << std::endl;
-            write_seal(mtp_sidecar_sha256);
+            write_seal(std::string(mtp_sidecar_sha256) + "\n");
             bool threw = false;
             try {
                 static_cast<void>(adopt_derived_pack(source_ptr, mtp_ptr, adopted_pack_guard->path, default_chunk_bytes, 1, TrustMode::local_seal));

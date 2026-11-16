@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -252,3 +253,42 @@ def test_changed_rust_library_notices_are_refused(checker, reviewed_tree):
     (root / manifest["rust_standard_library"]["file"]).write_text("Changed notices\n")
     with pytest.raises(ValueError, match="Rust library notice differs"):
         checker.validate(root)
+
+
+def test_notice_the_manifest_and_the_release_licences_agree(checker):
+    notice = (ROOT / "NOTICE").read_text()
+    manifest = json.loads((ROOT / checker.MANIFEST).read_text())
+    spec = importlib.util.spec_from_file_location(
+        "release_licences", ROOT / "scripts/release.py"
+    )
+    release = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(release)
+    shipped = set(release.LICENCES.values())
+    adapted = {
+        name
+        for key in ("native_files", "rust_files")
+        for row in manifest[key]
+        for name in row["sources"]
+    }
+    for project in manifest["projects"]:
+        name = project["id"]
+        assert project["revision"] in notice, name
+        assert Path(project["licence_file"]).parent.as_posix() in notice, name
+        assert project["licence_file"] in shipped, name
+        # A pin is a recorded source exactly when a recorded file adapts it.
+        assert (project["pin_kind"] == "recorded-source") == (name in adapted), name
+    assert manifest["model_licence"]["file"] in shipped
+    assert manifest["rust_standard_library"]["file"] in shipped
+
+    # NOTICE credits DFlash for drafter/, which no release archive contains, so the manifest and the release licences leave it out and NOTICE says so.
+    recorded = {project["revision"] for project in manifest["projects"]}
+    unrecorded = [
+        line
+        for line in notice.splitlines()
+        if set(re.findall(r"\b[0-9a-f]{40}\b", line)) - recorded
+    ]
+    assert len(unrecorded) == 1 and unrecorded[0].startswith("- DFlash ")
+    assert "drafter/model.py" in unrecorded[0]
+    assert "except DFlash" in notice
+    assert (ROOT / "third_party/dflash/LICENSE").is_file()
+    assert not any("dflash" in source for source in shipped)

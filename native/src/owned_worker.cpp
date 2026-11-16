@@ -528,7 +528,7 @@ struct OwnedWorker::Impl {
         require(options.executable.filename() == "tokspur-native" && access(options.executable.c_str(), X_OK) == 0, "only an explicit owned tokspur-native executable is admitted");
 #endif
         options.policy = fixed_file(options.policy); options.library = fixed_file(options.library);
-        require(options.shards.size() == 4 || (options.shards.size() == 1 && !options.derived_pack.empty()), "owned target requires four fixed shards");
+        require(options.shards.size() == 4 || (options.shards.size() == 1 && !options.derived_pack.empty()), "owned target requires four fixed shards or one base file with a derived pack");
         std::set<std::filesystem::path> distinct;
         for (auto& shard : options.shards) { shard = fixed_file(shard); require(distinct.emplace(shard).second, "owned target shard paths must be distinct"); }
         for (const auto timeout : {options.startup_timeout, options.step_timeout, options.drain_timeout})

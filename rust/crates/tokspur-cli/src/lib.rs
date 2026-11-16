@@ -60,10 +60,10 @@ pub enum PackFormat {
 }
 
 impl PackFormat {
-    fn parse(value: Option<&String>) -> Result<Self, CliError> {
-        match value.map(String::as_str) {
-            Some("v2") => Ok(Self::V2),
-            Some("v3") => Ok(Self::V3),
+    fn parse(value: &str) -> Result<Self, CliError> {
+        match value {
+            "v2" => Ok(Self::V2),
+            "v3" => Ok(Self::V3),
             _ => Err(CliError::Usage("--format requires v2 or v3".to_owned())),
         }
     }
@@ -274,7 +274,14 @@ options:
   --pack-v3                                   Require planar derived pack v3 (the default when installed; v2 is the fallback)
   --derived-pack <file>                       Explicit derived pack GGUF file path
   --gdn-prefill-only                          Retired GDN prefill experiment
-  --derived-pack-trust-mode {full,local-seal} Derived pack verification trust mode (default: full)
+  --derived-pack-trust-mode {full,local-seal} Derived pack verification at start (default: full). full reads and checks
+                                              the whole pack. local-seal skips that when the seal beside the pack records
+                                              this exact file (inode, size and times): the file passed full verification
+                                              and is unchanged since. The seal also records which source files the pack
+                                              was compared with and is accepted only by a start that has no source beyond
+                                              those; otherwise that start does the full verification and widens the seal.
+                                              Any change to the pack file costs one full verification. No protection
+                                              against a process running as the same user, which can rewrite both files
   --output-packet {8,64}                      Speculative output packet size (default: 8)
   --first-output-packet <1..64>               Opt-in initial speculative output packet cap before steady-state packets
   --prefill-dense {f32-staged,nax,f32,f16}    Dense Q8 prefill kernel mode (default: f32-staged)
@@ -327,10 +334,10 @@ options:
   --tool-arg-validation {strict,executor}     OpenAI tool argument schema policy (default: strict)
   --private-prefix-trace                      Opt-in private prefix reuse trace telemetry
   --telemetry-stdout                          Opt-in structured JSONL telemetry on stdout
-  --checkpoint-dir, --checkpoint-ssd-dir <dir> Custom SSD checkpoint directory (default: .tokspur/state/checkpoints)
   --checkpoint-cap-gib, --checkpoint-ssd-budget-gib <gib> SSD checkpoint capacity budget in GiB (0.0..32.0, default: 0.0, opt in with 8.0)
-  --checkpoint-floor-gib, --checkpoint-ssd-floor-gib <gib> APFS free space floor in GiB (0.0..100.0, default: 20.0)
-  --checkpoint-policy {recompute-cost,lru}    Eviction priority policy (default: recompute-cost)
+  --checkpoint-dir, --checkpoint-ssd-dir <dir> Custom SSD checkpoint directory (default: .tokspur/state/checkpoints; needs a capacity above 0)
+  --checkpoint-floor-gib, --checkpoint-ssd-floor-gib <gib> APFS free space floor in GiB (0.0..100.0, default: 20.0; needs a capacity above 0)
+  --checkpoint-policy {recompute-cost,lru}    Eviction priority policy (default: recompute-cost; needs a capacity above 0)
   --overlap-prefill                           Enable 16-token overlap background prefill with boundary protection
   --drain-timeouts-ms <ms,ms,ms,ms>           Graceful drain timeouts in milliseconds
   -h, --help                                  Show this help message and exit
@@ -485,10 +492,7 @@ where
             let mut opts = PullOptions::default();
             let mut i = 0;
             while i < rest.len() {
-                let (flag, inline_val) = match rest[i].split_once('=') {
-                    Some((k, v)) if k.starts_with("--") => (k, Some(v)),
-                    _ => (rest[i].as_str(), None),
-                };
+                let (flag, inline_val) = split_inline_value(&rest[i]);
                 let take_val = |flag: &str,
                                 inline: Option<&str>,
                                 idx: &mut usize,
@@ -578,10 +582,7 @@ where
             let mut check_only = false;
             let mut i = 0;
             while i < rest.len() {
-                let (flag, inline_val) = match rest[i].split_once('=') {
-                    Some((k, v)) if k.starts_with("--") => (k, Some(v)),
-                    _ => (rest[i].as_str(), None),
-                };
+                let (flag, inline_val) = split_inline_value(&rest[i]);
                 let take_val = |flag: &str,
                                 inline: Option<&str>,
                                 idx: &mut usize,
@@ -685,26 +686,26 @@ where
             let mut port = None;
             let mut i = 0;
             while i < rest.len() {
-                match rest[i].as_str() {
+                let (flag, inline_val) = split_inline_value(&rest[i]);
+                match flag {
                     "--port" => {
-                        i += 1;
-                        let val = rest.get(i).ok_or_else(|| {
-                            CliError::Usage("--port requires an integer".to_owned())
-                        })?;
+                        let val =
+                            flag_value(rest, &mut i, flag, inline_val, "requires an integer")?;
                         let parsed = val.parse::<u32>().map_err(|_| {
                             CliError::Usage(format!("invalid --port integer: {val}"))
                         })?;
                         port = Some(parsed);
                     }
-                    "--help" | "-h" => {
+                    "--help" | "-h" if inline_val.is_none() => {
                         return Ok(CliArgs {
                             state_root,
                             command: Command::PrintHelp(HelpTopic::Configure),
                         });
                     }
-                    other => {
+                    _ => {
                         return Err(CliError::Usage(format!(
-                            "unrecognised configure argument: {other}"
+                            "unrecognised configure argument: {}",
+                            rest[i]
                         )));
                     }
                 }
@@ -725,10 +726,7 @@ where
             let mut tool_arg_explicit = false;
             let mut i = 0;
             while i < rest.len() {
-                let (flag, inline_val) = match rest[i].split_once('=') {
-                    Some((k, v)) if k.starts_with("--") => (k, Some(v)),
-                    _ => (rest[i].as_str(), None),
-                };
+                let (flag, inline_val) = split_inline_value(&rest[i]);
                 let take_val = |flag: &str,
                                 inline: Option<&str>,
                                 idx: &mut usize,
@@ -1313,7 +1311,7 @@ where
                                 "{flag} must be between 0.0 and 100.0 GiB"
                             )));
                         }
-                        opts.checkpoint_floor_gib = gib;
+                        opts.checkpoint_floor_gib = Some(gib);
                     }
                     "--checkpoint-policy" => {
                         let val =
@@ -1323,7 +1321,7 @@ where
                                 "invalid --checkpoint-policy '{val}' (expected recompute-cost or lru)"
                             )));
                         }
-                        opts.checkpoint_policy = val;
+                        opts.checkpoint_policy = Some(val);
                     }
                     "--overlap-prefill" => {
                         forbid_val(flag, inline_val)?;
@@ -1468,40 +1466,34 @@ where
                     let mut check = false;
                     let mut i = 0;
                     while i < pack_rest.len() {
-                        match pack_rest[i].as_str() {
+                        let (flag, inline_val) = split_inline_value(&pack_rest[i]);
+                        let mut value =
+                            |hint: &str| flag_value(pack_rest, &mut i, flag, inline_val, hint);
+                        match flag {
                             "--chunk-mib" => {
-                                i += 1;
-                                chunk_mib = Some(parse_chunk_mib(pack_rest.get(i))?);
+                                chunk_mib = Some(parse_chunk_mib(&value("requires an integer")?)?);
                             }
                             "--format" => {
-                                i += 1;
-                                format = PackFormat::parse(pack_rest.get(i))?;
+                                format = PackFormat::parse(&value("requires v2 or v3")?)?;
                             }
                             "--target-dir" => {
-                                i += 1;
-                                let val = pack_rest.get(i).ok_or_else(|| {
-                                    CliError::Usage("--target-dir requires a path".to_owned())
-                                })?;
-                                target_dir = Some(PathBuf::from(val));
+                                target_dir = Some(PathBuf::from(value("requires a path")?));
                             }
                             "--reserve-gb" => {
-                                i += 1;
-                                let val = pack_rest.get(i).ok_or_else(|| {
-                                    CliError::Usage("--reserve-gb requires a number".to_owned())
-                                })?;
-                                reserve_gb = parse_nonnegative_gb(val)?;
+                                reserve_gb = parse_nonnegative_gb(&value("requires a number")?)?;
                             }
-                            "--json" => json = true,
-                            "--check" => check = true,
-                            "--help" | "-h" => {
+                            "--json" if inline_val.is_none() => json = true,
+                            "--check" if inline_val.is_none() => check = true,
+                            "--help" | "-h" if inline_val.is_none() => {
                                 return Ok(CliArgs {
                                     state_root,
                                     command: Command::PrintHelp(HelpTopic::PackPlan),
                                 });
                             }
-                            other => {
+                            _ => {
                                 return Err(CliError::Usage(format!(
-                                    "unrecognised pack plan argument: {other}"
+                                    "unrecognised pack plan argument: {}",
+                                    pack_rest[i]
                                 )));
                             }
                         }
@@ -1528,38 +1520,32 @@ where
                     let mut chunk_mib = None;
                     let mut i = 0;
                     while i < pack_rest.len() {
-                        match pack_rest[i].as_str() {
+                        let (flag, inline_val) = split_inline_value(&pack_rest[i]);
+                        let mut value =
+                            |hint: &str| flag_value(pack_rest, &mut i, flag, inline_val, hint);
+                        match flag {
                             "--chunk-mib" => {
-                                i += 1;
-                                chunk_mib = Some(parse_chunk_mib(pack_rest.get(i))?);
+                                chunk_mib = Some(parse_chunk_mib(&value("requires an integer")?)?);
                             }
                             "--format" => {
-                                i += 1;
-                                format = PackFormat::parse(pack_rest.get(i))?;
+                                format = PackFormat::parse(&value("requires v2 or v3")?)?;
                             }
                             "--output" => {
-                                i += 1;
-                                let val = pack_rest.get(i).ok_or_else(|| {
-                                    CliError::Usage("--output requires a file path".to_owned())
-                                })?;
-                                output = Some(PathBuf::from(val));
+                                output = Some(PathBuf::from(value("requires a file path")?));
                             }
                             "--reserve-gb" => {
-                                i += 1;
-                                let val = pack_rest.get(i).ok_or_else(|| {
-                                    CliError::Usage("--reserve-gb requires a number".to_owned())
-                                })?;
-                                reserve_gb = parse_nonnegative_gb(val)?;
+                                reserve_gb = parse_nonnegative_gb(&value("requires a number")?)?;
                             }
-                            "--help" | "-h" => {
+                            "--help" | "-h" if inline_val.is_none() => {
                                 return Ok(CliArgs {
                                     state_root,
                                     command: Command::PrintHelp(HelpTopic::PackBuild),
                                 });
                             }
-                            other => {
+                            _ => {
                                 return Err(CliError::Usage(format!(
-                                    "unrecognised pack build argument: {other}"
+                                    "unrecognised pack build argument: {}",
+                                    pack_rest[i]
                                 )));
                             }
                         }
@@ -1590,9 +1576,33 @@ where
     })
 }
 
-fn parse_chunk_mib(value: Option<&String>) -> Result<u64, CliError> {
+/// Splits `--flag=value` into the flag and its inline value. Any other argument is returned whole.
+fn split_inline_value(arg: &str) -> (&str, Option<&str>) {
+    match arg.split_once('=') {
+        Some((flag, value)) if flag.starts_with("--") => (flag, Some(value)),
+        _ => (arg, None),
+    }
+}
+
+/// Returns a flag's value: the inline `--flag=value` part if present, otherwise the next argument.
+fn flag_value(
+    args: &[String],
+    idx: &mut usize,
+    flag: &str,
+    inline: Option<&str>,
+    hint: &str,
+) -> Result<String, CliError> {
+    if let Some(value) = inline {
+        return Ok(value.to_owned());
+    }
+    *idx += 1;
+    args.get(*idx)
+        .cloned()
+        .ok_or_else(|| CliError::Usage(format!("{flag} {hint}")))
+}
+
+fn parse_chunk_mib(value: &str) -> Result<u64, CliError> {
     value
-        .ok_or_else(|| CliError::Usage("--chunk-mib requires an integer".to_owned()))?
         .parse()
         .map_err(|_| CliError::Usage("invalid --chunk-mib integer".to_owned()))
 }
@@ -1955,6 +1965,148 @@ mod tests {
             );
             assert!(parse_args(["pack", action, "--format"]).is_err());
             assert!(parse_args(["pack", action, "--format", "v4"]).is_err());
+        }
+    }
+
+    #[test]
+    fn checkpoint_settings_without_a_positive_capacity_are_refused() {
+        let options = |args: &[&str]| {
+            let Command::Serve(opts) = parse_args(args.iter().copied()).unwrap().command else {
+                panic!("expected Serve");
+            };
+            opts
+        };
+        // The default capacity is 0, and an explicit default value still counts as given.
+        for (args, flag) in [
+            (
+                &["serve", "--checkpoint-dir", "/tmp/checkpoints"][..],
+                "--checkpoint-dir",
+            ),
+            (
+                &["serve", "--checkpoint-policy", "recompute-cost"][..],
+                "--checkpoint-policy",
+            ),
+            (
+                &["serve", "--checkpoint-ssd-floor-gib", "20"][..],
+                "--checkpoint-floor-gib",
+            ),
+            (
+                &[
+                    "serve",
+                    "--checkpoint-cap-gib",
+                    "0",
+                    "--checkpoint-policy=lru",
+                ][..],
+                "--checkpoint-policy",
+            ),
+        ] {
+            let error = serve::validate_serve_options(&options(args)).unwrap_err();
+            assert!(matches!(error, CliError::Validation(_)), "{args:?}");
+            assert_eq!(
+                error.to_string(),
+                format!("{flag} has no effect unless --checkpoint-cap-gib is greater than 0")
+            );
+        }
+        serve::validate_serve_options(&options(&["serve"])).unwrap();
+        serve::validate_serve_options(&options(&["serve", "--checkpoint-cap-gib", "0"])).unwrap();
+
+        // With a capacity, unset settings take their defaults.
+        let flags = build_carrier_flags(
+            &options(&["serve", "--checkpoint-cap-gib", "4"]),
+            SpeculativeAsset::MtpSidecar(Path::new("/tmp/mtp.gguf")),
+            Path::new("/tmp/state"),
+        )
+        .unwrap();
+        for pair in [
+            ["--checkpoint-floor-gib", "20"],
+            ["--checkpoint-dir", "/tmp/state/checkpoints"],
+            ["--checkpoint-policy", "recompute-cost"],
+        ] {
+            assert!(flags.windows(2).any(|window| window == pair), "{pair:?}");
+        }
+    }
+
+    #[test]
+    fn configure_and_pack_accept_inline_flag_values() {
+        for (inline, spaced) in [
+            (
+                vec!["configure", "--port=18081"],
+                vec!["configure", "--port", "18081"],
+            ),
+            (
+                vec![
+                    "pack",
+                    "plan",
+                    "--format=v3",
+                    "--chunk-mib=2",
+                    "--target-dir=/tmp/plan",
+                    "--reserve-gb=1.5",
+                    "--json",
+                ],
+                vec![
+                    "pack",
+                    "plan",
+                    "--format",
+                    "v3",
+                    "--chunk-mib",
+                    "2",
+                    "--target-dir",
+                    "/tmp/plan",
+                    "--reserve-gb",
+                    "1.5",
+                    "--json",
+                ],
+            ),
+            (
+                vec![
+                    "pack",
+                    "build",
+                    "--format=v2",
+                    "--chunk-mib=8",
+                    "--output=/tmp/out.gguf",
+                    "--reserve-gb=2",
+                ],
+                vec![
+                    "pack",
+                    "build",
+                    "--format",
+                    "v2",
+                    "--chunk-mib",
+                    "8",
+                    "--output",
+                    "/tmp/out.gguf",
+                    "--reserve-gb",
+                    "2",
+                ],
+            ),
+        ] {
+            assert_eq!(parse_args(inline).unwrap(), parse_args(spaced).unwrap());
+        }
+        assert_eq!(
+            parse_args(["configure", "--port=18081"]).unwrap().command,
+            Command::Configure { port: Some(18081) }
+        );
+        // A value on a flag that takes none is refused, and the refusal names the whole argument.
+        for (args, expected) in [
+            (
+                vec!["configure", "--bogus=1"],
+                "unrecognised configure argument: --bogus=1",
+            ),
+            (
+                vec!["pack", "plan", "--json=1"],
+                "unrecognised pack plan argument: --json=1",
+            ),
+            (
+                vec!["pack", "build", "--help=1"],
+                "unrecognised pack build argument: --help=1",
+            ),
+            (vec!["configure", "--port="], "invalid --port integer: "),
+            (
+                vec!["pack", "plan", "--format="],
+                "--format requires v2 or v3",
+            ),
+        ] {
+            assert_eq!(parse_args(args).unwrap_err().to_string(), expected);
         }
     }
 

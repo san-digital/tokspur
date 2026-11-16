@@ -96,6 +96,8 @@ pub enum AdmissionError {
     Clock(SystemTimeError),
     /// Persisting a private prefix trace record failed.
     TracePersist(Arc<std::io::Error>),
+    /// The private prefix trace cannot take a record: it is full, or it failed earlier. A fault of the server, not of the request.
+    PrefixTrace(&'static str),
     /// MTP wire validation refused inside a session.
     Mtp(MtpWireError),
 }
@@ -110,6 +112,7 @@ impl PartialEq for AdmissionError {
             (Self::TracePersist(left), Self::TracePersist(right)) => {
                 left.kind() == right.kind() && left.raw_os_error() == right.raw_os_error()
             }
+            (Self::PrefixTrace(left), Self::PrefixTrace(right)) => left == right,
             (Self::Mtp(left), Self::Mtp(right)) => left == right,
             _ => false,
         }
@@ -126,6 +129,9 @@ impl fmt::Debug for AdmissionError {
             Self::Response(error) => formatter.debug_tuple("Response").field(error).finish(),
             Self::Clock(_) => formatter.write_str("Clock([redacted])"),
             Self::TracePersist(_) => formatter.write_str("TracePersist([redacted])"),
+            Self::PrefixTrace(reason) => {
+                formatter.debug_tuple("PrefixTrace").field(reason).finish()
+            }
             Self::Mtp(error) => formatter.debug_tuple("Mtp").field(error).finish(),
         }
     }
@@ -134,7 +140,7 @@ impl fmt::Debug for AdmissionError {
 impl fmt::Display for AdmissionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Refused(reason) => formatter.write_str(reason),
+            Self::Refused(reason) | Self::PrefixTrace(reason) => formatter.write_str(reason),
             Self::Json(error) => error.fmt(formatter),
             Self::Response(error) => error.fmt(formatter),
             Self::Clock(_) => formatter.write_str("invalid API clock"),
@@ -154,7 +160,7 @@ impl std::error::Error for AdmissionError {
             Self::Clock(error) => Some(error),
             Self::TracePersist(error) => Some(error.as_ref()),
             Self::Mtp(error) => Some(error),
-            Self::Refused(_) => None,
+            Self::Refused(_) | Self::PrefixTrace(_) => None,
         }
     }
 }
@@ -1156,6 +1162,28 @@ pub fn admit_chat_with_policies(
     admit_chat_with_context(request, alias, tool_enums, tool_args, 65_536)
 }
 
+/// How many times longer than the received body a request's canonical dump can be. The writer spells every control character as six bytes (`\u000a`) where a client may send two (`\n`), and nothing else grows.
+const DUMP_GROWTH: usize = 3;
+
+/// How many bytes shorter than its dump a client could have sent `value`: JSON has a two-byte escape for `\b`, `\t`, `\n`, `\f` and `\r`, which the writer spells as six. Call after a dump has bounded the nesting.
+fn short_escape_savings(value: &Json) -> usize {
+    fn text(bytes: &[u8]) -> usize {
+        4 * bytes
+            .iter()
+            .filter(|&&c| matches!(c, 0x08..=0x0a | 0x0c | 0x0d))
+            .count()
+    }
+    match value {
+        Json::String(bytes) => text(bytes),
+        Json::Array(items) => items.iter().map(short_escape_savings).sum(),
+        Json::Object(fields) => fields
+            .iter()
+            .map(|(name, item)| text(name) + short_escape_savings(item))
+            .sum(),
+        Json::Null | Json::Bool(_) | Json::Number(_) => 0,
+    }
+}
+
 /// `admit_chat`: validates one OpenAI-style request without side effects under the selected policies and configured context length.
 pub fn admit_chat_with_context(
     request: &Json,
@@ -1173,7 +1201,12 @@ pub fn admit_chat_with_context(
     } else {
         1024 * 1024
     };
-    request.dump_limited(max_request_bytes)?;
+    // The request is measured as a client could have sent it, not as the writer spells it: a body within the limit must not be refused because its newlines and tabs dump to six bytes each. The dump still refuses what only a value built in code can hold (invalid UTF-8, a duplicate key, nesting beyond 64).
+    let dumped = request.dump_limited(DUMP_GROWTH * max_request_bytes)?;
+    require(
+        dumped.len() - short_escape_savings(request) <= max_request_bytes,
+        "chat request exceeds byte limit",
+    )?;
     keys(
         request,
         &[
@@ -1729,6 +1762,97 @@ mod tests {
             "AdmittedChat { tools: 1, stream: false, thinking: true, maximum_tokens: 7, .. }"
         );
         assert!(!rendered.contains("private"));
+    }
+
+    /// A chat request whose one message is `escapes` two-byte JSON escapes of `control`, as a client would send it.
+    fn escaped_body(control: &[u8; 2], escapes: usize) -> Vec<u8> {
+        let mut body = br#"{"model":"m","messages":[{"role":"user","content":""#.to_vec();
+        for _ in 0..escapes {
+            body.extend_from_slice(control);
+        }
+        body.extend_from_slice(br#""}]}"#);
+        body
+    }
+
+    #[test]
+    fn a_body_within_the_request_limit_is_admitted_whatever_its_escapes_dump_to() {
+        for (context_length, limit, values) in [
+            (65_536, 1024 * 1024, 150_000),
+            (131_072, 4 * 1024 * 1024, 300_000),
+        ] {
+            for control in [br"\n", br"\t"] {
+                // Arrange: as long as the received-body limit allows, nearly all of it escaped control characters.
+                let frame = escaped_body(control, 0).len();
+                let body = escaped_body(control, (limit - frame) / 2);
+                assert!(limit - body.len() < 2);
+                let request =
+                    parse_json_limited(&body, JsonLimits::new(limit, values, 32)).unwrap();
+                // The canonical dump is almost three times the body, far past the limit.
+                assert!(request.dump().unwrap().len() > 2 * limit);
+
+                // Act
+                let admitted = admit_chat_with_context(
+                    &request,
+                    b"m",
+                    ToolEnumValidation::Strict,
+                    ToolArgValidation::Strict,
+                    context_length,
+                );
+
+                // Assert
+                assert!(admitted.is_ok(), "{:?}", admitted.err());
+            }
+        }
+    }
+
+    /// A chat request built in code, with `content` as its one message.
+    fn built(content: Vec<u8>) -> Json {
+        Json::new_object([
+            ("model", Json::from("m")),
+            (
+                "messages",
+                Json::Array(vec![Json::new_object([
+                    ("role", Json::from("user")),
+                    ("content", Json::String(content)),
+                ])]),
+            ),
+        ])
+    }
+
+    #[test]
+    fn a_request_no_body_within_the_limit_could_carry_is_still_refused() {
+        // Arrange: built in code, so nothing bounded these as received.
+        let limit = 1024 * 1024;
+        let fits_as_sent = built(vec![b'\n'; limit / 2 - 64]);
+        let too_long = built(vec![b'a'; limit]);
+        // \u0001 has no short escape: a client needs all six bytes.
+        let long_escapes = built(vec![0x01; limit / 6]);
+        let beyond_any_dump = built(vec![b'a'; 3 * limit]);
+        let invalid = built(vec![0xc0, 0x80]);
+
+        // Act and assert
+        assert!(fits_as_sent.dump().unwrap().len() > 2 * limit);
+        assert!(admit_chat(&fits_as_sent, b"m").is_ok());
+        assert_eq!(
+            admit_chat(&too_long, b"m").unwrap_err().to_string(),
+            "chat request exceeds byte limit"
+        );
+        assert_eq!(
+            admit_chat(&long_escapes, b"m").unwrap_err().to_string(),
+            "chat request exceeds byte limit"
+        );
+        assert_eq!(
+            admit_chat(&beyond_any_dump, b"m").unwrap_err().to_string(),
+            "JSON output byte limit exceeded"
+        );
+        assert_eq!(
+            admit_chat(&invalid, b"m").unwrap_err().to_string(),
+            "invalid UTF-8 input"
+        );
+        assert_eq!(
+            short_escape_savings(&built(b"\x08\t\n\x0b\x0c\r\x1f a".to_vec())),
+            20
+        );
     }
 
     #[test]
