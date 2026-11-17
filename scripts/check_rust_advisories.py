@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 """Check every Cargo lockfile against OSV, which merges RustSec with the GitHub advisory database.
 
-Adapted from the over-show app's scripts/check-rust-advisories.py at commit
-ecabf371a (SHA-256 12f0c56ad83552dc7228e1fe33bc446edfa4a7be35a5431b269f5eae8d595ef9),
-same owner. Changes: the lockfile and audit-config paths point at the Rust port in
-rust/, the user agent names tokspur, and the code is formatted for this repository.
-
 `cargo audit` reads RustSec alone and only the lockfile it is pointed at. Advisories filed only
 with GitHub (the Tauri origin confusion fix and the 2026 rust-openssl fixes, for example) never
 reach it, so this check queries OSV for every crates.io package in every lockfile the repository

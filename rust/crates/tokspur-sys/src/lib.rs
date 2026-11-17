@@ -17,8 +17,9 @@ pub mod net;
 pub mod process;
 
 pub use ffi::{
-    EADDRINUSE, EAGAIN, ECONNREFUSED, EEXIST, EINPROGRESS, EINTR, ESRCH, POLLERR, POLLHUP, POLLIN,
-    POLLNVAL, POLLOUT, PollFd, SIGINT, SIGKILL, SIGTERM, errno,
+    EADDRINUSE, EAGAIN, ECONNABORTED, ECONNREFUSED, EEXIST, EINPROGRESS, EINTR, EMFILE, ENFILE,
+    ENOBUFS, ENOMEM, EPROTO, ESRCH, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT, PollFd, SIGINT,
+    SIGKILL, SIGTERM, errno,
 };
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -143,10 +144,16 @@ pub mod sdk_layout {
     pub const S_IFLNK: u16 = ffi::S_IFLNK;
     pub const SO_REUSEADDR: i32 = ffi::SO_REUSEADDR;
     pub const SO_ERROR: i32 = ffi::SO_ERROR;
+    pub const ENOMEM: i32 = ffi::ENOMEM;
     pub const EEXIST: i32 = ffi::EEXIST;
+    pub const ENFILE: i32 = ffi::ENFILE;
+    pub const EMFILE: i32 = ffi::EMFILE;
     pub const EINPROGRESS: i32 = ffi::EINPROGRESS;
     pub const EADDRINUSE: i32 = ffi::EADDRINUSE;
+    pub const ECONNABORTED: i32 = ffi::ECONNABORTED;
+    pub const ENOBUFS: i32 = ffi::ENOBUFS;
     pub const ECONNREFUSED: i32 = ffi::ECONNREFUSED;
+    pub const EPROTO: i32 = ffi::EPROTO;
     pub const CTL_KERN: i32 = ffi::CTL_KERN;
     pub const KERN_PROCARGS2: i32 = ffi::KERN_PROCARGS2;
     pub const PROC_PIDTBSDINFO: i32 = ffi::PROC_PIDTBSDINFO;

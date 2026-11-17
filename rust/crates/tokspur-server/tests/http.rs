@@ -696,6 +696,145 @@ fn ownership_disconnect_listener() {
         get_all_fd(client.as_raw_fd()).ends_with(b"\r\n\r\n{}"),
         "Loopback HTTP exchange failed",
     );
+    {
+        // A burst of abortive RST peers before/during accept never ends the listener; it still serves the next valid client.
+        let reset_peer = || {
+            let rst = TcpStream::connect(("127.0.0.1", listener.port()));
+            need(rst.is_ok(), "Cannot create loopback RST client");
+            let rst = rst.unwrap();
+            need(true, "Cannot connect loopback RST client");
+            need(
+                tokspur_sys::net::abortive_close_on_drop(std::os::fd::AsFd::as_fd(&rst)).is_ok(),
+                "Cannot arm abortive close",
+            );
+            drop(rst);
+        };
+        for _ in 0..6 {
+            reset_peer();
+        }
+        loop {
+            match listener.accept(
+                Instant::now() + Duration::from_millis(15),
+                Limits::default(),
+            ) {
+                Ok(mut stale) => rejects(stale.read_request(soon()), 0, true),
+                Err(error) => {
+                    need(
+                        error.status() == 408 && !error.disconnected(),
+                        "Abortive peer burst failed listener accept",
+                    );
+                    break;
+                }
+            }
+        }
+        reset_peer();
+        let next_client = TcpStream::connect(("127.0.0.1", listener.port()));
+        need(next_client.is_ok(), "Cannot create post-RST test client");
+        let mut next_client = next_client.unwrap();
+        need(true, "Cannot connect post-RST test client");
+        next_client.write_all(GET_REQUEST).unwrap();
+        let mut served = false;
+        for _ in 0..4 {
+            if served {
+                break;
+            }
+            let mut accepted = listener.accept(soon(), Limits::default()).unwrap();
+            match accepted.read_request(soon()) {
+                Ok(request) => {
+                    need(request.path == "/health", "Post-RST request path differs");
+                    accepted.send_json(200, b"{}", soon()).unwrap();
+                    served = true;
+                }
+                Err(error) => {
+                    need(
+                        error.disconnected(),
+                        "Unexpected non-disconnect error on post-RST accept",
+                    );
+                }
+            }
+        }
+        need(
+            served && get_all_fd(next_client.as_raw_fd()).ends_with(b"\r\n\r\n{}"),
+            "Listener did not serve valid client after RST burst",
+        );
+    }
+    {
+        // Descriptor exhaustion (EMFILE) during accept waits to the deadline and returns 408 instead of ending the listener.
+        let pending_client = TcpStream::connect(("127.0.0.1", listener.port()));
+        need(pending_client.is_ok(), "Cannot create EMFILE test client");
+        let pending_client = pending_client.unwrap();
+        need(true, "Cannot connect EMFILE test client");
+        let saved = tokspur_sys::process::open_files_limit();
+        need(saved.is_ok(), "Cannot inspect RLIMIT_NOFILE");
+        let saved = saved.unwrap();
+        {
+            let mut filler = Vec::new();
+            let mut highest = listener.native_handle().max(pending_client.as_raw_fd());
+            for _ in 0..64 {
+                let pair = sysfd::pipe_pair();
+                need(pair.is_ok(), "Cannot allocate filler pipe for EMFILE check");
+                let (r, w) = pair.unwrap();
+                let top = r.as_raw_fd().max(w.as_raw_fd());
+                filler.push((r, w));
+                if top > highest {
+                    highest = top;
+                    break;
+                }
+            }
+            struct RestoreLimit(u64);
+            impl Drop for RestoreLimit {
+                fn drop(&mut self) {
+                    drop(tokspur_sys::process::set_open_files_limit(self.0));
+                }
+            }
+            let _restore = RestoreLimit(saved);
+            need(
+                tokspur_sys::process::set_open_files_limit((highest + 1) as u64).is_ok(),
+                "Cannot lower RLIMIT_NOFILE for EMFILE check",
+            );
+            rejects(
+                listener.accept(
+                    Instant::now() + Duration::from_millis(15),
+                    Limits::default(),
+                ),
+                408,
+                false,
+            );
+            drop(filler);
+        }
+        drop(pending_client);
+        loop {
+            match listener.accept(Instant::now() + Duration::from_millis(5), Limits::default()) {
+                Ok(_) => {}
+                Err(error) => {
+                    need(
+                        error.status() == 408,
+                        "Unexpected accept status draining EMFILE peer",
+                    );
+                    break;
+                }
+            }
+        }
+        let recovered_client = TcpStream::connect(("127.0.0.1", listener.port()));
+        need(
+            recovered_client.is_ok(),
+            "Cannot create post-EMFILE test client",
+        );
+        let mut recovered_client = recovered_client.unwrap();
+        need(true, "Cannot connect post-EMFILE test client");
+        let mut recovered = listener.accept(soon(), Limits::default()).unwrap();
+        recovered_client.write_all(GET_REQUEST).unwrap();
+        need(
+            recovered.read_request(soon()).unwrap().path == "/health",
+            "Post-EMFILE accepted request differs",
+        );
+        recovered.send_json(200, b"{}", soon()).unwrap();
+        recovered.close();
+        need(
+            get_all_fd(recovered_client.as_raw_fd()).ends_with(b"\r\n\r\n{}"),
+            "Post-EMFILE HTTP exchange failed",
+        );
+    }
     let mut moved = listener;
     need(
         moved.port() != 0,

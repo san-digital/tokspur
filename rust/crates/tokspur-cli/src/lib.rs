@@ -35,6 +35,10 @@ use crate::verify::verify_build;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Host RAM `--speed-preset` gives parked lanes when the shared prefix cache is on and SSD
+/// checkpoints are off: about 120K tokens of parked conversation at ~33 KB per token.
+const SPEED_PRESET_PARKED_LANES_MIB: u32 = 4096;
+
 /// Help topic for `--help` and `-h` requests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HelpTopic {
@@ -312,7 +316,7 @@ options:
   --native-verify-nax-m8 {off,on}             Explicit native matmul2d(8,32,32) verification mode (default: off)
   --native-verify-m8-splits <path>             Explicit M8 split policy (requires --verify-nax-m8)
   --request-timeout-seconds <1..86400>         Overall request deadline (default: 3600 seconds)
-  --speed-preset                              Opt-in Pack v3, NAX, MTP3/DFlash2, first8/output64 and executor speed preset
+  --speed-preset                              Opt-in Pack v3, NAX, MTP3/DFlash2, first8/output64, parked lanes and executor speed preset
   --mtp-depth {2,3}                           Opt-in MTP speculative lookahead depth (default: 2)
   --drafter {mtp,dflash2}                     Speculative drafter mode (default: mtp)
   --dflash2-dir <dir>                         Opt-in DFlash2 safetensors checkpoint directory
@@ -326,6 +330,7 @@ options:
   --hc-consumer-fused, --no-hc-consumer-fused Fused HC consumer operator (default: on)
   --ple-overlap, --no-ple-overlap             Chunk-ahead PLE prefill overlap (default: on)
   --shared-prefix-cache, --no-shared-prefix-cache Host-RAM shared system-prefix cache (default: on for mtp)
+  --parked-lanes-mib <mib>                    Host RAM for conversations parked on a switch (0..16384, default: 0, 4096 with the MTP speed preset and shared prefix cache)
   --mtp-lookup {off,bypass,hybrid}            Opt-in MTP prompt-lookup mode (default: off)
   --mtp-lookup-match <2..16>                  Opt-in MTP prompt-lookup match length
   --dflash2-lookup {off,bypass,hybrid}        Opt-in DFlash2 prompt-lookup mode (default: off)
@@ -722,6 +727,7 @@ where
             let mut verify_nax_m8_explicit = false;
             let mut prepared_validation_explicit = false;
             let mut output_packet_explicit = false;
+            let mut parked_lanes_explicit = false;
             let mut tool_enum_explicit = false;
             let mut tool_arg_explicit = false;
             let mut i = 0;
@@ -1206,6 +1212,19 @@ where
                         forbid_val(flag, inline_val)?;
                         opts.shared_prefix_cache = Some(false);
                     }
+                    "--parked-lanes-mib" => {
+                        let val = take_val(flag, inline_val, &mut i, "requires 0..16384")?;
+                        let mib = val.parse::<u32>().map_err(|_| {
+                            CliError::Usage(format!("invalid {flag} integer: {val}"))
+                        })?;
+                        if mib > 16_384 {
+                            return Err(CliError::Usage(format!(
+                                "invalid {flag} '{mib}' (expected 0..16384)"
+                            )));
+                        }
+                        opts.parked_lanes_mib = mib;
+                        parked_lanes_explicit = true;
+                    }
                     "--mtp-lookup" => {
                         let val =
                             take_val(flag, inline_val, &mut i, "requires off, bypass or hybrid")?;
@@ -1433,6 +1452,13 @@ where
                     if opts.dflash2_verify_rows.is_none() {
                         opts.dflash2_verify_rows = Some("auto".to_owned());
                     }
+                }
+                if !parked_lanes_explicit
+                    && opts.drafter == "mtp"
+                    && opts.shared_prefix_cache.unwrap_or(true)
+                    && opts.checkpoint_cap_gib.unwrap_or(0.0) <= 0.0
+                {
+                    opts.parked_lanes_mib = SPEED_PRESET_PARKED_LANES_MIB;
                 }
                 if !output_packet_explicit {
                     opts.output_packet = 64;
@@ -2779,6 +2805,42 @@ mod tests {
     }
 
     #[test]
+    fn speed_preset_parks_lanes_only_beside_the_shared_prefix_cache() {
+        let parked = |args: &[&str]| {
+            let mut full = vec!["serve", "--speed-preset"];
+            full.extend_from_slice(args);
+            let Command::Serve(opts) = parse_args(full).unwrap().command else {
+                panic!("expected Serve");
+            };
+            opts.parked_lanes_mib
+        };
+        assert_eq!(parked(&[]), SPEED_PRESET_PARKED_LANES_MIB);
+        assert_eq!(
+            parked(&["--drafter", "dflash2", "--shared-prefix-cache"]),
+            0
+        );
+        assert_eq!(
+            parked(&[
+                "--drafter",
+                "dflash2",
+                "--shared-prefix-cache",
+                "--parked-lanes-mib",
+                "1024"
+            ]),
+            1024
+        );
+        assert_eq!(parked(&["--drafter", "dflash2"]), 0);
+        assert_eq!(parked(&["--no-shared-prefix-cache"]), 0);
+        assert_eq!(parked(&["--checkpoint-cap-gib", "8"]), 0);
+        assert_eq!(parked(&["--parked-lanes-mib", "0"]), 0);
+        assert_eq!(parked(&["--parked-lanes-mib", "1024"]), 1024);
+        let Command::Serve(plain) = parse_args(["serve"]).unwrap().command else {
+            panic!("expected Serve");
+        };
+        assert_eq!(plain.parked_lanes_mib, 0);
+    }
+
+    #[test]
     fn mtp_depth_dflash2_precision_and_speed_preset_flags() {
         use crate::serve::build_carrier_flags;
         let Command::Serve(mtp3) = parse_args(["serve", "--mtp-depth", "3"]).unwrap().command
@@ -2820,6 +2882,7 @@ mod tests {
         assert_eq!(preset.mtp_fast_round, Some(true));
         assert_eq!(preset.output_packet, 64);
         assert_eq!(preset.first_output_packet, Some(8));
+        assert_eq!(preset.parked_lanes_mib, SPEED_PRESET_PARKED_LANES_MIB);
 
         let Command::Serve(preset_fast_off) = parse_args([
             "serve",

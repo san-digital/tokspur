@@ -7,14 +7,14 @@
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 
 #ifndef TOKSPUR_PRIVATE_DENSE_M32_SINGLE_TILE
-#define TOKSPUR_PRIVATE_DENSE_M32_SINGLE_TILE 0
+#define TOKSPUR_PRIVATE_DENSE_M32_SINGLE_TILE 1
 #endif
 #if TOKSPUR_PRIVATE_DENSE_M32_SINGLE_TILE != 0 && TOKSPUR_PRIVATE_DENSE_M32_SINGLE_TILE != 1
 #error "TOKSPUR_PRIVATE_DENSE_M32_SINGLE_TILE must be 0 or 1"
 #endif
 
 #ifndef TOKSPUR_PRIVATE_DENSE_M8_SINGLE_TILE
-#define TOKSPUR_PRIVATE_DENSE_M8_SINGLE_TILE 0
+#define TOKSPUR_PRIVATE_DENSE_M8_SINGLE_TILE 1
 #endif
 #if TOKSPUR_PRIVATE_DENSE_M8_SINGLE_TILE != 0 && TOKSPUR_PRIVATE_DENSE_M8_SINGLE_TILE != 1
 #error "TOKSPUR_PRIVATE_DENSE_M8_SINGLE_TILE must be 0 or 1"
@@ -499,11 +499,10 @@ union SwigluTileSmem {
 };
 static_assert(sizeof(SwigluTileSmem) == 16384, "SwigluTileSmem must remain 16 KiB");
 
-union Bf16TileSmem {
-    alignas(16) bfloat stage[2 * 64 * 64];
-    float epi[4][8][65];
+struct Bf16TileSmem {
+    alignas(16) bfloat stage[64 * 64];
 };
-static_assert(sizeof(Bf16TileSmem) == 16384, "Bf16TileSmem must remain 16 KiB");
+static_assert(sizeof(Bf16TileSmem) == 8192, "Bf16TileSmem 8 KiB occupancy budget (4 TGs/core)");
 
 static inline void prefill_dense_q8_m256_tile(device const uchar* weights, device bfloat* x_bf16, device float* output,
     constant GroupedMmArgs& a, device atomic_uint* error, uint2 group, ushort tid, ushort sg, threadgroup DenseQ8M32Smem& smem) {
@@ -842,8 +841,7 @@ static inline void prefill_dense_bf16_tile(device const uchar* weights, device b
     matmul2d<descriptor, execution_simdgroups<1>> operation;
 
     tensor<threadgroup bfloat, dextents<int, 2>, tensor_inline> bt0(stage, dextents<int, 2>{KS, Cols}, array<int, 2>{1, KS});
-    tensor<threadgroup bfloat, dextents<int, 2>, tensor_inline> bt1(stage + KS * Cols, dextents<int, 2>{KS, Cols}, array<int, 2>{1, KS});
-    auto b0 = bt0.slice<KS, Cols>(0, 0), b1 = bt1.slice<KS, Cols>(0, 0);
+    auto b0 = bt0.slice<KS, Cols>(0, 0);
     auto a0 = a_tensor.template slice<KS, RowsPerSG>(0, 0);
     auto acc = operation.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
     #pragma unroll
@@ -851,21 +849,23 @@ static inline void prefill_dense_bf16_tile(device const uchar* weights, device b
 
     uint bad = 0u;
     const uint steps = a.columns / KS;
-    Ushort32 next_w = load_bf16_half32(w_row, 0u, half_k, live_col, bad);
-
-    for (uint step = 0u; step < steps; ++step) {
-        threadgroup ushort4* dst = reinterpret_cast<threadgroup ushort4*>(
-            stage + (step & 1u) * (KS * Cols) + col * KS + half_k * 32u);
-        #pragma unroll
-        for (ushort i = 0; i < 8; ++i) dst[i] = next_w.v[i];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (step + 1u < steps) {
-            next_w = load_bf16_half32(w_row, step + 1u, half_k, live_col, bad);
-        }
-        if (owns_rows) {
-            auto a_slice = a_tensor.template slice<KS, RowsPerSG>(int(step * KS), 0);
-            if (step & 1u) operation.run(a_slice, b1, acc);
-            else operation.run(a_slice, b0, acc);
+    if (steps > 0u) {
+        Ushort32 next_w = load_bf16_half32(w_row, 0u, half_k, live_col, bad);
+        for (uint step = 0u; step < steps; ++step) {
+            threadgroup ushort4* dst = reinterpret_cast<threadgroup ushort4*>(stage + col * KS + half_k * 32u);
+            #pragma unroll
+            for (ushort i = 0; i < 8; ++i) dst[i] = next_w.v[i];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (step + 1u < steps) {
+                next_w = load_bf16_half32(w_row, step + 1u, half_k, live_col, bad);
+            }
+            if (owns_rows) {
+                auto a_slice = a_tensor.template slice<KS, RowsPerSG>(int(step * KS), 0);
+                operation.run(a_slice, b0, acc);
+            }
+            if (step + 1u < steps) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
         }
     }
 
@@ -1324,7 +1324,7 @@ static inline void prefill_dense_q8_t64_m8_tile(device const uchar* plane0, devi
 
     const uint sg_n_off = uint(sg_n) * uint(SN) * StageStride;
     tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(stage + sg_n_off, dextents<int, 2>{KS, SN}, array<int, 2>{1, StageStride});
-    tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt1(stage + PlaneElems + sg_n_off, dextents<int, 2>{KS, SN}, array<int, 2>{1, StageStride});
+    tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt1(stage + (TOKSPUR_PRIVATE_DENSE_M8_SINGLE_TILE ? 0u : PlaneElems) + sg_n_off, dextents<int, 2>{KS, SN}, array<int, 2>{1, StageStride});
     auto b_tile0 = bt0.slice<KS, SN>(0, 0);
     auto b_tile1 = bt1.slice<KS, SN>(0, 0);
     auto a0 = a_tensor.template slice<KS, SM>(0, 0);
@@ -1342,16 +1342,20 @@ static inline void prefill_dense_q8_t64_m8_tile(device const uchar* plane0, devi
     if (steps > 0u) {
         Q8Tile64Ipt1 w_next = load_q8_t64_ipt1(plane0, meta, G, col_tile, uint(gi), uint(col));
         for (uint step = 0u; step < steps; ++step) {
-            store_q8_t64_ipt1(w_next, stage + (step & 1u) * PlaneElems + stage_off, bad);
+            const uint plane = TOKSPUR_PRIVATE_DENSE_M8_SINGLE_TILE ? 0u : (step & 1u);
+            store_q8_t64_ipt1(w_next, stage + plane * PlaneElems + stage_off, bad);
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (step + 1u < steps) {
                 w_next = load_q8_t64_ipt1(plane0, meta, G, col_tile, 2u * (step + 1u) + uint(gi), uint(col));
             }
             if (owns_rows) {
                 auto a_slice = a_tensor.template slice<KS, SM>(int(step * KS), 0);
-                if ((step & 1u) == 0u) operation.run(a_slice, b_tile0, acc);
+                if (plane == 0u) operation.run(a_slice, b_tile0, acc);
                 else operation.run(a_slice, b_tile1, acc);
             }
+#if TOKSPUR_PRIVATE_DENSE_M8_SINGLE_TILE
+            if (step + 1u < steps) threadgroup_barrier(mem_flags::mem_threadgroup);
+#endif
         }
     }
 
@@ -1607,7 +1611,7 @@ kernel void nax_prefill_dense_q8_t64_m8(device const uchar* plane0 [[buffer(0)]]
         if (!tid && !group.x && !group.y) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
         return;
     }
-    alignas(16) threadgroup half stage[2 * 64 * 64];
+    alignas(16) threadgroup half stage[(TOKSPUR_PRIVATE_DENSE_M8_SINGLE_TILE ? 1 : 2) * 64 * 64];
     nax_detail::prefill_dense_q8_t64_m8_tile(plane0, meta, x, y, a, error, group, tid, sg, stage);
 }
 
@@ -5253,7 +5257,8 @@ kernel void nax_qsa_build_tile_lists(device const uint* ids [[buffer(0)]], devic
     device atomic_uint* error [[buffer(7)]], uint group [[threadgroup_position_in_grid]],
     ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]]) {
-    threadgroup atomic_uint mask_words[4096];
+    // 4080 * 4 + 32 + 4 = 16,356 B <= 16,384 B (2 TGs/core = 2.0x occupancy vs 16,420 B).
+    threadgroup atomic_uint mask_words[4080];
     threadgroup uint sg_totals[8];
     threadgroup atomic_uint tile_bad;
 
@@ -5273,9 +5278,9 @@ kernel void nax_qsa_build_tile_lists(device const uint* ids [[buffer(0)]], devic
     device uint* out_list = tile_lists + ulong(group) * p.list_stride;
     uint running_total = 0u;
 
-    for (uint win_base = 0u; win_base < history_blocks; win_base += 16384u) {
+    for (uint win_base = 0u; win_base < history_blocks; win_base += 16320u) {
         if (win_base > 0u) threadgroup_barrier(mem_flags::mem_threadgroup);
-        const uint win_blocks = min(16384u, history_blocks - win_base);
+        const uint win_blocks = min(16320u, history_blocks - win_base);
         const uint win_end = win_base + win_blocks;
         const uint num_words = (win_blocks + 3u) >> 2;
         for (uint w = tid; w < num_words; w += 256u) {
@@ -5623,7 +5628,8 @@ kernel void nax_qsa_build_tile_lists_r4(device const uint* ids [[buffer(0)]], de
     device atomic_uint* error [[buffer(7)]], uint group [[threadgroup_position_in_grid]],
     ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]]) {
-    threadgroup atomic_uint mask_words[4096];
+    // 4080 * 4 + 32 + 4 = 16,356 B <= 16,384 B (2 TGs/core = 2.0x occupancy vs 16,420 B).
+    threadgroup atomic_uint mask_words[4080];
     threadgroup uint sg_totals[8];
     threadgroup atomic_uint tile_bad;
 
@@ -5643,9 +5649,9 @@ kernel void nax_qsa_build_tile_lists_r4(device const uint* ids [[buffer(0)]], de
     device uint* out_list = tile_lists + ulong(group) * p.list_stride;
     uint running_total = 0u;
 
-    for (uint win_base = 0u; win_base < history_blocks; win_base += 16384u) {
+    for (uint win_base = 0u; win_base < history_blocks; win_base += 16320u) {
         if (win_base > 0u) threadgroup_barrier(mem_flags::mem_threadgroup);
-        const uint win_blocks = min(16384u, history_blocks - win_base);
+        const uint win_blocks = min(16320u, history_blocks - win_base);
         const uint win_end = win_base + win_blocks;
         const uint num_words = (win_blocks + 3u) >> 2;
         for (uint w = tid; w < num_words; w += 256u) {

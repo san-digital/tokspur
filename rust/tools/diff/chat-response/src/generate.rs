@@ -986,19 +986,21 @@ pub fn test_tools() -> Vec<ToolSpec> {
                 ParameterSpec::new("meta", ParameterType::Object, false),
                 ParameterSpec::new("items", ParameterType::Array, false),
                 ParameterSpec::new("empty", ParameterType::NullValue, false),
+                ParameterSpec::new("value", ParameterType::JsonValue, false),
             ],
         ),
         ToolSpec::new("ping", Vec::new()),
     ]
 }
 
-const TYPES: [ParameterType; 6] = [
+const TYPES: [ParameterType; 7] = [
     ParameterType::RawString,
     ParameterType::Boolean,
     ParameterType::Number,
     ParameterType::Object,
     ParameterType::Array,
     ParameterType::NullValue,
+    ParameterType::JsonValue,
 ];
 
 fn random_tools(random: &mut Random) -> Vec<ToolSpec> {
@@ -1132,6 +1134,24 @@ fn typed_value(random: &mut Random, kind: ParameterType) -> String {
         }
         ParameterType::NullValue => {
             (random.pick(&["null", " null\n", "nul", "None", "[]"])).to_owned()
+        }
+        ParameterType::JsonValue => {
+            if random.chance(1, 5) {
+                (random.pick(&[
+                    "",
+                    "   ",
+                    "not JSON",
+                    "{",
+                    "{\"a\":1,\"a\":2}",
+                    "NaN",
+                    "[1,]",
+                    "1 2",
+                ]))
+                .to_owned()
+            } else {
+                let value = json_value(random, 1);
+                String::from_utf8_lossy(&value.text(random)).into_owned()
+            }
         }
     }
 }
@@ -1943,21 +1963,23 @@ fn test_protocol_cases(cases: &mut Vec<Labeled>) {
         (
             "parameters",
             J::Arr(
-                ["string", "boolean", "number", "object", "array", "null"]
-                    .iter()
-                    .zip(["s", "b", "n", "o", "a", "z"])
-                    .map(|(kind, name)| {
-                        obj(vec![
-                            ("name", s(name)),
-                            ("type", s(kind)),
-                            ("required", J::Bool(true)),
-                        ])
-                    })
-                    .collect(),
+                [
+                    "string", "boolean", "number", "object", "array", "null", "any",
+                ]
+                .iter()
+                .zip(["s", "b", "n", "o", "a", "z", "v"])
+                .map(|(kind, name)| {
+                    obj(vec![
+                        ("name", s(name)),
+                        ("type", s(kind)),
+                        ("required", J::Bool(true)),
+                    ])
+                })
+                .collect(),
             ),
         ),
     ])]);
-    let typed_body = encode(b"<tool_call><function=typed>\n<parameter=s>\ntrue\n</parameter>\n<parameter=b>\ntrue\n</parameter>\n<parameter=n>\n-2.5\n</parameter>\n<parameter=o>\n{\"x\":1}\n</parameter>\n<parameter=a>\n[1,true]\n</parameter>\n<parameter=z>\nnull\n</parameter>\n</function></tool_call><|im_end|>");
+    let typed_body = encode(b"<tool_call><function=typed>\n<parameter=s>\ntrue\n</parameter>\n<parameter=b>\ntrue\n</parameter>\n<parameter=n>\n-2.5\n</parameter>\n<parameter=o>\n{\"x\":1}\n</parameter>\n<parameter=a>\n[1,true]\n</parameter>\n<parameter=z>\nnull\n</parameter>\n<parameter=v>\n\"quoted\"\n</parameter>\n</function></tool_call><|im_end|>");
     protocol(
         cases,
         "test_protocol typed",
@@ -1965,6 +1987,45 @@ fn test_protocol_cases(cases: &mut Vec<Labeled>) {
         &envelope(&typed_body, "stop", false, typed, stop()),
         fixture,
     );
+    let any_manifest = J::Arr(vec![obj(vec![
+        ("name", s("any_tool")),
+        (
+            "parameters",
+            J::Arr(vec![obj(vec![
+                ("name", s("v")),
+                ("type", s("any")),
+                ("required", J::Bool(true)),
+            ])]),
+        ),
+    ])]);
+    for (index, raw) in [
+        "null",
+        "false",
+        "0",
+        "\"hello\"",
+        "[1,{\"k\":true}]",
+        "{\"k\":null}",
+        "",
+        "unquoted",
+        "{\"a\":1,\"a\":2}",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let body = encode(
+            format!(
+                "<tool_call><function=any_tool>\n<parameter=v>\n{raw}\n</parameter>\n</function></tool_call><|im_end|>"
+            )
+            .as_bytes(),
+        );
+        protocol(
+            cases,
+            format!("test_protocol any/{index}"),
+            ADMISSION,
+            &envelope(&body, "stop", false, any_manifest.clone(), stop()),
+            fixture,
+        );
+    }
     let invalid = [
         envelope(&[], "stop", false, protocol_manifest(), stop()),
         envelope(&all, "stop", false, protocol_manifest(), J::Null),
@@ -2497,6 +2558,7 @@ fn manifest_json(tools: &[ToolSpec]) -> J {
                                         ParameterType::Object => "object",
                                         ParameterType::Array => "array",
                                         ParameterType::NullValue => "null",
+                                        ParameterType::JsonValue => "any",
                                     };
                                     J::Obj(vec![
                                         (b"name".to_vec(), J::Str(parameter.name.clone())),

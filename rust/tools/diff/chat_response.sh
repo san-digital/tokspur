@@ -12,14 +12,15 @@ mkdir -p "$out"
 cxx=${CXX:-c++}
 src="$root/native/src"
 here="$root/rust/tools/diff/chat-response"
-flags="-std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -I$root/native/include"
 
-# shellcheck disable=SC2086
-"$cxx" $flags "$here/cpp/text_driver.cpp" "$src/chat.cpp" "$src/response.cpp" \
+build() {
+    "$cxx" -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -I"$root/native/include" "$@"
+}
+
+build "$here/cpp/text_driver.cpp" "$src/chat.cpp" "$src/response.cpp" \
     "$src/response_protocol.cpp" "$src/json.cpp" "$src/unicode.cpp" "$src/tokenizer.cpp" \
     "$src/gguf.cpp" -o "$out/text-driver"
-# shellcheck disable=SC2086
-"$cxx" $flags "$root/native/tests/response_cli_main.cpp" "$src/response_cli.cpp" \
+build "$root/native/tests/response_cli_main.cpp" "$src/response_cli.cpp" \
     "$src/response_protocol.cpp" "$src/response.cpp" "$src/json.cpp" "$src/unicode.cpp" \
     "$src/tokenizer.cpp" "$src/gguf.cpp" "$here/cpp/native_text_stub.cpp" -o "$out/response-cli"
 

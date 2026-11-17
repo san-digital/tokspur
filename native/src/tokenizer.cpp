@@ -153,6 +153,18 @@ ByteBpe::ByteBpe(BpeData data) : vocabulary_(std::move(data.vocabulary)), specia
     }
 }
 
+std::vector<uint32_t> ByteBpe::nonordinary_token_ids() const {
+    std::vector<uint32_t> ids;
+    for (const auto& marker : markers_) if (marker.id >= 0) ids.push_back(uint32_t(marker.id));
+    for (size_t id = 0; id < vocabulary_.size(); ++id) {
+        const auto& token = vocabulary_[id];
+        if (token.starts_with("[PAD") && token == "[PAD" + std::to_string(id) + "]") ids.push_back(uint32_t(id));
+    }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    return ids;
+}
+
 std::vector<uint32_t> ByteBpe::encode_piece(std::string_view bytes) const {
     if (bytes.size() > piece_limit) throw FormatError("BPE piece exceeds limit");
     if (bytes.empty()) return {};

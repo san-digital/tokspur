@@ -153,6 +153,7 @@ fn parameter_type(value: ParameterType) -> u8 {
         ParameterType::Object => 3,
         ParameterType::Array => 4,
         ParameterType::NullValue => 5,
+        ParameterType::JsonValue => 6,
     }
 }
 

@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <charconv>
 #include <cctype>
 #include <cmath>
@@ -22,6 +23,9 @@
 #include <map>
 #include <limits>
 #include <set>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace tokspur {
 namespace {
@@ -480,12 +484,44 @@ void validate_tool_value(const Json& schema, const Json& value, ToolEnumValidati
     }
 }
 
+namespace {
+constexpr size_t dump_growth = 3;
+size_t short_escape_savings(const Json& value) {
+    const auto text = [](std::string_view bytes) {
+        size_t count = 0;
+        for (const unsigned char c : bytes) {
+            if (c == 0x08 || c == 0x09 || c == 0x0a || c == 0x0c || c == 0x0d) ++count;
+        }
+        return 4 * count;
+    };
+    switch (value.kind()) {
+        case Json::Kind::string: return text(value.string());
+        case Json::Kind::array: {
+            size_t sum = 0;
+            for (const auto& item : value.array()) sum += short_escape_savings(item);
+            return sum;
+        }
+        case Json::Kind::object: {
+            size_t sum = 0;
+            for (const auto& [name, item] : value.object()) sum += text(name) + short_escape_savings(item);
+            return sum;
+        }
+        case Json::Kind::null_value:
+        case Json::Kind::boolean:
+        case Json::Kind::number:
+            return 0;
+    }
+    return 0;
+}
+} // namespace
+
 AdmittedChat admit_chat(const Json& request, std::string_view alias, ToolEnumValidation tool_enums, ToolArgValidation tool_args, uint32_t context_length) {
     static_cast<void>(tool_enum_validation_name(tool_enums));
     static_cast<void>(tool_arg_validation_name(tool_args));
     require(context_length == 65536 || context_length == 131072, "unsupported serving context length");
     const size_t max_request_bytes = context_length > 65536 ? 4 * 1024 * 1024 : 1024 * 1024;
-    static_cast<void>(request.dump(max_request_bytes));
+    const auto dumped = request.dump(dump_growth * max_request_bytes);
+    require(dumped.size() - short_escape_savings(request) <= max_request_bytes, "chat request exceeds byte limit");
     keys(request, {"model", "messages", "n", "parallel_tool_calls", "stream", "stream_options", "keep_alive", "max_tokens", "max_completion_tokens", "temperature", "top_p", "top_k", "min_p", "seed", "tools", "tool_choice", "enable_thinking", "preserve_thinking", "reasoning_effort", "thinking_budget", "chat_template_kwargs", "presence_penalty", "repetition_penalty"});
     require(field(request, "model").string() == alias, "unknown model alias");
     AdmittedChat out;
@@ -652,6 +688,9 @@ ServeSession::ServeSession(ServeCodec codec, std::string alias, std::string stac
     static_cast<void>(tool_enum_validation_name(tool_enums_));
     static_cast<void>(tool_arg_validation_name(tool_args_));
     require(bool(codec_.render) && bool(codec_.encode) && bool(codec_.decode) && !alias_.empty(), "invalid serving codec");
+    for (const auto id : codec_.nonordinary_ids) require(id < codec_.admission.vocabulary, "nonordinary token outside vocabulary");
+    std::sort(codec_.nonordinary_ids.begin(), codec_.nonordinary_ids.end());
+    codec_.nonordinary_ids.erase(std::unique(codec_.nonordinary_ids.begin(), codec_.nonordinary_ids.end()), codec_.nonordinary_ids.end());
     require(context_length_ == 65536 || context_length_ == 131072, "unsupported serving context length");
     require(stack_execution_ == "direct" || stack_execution_ == "recurrent-replay", "unsupported serving startup execution mode");
 #ifdef TOKSPUR_PRIVATE_LANE_LAYOUT
@@ -761,10 +800,34 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
         require(!modes.empty() && modes.size() <= 4 && std::any_of(modes.begin(), modes.end(), [mode](const auto& value) { return value.string() == mode; }), "sampling mode is not calibrated by measured profile");
     }
 #endif
+    const auto policy = request.sampling.dump();
+    const bool compatible_sampling = sampling_ == policy && (!request.seed || *request.seed == seed_);
     const auto rendered = codec_.render(request.render); auto prompt = codec_.encode(rendered);
     const auto matches_committed = [&](const auto& value) { return value.size() >= committed_.size() && std::equal(committed_.begin(), committed_.end(), value.begin()); };
+    // Sampling can commit a token split that re-encoding the same bytes does not reproduce. Reuse requires matching added tokens, reserved padding slots and admission markers, with equal bytes between them. Only the canonical tail after the committed terminal is appended.
+    const auto respelled_on_committed = [&](const std::vector<uint32_t>& canonical) -> std::optional<std::vector<uint32_t>> {
+        const auto frame = [&](uint32_t id) { return id == codec_.admission.im_start || codec_.admission.is_stop(id) || std::binary_search(codec_.nonordinary_ids.begin(), codec_.nonordinary_ids.end(), id); };
+        if (committed_.empty() || !codec_.admission.is_stop(committed_.back())) return std::nullopt;
+        size_t shared = 0; while (shared < committed_.size() && shared < canonical.size() && committed_[shared] == canonical[shared]) ++shared;
+        size_t live = shared, fresh = shared;
+        while (live < committed_.size()) {
+            const auto live_end = size_t(std::find_if(committed_.begin() + live, committed_.end(), frame) - committed_.begin());
+            const auto fresh_end = size_t(std::find_if(canonical.begin() + fresh, canonical.end(), frame) - canonical.begin());
+            if (live_end == committed_.size() || fresh_end == canonical.size() || committed_[live_end] != canonical[fresh_end]) return std::nullopt;
+            auto live_changed = live_end, fresh_changed = fresh_end;
+            while (live < live_changed && fresh < fresh_changed && committed_[live] == canonical[fresh]) { ++live; ++fresh; }
+            while (live < live_changed && fresh < fresh_changed && committed_[live_changed - 1] == canonical[fresh_changed - 1]) { --live_changed; --fresh_changed; }
+            if ((live < live_changed || fresh < fresh_changed) &&
+                codec_.decode(std::span<const uint32_t>(committed_).subspan(live, live_changed - live)) !=
+                    codec_.decode(std::span<const uint32_t>(canonical).subspan(fresh, fresh_changed - fresh))) return std::nullopt;
+            live = live_end + 1; fresh = fresh_end + 1;
+        }
+        auto respelled = committed_; respelled.insert(respelled.end(), canonical.begin() + fresh, canonical.end());
+        return respelled;
+    };
+    std::optional<std::vector<uint32_t>> restored;
     if (reusable_ && !matches_committed(prompt) && !saved_reasoning_.empty()) {
-        auto fields = request.render.object();
+        auto fields = request.render.object(); bool filled = false;
         for (auto& [name, value] : fields) if (name == "messages") {
             auto messages = value.array(); size_t ordinal = 0;
             for (auto& message : messages) {
@@ -775,22 +838,27 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
                     auto entry = message.object();
                     std::erase_if(entry, [](const auto& field) { return field.first == "reasoning_content"; });
                     entry.emplace_back("reasoning_content", Json(found->second)); message = Json(std::move(entry));
+                    filled = true;
                 }
                 ++ordinal;
             }
             value = Json(std::move(messages));
         }
-        auto candidate = codec_.encode(codec_.render(Json(std::move(fields))));
-        if (candidate.size() < context_length_ && matches_committed(candidate)) prompt = std::move(candidate);
+        if (filled) {
+            auto candidate = codec_.encode(codec_.render(Json(std::move(fields))));
+            if (candidate.size() < context_length_ && matches_committed(candidate)) prompt = std::move(candidate);
+            else restored = std::move(candidate);
+        }
     }
+    if (reusable_ && compatible_sampling && !matches_committed(prompt))
+        if (auto respelled = respelled_on_committed(restored ? *restored : prompt); respelled && respelled->size() < context_length_) prompt = std::move(*respelled);
     require(!prompt.empty() && prompt.size() < context_length_,
         context_length_ == 131072 ? "request leaves no generation space in the 128K context" : "request leaves no generation space in the 64K context");
     const auto maximum_tokens = std::min(request.maximum_tokens, context_length_ - uint32_t(prompt.size()));
     for (const auto id : prompt) require(id < codec_.admission.vocabulary, "rendered token outside vocabulary");
-    const auto policy = request.sampling.dump();
     const auto created_signed = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     require(created_signed >= 0, "invalid API clock"); const auto created = uint64_t(created_signed);
-    const bool append = reusable_ && sampling_ == policy && (!request.seed || *request.seed == seed_) &&
+    const bool append = reusable_ && compatible_sampling &&
         prompt.size() >= committed_.size() && std::equal(committed_.begin(), committed_.end(), prompt.begin());
     size_t cached_prefix = append ? committed_.size() : 0;
     size_t common = 0;
@@ -1546,5 +1614,147 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
         return Json(std::move(result));
 #endif
     } catch (...) { if (state_touched) invalidate(); throw; }
+}
+
+void refuse_busy_connection(http::Connection connection) noexcept {
+    try {
+        const auto body = Json(Json::Object{{"error", Json(Json::Object{
+            {"message", Json("server is busy with other connections; retry shortly")},
+            {"type", Json("server_busy")},
+            {"code", Json("server_busy")}})}}).dump(8192);
+        connection.refuse_json(503, body);
+    } catch (...) {
+        // The peer is gone or not reading; there is nobody to tell.
+    }
+}
+
+void admit_reading(std::vector<std::pair<http::Connection, http::Clock::time_point>>& reading,
+                   http::Connection connection, http::Clock::time_point now) {
+    if (reading.size() >= reading_peers) {
+        auto oldest = std::move(reading.front().first);
+        reading.erase(reading.begin());
+        refuse_busy_connection(std::move(oldest));
+    }
+    reading.emplace_back(std::move(connection), now);
+}
+
+ArrivalQueue::ArrivalQueue(size_t capacity, size_t workers)
+    : capacity_(capacity), active_workers_(workers) {}
+
+bool ArrivalQueue::hand_off(Arrival arrival) {
+    std::unique_lock lock(mutex_);
+    if (closed_ || active_workers_ == 0 || unexpected_exit_ || failure_) return false;
+    if (queue_.size() >= capacity_) {
+        auto refused = std::move(arrival.connection);
+        lock.unlock();
+        refuse_busy_connection(std::move(refused));
+        return true;
+    }
+    queue_.push_back(std::move(arrival));
+    lock.unlock();
+    condition_.notify_one();
+    return true;
+}
+
+std::optional<Arrival> ArrivalQueue::recv() {
+    std::unique_lock lock(mutex_);
+    condition_.wait(lock, [&] { return closed_ || !queue_.empty(); });
+    if (closed_) return std::nullopt;
+    Arrival next = std::move(queue_.front());
+    queue_.pop_front();
+    return next;
+}
+
+void ArrivalQueue::worker_stopped(bool orderly, std::exception_ptr failure) noexcept {
+    std::lock_guard lock(mutex_);
+    if (failure && !failure_) failure_ = failure;
+    if (!closed_ && !orderly) unexpected_exit_ = true;
+    if (active_workers_ > 0) --active_workers_;
+}
+
+void ArrivalQueue::check_workers() const {
+    std::lock_guard lock(mutex_);
+    if (failure_) std::rethrow_exception(failure_);
+    require(!unexpected_exit_ && active_workers_ > 0, "HTTP readers stopped");
+}
+
+void ArrivalQueue::close() noexcept {
+    {
+        std::lock_guard lock(mutex_);
+        closed_ = true;
+        queue_.clear();
+    }
+    condition_.notify_all();
+}
+
+namespace {
+constexpr const char* prefix_trace_full_cstr =
+    "private prefix trace is full (16 MiB bound); no request is served until the server is restarted with a new trace file";
+constexpr const char* prefix_trace_unavailable_cstr = "private prefix trace is unavailable";
+constexpr const char* prefix_trace_refused_cstr = "private prefix trace requires a new owned mode 0600 file";
+constexpr const char* prefix_trace_exists_cstr =
+    "private prefix trace requires a new file: move or remove prefix-trace.jsonl from the state directory, or start without --private-prefix-trace";
+} // namespace
+
+PrefixTraceLog::~PrefixTraceLog() {
+    if (fd_ >= 0) ::close(fd_);
+}
+
+void PrefixTraceLog::enable(int directory_fd) {
+    const int opened = ::openat(directory_fd, "prefix-trace.jsonl", O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (opened < 0) throw FormatError(errno == EEXIST ? prefix_trace_exists_cstr : prefix_trace_refused_cstr);
+    struct stat info{};
+    if (::fstat(opened, &info) != 0 || !S_ISREG(info.st_mode) || info.st_uid != ::geteuid() ||
+        info.st_nlink != 1 || (info.st_mode & 0777) != 0600) {
+        ::close(opened);
+        throw FormatError(prefix_trace_refused_cstr);
+    }
+    if (::fsync(directory_fd) != 0) {
+        ::close(opened);
+        throw FormatError("cannot persist private prefix trace entry");
+    }
+    if (fd_ >= 0) ::close(fd_);
+    fd_ = opened;
+    bytes_ = 0;
+    refusal_ = nullptr;
+}
+
+void PrefixTraceLog::write(const Json& record) {
+    if (refusal_) throw PrefixTraceError(refusal_);
+    if (fd_ < 0) {
+        refusal_ = prefix_trace_unavailable_cstr;
+        throw PrefixTraceError(prefix_trace_unavailable_cstr);
+    }
+    const auto bytes = record.dump(4 * 1024 * 1024) + '\n';
+    if (bytes.size() > prefix_trace_limit_bytes - bytes_) {
+        refusal_ = prefix_trace_full_cstr;
+        throw PrefixTraceError(prefix_trace_full_cstr);
+    }
+    size_t offset = 0;
+    while (offset < bytes.size()) {
+        const auto written = ::write(fd_, bytes.data() + offset, bytes.size() - offset);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) {
+            refusal_ = prefix_trace_unavailable_cstr;
+            throw PrefixTraceError("cannot persist private prefix trace");
+        }
+        offset += size_t(written);
+    }
+    if (::fsync(fd_) != 0) {
+        refusal_ = prefix_trace_unavailable_cstr;
+        throw PrefixTraceError("cannot persist private prefix trace");
+    }
+    bytes_ += bytes.size();
+}
+
+std::string_view job_failure_kind(const std::exception& error, bool target_started) noexcept {
+    if (dynamic_cast<const PrefixTraceError*>(&error) != nullptr) return "server_error";
+    return target_started ? "generation_failed_no_retry" : "invalid_request_error";
+}
+
+int job_failure_status(const std::exception& error, bool expired, bool target_started) noexcept {
+    if (expired) return 408;
+    if (dynamic_cast<const PrefixTraceError*>(&error) != nullptr) return 500;
+    return target_started ? 502 : 400;
 }
 } // namespace tokspur

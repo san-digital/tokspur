@@ -86,10 +86,16 @@ int main(void) {
     printf("S_IFLNK=%u\n", (unsigned)S_IFLNK);
     printf("SO_REUSEADDR=%d\n", (int)SO_REUSEADDR);
     printf("SO_ERROR=%d\n", (int)SO_ERROR);
+    printf("ENOMEM=%d\n", (int)ENOMEM);
     printf("EEXIST=%d\n", (int)EEXIST);
+    printf("ENFILE=%d\n", (int)ENFILE);
+    printf("EMFILE=%d\n", (int)EMFILE);
     printf("EINPROGRESS=%d\n", (int)EINPROGRESS);
     printf("EADDRINUSE=%d\n", (int)EADDRINUSE);
+    printf("ECONNABORTED=%d\n", (int)ECONNABORTED);
+    printf("ENOBUFS=%d\n", (int)ENOBUFS);
     printf("ECONNREFUSED=%d\n", (int)ECONNREFUSED);
+    printf("EPROTO=%d\n", (int)EPROTO);
     printf("CTL_KERN=%d\n", (int)CTL_KERN);
     printf("KERN_PROCARGS2=%d\n", (int)KERN_PROCARGS2);
     printf("PROC_PIDTBSDINFO=%d\n", (int)PROC_PIDTBSDINFO);
@@ -193,10 +199,16 @@ int main(void) {
     assert_eq!(i64::from(sdk_layout::S_IFLNK), sdk["S_IFLNK"]);
     assert_eq!(i64::from(sdk_layout::SO_REUSEADDR), sdk["SO_REUSEADDR"]);
     assert_eq!(i64::from(sdk_layout::SO_ERROR), sdk["SO_ERROR"]);
+    assert_eq!(i64::from(sdk_layout::ENOMEM), sdk["ENOMEM"]);
     assert_eq!(i64::from(sdk_layout::EEXIST), sdk["EEXIST"]);
+    assert_eq!(i64::from(sdk_layout::ENFILE), sdk["ENFILE"]);
+    assert_eq!(i64::from(sdk_layout::EMFILE), sdk["EMFILE"]);
     assert_eq!(i64::from(sdk_layout::EINPROGRESS), sdk["EINPROGRESS"]);
     assert_eq!(i64::from(sdk_layout::EADDRINUSE), sdk["EADDRINUSE"]);
+    assert_eq!(i64::from(sdk_layout::ECONNABORTED), sdk["ECONNABORTED"]);
+    assert_eq!(i64::from(sdk_layout::ENOBUFS), sdk["ENOBUFS"]);
     assert_eq!(i64::from(sdk_layout::ECONNREFUSED), sdk["ECONNREFUSED"]);
+    assert_eq!(i64::from(sdk_layout::EPROTO), sdk["EPROTO"]);
     assert_eq!(i64::from(sdk_layout::CTL_KERN), sdk["CTL_KERN"]);
     assert_eq!(i64::from(sdk_layout::KERN_PROCARGS2), sdk["KERN_PROCARGS2"]);
     assert_eq!(

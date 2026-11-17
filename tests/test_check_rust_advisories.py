@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the OSV Rust advisory check offline with canned OSV responses.
-
-Adapted from the over-show app's scripts/tests/test_check_rust_advisories.py at
-commit ecabf371a (SHA-256 785c14d5b4415c593c4f9cac85aaabb9d207acd954314278e10b33774898c921).
-"""
+"""Exercise the OSV Rust advisory check offline with canned OSV responses."""
 
 from __future__ import annotations
 

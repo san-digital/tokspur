@@ -26,7 +26,7 @@ Path(sys.argv[2]).write_text(source)
 PY
 
 set -- "$objects"/*.o
-c++ -I"$root/native/include" -DTOKSPUR_HAS_METAL=1 -std=c++20 -O2 -g -Wall -Wextra -Wpedantic \
+c++ -I"$root/native/include" -std=c++20 -O2 -g -Wall -Wextra -Wpedantic \
     -Werror -pthread "$out/test_serve_protocol_sections.cpp" "$@" -o "$out/test-serve_protocol-sections"
 "$out/test-serve_protocol-sections" > "$out/cpp.txt"
 

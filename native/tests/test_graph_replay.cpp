@@ -560,6 +560,49 @@ void mapped_lifetime(MetalGraph& g) {
         "mapped replay resource ledger did not drain");
 }
 
+void mapped_residency_lifetime(const char* library) {
+    GeneratedMappedFile file;
+    const std::array<TensorSlice, 1> slices{{{"weight", 0, 0}}};
+    std::weak_ptr<ModelFiles> last_source;
+    {
+        MetalGraph g(library, 1024 * 1024);
+        const auto initial = g.memory().live_bytes;
+        require(!g.prepare_mapped_weight_residency(), "residency prepared without imported weights");
+        bool activity_refused = false, suspend_refused = false;
+        std::thread other([&] {
+            try { g.note_weight_activity(); } catch (const FormatError&) { activity_refused = true; }
+            try { static_cast<void>(g.suspend_mapped_weight_residency()); } catch (const FormatError&) { suspend_refused = true; }
+        });
+        other.join();
+        require(activity_refused && suspend_refused, "residency accepted cross-thread graph access");
+        for (unsigned pass = 0; pass < 2; ++pass) {
+            auto source = std::make_shared<ModelFiles>(std::vector<std::filesystem::path>{file.path});
+            const auto imported = g.import_weights(source, slices, uint64_t(getpagesize()));
+            last_source = source;
+            source.reset();
+            const bool available = g.prepare_mapped_weight_residency();
+            if (available) require(g.prepare_mapped_weight_residency(), "residency preparation was not idempotent");
+            require(!g.suspend_mapped_weight_residency(), "new residency set was active before a request");
+            g.note_weight_activity();
+            // The background pressure check may have already suspended the set.
+            const bool suspended = g.suspend_mapped_weight_residency();
+            require(available || !suspended, "unavailable residency set accepted activity");
+            require(!g.suspend_mapped_weight_residency(), "suspending residency twice reported more work");
+            g.note_weight_activity();
+            require(!last_source.expired(), "residency changed ownership of imported weights");
+            if (pass == 0) {
+                for (const auto region : imported.regions) g.release(region);
+                require(last_source.expired() && g.memory().live_bytes == initial,
+                    "releasing a recently active mapping retained its owner or its charge");
+                g.note_weight_activity();
+                require(!g.suspend_mapped_weight_residency() && !g.prepare_mapped_weight_residency(),
+                    "released mapping could still renew residency");
+            }
+        }
+    }
+    require(last_source.expired(), "destroying a recently active graph retained its mapped weights");
+}
+
 // Adjacent dense Q8, plain and expert-shaped Q8 tensors exercise import grouping and shared boundary pages without model data.
 class GeneratedImportIsolationFile {
 public:
@@ -896,7 +939,7 @@ int main(int argc, char** argv) {
         if (sparse) sparse_offsets(g);
         else {
             chains(g); encoded_formats(g); dynamic_routes(g); recurrent_components(g, false); recurrent_components(g, true); safety(g, argv[1]);
-            mapped_lifetime(g); mapped_q8_isolation(g, false); mapped_q8_isolation(g, true);
+            mapped_lifetime(g); mapped_residency_lifetime(argv[1]); mapped_q8_isolation(g, false); mapped_q8_isolation(g, true);
         }
         require(g.memory().live_bytes == initial && !g.memory().live_captures && !g.memory().capture_resource_bytes &&
             !g.memory().capture_binding_aliases && !g.memory().capture_binding_alias_span_bytes && !g.memory().capture_binding_alias_resource_bytes,

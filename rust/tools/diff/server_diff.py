@@ -11,10 +11,11 @@ Compared byte for byte:
   * every byte the server wrote to the worker, and every byte it read back;
   * the server's stdout protocol lines and its exit status;
   * every raw HTTP response, headers included.
-Only two fields are random or wall-clock by design in both servers and are
-masked after a strict shape check: the `chatcmpl-<32 hex>` response ID and the
-`"created":<seconds>` value. The ephemeral port in the ready line is masked
-too. Anything else that differs is reported, never normalized.
+Only random, wall-clock or OS-assigned fields are masked after a strict shape
+check: the `chatcmpl-<32 hex>` response ID, the `"created":<seconds>` value, the
+ephemeral port in the ready line, and opt-in `"worker_pid":<pid>` /
+`"guardian_pid":<pid>` fields. Anything else that differs is reported, never
+normalized.
 
 The pinned tokenizer and template are read from TOKSPUR_DIFF_ASSETS or the derived-text directory from adoption. Shards can sit beside those files or under split/ or UD-Q4_K_XL/. Without an override, the adoption receipt supplies the shard paths.
 
@@ -31,9 +32,11 @@ import json
 import math
 import os
 import re
+import select
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -84,6 +87,7 @@ os._exit(fake.wait())
 ID = re.compile(rb"chatcmpl-[0-9a-f]{32}")
 CREATED = re.compile(rb'"created":[0-9]{1,20}')
 PORT = re.compile(rb"http://127\.0\.0\.1:[0-9]{1,5}/v1")
+PID = re.compile(rb'"(worker_pid|guardian_pid)":[1-9][0-9]{0,9}')
 # The real target's host memory telemetry (target.cpp describe(Memory)) is read from the OS on every report and differs between runs; the cohort masks exactly these fields, textually, and counts every masked value.
 HOST_FIELDS = (
     "physical_footprint_bytes", "lifetime_peak_footprint_bytes", "free_plus_inactive_hint_bytes",
@@ -281,9 +285,15 @@ class Cohort:
         self.target, self.policy, self.library = target, policy, library
 
 
+def pid_shape_ok(data: bytes) -> bool:
+    expected = data.count(b'"worker_pid":') + data.count(b'"guardian_pid":')
+    return len(PID.findall(data)) == expected
+
+
 def mask(data: bytes) -> bytes:
     data = ID.sub(b"chatcmpl-<id>", data)
     data = CREATED.sub(b'"created":<created>', data)
+    data = PID.sub(lambda m: b'"' + m.group(1) + b'":<pid>', data)
     return PORT.sub(b"http://127.0.0.1:<port>/v1", data)
 
 
@@ -428,6 +438,7 @@ def requests(key: str) -> list[tuple[str, bytes]]:
         ("thinking", post(chat(first, enable_thinking=True))),
         ("tools", post(chat(first, tools=tools))),
         ("stochastic-refused", post(chat(first, temperature=0.5))),
+        ("escaped-size-as-sent", post(chat([{"role": "user", "content": "\n" * 200_000}], temperature=0.5))),
         # The client half-closes after sending: the queued job sees the disconnect before any worker command and answers nothing.
         ("cancel-before-start", post(chat(second))),
         ("after-refusal", post(chat(branch))),
@@ -516,6 +527,50 @@ def server_args(directory: Path, channel: str, cohort: Cohort | None = None) -> 
     ]
 
 
+def pre_auth_probes(port: int, key: str) -> dict[str, bytes]:
+    """Exercise abortive RST peers, 64-peer pre-auth reading eviction (503 server_busy),
+    and non-blocking /health behind silent pre-auth peers."""
+    for _ in range(4):
+        rst = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            rst.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            rst.connect(("127.0.0.1", port))
+        finally:
+            rst.close()
+    oldest = socket.create_connection(("127.0.0.1", port), timeout=10)
+    silent: list[socket.socket] = []
+    try:
+        oldest.sendall(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1")
+        select.select([oldest], [], [], 0.01)
+        for index in range(64):
+            silent.append(socket.create_connection(("127.0.0.1", port), timeout=10))
+            if (index + 1) % 4 == 0:
+                ready, _, _ = select.select([oldest], [], [], 0.005)
+                if ready:
+                    break
+        ready, _, _ = select.select([oldest], [], [], 5.0)
+        if not ready:
+            raise RuntimeError("oldest unfinished pre-auth peer was not evicted with 503")
+        oldest.settimeout(5.0)
+        chunks = []
+        while True:
+            data = oldest.recv(4096)
+            if not data:
+                break
+            chunks.append(data)
+        while len(silent) > 4:
+            silent.pop(0).close()
+        health = exchange(
+            port,
+            f"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {key}\r\n\r\n".encode(),
+        )
+        return {"evicted-reading-peer": b"".join(chunks), "health-behind-silent-peers": health}
+    finally:
+        oldest.close()
+        for peer in silent:
+            peer.close()
+
+
 def run(server: Path, fake: Path, directory: Path, channel: str, cohort: Cohort | None = None) -> dict:
     prepare(fake, directory, cohort)
     args = [str(server), *server_args(directory, channel, cohort)]
@@ -530,7 +585,7 @@ def run(server: Path, fake: Path, directory: Path, channel: str, cohort: Cohort 
         return {"startup_failed": True, "exit": process.returncode, "stderr": stderr}
     port = int(json.loads(ready)["endpoint"].rsplit(":", 1)[1].split("/")[0])
     key = (directory / "state" / "api-key").read_text().strip()
-    responses = {}
+    responses = pre_auth_probes(port, key) if cohort is None else {}
     for name, wire in requests(key):
         responses[name] = exchange(port, wire, half_close=name.startswith("cancel"))
         time.sleep(0.05)
@@ -582,15 +637,18 @@ def startup_cases(directory: Path) -> list[tuple[str, list[str]]]:
     shard_at = len(base) - len(shard_list)
     for option, values in {
         "--model-alias": ["", "a" * 65, "bad alias", "alias.ok-1"],
-        "--request-timeout-seconds": ["0", "3601"],
+        "--request-timeout-seconds": ["0", "86401"],
         "--startup-timeout-seconds": ["0", "3601"],
         "--step-timeout-seconds": ["0", "301"],
         "--stack-execution": ["recurrent-replay", "capture"],
+        "--telemetry-stdout": ["on", "off", "yes"],
+        "--private-prefix-trace": ["on", "off", "yes"],
         "--port": ["0"],
         "--bogus": ["1"],
     }.items():
         cases += [(f"add {option}={value!r}", base[:shard_at] + [option, value] + base[shard_at:]) for value in values]
     cases += [
+        ("existing prefix-trace.jsonl", base[:shard_at] + ["--private-prefix-trace", "on"] + base[shard_at:]),
         ("trailing option without value", base[:shard_at] + base[shard_at:] + ["--port"]),
     ]
     if len(shard_list) == 1:
@@ -610,8 +668,13 @@ def startup_cases(directory: Path) -> list[tuple[str, list[str]]]:
     return cases
 
 
-def startup(server: Path, fake: Path, directory: Path, args: list[str]) -> dict:
+def startup(server: Path, fake: Path, directory: Path, args: list[str], *, existing_trace: bool = False) -> dict:
     prepare(fake, directory)
+    if existing_trace:
+        state_dir = directory / "state"
+        state_dir.mkdir(mode=0o700)
+        fd = os.open(state_dir / "prefix-trace.jsonl", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(fd)
     process = subprocess.Popen(
         [str(server), *args],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=directory, env={"PATH": "/usr/bin:/bin"},
@@ -621,7 +684,13 @@ def startup(server: Path, fake: Path, directory: Path, args: list[str]) -> dict:
     if ready:
         process.send_signal(signal.SIGTERM)
     rest, stderr = process.communicate(timeout=120)
-    return {"stdout": mask(ready + rest), "stderr": stderr, "exit": process.returncode}
+    raw = ready + rest
+    return {
+        "stdout": mask(raw),
+        "pid_shape": pid_shape_ok(raw),
+        "stderr": stderr,
+        "exit": process.returncode,
+    }
 
 
 def compare(left: dict, right: dict, cohort: bool = False) -> list[str]:
@@ -641,6 +710,8 @@ def compare(left: dict, right: dict, cohort: bool = False) -> list[str]:
                 differences.append(f"telemetry-shape:{side}:{error}")
         wires.append(host(wire))
         inputs.append(source)
+        if not pid_shape_ok(result.get("stdout", b"")):
+            differences.append(f"pid-shape:{side}")
     if inputs[0] != inputs[1]:
         differences.append("wire_in")
     if wires[0] != wires[1]:
@@ -663,9 +734,12 @@ def startup_main(args: argparse.Namespace, work: Path) -> int:
     cases = startup_cases(work)
     results = []
     for name, argv in cases:
-        cpp = startup(args.cpp.resolve(), args.fake.resolve(), work, argv)
-        rust = startup(args.rust.resolve(), args.fake.resolve(), work, argv)
+        existing_trace = name == "existing prefix-trace.jsonl"
+        cpp = startup(args.cpp.resolve(), args.fake.resolve(), work, argv, existing_trace=existing_trace)
+        rust = startup(args.rust.resolve(), args.fake.resolve(), work, argv, existing_trace=existing_trace)
         fields = [field for field in ("exit", "stdout", "stderr") if cpp[field] != rust[field]]
+        if not cpp["pid_shape"] or not rust["pid_shape"]:
+            fields.append("pid_shape")
         results.append(
             {
                 "case": name,
@@ -791,7 +865,7 @@ def main() -> int:
         for side, result in (("cpp", cpp), ("rust", rust))
         if result.get("startup_failed")
     ]
-    expected = len(list(requests("")))
+    expected = len(list(requests(""))) + (2 if cohort is None else 0)
     if not failures and (
         len(cpp["responses"]) != expected
         or len(rust["responses"]) != expected

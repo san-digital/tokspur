@@ -22,21 +22,38 @@ fn int(value: u64) -> Json {
     Json::integer(value)
 }
 
-fn generation(active: bool, remaining: u64) -> Json {
+fn generation_v2(
+    active: bool,
+    remaining: u64,
+    committed: u64,
+    emitted: u64,
+    overflow: u64,
+) -> Json {
     Json::new_object([
         ("id", int(1)),
         ("active", Json::Bool(active)),
         ("remaining", int(remaining)),
         ("pending", Json::Bool(false)),
-        ("committed", int(0)),
-        ("emitted", int(0)),
-        ("overflow", int(0)),
-        ("remaining_compute", int(remaining)),
+        ("committed", int(committed)),
+        ("emitted", int(emitted)),
+        ("overflow", int(overflow)),
+        (
+            "remaining_compute",
+            int(if active {
+                256u64.saturating_sub(committed)
+            } else {
+                0
+            }),
+        ),
         ("total_budget", int(256)),
         ("continuation_allowed", Json::Bool(true)),
         ("stop_queued", Json::Bool(false)),
         ("stop_drained", Json::Bool(false)),
     ])
+}
+
+fn generation(active: bool, remaining: u64) -> Json {
+    generation_v2(active, remaining, 0, 0, 0)
 }
 
 fn ready() -> Json {
@@ -62,6 +79,9 @@ struct Done<'a> {
     prefix: u64,
     generated: &'a [u64],
     remaining: u64,
+    committed: u64,
+    emitted: u64,
+    overflow: u64,
     stop: Option<u64>,
     counters: [u64; 8],
 }
@@ -88,7 +108,13 @@ fn done(d: &Done<'_>) -> Json {
         ("stop_id", d.stop.map_or(Json::Null, int)),
         (
             "native_mtp_generation",
-            generation(d.remaining > 0, d.remaining),
+            generation_v2(
+                d.remaining > 0,
+                d.remaining,
+                d.committed,
+                d.emitted,
+                d.overflow,
+            ),
         ),
     ];
     fields.extend(COUNTERS.iter().zip(d.counters).map(|(n, v)| (*n, int(v))));
@@ -100,15 +126,28 @@ fn previous() -> Json {
         prefix: BASE,
         generated: &[42],
         remaining: 248,
+        committed: 8,
+        emitted: 8,
+        overflow: 0,
         stop: None,
         counters: [0; 8],
     })
 }
 
 fn output_job(remaining: u64, committed: u64, emitted: u64, pending: u64) -> Json {
+    output_job_of(1, remaining, committed, emitted, pending)
+}
+
+fn output_job_of(
+    generate: u64,
+    remaining: u64,
+    committed: u64,
+    emitted: u64,
+    pending: u64,
+) -> Json {
     Json::new_object([
         ("tokens", Json::Array(Vec::new())),
-        ("generate", int(1)),
+        ("generate", int(generate)),
         ("reset", Json::Bool(false)),
         ("stop_ids", Json::Array(vec![int(STOP)])),
         (
@@ -166,6 +205,9 @@ fn stopped_packet_without_its_stop_token_is_refused() {
         prefix: BASE + 2,
         generated: &[42],
         remaining: 0,
+        committed: 10,
+        emitted: 9,
+        overflow: 1,
         stop: Some(STOP),
         counters: [1, 1, 1, 1, 1, 0, 0, 0],
     }));
@@ -187,6 +229,9 @@ fn queued_stop_is_published_by_the_next_packet() {
         prefix: BASE + 2,
         generated: &[42],
         remaining: 247,
+        committed: 10,
+        emitted: 9,
+        overflow: 1,
         stop: None,
         counters: [1, 1, 1, 1, 1, 0, 0, 0],
     });
@@ -203,6 +248,9 @@ fn queued_stop_is_published_by_the_next_packet() {
         prefix: BASE + 2,
         generated: &[STOP],
         remaining: 0,
+        committed: 10,
+        emitted: 10,
+        overflow: 0,
         stop: Some(STOP),
         counters: [1, 1, 1, 1, 1, 0, 0, 0],
     }));
@@ -216,4 +264,62 @@ fn queued_stop_is_published_by_the_next_packet() {
         second_result.is_ok(),
         "drained stop completion: {second_result:?}"
     );
+}
+
+/// The 64K context limit the fixture `ready` event negotiates by default.
+const LIMIT: u64 = 65536;
+
+/// A packet that left `overflow` committed tokens pending with the committed prefix at the context limit.
+fn previous_at_limit(overflow: u64) -> Json {
+    done(&Done {
+        prefix: LIMIT,
+        generated: &[42],
+        remaining: 2,
+        committed: 10,
+        emitted: 10 - overflow,
+        overflow,
+        stop: None,
+        counters: [1, 1, 1, 1, 1, 0, 0, 0],
+    })
+}
+
+#[test]
+fn overflow_at_the_context_limit_is_drained_by_the_last_packet() {
+    // Arrange: the committed prefix already holds the pending token, so draining it commits nothing new.
+    let (ready, previous, job) = (ready(), previous_at_limit(1), output_job(2, 10, 9, 1));
+
+    // Act
+    let admission = MtpWireReply::new(&ready, &previous, &job, false);
+
+    // Assert
+    assert!(
+        admission.is_ok(),
+        "a packet that only drains committed overflow fits the context: {:?}",
+        admission.err().map(|e| e.to_string())
+    );
+}
+
+#[test]
+fn packet_past_the_context_limit_is_still_refused_with_overflow_pending() {
+    // Arrange: one pending token plus one new token would end one past the limit.
+    let (ready, previous, job) = (ready(), previous_at_limit(1), output_job_of(2, 2, 10, 9, 1));
+
+    // Act
+    let admission = MtpWireReply::new(&ready, &previous, &job, false);
+
+    // Assert
+    let error = admission
+        .err()
+        .expect("a packet ending past the context must be refused");
+    assert_eq!(error.to_string(), "MTP packet exceeds context reservation");
+}
+
+#[test]
+fn mismatched_v2_pending_overflow_cannot_bypass_context_limit_before_submit() {
+    // Arrange: previous has overflow == 0 at LIMIT; a job claiming pending == 1 is refused before submit.
+    let (ready, previous, job) = (ready(), previous_at_limit(0), output_job(2, 10, 9, 1));
+    let error = MtpWireReply::new(&ready, &previous, &job, false)
+        .err()
+        .expect("forged pending overflow must be refused before submit");
+    assert_eq!(error.to_string(), "MTP continuation v2 frontier differs");
 }

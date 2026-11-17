@@ -81,6 +81,10 @@ void merging() {
     const auto data = fixture();
     tokspur::ByteBpe model(data);
     require(model.vocabulary_size() == 266 && model.merge_count() == 6, "BPE geometry");
+    auto padded = data;
+    padded.vocabulary.emplace_back("[PAD266]");
+    padded.vocabulary.emplace_back("[PAD999]");
+    require(tokspur::ByteBpe(padded).nonordinary_token_ids() == std::vector<uint32_t>({262, 263, 264, 266}), "all added tokens and reserved padding retain their IDs");
     require(model.encode_piece("").empty(), "empty BPE piece");
     require(model.encode_piece("abab") == std::vector<uint32_t>({259}), "ranked composition");
     require(model.encode_piece("aaaaa") == std::vector<uint32_t>({260, 97}), "leftmost overlapping merge");

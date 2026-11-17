@@ -131,6 +131,7 @@ pub struct ServeOptions {
     pub hc_consumer_fused: bool,
     pub ple_overlap: bool,
     pub shared_prefix_cache: Option<bool>,
+    pub parked_lanes_mib: u32,
     pub mtp_lookup: String,
     pub mtp_lookup_match: Option<u32>,
     pub dflash2_lookup: String,
@@ -203,6 +204,7 @@ impl Default for ServeOptions {
             hc_consumer_fused: true,
             ple_overlap: true,
             shared_prefix_cache: None,
+            parked_lanes_mib: 0,
             mtp_lookup: "off".to_owned(),
             mtp_lookup_match: None,
             dflash2_lookup: "off".to_owned(),
@@ -288,6 +290,7 @@ impl fmt::Debug for ServeOptions {
             .field("hc_consumer_fused", &self.hc_consumer_fused)
             .field("ple_overlap", &self.ple_overlap)
             .field("shared_prefix_cache", &self.shared_prefix_cache)
+            .field("parked_lanes_mib", &self.parked_lanes_mib)
             .field("mtp_lookup", &self.mtp_lookup)
             .field("mtp_lookup_match", &self.mtp_lookup_match)
             .field("dflash2_lookup", &self.dflash2_lookup)
@@ -994,6 +997,15 @@ pub fn build_carrier_flags(
     if effective_shared_prefix {
         flags.push("--shared-prefix-cache".to_owned());
         flags.push("on".to_owned());
+    }
+    if opts.parked_lanes_mib > 0 {
+        if !effective_shared_prefix {
+            return Err(CliError::Validation(
+                "--parked-lanes-mib requires the shared prefix cache".to_owned(),
+            ));
+        }
+        flags.push("--native-parked-lanes-mib".to_owned());
+        flags.push(opts.parked_lanes_mib.to_string());
     }
     if opts.mtp_lookup != "off" {
         flags.push("--native-mtp-lookup".to_owned());

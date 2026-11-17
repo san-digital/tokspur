@@ -72,6 +72,11 @@ struct Worker {
     resets: usize,
     cancel_after_input: Option<usize>,
     corrupt_prime_count: bool,
+    /// Parked conversation length the next lane prompt restores, and the lane prompt lengths seen.
+    lane: Option<u64>,
+    inherited_lane: Option<(u64, u64)>,
+    seed_opt_ins: usize,
+    lane_prompts: Vec<usize>,
 }
 
 impl Worker {
@@ -89,6 +94,10 @@ impl Worker {
             resets: 0,
             cancel_after_input: None,
             corrupt_prime_count: false,
+            lane: None,
+            inherited_lane: None,
+            seed_opt_ins: 0,
+            lane_prompts: Vec::new(),
         }
     }
 
@@ -99,21 +108,38 @@ impl Worker {
         cancelled: &Cell<bool>,
     ) -> Result<Json, ServeError> {
         let reset = get(job, "reset").boolean().unwrap();
+        if job.find("lane_inherit_seed").unwrap().is_some() {
+            assert!(reset && get(job, "lane_inherit_seed").boolean().unwrap());
+            self.seed_opt_ins += 1;
+        }
+        let inherited = if reset {
+            self.inherited_lane.take()
+        } else {
+            None
+        };
         if reset {
             self.resets += 1;
             self.position = 0;
             self.sampling = get(job, "sampling").clone();
-            self.seed = number(job, "seed");
+            self.seed = inherited.map_or_else(|| number(job, "seed"), |(seed, _)| seed);
         }
         let inputs = get(job, "tokens").array().unwrap().len() as u64;
         let generate = number(job, "generate");
         let mut ids = Vec::new();
+        let mut lane_restored = None;
+        if let Some(lane) = job.find("lane_prompt").unwrap() {
+            self.lane_prompts.push(lane.array().unwrap().len());
+            lane_restored = self.lane.take().filter(|&length| length > inputs);
+        }
         let counts = if inputs > 0 {
             assert_eq!(generate, 0);
             self.input_packets += 1;
             self.position += inputs;
             // Native restore credits logical prime calls even when it skips their execution.
             self.primes += inputs - u64::from(reset);
+            if let Some(length) = lane_restored {
+                self.position = length;
+            }
             self.inputs.pop_front().unwrap_or(Counts::Restored(0))
         } else {
             assert_eq!(generate, 1);
@@ -169,6 +195,14 @@ impl Worker {
             put(&mut done, name, value);
         }
         counts.write(&mut done, inputs);
+        if let Some((seed, tokens)) = inherited {
+            put(&mut done, "lane_seed", Json::integer(seed));
+            put(&mut done, "lane_restored_tokens", Json::integer(tokens));
+        }
+        if let Some(length) = lane_restored {
+            put(&mut done, "lane_restored_prefix", Json::integer(length));
+            put(&mut done, "continuation_allowed", Json::Bool(false));
+        }
         if inputs > 0 && self.cancel_after_input == Some(self.input_packets) {
             cancelled.set(true);
         }
@@ -177,8 +211,13 @@ impl Worker {
 }
 
 fn session() -> ServeSession {
+    session_with(false)
+}
+
+fn session_with(lane_parking: bool) -> ServeSession {
     let codec = ServeCodec {
         control_ids: Vec::new(),
+        nonordinary_ids: Vec::new(),
         render: Box::new(|request| {
             let messages = get(request, "messages").array().unwrap();
             Ok(RenderedChat {
@@ -205,6 +244,7 @@ fn session() -> ServeSession {
         codec,
         SessionOptions {
             mtp_ready: ready(),
+            lane_parking,
             ..SessionOptions::default()
         },
     )
@@ -218,6 +258,17 @@ fn complete(
     stream: bool,
     cancelled: &Cell<bool>,
 ) -> (Result<Json, ServeError>, Vec<Json>, Vec<Json>) {
+    complete_with_seed(session, worker, prompt, stream, cancelled, Some(44))
+}
+
+fn complete_with_seed(
+    session: &mut ServeSession,
+    worker: &mut Worker,
+    prompt: &str,
+    stream: bool,
+    cancelled: &Cell<bool>,
+    requested_seed: Option<u64>,
+) -> (Result<Json, ServeError>, Vec<Json>, Vec<Json>) {
     let request = Json::new_object([
         ("model", Json::from("tokspur")),
         (
@@ -228,11 +279,13 @@ fn complete(
             ])]),
         ),
         ("max_tokens", Json::integer(1)),
-        ("seed", Json::integer(44)),
         ("stream", Json::Bool(stream)),
         ("enable_thinking", Json::Bool(false)),
     ]);
     let mut request = request;
+    if let Some(seed) = requested_seed {
+        put(&mut request, "seed", Json::integer(seed));
+    }
     if stream {
         put(
             &mut request,
@@ -327,6 +380,393 @@ fn accumulates_packets_once_and_preserves_active_prefix_then_resets_request_usag
         complete(&mut session, &mut worker, "fresh", false, &cancelled);
     assert_usage(&response.unwrap(), &traces, &chunks, 0);
     assert_eq!(worker.resets, 2);
+}
+
+#[test]
+fn parked_lane_restore_past_the_first_packet_counts_as_cached_and_resumes_as_append() {
+    let (mut plain, mut parked) = (session(), session_with(true));
+    let cancelled = Cell::new(false);
+    let prompt = "x".repeat(1100);
+
+    // Off: no lane prompt is ever sent.
+    let mut worker = Worker::new([]);
+    let (response, _, _) = complete(&mut plain, &mut worker, &prompt, false, &cancelled);
+    response.unwrap();
+    assert!(worker.lane_prompts.is_empty());
+
+    // On: the fresh first packet names the whole prompt; a 700-token parked lane restores past it.
+    let mut worker = Worker::new([Counts::Restored(512)]);
+    worker.lane = Some(700);
+    let (response, traces, chunks) = complete(&mut parked, &mut worker, &prompt, false, &cancelled);
+    assert_usage(&response.unwrap(), &traces, &chunks, 700);
+    assert_eq!(worker.lane_prompts, [1100]);
+    assert_eq!(worker.input_packets, 2); // 0..512 restored to 700, then 700..1100.
+    assert_eq!(worker.resets, 1);
+    assert_eq!(parked.committed_tokens(), 1101);
+
+    // The restored conversation continues as an ordinary append with no lane prompt.
+    let appended = format!("{prompt}a{}", "y".repeat(40));
+    let (response, traces, chunks) =
+        complete(&mut parked, &mut worker, &appended, false, &cancelled);
+    assert_usage(&response.unwrap(), &traces, &chunks, 1101);
+    assert_eq!(worker.lane_prompts, [1100]);
+    assert_eq!(worker.resets, 1);
+
+    // Single-packet fresh prompts (n == prompt.len() <= 512) omit lane_prompt while still
+    // accounting for parked-lane tokens restored inside the single packet.
+    let short_prompt = "z".repeat(400);
+    worker.inputs.push_back(Counts::Restored(320));
+    let (response, traces, chunks) =
+        complete(&mut parked, &mut worker, &short_prompt, false, &cancelled);
+    assert_usage(&response.unwrap(), &traces, &chunks, 320);
+    assert_eq!(worker.lane_prompts, [1100]);
+    assert_eq!(worker.resets, 2);
+}
+
+#[test]
+fn parked_lanes_preserve_saved_thinking_across_interleaved_conversations() {
+    let codec = ServeCodec {
+        control_ids: Vec::new(),
+        nonordinary_ids: Vec::new(),
+        render: Box::new(|request| {
+            let messages = get(request, "messages").array().unwrap();
+            let mut prompt = Vec::new();
+            for msg in messages {
+                let role = get(msg, "role").string().unwrap();
+                let content = get(msg, "content").string().unwrap();
+                if role == b"user" {
+                    prompt.extend_from_slice(b"U:");
+                    prompt.extend_from_slice(content);
+                    prompt.push(b'\n');
+                } else {
+                    assert_eq!(role, b"assistant");
+                    prompt.extend_from_slice(b"<think>");
+                    if let Some(r) = msg.find("reasoning_content").unwrap()
+                        && !r.is_null()
+                    {
+                        prompt.extend_from_slice(r.string().unwrap());
+                    }
+                    prompt.extend_from_slice(b"</think>");
+                    prompt.extend_from_slice(content);
+                    prompt.extend_from_slice(b"<|im_end|>");
+                }
+            }
+            prompt.extend_from_slice(b"<think>");
+            Ok(RenderedChat {
+                prompt,
+                normalized_messages: Json::Array(Vec::new()),
+                parsed_tool_arguments: 0,
+                hoisted_system_messages: 0,
+                literal_ranges: Vec::new(),
+            })
+        }),
+        encode: Box::new(|text| {
+            let mut out = Vec::new();
+            let s = &text.prompt;
+            let mut i = 0;
+            while i < s.len() {
+                if s[i..].starts_with(b"</think>") {
+                    out.push(2000);
+                    i += b"</think>".len();
+                } else if s[i..].starts_with(b"<|im_end|>") {
+                    out.push(1000);
+                    i += b"<|im_end|>".len();
+                } else {
+                    out.push(u32::from(s[i]));
+                    i += 1;
+                }
+            }
+            Ok(out)
+        }),
+        decode: Box::new(|ids| {
+            let mut out = Vec::new();
+            for &id in ids {
+                match id {
+                    1000 => out.extend_from_slice(b"<|im_end|>"),
+                    1001 => out.extend_from_slice(b"<|endoftext|>"),
+                    2000 => out.extend_from_slice(b"</think>"),
+                    _ => out.push(u8::try_from(id).unwrap()),
+                }
+            }
+            Ok(out)
+        }),
+        admission: ResponseAdmission {
+            vocabulary: 4096,
+            im_end: 1000,
+            end_of_text: 1001,
+            im_start: 1002,
+        },
+    };
+    let mut session = ServeSession::new(
+        codec,
+        SessionOptions {
+            mtp_ready: ready(),
+            lane_parking: true,
+            ..SessionOptions::default()
+        },
+    )
+    .unwrap();
+
+    let mut lifetime_primes = 0u64;
+    let mut gen_id = 0u64;
+    let mut run_turn = |session: &mut ServeSession,
+                        messages: Vec<Json>,
+                        think_out: &[u8],
+                        ans_out: &[u8],
+                        restored_prefix: u64|
+     -> (Json, Vec<u32>) {
+        let request = Json::new_object([
+            ("model", Json::from("tokspur")),
+            ("messages", Json::Array(messages)),
+            ("max_tokens", Json::integer(32)),
+            ("seed", Json::integer(44)),
+            ("stream", Json::Bool(false)),
+            ("enable_thinking", Json::Bool(true)),
+        ]);
+        let mut out_tokens: VecDeque<u32> = think_out.iter().map(|&b| u32::from(b)).collect();
+        out_tokens.push_back(2000); // </think>
+        out_tokens.extend(ans_out.iter().map(|&b| u32::from(b)));
+        out_tokens.push_back(1000); // <|im_end|>
+
+        let mut position = 0u64;
+        let mut sampling = Json::Null;
+        let mut submitted_prompt: Vec<u32> = Vec::new();
+        let mut target = |job: &Json, event: TokenCallback<'_>| -> Result<Json, ServeError> {
+            let reset = get(job, "reset").boolean().unwrap();
+            if reset {
+                position = 0;
+                sampling = get(job, "sampling").clone();
+            }
+            let toks = get(job, "tokens").array().unwrap();
+            let inputs = toks.len() as u64;
+            let generate = number(job, "generate") as usize;
+            let mut ids = Vec::new();
+            let mut status = "prefilled";
+            let mut stop_id = Json::Null;
+            let mut cont_allowed = true;
+            let mut restored_field = None;
+            if inputs > 0 {
+                for t in toks {
+                    submitted_prompt.push(t.unsigned_integer().unwrap() as u32);
+                }
+                position += inputs;
+                lifetime_primes += inputs - u64::from(reset);
+                if reset && restored_prefix > 0 {
+                    restored_field = Some((restored_prefix, inputs - restored_prefix));
+                }
+            } else {
+                let gen_meta = get(job, "mtp_generation");
+                gen_id = number(gen_meta, "id");
+                let rem = number(gen_meta, "remaining");
+                status = "length";
+                for _ in 0..generate {
+                    let tok = out_tokens.pop_front().unwrap();
+                    position += 1;
+                    lifetime_primes += 1;
+                    ids.push(Json::integer(u64::from(tok)));
+                    event(&Json::new_object([
+                        ("event", Json::from("token")),
+                        ("id", Json::integer(u64::from(tok))),
+                        ("committed_prefix", Json::integer(position)),
+                        ("entropy_words", Json::integer(0)),
+                    ]))?;
+                    if tok == 1000 {
+                        status = "stopped";
+                        stop_id = Json::integer(1000);
+                        cont_allowed = false;
+                        break;
+                    }
+                }
+                let next_rem = if status == "stopped" {
+                    0
+                } else {
+                    rem - ids.len() as u64
+                };
+                let _ = next_rem;
+            }
+            let next_rem = if inputs > 0 || status == "stopped" {
+                0
+            } else {
+                number(get(job, "mtp_generation"), "remaining") - ids.len() as u64
+            };
+            let mut sampled = sampling.clone();
+            for (name, value) in [
+                ("valid", Json::Bool(true)),
+                ("entropy_prefix", Json::integer(position)),
+                ("entropy_words", Json::integer(0)),
+                ("seed", Json::integer(44)),
+            ] {
+                put(&mut sampled, name, value);
+            }
+            let mut done = ready();
+            for (name, value) in [
+                ("event", Json::from("done")),
+                ("committed_prefix", Json::integer(position)),
+                ("generated_ids", Json::Array(ids)),
+                ("sampling", sampled),
+                ("status", Json::from(status)),
+                ("stop_id", stop_id),
+                ("continuation_allowed", Json::Bool(cont_allowed)),
+                ("native_mtp_prime_calls", Json::integer(lifetime_primes)),
+                (
+                    "native_mtp_generation",
+                    Json::new_object([
+                        ("id", Json::integer(gen_id)),
+                        ("active", Json::Bool(next_rem > 0)),
+                        ("remaining", Json::integer(next_rem)),
+                        ("pending", Json::Bool(false)),
+                    ]),
+                ),
+            ] {
+                put(&mut done, name, value);
+            }
+            if let Some((r, rep)) = restored_field {
+                put(&mut done, "checkpoint_restored_tokens", Json::integer(r));
+                put(&mut done, "replayed_input_tokens", Json::integer(rep));
+            }
+            Ok(done)
+        };
+        let mut check_cancelled = || false;
+        let mut new_seed = || 44;
+        let mut sink = ServeSink {
+            chunk: None,
+            cancelled: &mut check_cancelled,
+            new_seed: &mut new_seed,
+            prefix_trace: None,
+        };
+        let resp = session
+            .complete(&request, b"parked-think", &mut target, &mut sink)
+            .unwrap();
+        (resp, submitted_prompt)
+    };
+
+    let msg = |role: &str, content: &str| {
+        Json::new_object([("role", Json::from(role)), ("content", Json::from(content))])
+    };
+
+    // Turn A1: generates reasoning "planA" and content "ansA".
+    let (_, _) = run_turn(
+        &mut session,
+        vec![msg("user", "alpha")],
+        b"planA",
+        b"ansA",
+        0,
+    );
+    let a1_committed = session.committed_tokens() as u64;
+
+    // Turn B1 (short single-packet request): switches lanes, parking A1's saved reasoning.
+    let (_, _) = run_turn(
+        &mut session,
+        vec![msg("user", "beta")],
+        b"planB",
+        b"ansB",
+        0,
+    );
+    let b1_committed = session.committed_tokens() as u64;
+
+    // Turn A2 (content-only client omits reasoning_content): parked reasoning restores "planA"
+    // so the encoded prompt starts with A1's exact committed token IDs.
+    let (resp_a2, prompt_a2) = run_turn(
+        &mut session,
+        vec![
+            msg("user", "alpha"),
+            msg("assistant", "ansA"),
+            msg("user", "nextA"),
+        ],
+        b"planA2",
+        b"ansA2",
+        a1_committed,
+    );
+    assert_eq!(cached(&resp_a2), a1_committed);
+    assert!(
+        prompt_a2
+            .windows(b"planA".len())
+            .any(|w| w == b"planA".map(u32::from)),
+        "restored prompt must include parked reasoning from A1"
+    );
+
+    // Turn B2 (content-only client omits reasoning_content): B1's parked reasoning also restores.
+    let (resp_b2, prompt_b2) = run_turn(
+        &mut session,
+        vec![
+            msg("user", "beta"),
+            msg("assistant", "ansB"),
+            msg("user", "nextB"),
+        ],
+        b"planB2",
+        b"ansB2",
+        b1_committed,
+    );
+    assert_eq!(cached(&resp_b2), b1_committed);
+    assert!(
+        prompt_b2
+            .windows(b"planB".len())
+            .any(|w| w == b"planB".map(u32::from)),
+        "restored prompt must include parked reasoning from B1"
+    );
+
+    // Edited assistant content must NOT inject A1's parked reasoning.
+    let (_, tampered_prompt) = run_turn(
+        &mut session,
+        vec![
+            msg("user", "alpha"),
+            msg("assistant", "EDITED"),
+            msg("user", "nextA"),
+        ],
+        b"planT",
+        b"ansT",
+        0,
+    );
+    assert!(
+        !tampered_prompt
+            .windows(b"planA".len())
+            .any(|w| w == b"planA".map(u32::from)),
+        "edited history must not inherit parked reasoning"
+    );
+}
+
+#[test]
+fn implicit_seed_is_adopted_only_on_an_opted_in_parked_restore() {
+    let cancelled = Cell::new(false);
+    for (size, restored) in [(300, 200), (1100, 700)] {
+        let prompt = "x".repeat(size);
+        let mut session = session_with(true);
+        let mut worker = Worker::new([Counts::Restored(restored.min(512))]);
+        worker.lane = Some(restored);
+        worker.inherited_lane = Some((99, restored));
+        let (response, traces, chunks) =
+            complete_with_seed(&mut session, &mut worker, &prompt, false, &cancelled, None);
+        assert_usage(&response.unwrap(), &traces, &chunks, restored);
+        // An explicit request for the inherited seed can append only if the session retained it.
+        let next = format!("{prompt}ay");
+        let (response, _, _) = complete_with_seed(
+            &mut session,
+            &mut worker,
+            &next,
+            false,
+            &cancelled,
+            Some(99),
+        );
+        assert_eq!(cached(&response.unwrap()), (size + 1) as u64);
+        assert_eq!((worker.resets, worker.seed_opt_ins), (1, 1));
+    }
+
+    // An unsolicited report with the very same seed must still be refused.
+    let mut session = session_with(true);
+    let mut worker = Worker::new([Counts::Restored(2)]);
+    worker.inherited_lane = Some((44, 2));
+    let (result, _, _) = complete(&mut session, &mut worker, "fresh", false, &cancelled);
+    assert!(result.is_err());
+    assert_eq!(session.committed_tokens(), 0);
+    assert_eq!(worker.seed_opt_ins, 0);
+
+    // A seedless cache miss keeps the fresh seed supplied for the reset.
+    let (result, _, _) =
+        complete_with_seed(&mut session, &mut worker, "fresh", false, &cancelled, None);
+    assert_eq!(cached(&result.unwrap()), 0);
+    let (result, _, _) = complete(&mut session, &mut worker, "freshax", false, &cancelled);
+    assert_eq!(cached(&result.unwrap()), 6);
+    assert_eq!(worker.seed_opt_ins, 1);
 }
 
 #[test]
@@ -478,6 +918,7 @@ fn first_output_packet_streams_early_then_switches_to_steady_state_64_packets() 
 
     let make_codec = || ServeCodec {
         control_ids: Vec::new(),
+        nonordinary_ids: Vec::new(),
         render: Box::new(|request| {
             let messages = get(request, "messages").array().unwrap();
             Ok(RenderedChat {
@@ -755,6 +1196,7 @@ fn thinking_budget_mtp_v2_forced_close_and_natural_exit_within_one_generation() 
 
     let make_codec = || ServeCodec {
         control_ids: Vec::new(),
+        nonordinary_ids: Vec::new(),
         render: Box::new(|request| {
             let messages = get(request, "messages").array().unwrap();
             Ok(RenderedChat {

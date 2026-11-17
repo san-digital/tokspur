@@ -123,6 +123,24 @@ pub fn open_files_limit() -> io::Result<u64> {
     Ok(limit.rlim_cur)
 }
 
+/// `setrlimit(RLIMIT_NOFILE)`: updates the soft limit while preserving `rlim_max`.
+pub fn set_open_files_limit(soft: u64) -> io::Result<()> {
+    let mut limit = ffi::Rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is writable storage of the expected layout.
+    if unsafe { ffi::getrlimit(ffi::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    limit.rlim_cur = soft;
+    // SAFETY: `limit` points to an initialised Darwin rlimit structure.
+    if unsafe { ffi::setrlimit(ffi::RLIMIT_NOFILE, &limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// `access(path, X_OK) == 0`.
 pub fn is_executable(path: &std::ffi::CStr) -> bool {
     // SAFETY: `path` is NUL-terminated.

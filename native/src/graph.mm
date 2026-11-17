@@ -57,6 +57,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <sys/sysctl.h>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -195,6 +198,8 @@ bool lane_kernel(const char* name) {
         std::strcmp(name, "nax_m8_moe_down") == 0 ||
         std::strcmp(name, "graph_grouped_mm_f32") == 0 ||
         std::strcmp(name, "graph_hc_down_q8_window") == 0 ||
+        std::strcmp(name, "prefill_hc_down_q8_w4_r16") == 0 ||
+        std::strcmp(name, "prefill_hc_down_q8_w8_r32") == 0 ||
         std::strncmp(name, "verify_fused_hc_q8_", 19) == 0 ||
         std::strcmp(name, "graph_lanes_q8_many_1") == 0 || std::strcmp(name, "graph_lanes_q8_many_2") == 0 ||
         std::strcmp(name, "graph_lanes_q8_many_4") == 0 || std::strcmp(name, "graph_lanes_q8_many_8") == 0 ||
@@ -308,6 +313,95 @@ uint32_t pick_nax_m8_bf16_splits(uint32_t columns, uint32_t out_cols) {
     return 1u;
 }
 #endif
+// On macOS the driver can unwind even an explicitly requested residency set
+// between submissions. Renew only while a recently active client may return.
+class MappedWeightResidency {
+public:
+    explicit MappedWeightResidency(id<MTLResidencySet> set)
+        : set_(set), worker_([this] { run(); }) {}
+
+    ~MappedWeightResidency() {
+        {
+            std::lock_guard lock(mutex_);
+            stopping_ = true;
+        }
+        changed_.notify_one();
+        worker_.join();
+    }
+
+    void note_activity() {
+        std::lock_guard lock(mutex_);
+        const bool was_idle = deadline_ == Clock::time_point{};
+        deadline_ = Clock::now() + std::chrono::seconds(30);
+        if (was_idle) changed_.notify_one();
+    }
+
+    bool suspend() {
+        std::unique_lock lock(mutex_);
+        if (deadline_ == Clock::time_point{} && !renewing_) return false;
+        deadline_ = {};
+        suspend_ = true;
+        changed_.notify_one();
+        changed_.wait(lock, [&] { return !suspend_; });
+        return true;
+    }
+
+private:
+    static bool normal_memory_pressure() {
+        unsigned pressure = 0;
+        size_t size = sizeof(pressure);
+        return sysctlbyname("kern.memorystatus_vm_pressure_level", &pressure, &size, nullptr, 0) == 0 &&
+            size == sizeof(pressure) && pressure == 1;
+    }
+
+    void run() {
+        bool resident = false;
+        std::unique_lock lock(mutex_);
+        for (;;) {
+            changed_.wait(lock, [&] { return stopping_ || suspend_ || deadline_ != Clock::time_point{}; });
+            const auto now = Clock::now();
+            if (stopping_ || suspend_ || now >= deadline_) {
+                deadline_ = {};
+                lock.unlock();
+                if (resident) [set_ endResidency];
+                lock.lock();
+                resident = false;
+                renewing_ = false;
+                suspend_ = false;
+                changed_.notify_all();
+                if (stopping_) return;
+                continue;
+            }
+
+            // A driver call may itself take time. Publishing a completed packet
+            // only moves the deadline and must never wait for that call.
+            renewing_ = true;
+            lock.unlock();
+            const bool normal = normal_memory_pressure();
+            @autoreleasepool {
+                if (normal) [set_ requestResidency];
+                else if (resident) [set_ endResidency];
+            }
+            lock.lock();
+            resident = normal;
+            if (!normal) {
+                deadline_ = {};
+                renewing_ = false;
+            }
+            changed_.wait_until(lock, std::min(deadline_, now + std::chrono::seconds(1)),
+                [&] { return stopping_ || suspend_; });
+        }
+    }
+
+    id<MTLResidencySet> set_;
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    Clock::time_point deadline_{};
+    bool renewing_ = false;
+    bool suspend_ = false;
+    bool stopping_ = false;
+    std::thread worker_;
+};
 } // namespace
 
 struct MetalGraph::Impl {
@@ -327,6 +421,7 @@ struct MetalGraph::Impl {
     };
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
+    std::unique_ptr<MappedWeightResidency> mapped_weight_residency;
     id<MTLLibrary> library;
     id<MTLBuffer> error_flag;
     id<MTLCommandBuffer> command;
@@ -1325,7 +1420,9 @@ struct MetalGraph::Impl {
             || (minimum_threads == 32 && (std::strcmp(name, "qsa_prefill_attention_partial128") == 0 || std::strcmp(name, "qsa_prefill_attention_reduce") == 0))
 #endif
 #ifdef TOKSPUR_PRIVATE_HC_DOWN_WINDOW
-            || (minimum_threads == 256 && std::strcmp(name, "graph_hc_down_q8_window") == 0)
+            || (minimum_threads == 256 && (std::strcmp(name, "graph_hc_down_q8_window") == 0 ||
+                std::strcmp(name, "prefill_hc_down_q8_w4_r16") == 0 ||
+                std::strcmp(name, "prefill_hc_down_q8_w8_r32") == 0))
 #endif
 #ifdef TOKSPUR_PRIVATE_QSA_SPARSE
             || ((minimum_threads == 256 || minimum_threads == 512 || minimum_threads == 1024) && std::strncmp(name, "qsa_sparse_attention", 20) == 0)
@@ -1945,10 +2042,44 @@ MetalGraph::~MetalGraph() {
     impl_->command = nil;
     // Imported buffers have nil mmap deallocators: drop every indirect command
     // and binding reference before allocation/source owners can be destroyed.
+    impl_->mapped_weight_residency.reset();
     impl_->draft.commands = nil; impl_->draft.parameters = nil;
     impl_->captures.clear();
     impl_->draft.aliases.clear();
     for (auto& allocation : impl_->allocations) allocation.capture_aliases.clear();
+}
+
+bool MetalGraph::prepare_mapped_weight_residency() {
+    auto& p = *impl_;
+    p.idle();
+    if (@available(macOS 15.0, *)) {
+        if (p.mapped_weight_residency) return true;
+        if (!p.ledger.imported_backing_bytes) return false;
+        MTLResidencySetDescriptor* descriptor = [MTLResidencySetDescriptor new];
+        descriptor.label = @"parked chat model weights";
+        id<MTLResidencySet> set = [p.device newResidencySetWithDescriptor:descriptor error:nullptr];
+        if (!set) return false;
+        for (const auto& item : p.allocations) {
+            if (item.source && item.buffer) [set addAllocation:item.buffer];
+        }
+        [set commit];
+        try {
+            p.mapped_weight_residency = std::make_unique<MappedWeightResidency>(set);
+        } catch (const std::system_error&) {
+            // Thread creation can fail on a loaded host. Ordinary submission still works.
+            return false;
+        }
+        return true;
+    }
+    return false;
+}
+void MetalGraph::note_weight_activity() {
+    impl_->thread_check();
+    if (impl_->mapped_weight_residency) impl_->mapped_weight_residency->note_activity();
+}
+bool MetalGraph::suspend_mapped_weight_residency() {
+    impl_->thread_check();
+    return impl_->mapped_weight_residency && impl_->mapped_weight_residency->suspend();
 }
 
 GpuView MetalGraph::zeros(uint64_t bytes, std::string label) { return impl_->allocate(bytes, std::move(label), false, nullptr); }
@@ -2457,7 +2588,10 @@ void MetalGraph::release(GpuView full_buffer) {
     }
     impl_->allocations[full_buffer.slot].capture_aliases.clear();
     impl_->ledger.live_bytes -= item.charged;
-    if (item.source) impl_->ledger.imported_backing_bytes -= item.requested;
+    if (item.source) {
+        impl_->mapped_weight_residency.reset();
+        impl_->ledger.imported_backing_bytes -= item.requested;
+    }
     impl_->allocations[full_buffer.slot].buffer = nil;
     impl_->allocations[full_buffer.slot].source.reset();
     for (const auto& owned_alloc : owned_t64_to_release) release(owned_alloc);
@@ -6178,9 +6312,20 @@ void MetalGraph::prefill_hc_down_batch(GpuView weights, GpuRowsF32 input, GpuRow
     separate(output.view, {weights, input.view});
     const uint32_t layout_flag = (layout == PrefillWeightLayout::q8_lanes_v1) ? 1u : 0u;
     const HcDownWindowArgs args{input.columns, output.columns, input.rows, layout_flag, input.stride_bytes, output.stride_bytes};
-    p.select("graph_hc_down_q8_window", uint32_t(-1), {input.columns, output.columns, input.rows, 0}, 256);
+    const char* kernel_name = "graph_hc_down_q8_window";
+    uint32_t gx = 20u, w_tok = 16u;
+    if (input.rows <= (layout_flag ? 96u : 64u)) {
+        kernel_name = "prefill_hc_down_q8_w4_r16";
+        gx = 20u;
+        w_tok = 4u;
+    } else if (layout_flag == 1u) {
+        kernel_name = "prefill_hc_down_q8_w8_r32";
+        gx = 10u;
+        w_tok = 8u;
+    }
+    p.select(kernel_name, uint32_t(-1), {input.columns, output.columns, input.rows, 0}, 256);
     p.bind(weights, 0); p.bind(input.view, 1); p.bind(output.view, 2, true); p.parameter(args, 3);
-    p.dispatch(true, MTLSizeMake(20, (input.rows + 15u) / 16u, 1), MTLSizeMake(256, 1, 1));
+    p.dispatch(true, MTLSizeMake(gx, (input.rows + w_tok - 1u) / w_tok, 1), MTLSizeMake(256, 1, 1));
 }
 void MetalGraph::record_prefill_moe_chunk(uint32_t rows, bool used_batch_top10, bool top10_fallback, bool used_batch_mixture, bool mixture_fallback) {
     auto& p = *impl_; p.thread_check();
@@ -6243,8 +6388,8 @@ bool MetalGraph::prefill_hc_down_window() const { impl_->thread_check(); return 
 uint64_t MetalGraph::hc_down_window_encoded() const { impl_->thread_check(); return impl_->hc_down_window_encoded; }
 void MetalGraph::prepare_hc_down_window() {
     auto& p = *impl_; p.idle();
-    {
-        const auto pipeline = p.pipeline("graph_hc_down_q8_window", uint32_t(-1), 256);
+    for (const char* kname : {"graph_hc_down_q8_window", "prefill_hc_down_q8_w4_r16", "prefill_hc_down_q8_w8_r32"}) {
+        const auto pipeline = p.pipeline(kname, uint32_t(-1), 256);
         require(pipeline.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength, "HC down window threadgroup memory capability");
     }
     if (p.hc_down_window_enabled) {

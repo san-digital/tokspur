@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import re
+import tokenize
 import tomllib
 import urllib.request
 from pathlib import Path, PurePosixPath
@@ -16,10 +18,20 @@ ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = "native/third_party/sources.json"
 MAX_SOURCE = 5 << 20
 PROJECT = re.compile(
-    r"llama\.cpp|oMLX|mlx-vlm|Splash|m5-max-kernels|ggml authors", re.I
+    r"llama\.cpp|oMLX|mlx-vlm|Splash|m5-max-kernels|z-lab/dflash|ggml authors", re.I
 )
 COMMENTS = re.compile(r"/\*.*?\*/|//[^\n]*", re.S)
 SOURCE_SUFFIXES = {".cpp", ".hpp", ".h", ".metal", ".mm", ".inc"}
+
+
+def source_comments(text: str, suffix: str) -> list[str]:
+    if suffix == ".py":
+        return [
+            tok.string
+            for tok in tokenize.generate_tokens(io.StringIO(text).readline)
+            if tok.type == tokenize.COMMENT
+        ]
+    return COMMENTS.findall(text)
 
 
 def need(condition: bool, message: str) -> None:
@@ -79,6 +91,10 @@ def validate(root: Path, *, fetch: bool = False, opener=None) -> dict:
             "source pin must distinguish an import claim from a comparison",
         )
         need(
+            project.get("distribution", "runtime") in {"runtime", "source-only"},
+            "source project distribution must be runtime or source-only",
+        )
+        need(
             digest(local_bytes(root, project["licence_file"]))
             == project["licence_sha256"],
             "bundled licence differs from source record",
@@ -105,9 +121,10 @@ def validate(root: Path, *, fetch: bool = False, opener=None) -> dict:
                 fetched += 1
 
     listed = {}
-    for key, prefix, kind in (
-        ("native_files", "native/", "native"),
-        ("rust_files", "rust/", "Rust"),
+    for key, prefix, kind, runtime_shipped in (
+        ("native_files", "native/", "native", True),
+        ("rust_files", "rust/", "Rust", True),
+        ("drafter_files", "drafter/", "drafter", False),
     ):
         for entry in manifest.get(key, []):
             name = entry["path"]
@@ -119,6 +136,14 @@ def validate(root: Path, *, fetch: bool = False, opener=None) -> dict:
                 f"{kind} source review has drifted",
             )
             need(set(entry["sources"]) <= projects.keys(), "unknown source project")
+            if runtime_shipped:
+                need(
+                    all(
+                        projects[source].get("distribution", "runtime") == "runtime"
+                        for source in entry["sources"]
+                    ),
+                    "runtime source cites a source-only project",
+                )
             need(
                 entry["status"]
                 in {"recorded-adaptation", "reviewed-baseline", "unresolved"},
@@ -130,12 +155,16 @@ def validate(root: Path, *, fetch: bool = False, opener=None) -> dict:
         ("native/src", SOURCE_SUFFIXES, "native"),
         ("native/include", SOURCE_SUFFIXES, "native"),
         ("rust/crates", {".rs"}, "Rust"),
+        ("drafter", {".py"}, "drafter"),
     ):
         for path in (root / directory).rglob("*"):
             if path.suffix not in suffixes or not path.is_file():
                 continue
             text = local_bytes(root, path.relative_to(root).as_posix()).decode("utf-8")
-            if any(PROJECT.search(comment) for comment in COMMENTS.findall(text)):
+            if any(
+                PROJECT.search(comment)
+                for comment in source_comments(text, path.suffix)
+            ):
                 need(
                     path.relative_to(root).as_posix() in listed,
                     f"credited {kind} source is unrecorded",
@@ -247,6 +276,7 @@ def validate(root: Path, *, fetch: bool = False, opener=None) -> dict:
         "projects": len(projects),
         "native_files": len(manifest["native_files"]),
         "rust_files": len(manifest.get("rust_files", [])),
+        "drafter_files": len(manifest.get("drafter_files", [])),
         "upstream_files_fetched": fetched,
         "unresolved": [gap["id"] for gap in gaps],
         "retired_source_claims": [

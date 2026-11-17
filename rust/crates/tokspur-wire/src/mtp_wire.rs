@@ -300,14 +300,28 @@ pub fn mtp_generation_command(value: &Json) -> Result<MtpGenerationCommand> {
                 ],
             )?;
             out.v2 = true;
+            need(
+                committed <= 131_072 && emitted <= 131_072 && pending <= 131_072,
+                "MTP generation v2 counter bound exceeded",
+            )?;
             out.committed = committed as u32;
             out.emitted = emitted as u32;
             out.pending = pending as u32;
             if let Some(rc) = value.find("remaining_compute")? {
-                out.remaining_compute = rc.unsigned_integer()? as u32;
+                let rc_val = rc.unsigned_integer()?;
+                need(
+                    rc_val <= 131_072,
+                    "MTP generation remaining_compute bound exceeded",
+                )?;
+                out.remaining_compute = rc_val as u32;
             }
             if let Some(tb) = value.find("total_budget")? {
-                out.total_budget = tb.unsigned_integer()? as u32;
+                let tb_val = tb.unsigned_integer()?;
+                need(
+                    tb_val <= 131_072,
+                    "MTP generation total_budget bound exceeded",
+                )?;
+                out.total_budget = tb_val as u32;
             }
             if let Some(sc) = value.find("stage_a_controller")? {
                 need(
@@ -319,10 +333,17 @@ pub fn mtp_generation_command(value: &Json) -> Result<MtpGenerationCommand> {
                     ctrl.ewma_alpha1 = real_value(ea)?;
                 }
                 if let Some(cm) = sc.find("current_mode")? {
-                    ctrl.current_mode = cm.unsigned_integer()? as u8;
+                    let mode = cm.unsigned_integer()?;
+                    need(mode <= 255, "controller current_mode outside byte range")?;
+                    ctrl.current_mode = mode as u8;
                 }
                 if let Some(co) = sc.find("consecutive_ordinary_steps")? {
-                    ctrl.consecutive_ordinary_steps = co.unsigned_integer()? as u8;
+                    let steps = co.unsigned_integer()?;
+                    need(
+                        steps <= 255,
+                        "controller consecutive_ordinary_steps outside byte range",
+                    )?;
+                    ctrl.consecutive_ordinary_steps = steps as u8;
                 }
                 if let Some(cpd) = sc.find("controller_policy_digest")? {
                     need(
@@ -829,6 +850,9 @@ pub struct MtpWireReply<'a> {
     stopped: bool,
     finished: bool,
     restored_input_tokens: u32,
+    lane_prompt: u32,
+    lane_restored_prefix: u32,
+    lane_seed: Option<u64>,
     final_input_logits: bool,
     final_input: bool,
     last_words: u64,
@@ -868,13 +892,22 @@ impl<'a> MtpWireReply<'a> {
                     "seed",
                     "mtp_generation",
                     "prefill_final",
+                    "lane_prompt",
+                    "lane_inherit_seed",
                 ],
             )?;
         } else {
             keys(
                 job,
                 &[
-                    "tokens", "generate", "reset", "stop_ids", "sampling", "seed",
+                    "tokens",
+                    "generate",
+                    "reset",
+                    "stop_ids",
+                    "sampling",
+                    "seed",
+                    "lane_prompt",
+                    "lane_inherit_seed",
                 ],
             )?;
         }
@@ -891,6 +924,12 @@ impl<'a> MtpWireReply<'a> {
         let tokens = get(job, "tokens")?.array()?;
         let inputs = tokens.len() as u32;
         let outputs = integer(job, "generate")?;
+        if let Some(inherit) = job.find("lane_inherit_seed")? {
+            need(
+                inherit.boolean()? && reset && inputs > 0 && outputs == 0,
+                "MTP lane seed inheritance requires a fresh input packet",
+            )?;
+        }
 
         let input_packet_limit = mtp_input_packet(ready)?;
         let output_packet_limit = mtp_output_packet(ready)?;
@@ -961,11 +1000,12 @@ impl<'a> MtpWireReply<'a> {
                 "invalid MTP pending overflow bound",
             )?;
             position -= pending_overflow;
-            pending_tokens = pending_overflow;
+            pending_tokens = pending_overflow.min(maximum);
             round_end = base;
         }
+        // Measure from the emitted frontier: pending overflow is already inside the committed prefix.
         need(
-            u64::from(base) + u64::from(inputs) + u64::from(maximum) <= context_limit,
+            u64::from(position) + u64::from(inputs) + u64::from(maximum) <= context_limit,
             "MTP packet exceeds context reservation",
         )?;
 
@@ -989,6 +1029,14 @@ impl<'a> MtpWireReply<'a> {
         let mut carry = false;
         let mut discarded = 0u64;
         if scoped {
+            let scope_bytes = get(ready, "native_mtp_carry_scope")?.string()?;
+            if let Some(prev_scope) = previous.find("native_mtp_carry_scope")? {
+                need(
+                    prev_scope.string()? == scope_bytes,
+                    "MTP previous carry scope differs",
+                )?;
+            }
+            let is_v2_scope = scope_bytes == b"http-generation-v2";
             let previous_generation = get(previous, "native_mtp_generation")?;
             let previous_id = integer(previous_generation, "id")?;
             let previous_remaining = integer(previous_generation, "remaining")?;
@@ -1013,6 +1061,10 @@ impl<'a> MtpWireReply<'a> {
                     discarded = if pending { 1 } else { 0 };
                 } else {
                     need(
+                        generation.v2 == is_v2_scope,
+                        "MTP generation packet version differs from carry scope",
+                    )?;
+                    need(
                         u64::from(generation.remaining) >= u64::from(maximum),
                         "MTP packet exceeds remaining generation budget",
                     )?;
@@ -1021,6 +1073,14 @@ impl<'a> MtpWireReply<'a> {
                             !active && generation.id > previous_id,
                             "MTP overlapping/stale generation begin",
                         )?;
+                        if generation.v2 {
+                            need(
+                                generation.committed == 0
+                                    && generation.emitted == 0
+                                    && generation.pending == 0,
+                                "MTP generation begin must start with empty frontier",
+                            )?;
+                        }
                     } else {
                         need(
                             active
@@ -1028,6 +1088,19 @@ impl<'a> MtpWireReply<'a> {
                                 && u64::from(generation.remaining) == previous_remaining,
                             "MTP continuation lifetime differs",
                         )?;
+                        if generation.v2 {
+                            need(
+                                u64::from(generation.committed)
+                                    == integer(previous_generation, "committed")?
+                                    && u64::from(generation.emitted)
+                                        == integer(previous_generation, "emitted")?
+                                    && u64::from(generation.pending)
+                                        == integer(previous_generation, "overflow")?
+                                    && u64::from(generation.remaining_compute)
+                                        == integer(previous_generation, "remaining_compute")?,
+                                "MTP continuation v2 frontier differs",
+                            )?;
+                        }
                         carry = pending;
                     }
                 }
@@ -1036,6 +1109,30 @@ impl<'a> MtpWireReply<'a> {
 
         for token in tokens {
             need(token.unsigned_integer()? < 248320, "MTP input token bound")?;
+        }
+        let mut lane_prompt = 0u32;
+        if let Some(lane) = job.find("lane_prompt")? {
+            // The whole prompt of a fresh request; it must extend the packet and stay inside the context.
+            let all = lane.array()?;
+            need(
+                reset
+                    && inputs > 0
+                    && outputs == 0
+                    && all.len() > tokens.len()
+                    && (all.len() as u64) < context_limit,
+                "MTP lane prompt requires a fresh input packet it extends",
+            )?;
+            for (i, token) in all.iter().enumerate() {
+                let id = token.unsigned_integer()?;
+                need(id < 248320, "MTP lane prompt token bound")?;
+                if i < tokens.len() {
+                    need(
+                        tokens[i].unsigned_integer()? == id,
+                        "MTP lane prompt differs from its packet",
+                    )?;
+                }
+            }
+            lane_prompt = all.len() as u32;
         }
 
         if let Some(stops) = job.find("stop_ids")? {
@@ -1078,6 +1175,9 @@ impl<'a> MtpWireReply<'a> {
             stopped: false,
             finished: false,
             restored_input_tokens: 0,
+            lane_prompt,
+            lane_restored_prefix: 0,
+            lane_seed: None,
             final_input_logits,
             final_input,
             last_words,
@@ -1229,6 +1329,23 @@ impl<'a> MtpWireReply<'a> {
             u64::from(self.base + self.inputs + count)
         };
         let actual_prefix = integer(done, "committed_prefix")?;
+        // A parked conversation restored past the packet end: the prefix jumps to its length, which stays short of the named prompt.
+        let lane_restored = match done.find("lane_restored_prefix")? {
+            None => None,
+            Some(value) => {
+                let length = value.unsigned_integer()?;
+                need(
+                    self.lane_prompt > 0
+                        && length > expected_prefix
+                        && length < u64::from(self.lane_prompt)
+                        && actual_prefix == length
+                        && !get(done, "continuation_allowed")?.boolean()?,
+                    "MTP parked-lane restore differs from its lane prompt",
+                )?;
+                Some(length as u32)
+            }
+        };
+        let expected_prefix = lane_restored.map_or(expected_prefix, u64::from);
         need(
             actual_prefix == expected_prefix
                 && (if self.inputs > 0 {
@@ -1264,6 +1381,38 @@ impl<'a> MtpWireReply<'a> {
             }
         };
 
+        let inherit_seed = self.job.find("lane_inherit_seed")?.is_some();
+        let lane_seed = match (done.find("lane_seed")?, done.find("lane_restored_tokens")?) {
+            (None, None) => {
+                need(
+                    !inherit_seed || lane_restored.is_none(),
+                    "MTP parked restore omitted its inherited seed",
+                )?;
+                None
+            }
+            (Some(seed), Some(tokens)) => {
+                let seed = seed.unsigned_integer()?;
+                let tokens = tokens.unsigned_integer()?;
+                let packet = u64::from(self.inputs);
+                let prompt = if self.lane_prompt == 0 {
+                    packet
+                } else {
+                    u64::from(self.lane_prompt)
+                };
+                need(
+                    inherit_seed
+                        && tokens > 0
+                        && tokens < prompt
+                        && tokens.min(packet) == u64::from(restored_input_tokens)
+                        && lane_restored.map(u64::from) == (tokens > packet).then_some(tokens)
+                        && integer(get(done, "sampling")?, "seed")? == seed,
+                    "MTP inherited seed differs from its parked restore",
+                )?;
+                Some(seed)
+            }
+            _ => return Err(MtpWireError::Refused("MTP parked seed metadata incomplete")),
+        };
+
         let ids = get(done, "generated_ids")?.array()?;
         need(
             ids.len() == self.ids.len(),
@@ -1282,7 +1431,8 @@ impl<'a> MtpWireReply<'a> {
             "MTP sampler ancestry differs",
         )?;
 
-        let available = !self.final_input_logits || self.inputs == 0 || self.final_input;
+        let available = (!self.final_input_logits || self.inputs == 0 || self.final_input)
+            && lane_restored.is_none();
         need(
             get(done, "continuation_allowed")?.boolean()? == (available && !self.stopped),
             "MTP continuation flag differs",
@@ -1362,11 +1512,27 @@ impl<'a> MtpWireReply<'a> {
         }
 
         self.restored_input_tokens = restored_input_tokens;
+        self.lane_restored_prefix = lane_restored.unwrap_or(0);
+        self.lane_seed = lane_seed;
         self.finished = true;
         Ok(())
     }
 
-    /// Restored input tokens from a fully admitted completion, bounded by this command's input count.
+    /// The effective seed reported by a fully admitted, opted-in parked restore.
+    pub fn lane_seed(&self) -> Result<Option<u64>> {
+        need(self.finished, "MTP lane seed requires admitted completion")?;
+        Ok(self.lane_seed)
+    }
+
+    /// Length of the parked conversation restored past this packet, or 0.
+    pub fn lane_restored_prefix(&self) -> Result<u32> {
+        need(
+            self.finished,
+            "MTP lane accounting requires admitted completion",
+        )?;
+        Ok(self.lane_restored_prefix)
+    }
+
     pub fn restored_input_tokens(&self) -> Result<u32> {
         need(
             self.finished,
@@ -1570,6 +1736,115 @@ mod tests {
             }
         }
         assert!(mtp_input_packet(&parse(r#"{"native_mtp_priming_batch_capacity":512}"#)).is_err());
+    }
+
+    #[test]
+    fn lane_prompt_admits_only_a_parked_restore_inside_the_named_prompt() {
+        let ready = prefill_ready(2048, 2, "f32", "f32");
+        let fresh = r#""generate":0,"reset":true,"sampling":{"temperature":0,"top_k":0,"top_p":1,"min_p":0},"seed":0"#;
+        let job = parse(&format!(
+            r#"{{"tokens":[42,43],"lane_prompt":[42,43,44,45,46,47],{fresh}}}"#
+        ));
+        let done_at = |prefix: u64, continuation: bool, lane: Option<u64>| {
+            let mut done = with(&ready, "event", Json::from("done"));
+            for (name, value) in [
+                ("committed_prefix", Json::integer(prefix)),
+                ("generated_ids", Json::Array(vec![])),
+                (
+                    "sampling",
+                    parse(&format!(
+                        r#"{{"valid":true,"entropy_prefix":{prefix},"entropy_words":0}}"#
+                    )),
+                ),
+                ("continuation_allowed", Json::Bool(continuation)),
+                ("status", Json::from("prefilled")),
+                (PRIMING_FIELDS[2], Json::integer(1)),
+                // Two reset inputs prime one MTP row at depth 2.
+                (
+                    "native_mtp_prime_calls",
+                    Json::integer(integer(&ready, "native_mtp_prime_calls").unwrap() + 1),
+                ),
+            ] {
+                done = with(&done, name, value);
+            }
+            if let Some(length) = lane {
+                done = with(&done, "lane_restored_prefix", Json::integer(length));
+            }
+            done
+        };
+        // No restore: the packet commits as usual.
+        let mut reply = MtpWireReply::new(&ready, &ready, &job, false).unwrap();
+        reply.finish(&done_at(2, true, None)).unwrap();
+        assert_eq!(reply.lane_restored_prefix().unwrap(), 0);
+        // A parked lane of five tokens restores past the packet and leaves the prompt's last token to prefill.
+        let mut reply = MtpWireReply::new(&ready, &ready, &job, false).unwrap();
+        reply.finish(&done_at(5, false, Some(5))).unwrap();
+        assert_eq!(reply.lane_restored_prefix().unwrap(), 5);
+        for bad in [
+            done_at(6, false, Some(6)), // covers the whole prompt
+            done_at(5, true, Some(5)),  // claims logits it cannot have
+            done_at(4, false, Some(5)), // prefix differs from the claim
+            done_at(2, false, Some(2)), // no jump past the packet
+        ] {
+            let mut reply = MtpWireReply::new(&ready, &ready, &job, false).unwrap();
+            assert!(reply.finish(&bad).is_err());
+        }
+        // A restore claim needs a lane prompt.
+        let plain = parse(&format!(r#"{{"tokens":[42,43],{fresh}}}"#));
+        let mut reply = MtpWireReply::new(&ready, &ready, &plain, false).unwrap();
+        assert!(reply.finish(&done_at(5, false, Some(5))).is_err());
+        let opted_in = with(&job, "lane_inherit_seed", Json::Bool(true));
+        let mut hit = done_at(5, false, Some(5));
+        let sampled = with(get(&hit, "sampling").unwrap(), "seed", Json::integer(0));
+        for (key, value) in [
+            ("checkpoint_restored_tokens", Json::integer(2)),
+            ("replayed_input_tokens", Json::integer(0)),
+            ("lane_restored_tokens", Json::integer(5)),
+            ("lane_seed", Json::integer(0)),
+            ("sampling", sampled),
+        ] {
+            hit = with(&hit, key, value);
+        }
+        let check = |job, done: &Json| {
+            let mut reply = MtpWireReply::new(&ready, &ready, job, false).unwrap();
+            reply.finish(done)?;
+            reply.lane_seed()
+        };
+        assert_eq!(check(&opted_in, &hit).unwrap(), Some(0));
+        assert!(check(&job, &hit).is_err()); // same seed, no opt-in
+        assert!(check(&opted_in, &done_at(5, false, Some(5))).is_err());
+        for (key, value) in [
+            ("lane_seed", Json::Null),
+            ("lane_seed", Json::integer(1)),
+            ("lane_restored_tokens", Json::integer(0)),
+            ("lane_restored_tokens", Json::integer(1)),
+            ("lane_restored_tokens", Json::integer(4)),
+            ("lane_restored_tokens", Json::integer(6)),
+        ] {
+            assert!(check(&opted_in, &with(&hit, key, value)).is_err());
+        }
+        let short = done_at(2, true, None);
+        for (field, value) in [
+            ("lane_seed", Json::integer(0)),
+            ("lane_restored_tokens", Json::integer(1)),
+        ] {
+            assert!(check(&opted_in, &with(&short, field, value)).is_err());
+        }
+        for malformed in [Json::Bool(false), Json::Null, Json::integer(1)] {
+            let bad = with(&job, "lane_inherit_seed", malformed);
+            assert!(MtpWireReply::new(&ready, &ready, &bad, false).is_err());
+        }
+        // The lane prompt must extend its own fresh packet.
+        for bad in [
+            format!(r#"{{"tokens":[42,43],"lane_prompt":[42,43],{fresh}}}"#),
+            format!(r#"{{"tokens":[42,43],"lane_prompt":[42,9,44],{fresh}}}"#),
+            r#"{"tokens":[42],"generate":0,"reset":false,"lane_prompt":[42,43]}"#.to_owned(),
+        ] {
+            assert!(
+                MtpWireReply::new(&ready, &ready, &parse(&bad), false).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

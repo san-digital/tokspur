@@ -3,6 +3,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -12,6 +15,8 @@
 namespace tokspur::http {
 using Clock = std::chrono::steady_clock;
 using Deadline = Clock::time_point;
+
+inline constexpr size_t json_response_bytes = 8 * 1024 * 1024;
 
 // Deliberately narrow HTTP/1.1 service: GET/POST, one request per connection,
 // mandatory Host, canonical Content-Length for POST, no transfer-coded requests,
@@ -55,7 +60,9 @@ public:
     Connection& operator=(const Connection&) = delete;
     [[nodiscard]] int native_handle() const noexcept { return fd_; }
     [[nodiscard]] Request read_request(Deadline deadline);
+    [[nodiscard]] std::optional<Request> poll_request(Deadline deadline);
     void send_json(int status, std::string_view body, Deadline deadline);
+    void refuse_json(int status, std::string_view body);
     void begin_sse(Deadline deadline);
     // Each call writes one HTTP chunk carrying a complete SSE data event.
     // LF data is split into data fields. CR/NUL are refused to prevent injection;
@@ -68,10 +75,17 @@ public:
     [[nodiscard]] bool disconnected() noexcept;
     void close() noexcept;
 private:
+    enum class ReadState { fresh, polling, done };
+    struct Partial;
+    enum class ProgressKind { blocked, advanced, complete };
+    struct Progress;
     int fd_ = -1;
     Limits limits_{};
-    bool read_started_ = false, request_complete_ = false, poisoned_ = false;
+    ReadState read_ = ReadState::fresh;
+    std::unique_ptr<Partial> partial_;
+    bool request_complete_ = false, poisoned_ = false;
     enum class Response { idle, json, sse, finished } response_ = Response::idle;
+    Progress step(std::optional<Deadline> deadline);
     void write_all(std::string_view data, Deadline deadline);
 };
 
@@ -87,6 +101,7 @@ public:
     Listener& operator=(const Listener&) = delete;
     [[nodiscard]] uint16_t port() const noexcept { return port_; }
     [[nodiscard]] int native_handle() const noexcept { return fd_; }
+    [[nodiscard]] std::vector<bool> poll_input(std::span<const int> handles, int millis) const;
     // An idle accept deadline throws Error(408,...,false), so a caller can use
     // short bounded polls for shutdown. All accepted fds are owned by Connection.
     [[nodiscard]] Connection accept(Deadline deadline, Limits limits = {});

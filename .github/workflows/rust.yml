@@ -5,7 +5,7 @@ on:
   pull_request:
     branches: [main]
   push:
-    branches: ['lee/publication-*']
+    branches: [main]
   workflow_dispatch:
     inputs:
       suite:
@@ -26,7 +26,7 @@ env:
   CARGO_TERM_COLOR: never
   CARGO_BUILD_JOBS: 3
   CARGO_TARGET_DIR: ${{ github.workspace }}/build/rust-target
-  # Keep CI independent of compiler wrappers configured for a developer's external volume.
+  # Keep CI independent of any ambient compiler wrappers in the runner environment.
   RUSTC_WRAPPER: ""
   RUSTC_WORKSPACE_WRAPPER: ""
 

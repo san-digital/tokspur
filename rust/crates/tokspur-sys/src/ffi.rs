@@ -296,13 +296,19 @@ pub struct CcSha256Ctx {
 // <errno.h>
 pub const ESRCH: c_int = 3;
 pub const EINTR: c_int = 4;
+pub const ENOMEM: c_int = 12;
 pub const EEXIST: c_int = 17;
+pub const ENFILE: c_int = 23;
+pub const EMFILE: c_int = 24;
 pub const ERANGE: c_int = 34;
 pub const EAGAIN: c_int = 35;
 pub const EINPROGRESS: c_int = 36;
 pub const ENOTSUP: c_int = 45;
 pub const EADDRINUSE: c_int = 48;
+pub const ECONNABORTED: c_int = 53;
+pub const ENOBUFS: c_int = 55;
 pub const ECONNREFUSED: c_int = 61;
+pub const EPROTO: c_int = 100;
 
 pub const PROC_PIDLISTFDS: c_int = 1;
 pub const SO_LINGER: c_int = 0x0080;
@@ -345,6 +351,7 @@ unsafe extern "C" {
     pub fn sigaction(signal: c_int, action: *const Sigaction, old: *mut Sigaction) -> c_int;
     pub fn signal(signal: c_int, handler: usize) -> usize;
     pub fn getrlimit(resource: c_int, limit: *mut Rlimit) -> c_int;
+    pub fn setrlimit(resource: c_int, limit: *const Rlimit) -> c_int;
     pub fn access(path: *const c_char, mode: c_int) -> c_int;
     pub fn pipe(fds: *mut c_int) -> c_int;
     pub fn socketpair(domain: c_int, kind: c_int, protocol: c_int, fds: *mut c_int) -> c_int;

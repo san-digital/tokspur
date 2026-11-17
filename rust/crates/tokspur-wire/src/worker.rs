@@ -374,6 +374,8 @@ pub struct WorkerOptions {
     pub hc_consumer_fused: Option<bool>,
     pub ple_overlap: Option<bool>,
     pub shared_prefix_cache: Option<bool>,
+    /// Host RAM for whole conversations parked on a lane switch; 0 keeps the single-lane reset.
+    pub parked_lanes_mib: u32,
     pub context_length: u32,
 }
 
@@ -470,6 +472,7 @@ impl Default for WorkerOptions {
             hc_consumer_fused: None,
             ple_overlap: None,
             shared_prefix_cache: None,
+            parked_lanes_mib: 0,
             context_length: 65_536,
         }
     }
@@ -698,6 +701,7 @@ fn milliseconds_until(deadline: Instant, now: Instant) -> i64 {
 }
 
 /// The parent-side channel ends and process/framing state.
+#[cfg_attr(test, derive(Default))]
 struct Io {
     control: Option<OwnedFd>,
     status: Option<OwnedFd>,
@@ -1589,6 +1593,10 @@ impl OwnedWorker {
                 &mut words,
                 &["--shared-prefix-cache", if spc { "on" } else { "off" }],
             );
+        }
+        if o.parked_lanes_mib > 0 {
+            let mib = o.parked_lanes_mib.to_string();
+            text(&mut words, &["--native-parked-lanes-mib", &mib]);
         }
         if o.scalar_channel {
             text(
@@ -2617,28 +2625,29 @@ impl OwnedWorker {
                     "MTP commands exceed the negotiated input or output bound",
                 )?;
                 if self.options.scalar_channel {
-                    if self.options.mtp_request_carry {
-                        worker_keys(
-                            body,
-                            &[
-                                "tokens",
-                                "generate",
-                                "reset",
-                                "stop_ids",
-                                "sampling",
-                                "seed",
-                                "mtp_generation",
-                                "prefill_final",
-                            ],
-                        )?;
+                    // Parked prompt identity and seed inheritance are negotiated at worker startup.
+                    let lane = if self.options.parked_lanes_mib > 0 {
+                        &["lane_prompt", "lane_inherit_seed"][..]
                     } else {
-                        worker_keys(
-                            body,
-                            &[
-                                "tokens", "generate", "reset", "stop_ids", "sampling", "seed",
-                            ],
-                        )?;
-                    }
+                        &[][..]
+                    };
+                    let base: &[&str] = if self.options.mtp_request_carry {
+                        &[
+                            "tokens",
+                            "generate",
+                            "reset",
+                            "stop_ids",
+                            "sampling",
+                            "seed",
+                            "mtp_generation",
+                            "prefill_final",
+                        ]
+                    } else {
+                        &[
+                            "tokens", "generate", "reset", "stop_ids", "sampling", "seed",
+                        ]
+                    };
+                    worker_keys(body, &[base, lane].concat())?;
                 }
             } else if mtp_abort {
                 require(
@@ -3097,6 +3106,48 @@ mod tests {
     use tokspur_json::parse_json;
 
     use super::*;
+
+    #[test]
+    fn parked_seedless_command_passes_only_the_negotiated_worker_proxy() {
+        // Command admission executes before I/O. The closed fixture has no pipes or process.
+        let mut worker = OwnedWorker {
+            io: Io {
+                closed: true,
+                ..Default::default()
+            },
+            options: WorkerOptions {
+                scalar_channel: true,
+                mtp_sidecar: "mock-sidecar".into(),
+                ..Default::default()
+            },
+            pacing: None,
+            ready_value: Json::Object(Vec::new()),
+            last_response: Json::Null,
+            needs_reset: false,
+            broker_epoch: 0,
+            broker_command: 0,
+            broker_lease: 0,
+            broker_position: 0,
+            #[cfg(feature = "verify8")]
+            verify_previous: Json::Null,
+            #[cfg(feature = "verify8")]
+            verify_sampling: Json::Null,
+            #[cfg(feature = "verify8")]
+            verify_seed: 0,
+            #[cfg(feature = "verify8")]
+            verify_position: 0,
+        };
+        let job = parse_json(br#"{"tokens":[42],"generate":0,"reset":true,"seed":7,"sampling":{"temperature":1,"top_k":20,"top_p":0.9,"min_p":0},"lane_inherit_seed":true}"#).unwrap();
+        for carry in [false, true] {
+            worker.options.mtp_request_carry = carry;
+            worker.options.parked_lanes_mib = 0;
+            assert!(worker.admit(&job).is_err());
+            worker.options.parked_lanes_mib = 4096;
+            let admitted = worker.admit(&job).unwrap();
+            assert!(admitted.reset);
+            assert_eq!((admitted.input_count, admitted.output_count), (1, 0));
+        }
+    }
 
     #[test]
     fn burst_pacing_charges_only_work_and_recovers_when_idle() {

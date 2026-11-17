@@ -175,3 +175,50 @@ def test_git_attributes_cannot_change_notice_bytes(publisher, source, tmp_path):
     git(source, "commit", "--quiet", "-m", "normalisation fixture")
     with pytest.raises(ValueError, match="Git changed a source or notice byte"):
         publisher.prepare(source, tmp_path / "publication")
+
+
+@pytest.mark.parametrize("archive_attributes", [False, True])
+def test_private_tools_and_workflow_are_absent_from_snapshot_and_bundle(
+    publisher, source, tmp_path, archive_attributes
+):
+    names = ["private/experiment-lab/receipt.json", ".github/workflows/private-lab.yml"]
+    for name in names:
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("private-owner@example.invalid\nprivate fixture " + name)
+    (source / "private-notes.txt").write_text("public path with a different name")
+    if archive_attributes:
+        (source / ".gitattributes").write_text(
+            "private/ export-ignore\n.github/workflows/private-lab.yml export-ignore\n"
+        )
+    git(source, "add", ".")
+    git(source, "commit", "--quiet", "-m", "private tools fixture")
+    private_blobs = [
+        git(source, "rev-parse", "HEAD:" + name).decode().strip() for name in names
+    ]
+    publisher.prepare(source, tmp_path / "publication")
+    snapshot = tmp_path / "publication/source"
+    clone = tmp_path / "bundle-clone"
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "--quiet",
+            str(tmp_path / "publication/source.bundle"),
+            str(clone),
+        ],
+        check=True,
+    )
+    for tree in (snapshot, clone):
+        assert not (tree / "private").exists()
+        assert not (tree / ".github/workflows/private-lab.yml").exists()
+        assert (
+            tree / "private-notes.txt"
+        ).read_text() == "public path with a different name"
+        for oid in private_blobs:
+            assert (
+                subprocess.run(
+                    ["git", "-C", str(tree), "cat-file", "-e", oid], capture_output=True
+                ).returncode
+                != 0
+            )

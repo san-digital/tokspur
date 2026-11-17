@@ -32,7 +32,7 @@ def extract(source):
 
 CHECKS = r"""
 struct FakeResult { std::vector<float> logits; };
-int checks = 0;
+int checks = 0, parked_checks = 0;
 void check(bool condition, const char* label) {
     ++checks; if (!condition) throw std::runtime_error(label);
 }
@@ -46,7 +46,50 @@ Request parse(std::string_view body, uint32_t prefix = 0, bool has_logits = fals
               uint32_t block = 0, bool sampling_matches = true) {
     return request(parse_json(body), prefix, small, block, allow, has_logits, continuable, sampling_matches);
 }
+struct FakeParkedLane { std::vector<uint32_t> tokens; bool has_logits; TargetSampling lane_sampling; };
+void check_parked_lanes() {
+    const auto input = [](std::string_view body, bool enabled = true) {
+        return request(parse_json(body), 0, 0, 0, false, false, false, true, 0, false, false,
+            8, false, false, 0, false, false, false, false, 65536, enabled);
+    };
+    auto short_job = input(R"({"tokens":[2,4,6,8],"generate":0,"reset":true,"seed":7})");
+    auto long_job = input(R"({"tokens":[2,4],"lane_prompt":[2,4,6,8],"generate":0,"reset":true,"seed":7})");
+    const auto inherited = input(R"({"tokens":[2,4,6,8],"generate":0,"reset":true,"seed":9,"lane_inherit_seed":true})");
+    refuses([&] { input(R"({"tokens":[2],"generate":0,"reset":true,"lane_inherit_seed":false})"); }, "false seed inheritance was accepted");
+    refuses([&] { input(R"({"tokens":[2],"generate":0,"reset":true,"lane_inherit_seed":true})", false); }, "seed inheritance requires parked worker");
+    refuses([&] { input(R"({"tokens":[2],"generate":0,"reset":false,"lane_inherit_seed":true})"); }, "append cannot adopt parked entropy");
+    const auto same = short_job.sampling;
+    auto other = same; other.seed = 99;
+    auto retuned = same; retuned.policy.top_k = 3;
+    ParkedLanes<FakeParkedLane> parked;
+    parked.lanes = {{{2,4}, false, same}, {{2,4,6}, true, retuned}};
+    check(parked.find(short_job) == std::pair<size_t, ParkedMatch>{0, ParkedMatch::without_logits}, "one-packet hit with a longer retuned neighbor");
+    short_job.lane_inherit_seed = true;
+    check(parked.find(short_job).first == 0, "seed inheritance cannot match a changed policy");
+#ifdef TOKSPUR_PRIVATE_HTTP_PREFILL512
+    check(parked.find(long_job).second == ParkedMatch::miss, "packet boundary must retain required logits");
+    parked.lanes[0].has_logits = true;
+    check(parked.find(long_job).second == ParkedMatch::with_logits, "packet boundary publishes saved logits");
+    parked.lanes[0].has_logits = false; long_job.final_logits = true; long_job.prefill_final = false;
+    check(parked.find(long_job).second == ParkedMatch::without_logits, "deferred packet boundary requires no logits");
+#endif
+    parked.lanes.push_back({{2,4,6}, false, same});
+    check(parked.find(long_job) == std::pair<size_t, ParkedMatch>{2, ParkedMatch::without_logits}, "past-packet restoration defers logits");
+    parked.lanes.push_back({{2,4,6}, false, other});
+    check(parked.find(long_job).first == 2, "explicit seed selects its own stream");
+    check(parked.find(inherited).second == ParkedMatch::miss, "ambiguous identical histories cannot adopt a seed");
+    parked.lanes.pop_back();
+    check(parked.find(inherited).first == 2, "unique longest history can adopt its seed");
+    parked.lanes.push_back({{2,4,6,8}, true, same});
+    check(parked.find(long_job).first == 2, "a parked conversation cannot consume the final input");
+    parked.bytes = 237;
+    check(parked.reclaim() == 237 && parked.bytes == 0 && parked.lanes.empty() && parked.evictions == 4, "parked reclaim must release every accounted entry");
+    check(parked.reclaim() == 0 && parked.evictions == 4, "repeated parked reclaim must be idempotent");
+}
 void run() {
+    const int before_parking = checks;
+    check_parked_lanes();
+    parked_checks = checks - before_parking;
     hc_down_f32_preparation(false, false, false, false, false, false, true);
     hc_down_f32_preparation(true, true, true, true, true, true, false);
     for (uint32_t missing = 0; missing < 5; ++missing) refuses([&] { hc_down_f32_preparation(true, missing != 0, missing != 1, missing != 2, missing != 3, missing != 4, false); }, "HC down startup refuses incompatible input/precision/scheduling/carry");
@@ -404,6 +447,19 @@ void run_stack_experiments() {
         {"generation_requested", Json(true)}, {"allow_restore", Json(false)},
         {"sampling", parse_json(R"({"temperature":0,"top_k":0,"top_p":1,"min_p":0})")}, {"seed", Json::integer(0)}});
     stack_check(broker128.admit(broker_begin128, 0).begin, "128K broker admits >64K prompt_ids");
+    const auto parse_overflow = [&](std::string_view body, uint32_t prefix, uint32_t overflow, uint32_t ctx = 65536) {
+        return request(parse_json(body), prefix, 0, 0, false, true, true, true, 0, false, false, 0, false, false, 0, false, false, false, false, ctx, false, overflow);
+    };
+    stack_check(parse_overflow(R"({"tokens":[],"generate":1,"reset":false})", 65536, 1).generate == 1,
+        "output packet draining 1 pending overflow token at 64K limit admitted");
+    stack_check(parse_overflow(R"({"tokens":[],"generate":4,"reset":false})", 131072, 4, 131072).generate == 4,
+        "output packet draining 4 pending overflow tokens at 128K limit admitted");
+    stack_refuses([&] { parse_overflow(R"({"tokens":[],"generate":2,"reset":false})", 65536, 1); },
+        "output packet exceeding pending overflow at 64K limit refused");
+    stack_refuses([&] { parse_overflow(R"({"tokens":[1],"generate":0,"reset":false})", 65536, 1); },
+        "input packet ignores pending overflow at 64K limit");
+    stack_check(parse_overflow(R"({"tokens":[],"generate":1,"reset":false})", 1, 7).generate == 1,
+        "pending overflow clamped safely to prefix without underflow");
 }
 """
 
@@ -442,7 +498,8 @@ def main():
         + protocol
         + CHECKS
         + "\n} }\nint main() { try { tokspur::run(); tokspur::run_stack_experiments(); "
-        + 'std::cout << "Owned CPU target protocol checks passed: " << tokspur::checks << "\\n" '
+        + 'std::cout << "Owned CPU target protocol checks passed: " << tokspur::checks - tokspur::parked_checks << "\\n" '
+        + '<< "Owned CPU parked conversation checks passed: " << tokspur::parked_checks << "\\n" '
         + '<< "Owned CPU target stack-experiment protocol checks passed: " << tokspur::stack_checks << "\\n"; return 0; } '
         + 'catch (const std::exception& error) { std::cerr << error.what() << "\\n"; return 1; } }\n'
     )

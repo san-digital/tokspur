@@ -533,6 +533,7 @@ def test_serve_default_uses_f32_and_keeps_speed_lead_paths_opt_in(harness):
         "--checkpoint-cap-gib",
         "--checkpoint-floor-gib",
         "--checkpoint-policy",
+        "--native-parked-lanes-mib",
     ):
         assert opt_in_flag not in command
 
@@ -639,6 +640,22 @@ def test_serve_opt_in_speed_lead_flags_are_forwarded(harness, tmp_path):
     assert cached[cached.index("--checkpoint-ssd") + 1] == "on"
     assert cached[cached.index("--native-dflash2-lookup") + 1] == "hybrid"
     assert cached[cached.index("--native-dflash2-lookup-match") + 1] == "4"
+    assert "--native-parked-lanes-mib" not in cached
+
+    with pytest.raises(SystemExit):
+        cli.serve(speed_preset=True)
+    preset_cmd = harness.last_command
+    assert preset_cmd[preset_cmd.index("--native-parked-lanes-mib") + 1] == "4096"
+
+    with pytest.raises(SystemExit):
+        cli.serve(speed_preset=True, parked_lanes_mib=0)
+    assert "--native-parked-lanes-mib" not in harness.last_command
+
+    with pytest.raises(ValueError, match="requires the shared prefix cache"):
+        cli.serve(shared_prefix_cache=False, parked_lanes_mib=1024)
+
+    with pytest.raises(ValueError, match="incompatible with SSD checkpoints"):
+        cli.serve(checkpoint_cap_gib=4.0, parked_lanes_mib=1024)
 
     for bad_kwargs in (
         {"drafter": "dflash2"},
@@ -652,6 +669,27 @@ def test_serve_opt_in_speed_lead_flags_are_forwarded(harness, tmp_path):
     ):
         with pytest.raises(ValueError):
             cli.serve(**bad_kwargs)
+
+
+@pytest.mark.parametrize("budget", [None, 1024])
+def test_dflash2_speed_preset_requires_an_explicit_parking_budget(
+    harness, tmp_path, budget
+):
+    dflash2_dir = tmp_path / "dflash2"
+    dflash2_dir.mkdir()
+    with pytest.raises(SystemExit):
+        cli.serve(
+            drafter="dflash2",
+            dflash2_dir=dflash2_dir,
+            speed_preset=True,
+            shared_prefix_cache=True,
+            parked_lanes_mib=budget,
+        )
+    command = harness.last_command
+    if budget is None:
+        assert "--native-parked-lanes-mib" not in command
+    else:
+        assert command[command.index("--native-parked-lanes-mib") + 1] == str(budget)
 
 
 def test_main_defaults_to_rust_cli_and_preserves_python_selector(

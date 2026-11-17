@@ -1009,6 +1009,12 @@ OwnedWorker::OwnedWorker(OwnedWorkerOptions options) : impl_(std::make_unique<Im
 }
 OwnedWorker::~OwnedWorker() = default;
 const Json& OwnedWorker::ready() const { return impl_->ready_value; }
+std::optional<uint32_t> OwnedWorker::worker_pid() const noexcept {
+    return impl_->worker_pid > 0 ? std::optional<uint32_t>(uint32_t(impl_->worker_pid)) : std::nullopt;
+}
+std::optional<uint32_t> OwnedWorker::guardian_pid() const noexcept {
+    return impl_->guardian_pid > 0 ? std::optional<uint32_t>(uint32_t(impl_->guardian_pid)) : std::nullopt;
+}
 bool OwnedWorker::alive() const {
     const auto& p = *impl_; std::unique_lock lock(p.mutex, std::try_to_lock);
     if (!lock || p.failed || p.closed || p.worker_exited || p.out_eof || p.status_eof) return false;

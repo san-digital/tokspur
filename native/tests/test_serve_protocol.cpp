@@ -5,9 +5,14 @@
 #include <array>
 #include <charconv>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <source_location>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 using namespace tokspur;
 namespace {
@@ -285,6 +290,132 @@ void original_agent_contract() {
     check(message(result).find("reasoning_content")->string() == "Read it.");
     const auto& call = message(result).find("tool_calls")->array()[0];
     check(call.find("function")->find("name")->string() == "read_file" && call.find("function")->find("arguments")->string() == "{\"path\":\"src/lib.rs\"}");
+}
+Json refused_prefix_trace(ServeSession& session, const Json& input) {
+    Json observed;
+    const ServeSink sink{{}, [] { return false; }, [] { return uint64_t(42); }, [&](const Json& value) {
+        observed = value;
+        throw FormatError("controlled trace refusal");
+    }};
+    refusal([&] { session.complete(input, "prefix-test", [](const Json&, const auto&) -> Json {
+        throw std::logic_error("prefix trace refusal submitted worker work");
+    }, sink); });
+    check(observed.find("event") && observed.find("event")->string() == "prompt_prefix");
+    return observed;
+}
+void respelled_prefix_reuse() {
+    // Token 300 spells "Vi" in one token. Re-encoding the echoed text spells it as two.
+    auto spelled = codec();
+    spelled.decode = [](std::span<const uint32_t> ids) {
+        std::string result;
+        for (const auto& id : ids) result += id == 300 ? std::string("Vi") : decode(std::span<const uint32_t>(&id, 1));
+        return result;
+    };
+    const ServeSink sink{{}, [] { return false; }, [] { return uint64_t(42); }};
+    const auto sampled = [] { auto ids = encode("sible<|im_end|>"); ids.insert(ids.begin(), 300); return ids; };
+    {
+        ServeSession session(spelled); Fake fake;
+        const auto target = [&](const Json& job, const auto& event) { return fake(job, event); };
+        fake.output = sampled();
+        const auto first = session.complete(request(), "spelled", target, sink);
+        check(message(first).find("content")->string() == "Visible" && session.committed_tokens() == 8 && fake.resets == 1);
+        fake.reply("Next<|im_end|>");
+        const auto same = session.complete(request("AVisible<|im_end|>B"), "same-text", target, sink);
+        check(finish(same).string() == "stop" && fake.resets == 1 && fake.prefills == 2);
+        check(same.find("usage")->find("prompt_tokens_details")->find("cached_tokens")->unsigned_integer() == 8);
+    }
+    {
+        ServeSession session(spelled); Fake fake;
+        const auto target = [&](const Json& job, const auto& event) { return fake(job, event); };
+        fake.output = sampled();
+        static_cast<void>(session.complete(request(), "spelled", target, sink));
+        fake.reply("Next<|im_end|>");
+        const auto edited = session.complete(request("AVisibly<|im_end|>B"), "edited-text", target, sink);
+        check(finish(edited).string() == "stop" && fake.resets == 2);
+    }
+    for (const bool change_seed : {true, false}) {
+        ServeSession session(spelled); Fake fake;
+        const auto target = [&](const Json& job, const auto& event) { return fake(job, event); };
+        fake.output = sampled();
+        const auto initial = with(with(request(), "seed", Json::integer(42)), "temperature", parse_json("0.7"));
+        static_cast<void>(session.complete(initial, "spelled", target, sink));
+        auto next = with(with(request("AVisible<|im_end|>B"), "seed", Json::integer(change_seed ? 99 : 42)), "temperature", parse_json(change_seed ? "0.7" : "0.5"));
+        const auto trace = refused_prefix_trace(session, next);
+        check(!trace.find("append")->boolean());
+        const auto expected = encode("AVisible<|im_end|>B");
+        const auto& actual = trace.find("prompt_ids")->array();
+        check(actual.size() == expected.size());
+        for (size_t i = 0; i < expected.size(); ++i) check(actual[i].unsigned_integer() == expected[i]);
+    }
+}
+void respelled_prefix_preserves_nonordinary_tokens() {
+    for (const auto& [marker, spelling] : std::vector<std::pair<uint32_t, std::string>>{
+        {301, "<think>"}, {302, "</think>"}, {303, "<tool_call>"}, {304, "</tool_call>"},
+        {305, "<tool_response>"}, {306, "</tool_response>"}, {307, "<added>"}, {308, "[PAD308]"}}) {
+        for (const bool original_special : {false, true}) for (const bool echoed_special : {false, true}) {
+            bool first_encode = true;
+            auto spelled = codec();
+            spelled.nonordinary_ids = {marker, marker};
+            spelled.encode = [&](const RenderedChat&) {
+                const bool first = first_encode;
+                first_encode = false;
+                auto ids = first ? std::vector<uint32_t>{300} : encode("Vi");
+                if (first ? original_special : echoed_special) ids.push_back(marker);
+                else { const auto bytes = encode(spelling); ids.insert(ids.end(), bytes.begin(), bytes.end()); }
+                ids.push_back(uint32_t('x') + 1);
+                if (!first) { const auto tail = encode("ok<|im_end|>B"); ids.insert(ids.end(), tail.begin(), tail.end()); }
+                return ids;
+            };
+            spelled.decode = [&](std::span<const uint32_t> ids) {
+                std::string result;
+                for (const auto& id : ids) {
+                    if (id == 300) result += "Vi";
+                    else if (id == marker) result += spelling;
+                    else result += decode(std::span<const uint32_t>(&id, 1));
+                }
+                return result;
+            };
+            ServeSession session(spelled); Fake fake; fake.reply("ok<|im_end|>");
+            const ServeSink sink{{}, [] { return false; }, [] { return uint64_t(42); }};
+            static_cast<void>(session.complete(request(), "nonordinary", [&](const Json& job, const auto& event) { return fake(job, event); }, sink));
+            const auto trace = refused_prefix_trace(session, request("B"));
+            check(trace.find("append")->boolean() == (original_special == echoed_special));
+        }
+    }
+    auto invalid = codec(); invalid.nonordinary_ids = {invalid.admission.vocabulary};
+    refusal([&] { ServeSession rejected(invalid); });
+}
+void respelled_prefix_decodes_only_changed_tokens() {
+    bool first_encode = true;
+    size_t decoded = 0;
+    const std::vector<uint32_t> equal(20000, uint32_t('x') + 1);
+    auto spelled = codec();
+    spelled.encode = [&](const RenderedChat&) {
+        const bool first = first_encode;
+        first_encode = false;
+        auto ids = first ? std::vector<uint32_t>{300} : encode("Vi");
+        ids.push_back(1000);
+        ids.insert(ids.end(), equal.begin(), equal.end()); ids.push_back(1000);
+        ids.insert(ids.end(), equal.begin(), equal.end());
+        if (first) ids.push_back(300);
+        else { ids.push_back(uint32_t('V') + 1); ids.push_back(uint32_t('i') + 1); }
+        ids.insert(ids.end(), equal.begin(), equal.end());
+        if (!first) { const auto tail = encode("ok<|im_end|>B"); ids.insert(ids.end(), tail.begin(), tail.end()); }
+        return ids;
+    };
+    spelled.decode = [&](std::span<const uint32_t> ids) {
+        decoded += ids.size();
+        std::string result;
+        for (const auto& id : ids) result += id == 300 ? std::string("Vi") : decode(std::span<const uint32_t>(&id, 1));
+        return result;
+    };
+    ServeSession session(spelled); Fake fake; fake.reply("ok<|im_end|>");
+    const ServeSink sink{{}, [] { return false; }, [] { return uint64_t(42); }};
+    static_cast<void>(session.complete(request(), "long-prefix", [&](const Json& job, const auto& event) { return fake(job, event); }, sink));
+    decoded = 0;
+    const auto trace = refused_prefix_trace(session, request("B"));
+    check(trace.find("append")->boolean());
+    check(decoded == 6);
 }
 void extended_output_budget() {
     ServeSession session(codec()); Fake fake;
@@ -679,6 +810,9 @@ int main() {
         worker_ready_admission();
         original_agent_contract();
         extended_output_budget();
+        respelled_prefix_reuse();
+        respelled_prefix_preserves_nonordinary_tokens();
+        respelled_prefix_decodes_only_changed_tokens();
         startup_execution_policy();
         broker_sessions();
         executor_enum_contract();
@@ -935,6 +1069,149 @@ int main() {
             chunks.clear(); fake.reply("abcdefghij");
             tb_res = session.complete(with(with(request("L", false, true), "thinking_budget", Json::integer(3)), "max_tokens", Json::integer(5)), "tb-tight", call, sink);
             check(finish(tb_res).string() == "length" && tb_res.find("usage")->find("completion_tokens")->unsigned_integer() == 5);
+        }
+        {
+            const auto escaped_body = [](std::string_view control, size_t escapes) {
+                std::string body = R"({"model":"m","messages":[{"role":"user","content":")";
+                body.reserve(body.size() + 2 * escapes + 4);
+                for (size_t i = 0; i < escapes; ++i) body.append(control);
+                body.append(R"("}]})");
+                return body;
+            };
+            for (const auto& [context_length, limit, values] : std::vector<std::tuple<uint32_t, size_t, size_t>>{
+                {65536u, 1024u * 1024u, 150000u},
+                {131072u, 4u * 1024u * 1024u, 300000u},
+            }) {
+                for (const std::string_view control : {"\\n", "\\t"}) {
+                    const size_t frame = escaped_body(control, 0).size();
+                    const auto body = escaped_body(control, (limit - frame) / 2);
+                    check(limit - body.size() < 2);
+                    const auto parsed = parse_json(body, {limit, values, 32});
+                    check(parsed.dump().size() > 2 * limit);
+                    const auto admitted = admit_chat(parsed, "m", ToolEnumValidation::strict, ToolArgValidation::strict, context_length);
+                    check(admitted.maximum_tokens == 8192);
+                }
+            }
+            const auto built = [](std::string content) {
+                return Json(Json::Object{
+                    {"model", Json("m")},
+                    {"messages", Json(Json::Array{Json(Json::Object{
+                        {"role", Json("user")},
+                        {"content", Json(std::move(content))},
+                    })})},
+                });
+            };
+            const size_t limit = 1024 * 1024;
+            const auto fits_as_sent = built(std::string(limit / 2 - 64, '\n'));
+            const auto too_long = built(std::string(limit, 'a'));
+            const auto long_escapes = built(std::string(limit / 6, '\x01'));
+            const auto beyond_any_dump = built(std::string(3 * limit, 'a'));
+            const auto invalid = built("\xc0\x80");
+            check(fits_as_sent.dump().size() > 2 * limit);
+            check(admit_chat(fits_as_sent, "m").maximum_tokens == 8192);
+            const auto expect_reason = [&](const Json& candidate, std::string_view expected) {
+                ++checks;
+                try {
+                    static_cast<void>(admit_chat(candidate, "m"));
+                } catch (const FormatError& error) {
+                    check(error.what() == expected);
+                    return;
+                }
+                throw std::runtime_error("oversized or invalid built request was admitted");
+            };
+            expect_reason(too_long, "chat request exceeds byte limit");
+            expect_reason(long_escapes, "chat request exceeds byte limit");
+            expect_reason(beyond_any_dump, "JSON output byte limit exceeded");
+            expect_reason(invalid, "invalid UTF-8 input");
+        }
+        {
+            struct TempDir {
+                std::filesystem::path path;
+                int fd = -1;
+                explicit TempDir(std::string_view label) {
+                    const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    path = std::filesystem::temp_directory_path() /
+                        ("tokspur-" + std::string(label) + "-" + std::to_string(::getpid()) + "-" + std::to_string(nanos));
+                    check(::mkdir(path.c_str(), 0700) == 0);
+                    fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+                    check(fd >= 0);
+                }
+                ~TempDir() {
+                    if (fd >= 0) ::close(fd);
+                    std::error_code ec;
+                    std::filesystem::remove_all(path, ec);
+                }
+            };
+            const auto read_file_bytes = [](const std::filesystem::path& file) {
+                std::ifstream in(file, std::ios::binary);
+                return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            };
+            {
+                TempDir dir("prefix-trace-full-cpp");
+                PrefixTraceLog trace;
+                trace.enable(dir.fd);
+                const Json record(Json::Object{{"event", Json("prompt_prefix")}});
+                trace.write(record);
+                const uint64_t line = trace.bytes_written();
+                trace.set_bytes_written_for_test(prefix_trace_limit_bytes - line + 1);
+                for (int attempt = 0; attempt < 2; ++attempt) {
+                    if (attempt == 1) trace.set_bytes_written_for_test(line);
+                    bool caught = false;
+                    try {
+                        trace.write(record);
+                    } catch (const PrefixTraceError& error) {
+                        caught = true;
+                        check(error.what() == prefix_trace_full_message);
+                        for (const bool started : {false, true}) {
+                            check(job_failure_kind(error, started) == "server_error");
+                            check(job_failure_status(error, false, started) == 500);
+                        }
+                        check(job_failure_status(error, true, false) == 408);
+                    }
+                    check(caught);
+                }
+                check(read_file_bytes(dir.path / "prefix-trace.jsonl") == "{\"event\":\"prompt_prefix\"}\n");
+
+                const PrefixTraceError persist("cannot persist private prefix trace");
+                check(job_failure_kind(persist, false) == "server_error");
+                check(job_failure_status(persist, false, false) == 500);
+                const FormatError refused("missing required API field");
+                check(job_failure_kind(refused, false) == "invalid_request_error");
+                check(job_failure_status(refused, false, false) == 400);
+                check(job_failure_kind(refused, true) == "generation_failed_no_retry");
+                check(job_failure_status(refused, false, true) == 502);
+                check(job_failure_status(refused, true, true) == 408);
+            }
+            {
+                TempDir dir("prefix-trace-exists-cpp");
+                const Json record(Json::Object{{"event", Json("prompt_prefix")}});
+                {
+                    PrefixTraceLog earlier;
+                    earlier.enable(dir.fd);
+                    earlier.write(record);
+                }
+                PrefixTraceLog restarted;
+                bool startup_refused = false;
+                try {
+                    restarted.enable(dir.fd);
+                } catch (const FormatError& error) {
+                    startup_refused = true;
+                    check(std::string_view(error.what()) ==
+                        "private prefix trace requires a new file: move or remove prefix-trace.jsonl from the state directory, or start without --private-prefix-trace");
+                }
+                check(startup_refused);
+                check(read_file_bytes(dir.path / "prefix-trace.jsonl") == "{\"event\":\"prompt_prefix\"}\n");
+                bool write_refused = false;
+                try {
+                    restarted.write(record);
+                } catch (const PrefixTraceError& error) {
+                    write_refused = true;
+                    check(error.what() == prefix_trace_unavailable_message);
+                    check(job_failure_status(error, false, false) == 500);
+                }
+                check(write_refused);
+            }
         }
         std::cout << "PASS owned serving protocol checks=" << checks << " (model-free; no tools executed)\n";
         return 0;

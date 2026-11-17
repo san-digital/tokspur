@@ -134,16 +134,56 @@ kernel void qsa_prefill_index_scores(device const float* query [[buffer(0)]],dev
 }
 kernel void qsa_prefill_select_sort(device const float* input [[buffer(0)]],device float* scores [[buffer(1)]],
     device uint* ids [[buffer(2)]],constant QsaPrefillParams& p [[buffer(6)]],device atomic_uint* error [[buffer(7)]],
-    uint2 group [[threadgroup_position_in_grid]],ushort tid [[thread_index_in_threadgroup]]) {
+    uint2 group [[threadgroup_position_in_grid]],ushort tid [[thread_index_in_threadgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],ushort lane [[thread_index_in_simdgroup]]) {
     const uint blocks=(p.v[1]+group.y+1)/4;if(blocks<=p.v[4] || group.x*512>=blocks)return;
     threadgroup float ls[512];threadgroup uint li[512];
+    uint bad=0u;
     for(uint i=tid;i<512;i+=128){const uint id=group.x*512+i;const float score=id<blocks?input[ulong(group.y)*p.v[2]+id]:-INFINITY;
-        if(id<blocks && (!isfinite(score)||score<0))atomic_fetch_or_explicit(error,1u,memory_order_relaxed);
+        if(id<blocks && (!isfinite(score)||score<0))bad=1u;
         ls[i]=score;li[i]=id<blocks?id:0xffffffffu;}
+    if(bad)atomic_fetch_or_explicit(error,1u,memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for(uint k=2;k<=512;k*=2)for(uint stride=k/2;stride;stride/=2){for(uint i=tid;i<512;i+=128){const uint j=i^stride;
-        if(j>i){const bool before=qpf_before(ls[i],li[i],ls[j],li[j]);if(((i&k)==0&&!before)||((i&k)!=0&&before)){
-            const float a=ls[i];const uint id=li[i];ls[i]=ls[j];li[i]=li[j];ls[j]=a;li[j]=id;}}}threadgroup_barrier(mem_flags::mem_threadgroup);}
+    const auto cmp_swap = [&](uint t, uint k, uint stride) {
+        const uint low = t & (stride - 1u);
+        const uint i = ((t - low) << 1u) + low;
+        const uint j = i + stride;
+        const float si = ls[i], sj = ls[j];
+        const uint idi = li[i], idj = li[j];
+        const bool before = qpf_before(si, idi, sj, idj);
+        const bool swap = ((i & k) == 0u) ? !before : before;
+        ls[i] = swap ? sj : si;
+        li[i] = swap ? idj : idi;
+        ls[j] = swap ? si : sj;
+        li[j] = swap ? idi : idj;
+    };
+    const uint sg_t0 = uint(sg) * 64u + uint(lane), sg_t1 = sg_t0 + 32u;
+    #pragma clang loop unroll(disable)
+    for (uint k = 2u; k <= 128u; k <<= 1u) {
+        #pragma clang loop unroll(disable)
+        for (uint stride = k >> 1u; stride > 0u; stride >>= 1u) {
+            cmp_swap(sg_t0, k, stride);
+            cmp_swap(sg_t1, k, stride);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    #pragma clang loop unroll(disable)
+    for (uint k = 256u; k <= 512u; k <<= 1u) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma clang loop unroll(disable)
+        for (uint stride = k >> 1u; stride >= 128u; stride >>= 1u) {
+            cmp_swap(uint(tid), k, stride);
+            cmp_swap(uint(tid) + 128u, k, stride);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        #pragma clang loop unroll(disable)
+        for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+            cmp_swap(sg_t0, k, stride);
+            cmp_swap(sg_t1, k, stride);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint count=min(p.v[4],min(512u,blocks-group.x*512));
     for(uint i=tid;i<count;i+=128){const ulong at=ulong(group.y)*p.v[3]+group.x*p.v[4]+i;scores[at]=ls[i];ids[at]=li[i];}
 }
@@ -160,13 +200,22 @@ kernel void qsa_prefill_select_merge(device const float* scores [[buffer(0)]],de
         const uint rank=own+low;if(rank<p.v[3]){const ulong out=ulong(group.y)*p.v[2]+group.x*p.v[3]+rank;out_scores[out]=score;out_ids[out]=id;}}
 }
 kernel void qsa_prefill_select_ids(device const uint* input [[buffer(0)]],device uint* output [[buffer(1)]],
-    constant QsaPrefillParams& p [[buffer(6)]],device atomic_uint* error [[buffer(7)]],uint2 group [[threadgroup_position_in_grid]],ushort tid [[thread_index_in_threadgroup]]) {
+    constant QsaPrefillParams& p [[buffer(6)]],device atomic_uint* error [[buffer(7)]],
+    uint2 group [[threadgroup_position_in_grid]],ushort tid [[thread_index_in_threadgroup]]) {
     const uint blocks=(p.v[1]+group.y+1)/4,count=min(blocks,p.v[4]);threadgroup uint ids[512];
     for(uint i=tid;i<512;i+=128){const uint id=i<count?(blocks<=p.v[4]?i:input[ulong(group.y)*p.v[2]+i]):0xffffffffu;
         ids[i]=id;if(i<count && id>=blocks)atomic_fetch_or_explicit(error,4u,memory_order_relaxed);}
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for(uint k=2;k<=512;k*=2)for(uint stride=k/2;stride;stride/=2){for(uint i=tid;i<512;i+=128){const uint j=i^stride;
-        if(j>i&&(((i&k)==0&&ids[i]>ids[j])||((i&k)!=0&&ids[i]<ids[j]))){const uint id=ids[i];ids[i]=ids[j];ids[j]=id;}}threadgroup_barrier(mem_flags::mem_threadgroup);}
+    for(uint k=2;k<=512;k*=2)for(uint stride=k/2;stride;stride/=2){
+        for(ushort pass=0;pass<2;++pass){
+            const uint t=uint(tid)+uint(pass)*128u;
+            const uint low=t&(stride-1u);
+            const uint i=((t-low)<<1u)+low,j=i+stride;
+            const uint idi=ids[i],idj=ids[j];
+            if(((i&k)==0u&&idi>idj)||((i&k)!=0u&&idi<idj)){ids[i]=idj;ids[j]=idi;}
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
     for(uint i=tid;i<count;i+=128){if(i&&ids[i]==ids[i-1])atomic_fetch_or_explicit(error,4u,memory_order_relaxed);output[ulong(group.y)*p.v[3]+i]=ids[i];}
 }
 // A SIMD owns each 128-key partial. Its online softmax retains the existing per-token arithmetic; only the deterministic partial merge reassociates sums.
@@ -334,18 +383,37 @@ kernel void nax_qsa_index_scores(device const float* query [[buffer(0)]],device 
     auto result=op.template get_destination_cooperative_tensor<decltype(left),decltype(right),float>();
     for(auto it=result.begin();it!=result.end();++it)*it=0;
     uint bad=0;
-    for(uint at=0u;at<128u;at+=32u) {
-        for(uint i=tid;i<1024u;i+=128u) {
-            const uint row_local=i/32u,k_local=i%32u;
-            const uint b_col=b_base+row_local;
-            const float kv=b_col<tile_max_blocks?qpf_bf16(keys[ulong(b_col)*128ul+at+k_local]):0.0f;
-            const uint tok=tok_base+(row_local>>2u),h=row_local&3u;
-            const float qv=tok<p.v[0]?query[ulong(tok)*p.v[5]+h*128u+at+k_local]:0.0f;
-            if(!isfinite(kv)||!isfinite(qv))bad=1u;
-            l[row_local*33u+k_local]=kv;
-            r[k_local*33u+row_local]=qv;
+    const uint k_local = uint(tid) & 31u;
+    const uint sg_row = uint(tid) >> 5u;
+    float kv_reg[8], qv_reg[8];
+    const auto load_tile = [&](uint at, thread float (&kv_dst)[8], thread float (&qv_dst)[8]) {
+        #pragma unroll
+        for (ushort p_idx = 0; p_idx < 8; ++p_idx) {
+            const uint row_local = uint(p_idx) * 4u + sg_row;
+            const uint b_col = b_base + row_local;
+            const float kv = b_col < tile_max_blocks ? qpf_bf16(keys[ulong(b_col) * 128ul + at + k_local]) : 0.0f;
+            const uint tok = tok_base + (row_local >> 2u), h = row_local & 3u;
+            const float qv = tok < p.v[0] ? query[ulong(tok) * p.v[5] + h * 128u + at + k_local] : 0.0f;
+            if (((as_type<uint>(kv) & 0x7f800000u) == 0x7f800000u) || ((as_type<uint>(qv) & 0x7f800000u) == 0x7f800000u)) bad = 1u;
+            kv_dst[p_idx] = kv;
+            qv_dst[p_idx] = qv;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);op.run(left,right,result);threadgroup_barrier(mem_flags::mem_threadgroup);
+    };
+    load_tile(0u, kv_reg, qv_reg);
+    #pragma unroll
+    for(uint at=0u;at<128u;at+=32u) {
+        #pragma unroll
+        for (ushort p_idx = 0; p_idx < 8; ++p_idx) {
+            const uint row_local = uint(p_idx) * 4u + sg_row;
+            l[row_local * 33u + k_local] = kv_reg[p_idx];
+            r[k_local * 33u + row_local] = qv_reg[p_idx];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (at + 32u < 128u) {
+            load_tile(at + 32u, kv_reg, qv_reg);
+        }
+        op.run(left,right,result);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     for(auto it=result.begin();it!=result.end();++it) {
         if(!result.is_valid_element(it))continue;

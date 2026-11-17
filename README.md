@@ -50,6 +50,12 @@ tokspur serve --speed-preset --drafter dflash2 --shared-prefix-cache
 
 Add `--dflash2-vocab-gather cjk64k --dflash2-lookup hybrid --ple-ram-resident` when serving multilingual or CJK prompts alongside `<think>` reasoning.
 
+With the MTP drafter, the shared prefix cache on and SSD checkpoints off, `--speed-preset` parks up to 4 GiB of conversation state in host RAM. Chats become eligible at 2,048 committed tokens. To resume a parked chat, send the previous messages with the same sampling settings. The server can fill in omitted `reasoning_content` when it retains the matching conversation history. An explicit `seed` must match the parked chat. If you omit it, a unique matching chat resumes its sampling stream. Set `--parked-lanes-mib` to change the budget, or `--parked-lanes-mib 0` to turn it off.
+
+With Pack v3 and MTP parking, the worker also asks Metal to keep the mapped model weights resident for up to 30 seconds after a request packet. This can keep most of the model wired between chat turns. The worker releases that request on memory pressure or idle expiry. The parking budget covers the saved conversation state. The [parked-chat benchmark](scripts/benchmark_parked_chats.py) compares interleaved Japanese and Rust replies with an uninterrupted run.
+
+DFlash2 parking is experimental. An explicit `--parked-lanes-mib` budget, `--shared-prefix-cache` and `--native-dflash2-defer-context off` are required for a parked restore.
+
 ### Pack formats
 
 [`san-digital/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF`](https://huggingface.co/san-digital/Qwen3.8-Flash-Next-Q4_K-Tokspur-GGUF) includes Planar Pack v3 (`Qwen3.8-Flash-Next-Q4_K.tokspur.gguf`), which Tokspur uses directly from the model directory with no local pack build. The pinned asset profile requires this pre-built pack and its matching base GGUF and MTP sidecar. `--pack-v3` on `serve` refuses fallback to an older layout.
