@@ -388,7 +388,7 @@ pub fn exited_zero(status: i32) -> bool {
     status & 0x7f == 0 && (status >> 8) & 0xff == 0
 }
 
-/// The guardian (`guardian()` in owned_worker.cpp), in the forked child.
+/// Runs the child side of the guardian handshake, as in `fork_guardian()` in `native/src/owned_worker.cpp`.
 fn guardian(plan: &GuardianPlan) -> ! {
     let c = plan.fds;
     set_signal(ffi::SIGPIPE, ffi::SIG_IGN);

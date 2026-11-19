@@ -183,7 +183,7 @@ void workers(const std::filesystem::path& executable) {
 #endif
 int main(int argc, char** argv) {
     if (argc > 1 && std::string_view(argv[1]) == "target") return mtp_fixture::target(argc, argv);
-    const auto inherited = inherited_http_concurrent_entry(argc, argv); if (inherited) return inherited;
+    if (argc > 1) return inherited_http_concurrent_entry(argc, argv);
     try {
 #ifdef TOKSPUR_PRIVATE_MTP_OUTPUT64
         packet_fixture::metadata(); packet_fixture::wire(); packet_fixture::sessions(); packet_fixture::workers(std::filesystem::canonical(argv[0]));
