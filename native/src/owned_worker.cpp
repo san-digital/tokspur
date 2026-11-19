@@ -87,9 +87,7 @@ ssize_t send_bytes(int fd, const void* data, size_t size) {
 }
 void nonblocking(int fd) { const auto flags = fcntl(fd, F_GETFL); require(flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0, "cannot configure bounded worker pipe"); }
 
-// Everything below in the forked guardian/exec child uses precomputed data and
-// fixed-size storage, no C++ allocation, locks, streams, Foundation or callbacks.
-// Thus a multithreaded HTTP parent does not run heap/Objective-C work after fork.
+// The child uses fixed storage and arguments prepared by the parent. Keeping fork() inside fork_guardian avoids compiler-generated sanitiser calls before the child can arm.
 #if defined(__clang__) || defined(__GNUC__)
 #define TOKSPUR_POST_FORK_NO_SANITIZE __attribute__((no_sanitize("address", "undefined")))
 #else
@@ -138,7 +136,10 @@ TOKSPUR_POST_FORK_NO_SANITIZE int reap_child(pid_t pid) noexcept {
     do { result = waitpid(pid, &status, 0); } while (result < 0 && errno == EINTR);
     return result == pid ? status : -1;
 }
-[[noreturn]] TOKSPUR_POST_FORK_NO_SANITIZE void guardian(Channels c, int ceiling, pid_t parent, char* const* argv, char* const* environment) noexcept {
+TOKSPUR_POST_FORK_NO_SANITIZE pid_t fork_guardian(const Channels& c, int ceiling, char* const* argv, char* const* environment) noexcept {
+    const pid_t parent = getpid();
+    const pid_t pid = fork();
+    if (pid != 0) return pid;
     struct sigaction action{}; sigemptyset(&action.sa_mask); action.sa_handler = SIG_IGN;
     sigaction(SIGPIPE, &action, nullptr); action.sa_handler = SIG_DFL; sigaction(SIGCHLD, &action, nullptr);
     const int keep[]{c.control[1], c.status[1], c.input[1], c.output[1], c.error[1], c.gate[0], c.gate[1]};
@@ -710,15 +711,22 @@ struct OwnedWorker::Impl {
         char* environment[]{path_env, lang_env, locale_env, nullptr};
         socket_pair(channels.control); pipe_pair(channels.status); socket_pair(channels.input);
         pipe_pair(channels.output); pipe_pair(channels.error); pipe_pair(channels.gate);
-        const auto parent = getpid(); guardian_pid = fork();
+        guardian_pid = fork_guardian(channels, int(limit.rlim_cur), arguments.data(), environment);
         require(guardian_pid >= 0, "cannot launch owned worker guardian");
-        if (!guardian_pid) guardian(channels, int(limit.rlim_cur), parent, arguments.data(), environment);
         drop(channels.control[1]); drop(channels.status[1]); drop(channels.input[1]); drop(channels.output[1]); drop(channels.error[1]); drop(channels.gate[0]); drop(channels.gate[1]);
         for (const int fd : {channels.control[0], channels.status[0], channels.input[0], channels.output[0], channels.error[0]}) nonblocking(fd);
         const auto deadline = Clock::now() + options.startup_timeout;
-        while (!armed) { require(Clock::now() < deadline && !status_eof, "owned guardian did not arm before the startup deadline"); pump(deadline); }
+        while (!armed) {
+            require(!status_eof, "owned guardian closed its status pipe before arming");
+            require(Clock::now() < deadline, "owned guardian did not arm before the startup deadline");
+            pump(deadline);
+        }
         send_control('L', deadline);
-        while (worker_pid < 0) { require(Clock::now() < deadline && !status_eof, "owned guardian did not identify its worker"); pump(deadline); }
+        while (worker_pid < 0) {
+            require(!status_eof, "owned guardian closed its status pipe before identifying its worker");
+            require(Clock::now() < deadline, "owned guardian did not identify its worker before the startup deadline");
+            pump(deadline);
+        }
         send_control('E', deadline);
         ready_value = next(deadline);
         require(ready_value.kind() == Json::Kind::object && event_is(ready_value, "ready"), "owned target did not emit a single ready event");
@@ -1004,7 +1012,18 @@ struct OwnedWorker::Impl {
 };
 
 OwnedWorker::OwnedWorker(OwnedWorkerOptions options) : impl_(std::make_unique<Impl>(std::move(options))) {
-    try { impl_->start(); } catch (const WorkerError&) { impl_->invalidate(); throw; }
+    try { impl_->start(); } catch (const WorkerError& error) {
+        const bool guardian_closed = impl_->status_eof && impl_->worker_pid < 0;
+        impl_->invalidate();
+        if (guardian_closed && impl_->guardian_reaped) {
+            const auto status = impl_->guardian_status;
+            if (WIFSIGNALED(status))
+                throw WorkerError(std::string(error.what()) + " (signal " + std::to_string(WTERMSIG(status)) + ")");
+            if (WIFEXITED(status))
+                throw WorkerError(std::string(error.what()) + " (exit " + std::to_string(WEXITSTATUS(status)) + ")");
+        }
+        throw;
+    }
     catch (...) { impl_->invalidate(); throw WorkerError("owned worker startup configuration failed"); }
 }
 OwnedWorker::~OwnedWorker() = default;
