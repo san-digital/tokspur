@@ -94,6 +94,7 @@
 #include <sys/proc.h>
 #include <sys/resource.h>
 #include <sys/sysctl.h>
+#include <dispatch/dispatch.h>
 #include <unistd.h>
 #if defined(TOKSPUR_PRIVATE_MTP_DISPATCH_PROFILE) || defined(TOKSPUR_PRIVATE_TASK4_PROFILE) || defined(TOKSPUR_PRIVATE_OPERATOR_CHECKPOINTS) || defined(TOKSPUR_PRIVATE_NATIVE_MTP)
 #include <fcntl.h>
@@ -310,6 +311,16 @@ Json describe(Memory m) { return Json(Json::Object{{"physical_footprint_bytes", 
     {"swap_used_bytes", Json::integer(m.swap)}, {"pressure_level", Json::integer(m.pressure)},
     {"resident_size_bytes", Json::integer(m.resident_size)}, {"pageins", Json::integer(m.pageins)},
     {"compressed_bytes", Json::integer(m.compressed)}}); }
+class HostMemoryPressure : public FormatError {
+public:
+    using FormatError::FormatError;
+};
+[[noreturn]] void refuse_memory_work(Memory m) {
+    const auto reason = "target process/host memory guard refused further work: " + describe(m).dump();
+    if (m.current <= native_limit && (m.pressure == DISPATCH_MEMORYPRESSURE_WARN || m.pressure == DISPATCH_MEMORYPRESSURE_CRITICAL))
+        throw HostMemoryPressure(reason);
+    throw FormatError(reason);
+}
 void own_memory_guard(const std::function<bool()>& reclaim = {}) {
     auto m = memory();
     if (!memory_work_admitted({m.current, m.pressure}, native_limit) && reclaim && reclaim()) {
@@ -318,7 +329,7 @@ void own_memory_guard(const std::function<bool()>& reclaim = {}) {
     }
     // Lifetime peak remains diagnostic because releasing memory cannot lower it.
     if (!memory_work_admitted({m.current, m.pressure}, native_limit))
-        throw FormatError("target process/host memory guard refused further work: " + describe(m).dump());
+        refuse_memory_work(m);
 }
 void other_workers() {
     // proc_name() yields nothing for processes owned by other users, so a root or
@@ -3984,11 +3995,16 @@ int target_cli(int argc, char** argv) {
 #endif
         indices.emplace(name, slices.size()); slices.push_back({name, 0, 0});
     }
-    // Replace large original Metal resources rather than layering capture aliases
-    // over them. Whole tensor slices stay intact; capped edge pages are charged
-    // for every actual resource. Both same-resident comparators share this plan.
+    constexpr uint64_t pack_buffer_bytes = uint64_t(4) << 30;
+    const uint64_t page = getpagesize();
+    const bool split_pack_weights = pack_v3 && pack_v3->plan.recipe == planar_v3::pack_recipe_v3 &&
+        std::all_of(pack_v3->plan.tensors.begin(), pack_v3->plan.tensors.end(), [&](const auto& tensor) {
+            const auto offset = checked_add(pack_v3->plan.data_offset, tensor.offset);
+            return tensor.bytes <= pack_buffer_bytes - offset % page;
+        });
     const uint64_t mapped_region_limit = (execution == StackExecution::recurrent_replay ||
-        (TOKSPUR_PRIVATE_M5_RESOURCE_SCREEN && execution == StackExecution::direct)) ? uint64_t(1) << 32 : 0;
+        (TOKSPUR_PRIVATE_M5_RESOURCE_SCREEN && execution == StackExecution::direct)) ? pack_buffer_bytes : 0;
+    const uint64_t pack_region_limit = split_pack_weights ? pack_buffer_bytes : mapped_region_limit;
     ImportedWeights imports;
     if (!slices.empty()) {
         imports = gpu.import_weights(source, slices, mapped_region_limit);
@@ -4052,7 +4068,7 @@ int target_cli(int argc, char** argv) {
             packed_slices.push_back({tensor.name, 0, 0});
             packed_plan_indices.push_back(i);
         }
-        const auto packed = gpu.import_weights(pack_v3->model, packed_slices, mapped_region_limit
+        const auto packed = gpu.import_weights(pack_v3->model, packed_slices, pack_region_limit
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
             , true
 #endif
@@ -4183,7 +4199,7 @@ int target_cli(int argc, char** argv) {
         const bool admitted = reclaim_before_memory_refusal(native_limit, [&]() {
             observed = memory(); return MemoryGuardReading{observed.current, observed.pressure};
         }, reclaim_own_caches);
-        if (!admitted) throw FormatError("target process/host memory guard refused further work: " + describe(observed).dump());
+        if (!admitted) refuse_memory_work(observed);
     };
 #else
     const auto own_memory_guard = [&]() {
@@ -5842,7 +5858,7 @@ int target_cli(int argc, char** argv) {
         counter_sampling = gpu.configure_profiling(16384);
     }
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
-    const bool parked_weight_residency = parked_lane_budget_bytes && pack_v3 && mtp && gpu.prepare_mapped_weight_residency();
+    const bool parked_weight_residency = parked_lane_budget_bytes && pack_v3 && !split_pack_weights && mtp && gpu.prepare_mapped_weight_residency();
 #else
     constexpr bool parked_weight_residency = false;
 #endif
@@ -5874,7 +5890,7 @@ int target_cli(int argc, char** argv) {
         {"peak_metal_buffer_bytes", Json::integer(gpu.memory().peak_bytes)}, {"gpu_allocation_count", Json::integer(gpu.memory().allocations)},
         {"gpu_buffer_limit_bytes", Json::integer(gpu.memory().budget)}, {"live_captures", Json::integer(gpu.memory().live_captures)},
         {"imported_weight_backing_bytes", Json::integer(gpu.memory().imported_backing_bytes)}, {"imported_regions", Json::integer(imported_region_count)}, {"weight_copy", Json(false)},
-        {"mapped_weight_region_limit_bytes", Json::integer(mapped_region_limit)},
+        {"mapped_weight_region_limit_bytes", Json::integer(pack_region_limit)},
         {"weights_storage", Json("read-only mapped Metal views; first-use page faults are not hidden from request time")},
         {"gpu_profile_mode", Json(profile_mode(counter_sampling))}, {"profile_counter_payload_bytes", Json::integer(gpu.memory().profile_counter_payload_bytes)},
 #ifdef TOKSPUR_PRIVATE_TASK4_PROFILE
@@ -6349,6 +6365,7 @@ int target_cli(int argc, char** argv) {
         }
         advance_known_prepared(tokens, base, emit_logits);
     };
+    bool pressure_reset_required = false;
     const auto emit_error = [&](const std::exception& error, bool fatal) {
 #ifdef TOKSPUR_PRIVATE_ROUTE_LOCK
         if(route_census_only)route_census_failed=true;
@@ -6372,10 +6389,17 @@ int target_cli(int argc, char** argv) {
         if (branches && !branches->matches(position)) { branches->invalidate(); retained.clear(); sampler.invalidate(); }
         reconcile_failure(retained, sampler, position, fatal);
         if (branches && (fatal || !sampler.matches(position) || (position && !retained.matches(position)))) branches->invalidate();
-        std::cout << decorate(Json(Json::Object{{"event", Json("error")}, {"message", Json(error.what())}, {"committed_prefix", Json::integer(position)}, {"automatic_retry_safe", Json(false)},
+        Json::Object fields{{"event", Json("error")}, {"message", Json(error.what())}, {"committed_prefix", Json::integer(position)}, {"automatic_retry_safe", Json(false)},
             {"status", Json("error")}, {"finish_reason", Json("error")}, {"fatal", Json(fatal)}, {"sampling", sampling_json(sampler, position)},
             {"stack_execution", Json(execution_name(stack.execution()))}, {"replay_prepared", Json(stack.replay_prepared())},
-            {"logits_available", Json(retained.matches(position))}, {"continuation_allowed", Json(retained.continuable(position) && sampler.matches(position))}})).dump() << std::endl;
+            {"logits_available", Json(retained.matches(position))}, {"continuation_allowed", Json(retained.continuable(position) && sampler.matches(position))}};
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+        if (!fatal && !broker && has_speculative && dynamic_cast<const HostMemoryPressure*>(&error)) {
+            pressure_reset_required = true;
+            fields.emplace_back("code", Json("host_memory_pressure"));
+        }
+#endif
+        std::cout << decorate(Json(std::move(fields))).dump() << std::endl;
     };
 #ifdef TOKSPUR_PRIVATE_VERIFICATION_COST
 #include "verification_cost_probe.inc"
@@ -7140,6 +7164,7 @@ int target_cli(int argc, char** argv) {
                 , mtp_generation.pending_overflow()
 #endif
                 ); files.assert_unchanged();
+            require(!pressure_reset_required || job.reset, "host memory pressure requires a fresh input with reset");
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
             require(!carrier_forced_input || !job.generate, "forced-history components cannot measure live controller decisions");
             require(!carrier_component_needs_reset || job.reset, "target verification component requires an explicit reset before further work");
@@ -8538,7 +8563,7 @@ int target_cli(int argc, char** argv) {
                 {"gpu_allocation_count", Json::integer(gpu.memory().allocations)}, {"gpu_buffer_limit_bytes", Json::integer(gpu.memory().budget)},
                 {"live_captures", Json::integer(gpu.memory().live_captures)}, {"imported_weight_backing_bytes", Json::integer(gpu.memory().imported_backing_bytes)},
                 {"native_limit_bytes", Json::integer(native_limit)}, {"profile_counter_payload_bytes", Json::integer(gpu.memory().profile_counter_payload_bytes)},
-                {"mapped_weight_region_limit_bytes", Json::integer(mapped_region_limit)},
+                {"mapped_weight_region_limit_bytes", Json::integer(pack_region_limit)},
                 {"block_gemv_formats", Json::integer(block_gemv_formats)},
                 {"sampling", sampling_json(sampler, stack.position())},
                 {"thermal_state", Json::integer(host_thermal_state())},
@@ -8551,6 +8576,7 @@ int target_cli(int argc, char** argv) {
 #ifdef TOKSPUR_PRIVATE_KERNEL_SEARCH_CAPTURE
             if (kernel_search_capture_path && ++kernel_search_requests == 3) break;
 #endif
+            pressure_reset_required = false;
         } catch (const FormatError& e) {
             emit_error(e, false);
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC

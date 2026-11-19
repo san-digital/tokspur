@@ -54,6 +54,7 @@ impl BurstPacing {
 pub enum WorkerError {
     /// `WorkerError`: refused, failed or ambiguous without an inner system/codec error.
     Refused(&'static str),
+    HostMemoryPressure,
     StartupOutput {
         source: Box<WorkerError>,
         stderr: Vec<u8>,
@@ -108,6 +109,7 @@ impl fmt::Debug for WorkerError {
                 .field("bytes", &stderr.len())
                 .finish_non_exhaustive(),
             Self::Refused(reason) => formatter.debug_tuple("Refused").field(reason).finish(),
+            Self::HostMemoryPressure => formatter.write_str("HostMemoryPressure"),
             Self::Channel { create, .. } => formatter
                 .debug_struct("Channel")
                 .field("create", create)
@@ -143,6 +145,9 @@ impl fmt::Display for WorkerError {
         match self {
             Self::StartupOutput { source, .. } => source.fmt(formatter),
             Self::Refused(reason) | Self::Cancelled(reason) => formatter.write_str(reason),
+            Self::HostMemoryPressure => {
+                formatter.write_str("generation stopped because of host memory pressure")
+            }
             Self::Channel { create, source } => formatter.write_str(match source {
                 PairError::Create(_) => create,
                 PairError::Secure(_) => "cannot secure worker pipe descriptor",
@@ -198,7 +203,10 @@ impl std::error::Error for WorkerError {
             Self::CommandInvalidated(Some(error)) => Some(error.as_ref()),
             #[cfg(feature = "verify8")]
             Self::Admission(error) => Some(error),
-            Self::Refused(_) | Self::Cancelled(_) | Self::CommandInvalidated(None) => None,
+            Self::Refused(_)
+            | Self::Cancelled(_)
+            | Self::HostMemoryPressure
+            | Self::CommandInvalidated(None) => None,
         }
     }
 }
@@ -227,6 +235,7 @@ impl WorkerError {
             #[cfg(feature = "verify8")]
             Self::Admission(_) => false,
             Self::Refused(_)
+            | Self::HostMemoryPressure
             | Self::Channel { .. }
             | Self::GuardianLaunch(_)
             | Self::PipeConfigure(_)
@@ -615,6 +624,26 @@ fn worker_number(value: &Json) -> Result<f64> {
     from_chars_f64(text)
         .filter(|number| number.is_finite())
         .ok_or(WorkerError::Refused("invalid owned broker numeric field"))
+}
+
+fn host_pressure_refusal(value: &Json, context_length: u32) -> Result<bool> {
+    let Some(code) = value.find("code")? else {
+        return Ok(false);
+    };
+    if code.string()? != b"host_memory_pressure" {
+        return Ok(false);
+    }
+    require(
+        !worker_field(value, "fatal")?.boolean()?
+            && !worker_field(value, "automatic_retry_safe")?.boolean()?
+            && !worker_field(value, "continuation_allowed")?.boolean()?
+            && !worker_field(value, "logits_available")?.boolean()?
+            && worker_field(value, "status")?.string()? == b"error"
+            && worker_field(value, "finish_reason")?.string()? == b"error"
+            && worker_integer(value, "committed_prefix")? <= u64::from(context_length),
+        "invalid host memory pressure refusal",
+    )?;
+    Ok(true)
 }
 
 fn worker_keys(value: &Json, allowed: &[&str]) -> Result<()> {
@@ -1092,6 +1121,7 @@ pub struct OwnedWorker {
     ready_value: Json,
     last_response: Json,
     needs_reset: bool,
+    resync_after_pressure: bool,
     broker_epoch: u64,
     broker_command: u64,
     broker_lease: u64,
@@ -1141,6 +1171,7 @@ struct Admitted {
 
 /// Failures inside the submitted-command block before its conversion.
 enum CommandError {
+    HostMemoryPressure,
     Cancelled(&'static str),
     Cause(Option<Box<dyn std::error::Error + Send + Sync>>),
 }
@@ -1264,6 +1295,7 @@ impl OwnedWorker {
             ready_value: Json::Null,
             last_response: Json::Null,
             needs_reset: false,
+            resync_after_pressure: false,
             broker_epoch: 0,
             broker_command: 0,
             broker_lease: 0,
@@ -2313,7 +2345,7 @@ impl OwnedWorker {
     }
 
     pub fn abort_mtp_generation(&mut self, deadline: Instant) -> Result<()> {
-        if self.io.failed || self.io.closed {
+        if self.io.failed || self.io.closed || self.resync_after_pressure {
             return Ok(());
         }
         let generation = match self.last_response.find("native_mtp_generation") {
@@ -2338,9 +2370,11 @@ impl OwnedWorker {
             ),
         ]);
         let result = self.request(&job, deadline, None, None);
-        if result.is_err() {
-            self.invalidate();
-            return result.map(|_| ());
+        if let Err(error) = result {
+            if !matches!(error, WorkerError::HostMemoryPressure) {
+                self.invalidate();
+            }
+            return Err(error);
         }
         self.needs_reset = true;
         Ok(())
@@ -2415,8 +2449,13 @@ impl OwnedWorker {
         };
         let mut mtp_reply = match &mtp_snapshots {
             Some((ready, previous)) => Some(
-                crate::mtp_wire::MtpWireReply::new(ready, previous, body, false)
-                    .map_err(WorkerError::MtpBeforeSubmit)?,
+                crate::mtp_wire::MtpWireReply::new(
+                    ready,
+                    previous,
+                    body,
+                    self.resync_after_pressure,
+                )
+                .map_err(WorkerError::MtpBeforeSubmit)?,
             ),
             None => None,
         };
@@ -2492,6 +2531,7 @@ impl OwnedWorker {
         }
         match outcome {
             Ok(value) => Ok(value),
+            Err(CommandError::HostMemoryPressure) => Err(WorkerError::HostMemoryPressure),
             Err(CommandError::Cancelled(reason)) => Err(WorkerError::Cancelled(reason)),
             Err(CommandError::Cause(cause)) => {
                 self.invalidate();
@@ -2697,6 +2737,10 @@ impl OwnedWorker {
             }
         }
         require(
+            !self.resync_after_pressure || admitted.reset,
+            "host memory pressure requires a fresh input with reset",
+        )?;
+        require(
             !self.needs_reset
                 || admitted.reset
                 || (admitted.begin && !admitted.allow_restore)
@@ -2752,7 +2796,7 @@ struct Submission<'s, 'a> {
 }
 
 impl OwnedWorker {
-    /// The C++ submitted-command `try` block. Any error except a cancellation becomes the caller's invalidating refusal.
+    /// Drains one submitted command. A validated pressure refusal requires a fresh input and preserves the worker.
     fn submit(
         &mut self,
         submission: Submission<'_, '_>,
@@ -2841,6 +2885,16 @@ impl OwnedWorker {
                 value.kind() == Kind::Object,
                 "owned target emitted a nonobject event",
             )?;
+            if self.options.scalar_channel
+                && self.broker_epoch == 0
+                && mtp_reply.is_some()
+                && event_is(&value, "error")?
+                && host_pressure_refusal(&value, self.options.context_length)?
+            {
+                self.io.idle_check()?;
+                self.resync_after_pressure = true;
+                return Err(CommandError::HostMemoryPressure);
+            }
             if let Some(reply) = mtp_reply.as_deref_mut()
                 && !event_is(&value, "done")?
             {
@@ -3012,6 +3066,7 @@ impl OwnedWorker {
                     }
                 }
                 self.needs_reset = false;
+                self.resync_after_pressure = false;
                 self.last_response = value.clone();
                 return Ok(value);
             } else {
@@ -3124,6 +3179,7 @@ mod tests {
             ready_value: Json::Object(Vec::new()),
             last_response: Json::Null,
             needs_reset: false,
+            resync_after_pressure: false,
             broker_epoch: 0,
             broker_command: 0,
             broker_lease: 0,
@@ -3147,6 +3203,31 @@ mod tests {
             assert!(admitted.reset);
             assert_eq!((admitted.input_count, admitted.output_count), (1, 0));
         }
+    }
+
+    #[test]
+    fn host_pressure_refusal_requires_a_discarded_context() {
+        let terminal = r#"{"code":"host_memory_pressure","fatal":false,"automatic_retry_safe":false,"continuation_allowed":false,"logits_available":false,"status":"error","finish_reason":"error","committed_prefix":512}"#;
+        let check = |text: &str| host_pressure_refusal(&parse_json(text.as_bytes()).unwrap(), 512);
+        assert!(check(terminal).unwrap());
+        assert!(!check("{}").unwrap());
+        assert!(!check(&terminal.replace("host_memory_pressure", "invalid_request")).unwrap());
+        for field in [
+            "fatal",
+            "automatic_retry_safe",
+            "continuation_allowed",
+            "logits_available",
+        ] {
+            let flag = format!(r#""{field}":false"#);
+            assert!(check(&terminal.replace(&flag, &format!(r#""{field}":true"#))).is_err());
+            assert!(check(&terminal.replace(&(flag + ","), "")).is_err());
+        }
+        assert!(check(&terminal.replace("512", "513")).is_err());
+        assert!(check(&terminal.replace(r#""status":"error""#, r#""status":"ok""#)).is_err());
+        assert!(
+            check(&terminal.replace(r#""finish_reason":"error""#, r#""finish_reason":"stop""#))
+                .is_err()
+        );
     }
 
     #[test]

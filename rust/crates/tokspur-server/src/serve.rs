@@ -2075,7 +2075,12 @@ fn trace_failure(error: &JobError) -> bool {
 
 /// The error type a failed job reports. A trace failure is the server's fault whether or not generation began.
 fn failure_kind(error: &JobError, target_started: bool) -> &'static str {
-    if trace_failure(error) {
+    if matches!(
+        error,
+        JobError::Serve(ServeError::Worker(WorkerError::HostMemoryPressure))
+    ) {
+        "host_memory_pressure"
+    } else if trace_failure(error) {
         "server_error"
     } else if target_started {
         "generation_failed_no_retry"
@@ -2088,6 +2093,11 @@ fn failure_kind(error: &JobError, target_started: bool) -> &'static str {
 fn failure_status(error: &JobError, expired: bool, target_started: bool) -> i32 {
     if expired {
         408
+    } else if matches!(
+        error,
+        JobError::Serve(ServeError::Worker(WorkerError::HostMemoryPressure))
+    ) {
+        503
     } else if trace_failure(error) {
         500
     } else if target_started {
@@ -3490,6 +3500,14 @@ mod tests {
         assert_eq!(failure_kind(&refused, true), "generation_failed_no_retry");
         assert_eq!(failure_status(&refused, false, true), 502);
         assert_eq!(failure_status(&refused, true, true), 408);
+    }
+
+    #[test]
+    fn host_pressure_reports_a_temporary_refusal() {
+        let pressure = JobError::Serve(ServeError::Worker(WorkerError::HostMemoryPressure));
+        assert_eq!(failure_kind(&pressure, true), "host_memory_pressure");
+        assert_eq!(failure_status(&pressure, false, true), 503);
+        assert_eq!(failure_status(&pressure, true, true), 408);
     }
 
     #[test]
