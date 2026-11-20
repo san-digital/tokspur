@@ -3,3 +3,7 @@ third_party/model-licences/Qwen3.8-Flash-Next/LICENSE -text whitespace=-blank-at
 
 # Keep the generated upstream library notices byte for byte.
 third_party/rust/COPYRIGHT-library.html -text whitespace=-blank-at-eol linguist-generated
+
+private/ export-ignore
+.github/workflows/private-lab.yml export-ignore
+private/experiment-lab/vendor/** -text linguist-vendored

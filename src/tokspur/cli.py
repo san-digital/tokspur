@@ -553,6 +553,7 @@ def serve(
     hc_consumer_fused: bool = True,
     ple_overlap: bool = True,
     shared_prefix_cache: bool | None = None,
+    parked_lanes_mib: int | None = None,
     mtp_lookup: str = "off",
     mtp_lookup_match: int | None = None,
     dflash2_lookup: str = "off",
@@ -856,6 +857,25 @@ def serve(
     effective_shared_prefix = (
         (drafter == "mtp") if shared_prefix_cache is None else bool(shared_prefix_cache)
     )
+    if parked_lanes_mib is None:
+        effective_parked_lanes_mib = (
+            4096
+            if (
+                speed_preset
+                and drafter == "mtp"
+                and effective_shared_prefix
+                and effective_checkpoint_cap_gib <= 0.0
+            )
+            else 0
+        )
+    else:
+        effective_parked_lanes_mib = int(parked_lanes_mib)
+    if not (0 <= effective_parked_lanes_mib <= 16384):
+        raise ValueError("--parked-lanes-mib must be between 0 and 16384")
+    if effective_parked_lanes_mib > 0 and not effective_shared_prefix:
+        raise ValueError("--parked-lanes-mib requires the shared prefix cache")
+    if effective_parked_lanes_mib > 0 and effective_checkpoint_cap_gib > 0.0:
+        raise ValueError("--parked-lanes-mib is incompatible with SSD checkpoints")
 
     state = private_dir(ROOT / ".tokspur/state")
     with state_lock():
@@ -1324,6 +1344,11 @@ def serve(
             *(["--native-hc-consumer-fused", "on"] if hc_consumer_fused else []),
             *(["--native-ple-overlap", "on"] if ple_overlap else []),
             *(["--shared-prefix-cache", "on"] if effective_shared_prefix else []),
+            *(
+                ["--native-parked-lanes-mib", str(effective_parked_lanes_mib)]
+                if effective_parked_lanes_mib > 0
+                else []
+            ),
             *(["--native-mtp-lookup", mtp_lookup] if mtp_lookup != "off" else []),
             *(
                 ["--native-mtp-lookup-match", str(mtp_lookup_match)]
@@ -1864,6 +1889,12 @@ def main() -> None:
         help="Host-RAM shared system-prefix cache (default: on for mtp)",
     )
     s.add_argument(
+        "--parked-lanes-mib",
+        type=int,
+        default=None,
+        help="Host RAM for conversations parked on a switch (0..16384, default: 0, 4096 with the MTP speed preset and shared prefix cache)",
+    )
+    s.add_argument(
         "--mtp-lookup",
         choices=["off", "bypass", "hybrid"],
         default="off",
@@ -2046,6 +2077,7 @@ def main() -> None:
                 hc_consumer_fused=args.hc_consumer_fused,
                 ple_overlap=args.ple_overlap,
                 shared_prefix_cache=args.shared_prefix_cache,
+                parked_lanes_mib=args.parked_lanes_mib,
                 mtp_lookup=args.mtp_lookup,
                 mtp_lookup_match=args.mtp_lookup_match,
                 dflash2_lookup=args.dflash2_lookup,

@@ -38,7 +38,10 @@ NativeText::NativeText(const std::filesystem::path& tokenizer_json, std::string_
 }
 
 NativeText::~NativeText() = default;
-std::vector<uint32_t> NativeText::encode(std::string_view text) const { return impl_->bpe->encode(text, identity); }
+std::vector<uint32_t> NativeText::encode(std::string_view text,
+    std::span<const std::pair<size_t, size_t>> literal_ranges) const {
+    return impl_->bpe->encode(text, identity, literal_ranges);
+}
 std::string NativeText::decode_bytes(std::span<const uint32_t> ids, bool skip_special) const {
     return impl_->bpe->decode_bytes(ids, skip_special);
 }

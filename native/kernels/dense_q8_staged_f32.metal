@@ -1,6 +1,6 @@
 // Bounded dense adaptation of Tokspur's grouped_mm_f32 tile and packed Q8 decoder from llama.cpp 6050b467.
 // Copyright (c) 2023-2026 The ggml authors. MIT notice: ../third_party/llama-cpp/LICENSE.
-// Grid band ordering follows m5-max-kernels a6d92a3bdd7c784fde2e3e86b303d533354f4603 (MIT, Copyright 2026 9Tempest). The untraced multi-segment kernels are removed.
+// Grid band ordering follows m5-max-kernels a6d92a3bdd7c784fde2e3e86b303d533354f4603 (MIT, Copyright (c) 2026 m5-max-kernels contributors). The untraced multi-segment kernels are removed.
 // Tokspur retains the graph, views, scheduling and original raw GGUF Q8_0 representation.
 #include <metal_stdlib>
 #include <metal_tensor>

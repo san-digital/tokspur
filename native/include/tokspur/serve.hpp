@@ -1,11 +1,18 @@
 #pragma once
 
 #include "tokspur/chat.hpp"
+#include "tokspur/gguf.hpp"
+#include "tokspur/http.hpp"
 #include "tokspur/response.hpp"
 #include "tokspur/response_protocol.hpp"
 
+#include <condition_variable>
+#include <deque>
+#include <exception>
 #include <functional>
+#include <mutex>
 #include <optional>
+#include <variant>
 
 namespace tokspur {
 
@@ -26,6 +33,7 @@ struct ServeCodec {
     std::function<std::vector<uint32_t>(const RenderedChat&)> encode;
     ResponseDecoder decode;
     ResponseAdmission admission;
+    std::vector<uint32_t> nonordinary_ids = {};
 };
 using ServeTarget = std::function<Json(const Json&, const std::function<void(const Json&)>&)>;
 struct ServeSink {
@@ -129,4 +137,68 @@ private:
 };
 
 int server_cli(int argc, char** argv);
+
+inline constexpr auto http_read_seconds = std::chrono::seconds(5);
+inline constexpr size_t reading_peers = 64;
+inline constexpr size_t hand_off_capacity = 8;
+inline constexpr size_t routing_workers = 4;
+
+struct Arrival {
+    http::Connection connection;
+    http::Clock::time_point arrival;
+    std::variant<http::Request, http::Error> read;
+};
+
+void refuse_busy_connection(http::Connection connection) noexcept;
+void admit_reading(std::vector<std::pair<http::Connection, http::Clock::time_point>>& reading,
+                   http::Connection connection, http::Clock::time_point now);
+
+class ArrivalQueue {
+public:
+    explicit ArrivalQueue(size_t capacity = hand_off_capacity, size_t workers = routing_workers);
+    [[nodiscard]] bool hand_off(Arrival arrival);
+    [[nodiscard]] std::optional<Arrival> recv();
+    void worker_stopped(bool orderly, std::exception_ptr failure = nullptr) noexcept;
+    void check_workers() const;
+    void close() noexcept;
+private:
+    const size_t capacity_;
+    mutable std::mutex mutex_;
+    std::condition_variable condition_;
+    std::deque<Arrival> queue_;
+    size_t active_workers_;
+    bool closed_ = false;
+    bool unexpected_exit_ = false;
+    std::exception_ptr failure_;
+};
+
+inline constexpr uint64_t prefix_trace_limit_bytes = 16ull << 20;
+inline constexpr std::string_view prefix_trace_full_message =
+    "private prefix trace is full (16 MiB bound); no request is served until the server is restarted with a new trace file";
+inline constexpr std::string_view prefix_trace_unavailable_message = "private prefix trace is unavailable";
+
+class PrefixTraceError : public FormatError {
+public:
+    using FormatError::FormatError;
+};
+
+class PrefixTraceLog {
+public:
+    PrefixTraceLog() = default;
+    ~PrefixTraceLog();
+    PrefixTraceLog(const PrefixTraceLog&) = delete;
+    PrefixTraceLog& operator=(const PrefixTraceLog&) = delete;
+    void enable(int directory_fd);
+    void write(const Json& record);
+    [[nodiscard]] uint64_t bytes_written() const noexcept { return bytes_; }
+    void set_bytes_written_for_test(uint64_t bytes) noexcept { bytes_ = bytes; }
+    [[nodiscard]] int native_handle_for_test() const noexcept { return fd_; }
+private:
+    int fd_ = -1;
+    uint64_t bytes_ = 0;
+    const char* refusal_ = nullptr;
+};
+
+[[nodiscard]] std::string_view job_failure_kind(const std::exception& error, bool target_started) noexcept;
+[[nodiscard]] int job_failure_status(const std::exception& error, bool expired, bool target_started) noexcept;
 } // namespace tokspur

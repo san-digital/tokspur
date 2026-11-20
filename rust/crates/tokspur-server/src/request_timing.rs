@@ -1,6 +1,6 @@
 //! The opt-in per-request phase record (`request_timing`), printed under `--telemetry-stdout` for every request that reached the generation thread, failures included.
 //!
-//! Every time is integer microseconds. Fields ending `_at_us` are offsets from the request's arrival (the accept instant). The others are durations. A field whose phase never happened is left out and named in `unavailable`. No token IDs and no text are recorded.
+//! Every time is integer microseconds. Fields ending `_at_us` are offsets from the request's arrival (the accept instant). The others are durations. A field whose phase never happened is left out and named in `unavailable`. No token IDs and no prompt or generated text are recorded. A request that did not end `ok` also carries `error_type` and `error_message` from its error reply. The message keeps up to 512 bytes, ending at a complete UTF-8 character, so a failure can be read from the server's own output.
 //!
 //! Two fields have a fixed meaning that their names alone do not give. `first_sse_write_at_us` is the role delta, which is written before prefill starts. `first_tool_call_at_us` is written only after the whole generation and the final response parse. `arrival_to_dequeue_us` includes reading and routing the request on its reader thread, so it is an upper bound on time spent waiting for the slot.
 
@@ -10,6 +10,9 @@ use tokspur_json::Json;
 
 /// The record's schema number.
 pub const REQUEST_TIMING_SCHEMA: u64 = 1;
+
+/// The maximum error message size in bytes, truncated at a complete UTF-8 character.
+const ERROR_MESSAGE_BYTES: usize = 512;
 
 /// How a request that reached the generation thread ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +206,18 @@ impl RequestTiming {
         phases: &PhaseStamps,
         finished: Instant,
     ) -> Json {
+        self.record_with_error(response_id, outcome, None, phases, finished)
+    }
+
+    /// The record of a request that did not end `ok`, with the type and message of its error reply.
+    pub fn record_with_error(
+        &self,
+        response_id: Option<&[u8]>,
+        outcome: Outcome,
+        error: Option<(&str, &[u8])>,
+        phases: &PhaseStamps,
+        finished: Instant,
+    ) -> Json {
         let mut fields: Vec<(Vec<u8>, Json)> = Vec::with_capacity(32);
         let mut unavailable: Vec<Json> = Vec::new();
         let mut put = |name: &str, value: Option<Json>| match value {
@@ -220,6 +235,13 @@ impl RequestTiming {
         put("schema", Some(Json::integer(REQUEST_TIMING_SCHEMA)));
         put("response_id", response_id.map(Json::from));
         put("outcome", Some(Json::from(outcome.name())));
+        if let Some((kind, message)) = error {
+            put("error_type", Some(Json::from(kind)));
+            let capped = &message[..message.len().min(ERROR_MESSAGE_BYTES)];
+            let valid_bytes = std::str::from_utf8(capped)
+                .map_or_else(|error| error.valid_up_to(), |_| capped.len());
+            put("error_message", Some(Json::from(&capped[..valid_bytes])));
+        }
         put("stream", Some(Json::Bool(self.stream)));
         put(
             "arrival_to_dequeue_us",
@@ -476,12 +498,109 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_request_carries_its_error_type_and_message() {
+        let t0 = Instant::now();
+        let timing = RequestTiming::new(t0, ms(t0, 3), true);
+        let phases = PhaseStamps {
+            request_start: Some(ms(t0, 3)),
+            ..PhaseStamps::default()
+        };
+        let long = [b'x'; 600];
+        for (message, kept) in [
+            (b"MTP packet exceeds context reservation".as_slice(), 38),
+            (long.as_slice(), 512),
+        ] {
+            let record = timing.record_with_error(
+                Some(b"chatcmpl-x"),
+                Outcome::Failed,
+                Some(("generation_failed_no_retry", message)),
+                &phases,
+                ms(t0, 9),
+            );
+            let text = |name: &str| {
+                record
+                    .find(name)
+                    .unwrap()
+                    .unwrap()
+                    .string()
+                    .unwrap()
+                    .to_vec()
+            };
+            assert_eq!(text("outcome"), b"failed");
+            assert_eq!(text("error_type"), b"generation_failed_no_retry");
+            assert_eq!(text("error_message"), &message[..kept]);
+        }
+        let ok = timing.record(Some(b"chatcmpl-x"), Outcome::Ok, &phases, ms(t0, 9));
+        assert!(ok.find("error_type").unwrap().is_none());
+        assert!(ok.find("error_message").unwrap().is_none());
+        assert!(!unavailable(&ok).contains(&b"error_type".to_vec()));
+    }
+
+    #[test]
     fn the_record_holds_no_text_and_stays_small() {
         let record = streamed(5, 2, 1);
         let bytes = record.dump().unwrap();
         assert!(bytes.len() < 1024, "{}", bytes.len());
         for text in [b"\"r\"".as_slice(), b"\"a\"", b"\"b\""] {
             assert!(!bytes.windows(text.len()).any(|window| window == text));
+        }
+    }
+
+    #[test]
+    fn truncated_unicode_errors_keep_a_valid_json_record() {
+        let now = Instant::now();
+        let timing = RequestTiming::new(now, now, true);
+        for (message, expected) in [
+            ("文".repeat(200), "文".repeat(170)),
+            (format!("{}é", "x".repeat(511)), "x".repeat(511)),
+            (format!("{}𐀀", "x".repeat(511)), "x".repeat(511)),
+            (format!("{}𐀀", "x".repeat(510)), "x".repeat(510)),
+            (format!("{}𐀀", "x".repeat(509)), "x".repeat(509)),
+            (
+                format!("{}𐀀", "x".repeat(508)),
+                format!("{}𐀀", "x".repeat(508)),
+            ),
+            ("short 文 error".to_owned(), "short 文 error".to_owned()),
+        ] {
+            let record = timing.record_with_error(
+                Some(b"chatcmpl-unicode"),
+                Outcome::Failed,
+                Some(("generation_failed_no_retry", message.as_bytes())),
+                &PhaseStamps::default(),
+                now,
+            );
+            let parsed = tokspur_json::parse_json(&record.dump().unwrap()).unwrap();
+            assert_eq!(
+                parsed
+                    .find("error_message")
+                    .unwrap()
+                    .unwrap()
+                    .string()
+                    .unwrap(),
+                expected.as_bytes()
+            );
+            assert_eq!(
+                parsed.find("outcome").unwrap().unwrap().string().unwrap(),
+                b"failed"
+            );
+            assert_eq!(
+                parsed
+                    .find("error_type")
+                    .unwrap()
+                    .unwrap()
+                    .string()
+                    .unwrap(),
+                b"generation_failed_no_retry"
+            );
+            assert_eq!(
+                parsed
+                    .find("response_id")
+                    .unwrap()
+                    .unwrap()
+                    .string()
+                    .unwrap(),
+                b"chatcmpl-unicode"
+            );
         }
     }
 }

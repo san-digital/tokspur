@@ -46,6 +46,7 @@ public:
     [[nodiscard]] std::string decode_text(std::span<const uint32_t> ids, bool skip_special = false) const;
     [[nodiscard]] size_t vocabulary_size() const { return vocabulary_.size(); }
     [[nodiscard]] size_t merge_count() const { return merges_.size(); }
+    [[nodiscard]] std::vector<uint32_t> nonordinary_token_ids() const;
 
 private:
     struct Merge { uint32_t rank; uint32_t output; };

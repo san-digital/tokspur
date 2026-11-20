@@ -295,17 +295,30 @@ inline MtpGenerationCommand mtp_generation_command(const Json& value) {
                     throw FormatError("unknown MTP generation command field");
             }
             out.v2 = true;
-            out.committed = uint32_t(committed->unsigned_integer());
-            out.emitted = uint32_t(emitted->unsigned_integer());
-            out.pending = uint32_t(pending->unsigned_integer());
-            if (const auto* rc = value.find("remaining_compute")) out.remaining_compute = uint32_t(rc->unsigned_integer());
-            if (const auto* tb = value.find("total_budget")) out.total_budget = uint32_t(tb->unsigned_integer());
+            const auto parse_u32_bounded = [](const Json& v, uint64_t max_val, const char* msg) {
+                const auto raw = v.unsigned_integer();
+                if (raw > max_val) throw FormatError(msg);
+                return uint32_t(raw);
+            };
+            out.committed = parse_u32_bounded(*committed, 131072, "MTP generation committed bound exceeded");
+            out.emitted = parse_u32_bounded(*emitted, 131072, "MTP generation emitted bound exceeded");
+            out.pending = parse_u32_bounded(*pending, 131072, "MTP generation pending bound exceeded");
+            if (const auto* rc = value.find("remaining_compute")) out.remaining_compute = parse_u32_bounded(*rc, 131072, "MTP generation remaining_compute bound exceeded");
+            if (const auto* tb = value.find("total_budget")) out.total_budget = parse_u32_bounded(*tb, 131072, "MTP generation total_budget bound exceeded");
             if (const auto* sc = value.find("stage_a_controller")) {
                 if (sc->kind() != Json::Kind::object) throw FormatError("stage_a_controller must be an object");
                 StageAControllerState ctrl;
                 if (const auto* ea = sc->find("ewma_alpha1")) ctrl.ewma_alpha1 = std::stod(std::string(ea->number_lexeme()));
-                if (const auto* cm = sc->find("current_mode")) ctrl.current_mode = uint8_t(cm->unsigned_integer());
-                if (const auto* co = sc->find("consecutive_ordinary_steps")) ctrl.consecutive_ordinary_steps = uint8_t(co->unsigned_integer());
+                if (const auto* cm = sc->find("current_mode")) {
+                    const auto mode = cm->unsigned_integer();
+                    if (mode > 255) throw FormatError("controller current_mode outside byte range");
+                    ctrl.current_mode = uint8_t(mode);
+                }
+                if (const auto* co = sc->find("consecutive_ordinary_steps")) {
+                    const auto steps = co->unsigned_integer();
+                    if (steps > 255) throw FormatError("controller consecutive_ordinary_steps outside byte range");
+                    ctrl.consecutive_ordinary_steps = uint8_t(steps);
+                }
                 if (const auto* cpd = sc->find("controller_policy_digest")) {
                     if (cpd->kind() != Json::Kind::array || cpd->array().size() != 32)
                         throw FormatError("controller_policy_digest must be a 32-element array");
@@ -368,7 +381,7 @@ public:
                 controller_state_ = StageAControllerState{}; controller_state_.controller_policy_digest = expected_policy_;
             } else if (command.stage_a_controller) controller_state_ = *command.stage_a_controller;
             else { controller_state_ = StageAControllerState{}; controller_state_.controller_policy_digest = expected_policy_; }
-        } else if (!active_ || command.id != id_ || command.remaining != remaining_ || prefix != prefix_ ||
+        } else if (!active_ || command.id != id_ || command.v2 != v2_ || command.remaining != remaining_ || prefix != prefix_ ||
                    stops.size() != stop_count_ || !std::equal(stops.begin(), stops.end(), stops_.begin()))
             throw FormatError("MTP generation continuation identity/budget/frontier/stops differ");
         else if (command.v2) {

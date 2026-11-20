@@ -8,7 +8,10 @@ use std::time::Instant;
 
 use tokspur_sys::fd as sysfd;
 use tokspur_sys::net::{self, Ipv4Address};
-use tokspur_sys::{EAGAIN, EINTR, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT, PollFd};
+use tokspur_sys::{
+    EAGAIN, ECONNABORTED, EINTR, EMFILE, ENFILE, ENOBUFS, ENOMEM, EPROTO, POLLERR, POLLHUP, POLLIN,
+    POLLNVAL, POLLOUT, PollFd,
+};
 
 pub type Deadline = Instant;
 
@@ -1078,8 +1081,15 @@ impl Listener {
             let (accepted, peer) = match net::accept(fd.as_fd()) {
                 Ok(pair) => pair,
                 Err(error) => {
-                    if matches!(error.raw_os_error(), Some(EAGAIN | EINTR)) {
-                        continue;
+                    match error.raw_os_error() {
+                        Some(EAGAIN | EINTR | ECONNABORTED | EPROTO) => continue,
+                        Some(EMFILE | ENFILE | ENOBUFS | ENOMEM) => {
+                            if Instant::now() < deadline {
+                                sysfd::pause(1);
+                            }
+                            continue;
+                        }
+                        _ => {}
                     }
                     return Err(HttpError::system_from(
                         "Accept loopback HTTP connection",

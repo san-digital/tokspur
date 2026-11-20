@@ -371,11 +371,10 @@ kernel void dflash2_attention_split(device bfloat* queries_all [[buffer(0)]],
         return;
     }
 
-    threadgroup float workspace[uint(M) * uint(N) + 3u * uint(M)];
-    threadgroup float* score_storage = workspace;
-    threadgroup float* row_max = workspace + uint(M) * uint(N);
-    threadgroup float* row_sum = row_max + M;
-    threadgroup float* previous_scale = row_sum + M;
+    // 16,384 B exact (<= 16 KiB -> 2 TGs / 512 threads per M5 Max GPU core, 2.0x occupancy vs 16,768 B).
+    threadgroup float score_storage[uint(M) * uint(N)];
+    float my_row_max[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
+    float my_row_sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     auto qt = tensor(queries, dextents<int, 2>{D, M}, array<int, 2>{1, D});
     constexpr auto qk_desc = matmul2d_descriptor(M, N, TileK, false, true, false);
@@ -390,11 +389,6 @@ kernel void dflash2_attention_split(device bfloat* queries_all [[buffer(0)]],
     auto running = pv.template get_destination_cooperative_tensor<decltype(p0), decltype(first_v0), float>();
     #pragma unroll
     for (ushort i = 0; i < running.get_capacity(); ++i) running[i] = 0.0f;
-    if (tid < M) {
-        row_max[tid] = -INFINITY;
-        row_sum[tid] = 0.0f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint tile = split; tile < live_tiles; tile += Splits) {
         const uint slot = (tile < wrapped ? tile : (resume + tile - wrapped)) * uint(N);
@@ -415,8 +409,10 @@ kernel void dflash2_attention_split(device bfloat* queries_all [[buffer(0)]],
         scores.store(pt.slice<N, M>(0, 0));
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (ushort batch = 0; batch < M; batch += 8) {
-            const ushort matrix_row = batch + sg;
+        float my_scale[4];
+        #pragma unroll
+        for (ushort b = 0; b < 4; ++b) {
+            const ushort matrix_row = b * 8u + sg;
             const uint proposal_row = uint(matrix_row) % Rows;
             const uint query_pos = cache_length + proposal_row;
             const uint row_start = query_pos >= (Window - 1u) ? (query_pos - (Window - 1u)) : 0u;
@@ -434,7 +430,7 @@ kernel void dflash2_attention_split(device bfloat* queries_all [[buffer(0)]],
                 tile_max = max(tile_max, local_scores[i]);
             }
             tile_max = simd_max(tile_max);
-            const float prev_max = row_max[matrix_row];
+            const float prev_max = my_row_max[b];
             const float next_max = max(prev_max, tile_max);
             const bool empty = (next_max == -INFINITY);
             const float scale = empty ? 1.0f : (prev_max == -INFINITY ? 0.0f : exp(prev_max - next_max));
@@ -445,11 +441,9 @@ kernel void dflash2_attention_split(device bfloat* queries_all [[buffer(0)]],
                 tile_sum += local_scores[i];
             }
             tile_sum = simd_sum(tile_sum);
-            if (!lane) {
-                previous_scale[matrix_row] = scale;
-                row_sum[matrix_row] = row_sum[matrix_row] * scale + tile_sum;
-                row_max[matrix_row] = next_max;
-            }
+            my_scale[b] = scale;
+            my_row_sum[b] = my_row_sum[b] * scale + tile_sum;
+            my_row_max[b] = next_max;
             #pragma unroll
             for (ushort i = 0; i < 4; ++i) {
                 score_storage[uint(matrix_row) * N + uint(lane) + uint(i) * 32u] = local_scores[i];
@@ -471,10 +465,23 @@ kernel void dflash2_attention_split(device bfloat* queries_all [[buffer(0)]],
             #pragma unroll
             for (ushort i = 0; i < partial_out.get_capacity(); ++i) partial_out[i] += pv_acc[i];
         }
-        #pragma unroll
-        for (ushort i = 0; i < running.get_capacity(); ++i) {
-            const auto idx = running.get_multidimensional_index(i);
-            running[i] = running[i] * previous_scale[idx[1]] + partial_out[i];
+        if (tile == split) {
+            #pragma unroll
+            for (ushort i = 0; i < running.get_capacity(); ++i) {
+                running[i] = 0.0f + partial_out[i];
+            }
+        } else {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (!lane) {
+                #pragma unroll
+                for (ushort b = 0; b < 4; ++b) score_storage[b * 8u + sg] = my_scale[b];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            #pragma unroll
+            for (ushort i = 0; i < running.get_capacity(); ++i) {
+                const auto idx = running.get_multidimensional_index(i);
+                running[i] = running[i] * score_storage[idx[1]] + partial_out[i];
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -483,6 +490,7 @@ kernel void dflash2_attention_split(device bfloat* queries_all [[buffer(0)]],
         constexpr ushort CurrentN = 8, CurrentValueTile = 16;
         threadgroup float* current_raw_scores = score_storage + uint(M) * CurrentValueTile;
         threadgroup bfloat* current_values = reinterpret_cast<threadgroup bfloat*>(score_storage + uint(M) * CurrentValueTile + uint(M) * CurrentN);
+        threadgroup float* cur_prev_scale = score_storage + (uint(M) * uint(N) - uint(M));
         auto current_scores = tensor(current_raw_scores, dextents<int, 2>{CurrentN, M}, array<int, 2>{1, CurrentN});
         constexpr auto cur_qk_desc = matmul2d_descriptor(M, CurrentN, TileK, false, true, false);
         matmul2d<cur_qk_desc, execution_simdgroups<8>> cur_qk;
@@ -503,20 +511,21 @@ kernel void dflash2_attention_split(device bfloat* queries_all [[buffer(0)]],
         cur.store(current_scores.slice<CurrentN, M>(0, 0));
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (ushort batch = 0; batch < M; batch += 8) {
-            const ushort matrix_row = batch + sg;
+        #pragma unroll
+        for (ushort b = 0; b < 4; ++b) {
+            const ushort matrix_row = b * 8u + sg;
             const float sc = lane < CurrentN ? (current_raw_scores[uint(matrix_row) * CurrentN + lane] * 0.08838834765f) : -INFINITY;
             const float tile_max = simd_max(sc);
-            const float prev_max = row_max[matrix_row];
+            const float prev_max = my_row_max[b];
             const float next_max = max(prev_max, tile_max);
             const float scale = (prev_max == -INFINITY || next_max == -INFINITY) ? 0.0f : exp(prev_max - next_max);
             const float prob = (lane < CurrentN && next_max != -INFINITY) ? exp(sc - next_max) : 0.0f;
             const float tile_sum = simd_sum(prob);
             if (!lane) {
-                previous_scale[matrix_row] = scale;
-                row_sum[matrix_row] = row_sum[matrix_row] * scale + tile_sum;
-                row_max[matrix_row] = next_max;
+                cur_prev_scale[matrix_row] = scale;
             }
+            my_row_sum[b] = my_row_sum[b] * scale + tile_sum;
+            my_row_max[b] = next_max;
             if (lane < CurrentValueTile) {
                 score_storage[uint(matrix_row) * CurrentValueTile + lane] = lane < CurrentN ? prob : 0.0f;
             }
@@ -541,16 +550,20 @@ kernel void dflash2_attention_split(device bfloat* queries_all [[buffer(0)]],
         #pragma unroll
         for (ushort i = 0; i < running.get_capacity(); ++i) {
             const auto idx = running.get_multidimensional_index(i);
-            running[i] = running[i] * previous_scale[idx[1]] + cur_out[i];
+            running[i] = running[i] * cur_prev_scale[idx[1]] + cur_out[i];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     auto acc_tensor = tensor(partial, dextents<int, 2>{D, M}, array<int, 2>{1, D});
     running.store(acc_tensor.slice<D, M>(0, 0));
-    if (tid < M) {
-        partial[M * D + tid] = row_max[tid];
-        partial[M * D + M + tid] = row_sum[tid];
+    if (!lane) {
+        #pragma unroll
+        for (ushort b = 0; b < 4; ++b) {
+            const uint matrix_row = uint(b) * 8u + uint(sg);
+            partial[M * D + matrix_row] = my_row_max[b];
+            partial[M * D + M + matrix_row] = my_row_sum[b];
+        }
     }
 }
 

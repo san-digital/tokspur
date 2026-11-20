@@ -209,6 +209,8 @@ public:
     OwnedWorker(const OwnedWorker&) = delete;
     OwnedWorker& operator=(const OwnedWorker&) = delete;
     [[nodiscard]] const Json& ready() const;
+    [[nodiscard]] std::optional<uint32_t> worker_pid() const noexcept;
+    [[nodiscard]] std::optional<uint32_t> guardian_pid() const noexcept;
     Json request(const Json&, WorkerDeadline, const std::function<bool()>& cancelled,
                  const std::function<void(const Json&)>& on_token = {});
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP

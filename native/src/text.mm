@@ -283,6 +283,7 @@ std::string NativeText::decode_bytes(std::span<const uint32_t> ids, bool skip_sp
 std::string NativeText::decode(std::span<const uint32_t> ids, bool skip_special) const { return impl_->bpe->decode_text(ids, skip_special); }
 size_t NativeText::vocabulary_size() const { return impl_->bpe->vocabulary_size(); }
 size_t NativeText::merge_count() const { return impl_->bpe->merge_count(); }
+std::vector<uint32_t> NativeText::nonordinary_token_ids() const { return impl_->bpe->nonordinary_token_ids(); }
 
 void NativeText::verify_gguf(const ModelFiles& model) const {
     size_t found = 0;

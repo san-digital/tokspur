@@ -1110,8 +1110,7 @@ static inline void planar_moe_down_union_impl(
     uint2 group,
     ushort sg,
     ushort lane,
-    ushort tid,
-    threadgroup float (*sx)[256]
+    ushort tid
 ) {
     if ((planar_encoding != 7u && planar_encoding != 8u) ||
         !a.tokens || a.tokens > MaxTokens || !a.selected || a.selected > 16u || !a.experts || a.experts > 512u ||
@@ -1309,20 +1308,22 @@ static inline void planar_moe_down_union_impl(
         float sums[MCap][kRows] = {{0.0f}};
         uint k_blk = 0u;
         if (planar_encoding == 7u) {
-            const ushort ib8 = lane >> 2u;
-            const ushort l4 = lane & 3u;
-            const ushort j_base = l4 * 4u;
-            const uint sx_off8 = uint(ib8) * 32u + uint(j_base);
-            const uint col2 = uint(tid) * 2u;
-            for (; k_blk + 8u <= blocks_per_row; k_blk += 8u) {
-                for (ushort m = 0; m < m_cnt; ++m) {
-                    device const float* x_src = expert_hidden + ulong(f_idx[m]) * in_stride_f32 + k_blk * 32u + col2;
-                    const float2 xv2 = float2(*reinterpret_cast<device const packed_float2*>(x_src));
-                    bad |= nonfinite_vec2(xv2);
-                    *reinterpret_cast<threadgroup float2*>(&sx[m][col2]) = xv2;
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (sg_live) {
+            if (sg_live) {
+                const ushort ib8 = lane >> 2u;
+                const ushort l4 = lane & 3u;
+                const ushort j_base = l4 * 4u;
+                for (; k_blk + 8u <= blocks_per_row; k_blk += 8u) {
+                    const uint x_col = (k_blk + uint(ib8)) * 32u + uint(j_base);
+                    float4 x_lo[MCap], x_hi[MCap];
+                    #pragma unroll
+                    for (ushort m = 0; m < MCap; ++m) {
+                        if (m < m_cnt) {
+                            device const float* x_src = expert_hidden + ulong(f_idx[m]) * in_stride_f32 + x_col;
+                            x_lo[m] = float4(*reinterpret_cast<device const packed_float4*>(x_src));
+                            x_hi[m] = float4(*reinterpret_cast<device const packed_float4*>(x_src + 16u));
+                            bad |= nonfinite_vec4(x_lo[m]) | nonfinite_vec4(x_hi[m]);
+                        }
+                    }
                     const uint b_cur = k_blk + uint(ib8);
                     #pragma unroll
                     for (ushort r = 0; r < kRows; ++r) {
@@ -1354,27 +1355,27 @@ static inline void planar_moe_down_union_impl(
                             #pragma unroll
                             for (ushort m = 0; m < MCap; ++m) {
                                 if (m < m_cnt) {
-                                    const float4 x_lo = *reinterpret_cast<threadgroup const float4*>(&sx[m][sx_off8]);
-                                    const float4 x_hi = *reinterpret_cast<threadgroup const float4*>(&sx[m][sx_off8 + 16u]);
-                                    sums[m][r] += dot(wl, x_lo) + dot(wh, x_hi);
+                                    sums[m][r] += dot(wl, x_lo[m]) + dot(wh, x_hi[m]);
                                 }
                             }
                         }
                     }
                 }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            const ushort ib4 = lane >> 3u;
-            const ushort l8 = lane & 7u;
-            const uint sx_off4 = uint(ib4) * 32u + uint(l8) * 2u;
-            for (; k_blk + 4u <= blocks_per_row; k_blk += 4u) {
-                for (ushort m = 0; m < m_cnt; ++m) {
-                    const float xv = expert_hidden[ulong(f_idx[m]) * in_stride_f32 + k_blk * 32u + uint(tid)];
-                    bad |= nonfinite_bit(xv);
-                    sx[m][tid] = xv;
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (sg_live) {
+                const ushort ib4 = lane >> 3u;
+                const ushort l8 = lane & 7u;
+                for (; k_blk + 4u <= blocks_per_row; k_blk += 4u) {
+                    const uint x_blk = (k_blk + uint(ib4)) * 32u;
+                    float4 x4[MCap];
+                    #pragma unroll
+                    for (ushort m = 0; m < MCap; ++m) {
+                        if (m < m_cnt) {
+                            device const float* x_src = expert_hidden + ulong(f_idx[m]) * in_stride_f32 + x_blk;
+                            const float2 x01 = float2(reinterpret_cast<device const packed_float2*>(x_src)[l8]);
+                            const float2 x23 = float2(reinterpret_cast<device const packed_float2*>(x_src + 16u)[l8]);
+                            bad |= nonfinite_vec2(x01) | nonfinite_vec2(x23);
+                            x4[m] = float4(x01.x, x01.y, x23.x, x23.y);
+                        }
+                    }
                     const uint b_cur = k_blk + uint(ib4);
                     const ushort j0 = l8 * 2u;
                     const ushort j1 = j0 + 1u;
@@ -1404,28 +1405,23 @@ static inline void planar_moe_down_union_impl(
                             #pragma unroll
                             for (ushort m = 0; m < MCap; ++m) {
                                 if (m < m_cnt) {
-                                    const float2 x01 = *reinterpret_cast<threadgroup const float2*>(&sx[m][sx_off4]);
-                                    const float2 x23 = *reinterpret_cast<threadgroup const float2*>(&sx[m][sx_off4 + 16u]);
-                                    sums[m][r] += dot(w4, float4(x01.x, x01.y, x23.x, x23.y));
+                                    sums[m][r] += dot(w4, x4[m]);
                                 }
                             }
                         }
                     }
                 }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            const uint shift_tail = 4u * (uint(lane) / 16u);
-            const uint j_tail = uint(lane) % 16u;
-            for (; k_blk < blocks_per_row; ++k_blk) {
-                if (tid < 32u) {
-                    for (ushort m = 0; m < m_cnt; ++m) {
-                        const float xv = expert_hidden[ulong(f_idx[m]) * in_stride_f32 + k_blk * 32u + uint(tid)];
-                        bad |= nonfinite_bit(xv);
-                        sx[m][tid] = xv;
+                const uint shift_tail = 4u * (uint(lane) / 16u);
+                const uint j_tail = uint(lane) % 16u;
+                for (; k_blk < blocks_per_row; ++k_blk) {
+                    float xv[MCap];
+                    #pragma unroll
+                    for (ushort m = 0; m < MCap; ++m) {
+                        if (m < m_cnt) {
+                            xv[m] = expert_hidden[ulong(f_idx[m]) * in_stride_f32 + k_blk * 32u + uint(lane)];
+                            bad |= nonfinite_bit(xv[m]);
+                        }
                     }
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (sg_live) {
                     #pragma unroll
                     for (ushort r = 0; r < kRows; ++r) {
                         if (r < active_rows) {
@@ -1442,12 +1438,17 @@ static inline void planar_moe_down_union_impl(
                             const float w1 = d * float(q) + mv;
                             #pragma unroll
                             for (ushort m = 0; m < MCap; ++m) {
-                                if (m < m_cnt) sums[m][r] += w1 * sx[m][lane];
+                                if (m < m_cnt) sums[m][r] += w1 * xv[m];
                             }
                         }
                     }
                 }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
+            } else {
+                for (; k_blk < blocks_per_row; ++k_blk) {
+                    for (ushort m = 0; m < m_cnt; ++m) {
+                        bad |= nonfinite_bit(expert_hidden[ulong(f_idx[m]) * in_stride_f32 + k_blk * 32u + uint(lane)]);
+                    }
+                }
             }
         } else {
             if (sg_live) {
@@ -1774,14 +1775,13 @@ kernel void planar_moe_down_m4(device const uchar* down_weights [[buffer(0)]],
                                ushort sg [[simdgroup_index_in_threadgroup]],
                                ushort lane [[thread_index_in_simdgroup]],
                                ushort tid [[thread_index_in_threadgroup]]) {
-    alignas(16) threadgroup float sx[2][256];
     const uint n_est = (a.tokens >= 1u && a.tokens <= 4u && a.use_union == 1u && group.y < meta[6]) ? meta[136u + group.y] : 4u;
     if (n_est == 1u) {
         planar_v3_detail::planar_moe_down_union_impl<1, 4>(
-            down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid, sx);
+            down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid);
     } else {
         planar_v3_detail::planar_moe_down_union_impl<2, 4>(
-            down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid, sx);
+            down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid);
     }
 }
 
@@ -1795,36 +1795,37 @@ kernel void planar_moe_down_m8(device const uchar* down_weights [[buffer(0)]],
                                ushort sg [[simdgroup_index_in_threadgroup]],
                                ushort lane [[thread_index_in_simdgroup]],
                                ushort tid [[thread_index_in_threadgroup]]) {
-    alignas(16) threadgroup float sx[2][256];
     const uint n_est = (a.tokens >= 1u && a.tokens <= 8u && a.use_union == 1u && group.y < meta[6]) ? meta[136u + group.y] : 8u;
     if (n_est == 1u) {
         planar_v3_detail::planar_moe_down_union_impl<1, 8>(
-            down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid, sx);
+            down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid);
     } else {
         planar_v3_detail::planar_moe_down_union_impl<2, 8>(
-            down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid, sx);
+            down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid);
     }
 }
 
 namespace planar_v3_detail {
 
 union PlanarNaxGateUpSmemV3 {
-    alignas(16) half b_stage[2][2][32 * 32];
+    alignas(16) half b_stage[2][32 * 32];
 #if TOKSPUR_PRIVATE_PLANAR_GU_STAGE64
     alignas(16) half k64_stage[2][32 * 64];
 #endif
     struct {
-        float gate_epi[32][33];
+        float gate_epi[16][33];
         uint rids[32];
     } epi;
 };
-static_assert(sizeof(PlanarNaxGateUpSmemV3) == 8192, "PlanarNaxGateUpSmemV3 must remain 8 KiB per 2-SG TG");
+#if !TOKSPUR_PRIVATE_PLANAR_GU_STAGE64
+static_assert(sizeof(PlanarNaxGateUpSmemV3) == 4096, "PlanarNaxGateUpSmemV3 4 KiB per 2-SG TG (8 TGs/core)");
+#endif
 
 union PlanarNaxSgSmemV3 {
-    alignas(16) half b_stage[2][32 * 32];
+    alignas(16) half b_stage[32 * 32];
     uint rids[32];
 };
-static_assert(sizeof(PlanarNaxSgSmemV3) == 4096, "PlanarNaxSgSmemV3 must remain 4 KiB per simdgroup (8 KiB per 2-SG TG)");
+static_assert(sizeof(PlanarNaxSgSmemV3) == 2048, "PlanarNaxSgSmemV3 2 KiB per simdgroup (4 KiB per 2-SG TG = 8 TGs/core)");
 
 __attribute__((noinline))
 static void run_col_grouped_moe_gate_up_swiglu_v3(
@@ -2084,11 +2085,8 @@ static inline void run_nax_grouped_moe_gate_up_swiglu_v3(
     matmul2d<descriptor, execution_simdgroups<1>> operation;
 
     tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(
-        smem.b_stage[sg][0], dextents<int, 2>{KS, ColsPerSG}, array<int, 2>{1, KS});
-    tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt1(
-        smem.b_stage[sg][1], dextents<int, 2>{KS, ColsPerSG}, array<int, 2>{1, KS});
+        smem.b_stage[sg], dextents<int, 2>{KS, ColsPerSG}, array<int, 2>{1, KS});
     auto b0 = bt0.slice<KS, ColsPerSG>(0, 0);
-    auto b1 = bt1.slice<KS, ColsPerSG>(0, 0);
     auto a0 = a_tensor.template slice<KS, MTile>(0, 0);
     auto acc = operation.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
     #pragma unroll
@@ -2127,14 +2125,14 @@ static inline void run_nax_grouped_moe_gate_up_swiglu_v3(
             a.qs_offset, a.qh_offset, a.sm_offset, a.dm_offset, live1, bad);
 #endif
 
-        for (uint step = 0u; step < steps; ++step) {
-            threadgroup half* plane = smem.b_stage[sg][step & 1u];
-            threadgroup half4* dst0 = reinterpret_cast<threadgroup half4*>(plane + uint(local_col) * KS + uint(ai) * 16u);
+        threadgroup half* plane = smem.b_stage[sg];
+        threadgroup half4* dst0 = reinterpret_cast<threadgroup half4*>(plane + uint(local_col) * KS + uint(ai) * 16u);
 #if TOKSPUR_PRIVATE_PLANAR_COLUMN32
-            threadgroup half4* dst1 = dst0 + 4u;
+        threadgroup half4* dst1 = dst0 + 4u;
 #else
-            threadgroup half4* dst1 = reinterpret_cast<threadgroup half4*>(plane + uint(16u + local_col) * KS + uint(ai) * 16u);
+        threadgroup half4* dst1 = reinterpret_cast<threadgroup half4*>(plane + uint(16u + local_col) * KS + uint(ai) * 16u);
 #endif
+        for (uint step = 0u; step < steps; ++step) {
             #pragma unroll
             for (ushort i = 0; i < 4; ++i) { dst0[i] = w0[i]; dst1[i] = w1[i]; }
             simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -2152,63 +2150,75 @@ static inline void run_nax_grouped_moe_gate_up_swiglu_v3(
 #endif
             }
             auto a_slice = a_tensor.template slice<KS, MTile>(int(step * KS), 0);
-            if ((step & 1u) == 0u) operation.run(a_slice, b0, acc);
-            else operation.run(a_slice, b1, acc);
+            operation.run(a_slice, b0, acc);
+            if (step + 1u < steps) {
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
         }
     }
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0u) {
-        smem.epi.rids[lane] = my_rid;
-        #pragma unroll
-        for (ushort i = 0; i < acc.get_capacity(); ++i) {
-            if (!acc.is_valid_element(i)) continue;
-            const auto idx = acc.get_multidimensional_index(i);
-            smem.epi.gate_epi[uint(idx[1])][uint(idx[0])] = float(acc[i]);
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (sg == 1u) {
-        if (a.write_bf16_gathered) {
-            device bfloat* gathered_h = reinterpret_cast<device bfloat*>(output_buf);
+    constexpr ushort Passes = (MTile <= 16) ? 1 : 2;
+    #pragma unroll
+    for (ushort pass = 0; pass < Passes; ++pass) {
+        const uint r_base = uint(pass) * 16u;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0u) {
+            if (pass == 0) smem.epi.rids[lane] = my_rid;
             #pragma unroll
             for (ushort i = 0; i < acc.get_capacity(); ++i) {
                 if (!acc.is_valid_element(i)) continue;
                 const auto idx = acc.get_multidimensional_index(i);
-                const uint col_idx = uint(idx[0]), r = uint(idx[1]);
-                const uint col_out = first_col + col_idx;
-                if (col_out < a.rows) {
-                    device bfloat* dst_row = gathered_h + (ulong(group_y) * 32ul + r) * a.rows;
+                const uint r = uint(idx[1]);
+                if (r >= r_base && r < r_base + 16u) {
+                    smem.epi.gate_epi[r - r_base][uint(idx[0])] = float(acc[i]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sg == 1u) {
+            if (a.write_bf16_gathered) {
+                device bfloat* gathered_h = reinterpret_cast<device bfloat*>(output_buf);
+                #pragma unroll
+                for (ushort i = 0; i < acc.get_capacity(); ++i) {
+                    if (!acc.is_valid_element(i)) continue;
+                    const auto idx = acc.get_multidimensional_index(i);
+                    const uint col_idx = uint(idx[0]), r = uint(idx[1]);
+                    if (r < r_base || r >= r_base + 16u) continue;
+                    const uint col_out = first_col + col_idx;
+                    if (col_out < a.rows) {
+                        device bfloat* dst_row = gathered_h + (ulong(group_y) * 32ul + r) * a.rows;
+                        const uint rid = smem.epi.rids[r];
+                        if (r < n && rid != UINT_MAX) {
+                            const float g = smem.epi.gate_epi[r - r_base][col_idx];
+                            const float u = float(acc[i]);
+                            bad |= nonfinite_bit(g) | nonfinite_bit(u);
+                            const float act = (g * sigmoid_f32(g)) * u;
+                            bad |= nonfinite_bit(act);
+                            dst_row[col_out] = clean_bf16(act, bad);
+                        } else {
+                            dst_row[col_out] = bfloat(0);
+                        }
+                    }
+                }
+            } else {
+                #pragma unroll
+                for (ushort i = 0; i < acc.get_capacity(); ++i) {
+                    if (!acc.is_valid_element(i)) continue;
+                    const auto idx = acc.get_multidimensional_index(i);
+                    const uint col_idx = uint(idx[0]), r = uint(idx[1]);
+                    if (r < r_base || r >= r_base + 16u) continue;
+                    const uint col_out = first_col + col_idx;
                     const uint rid = smem.epi.rids[r];
-                    if (r < n && rid != UINT_MAX) {
-                        const float g = smem.epi.gate_epi[r][col_idx];
+                    if (r < n && rid != UINT_MAX && col_out < a.rows) {
+                        const float g = smem.epi.gate_epi[r - r_base][col_idx];
                         const float u = float(acc[i]);
                         bad |= nonfinite_bit(g) | nonfinite_bit(u);
                         const float act = (g * sigmoid_f32(g)) * u;
                         bad |= nonfinite_bit(act);
-                        dst_row[col_out] = clean_bf16(act, bad);
-                    } else {
-                        dst_row[col_out] = bfloat(0);
+                        device float* y = reinterpret_cast<device float*>(output_buf + ulong(rid) * a.output_stride_bytes);
+                        y[col_out] = act;
                     }
-                }
-            }
-        } else {
-            #pragma unroll
-            for (ushort i = 0; i < acc.get_capacity(); ++i) {
-                if (!acc.is_valid_element(i)) continue;
-                const auto idx = acc.get_multidimensional_index(i);
-                const uint col_idx = uint(idx[0]), r = uint(idx[1]);
-                const uint col_out = first_col + col_idx;
-                const uint rid = smem.epi.rids[r];
-                if (r < n && rid != UINT_MAX && col_out < a.rows) {
-                    const float g = smem.epi.gate_epi[r][col_idx];
-                    const float u = float(acc[i]);
-                    bad |= nonfinite_bit(g) | nonfinite_bit(u);
-                    const float act = (g * sigmoid_f32(g)) * u;
-                    bad |= nonfinite_bit(act);
-                    device float* y = reinterpret_cast<device float*>(output_buf + ulong(rid) * a.output_stride_bytes);
-                    y[col_out] = act;
                 }
             }
         }
@@ -2329,11 +2339,8 @@ static inline void run_nax_grouped_moe_down_v3(
     matmul2d<descriptor, execution_simdgroups<1>> operation;
 
     tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(
-        smem_sg.b_stage[0], dextents<int, 2>{KS, ColsPerSG}, array<int, 2>{1, KS});
-    tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt1(
-        smem_sg.b_stage[1], dextents<int, 2>{KS, ColsPerSG}, array<int, 2>{1, KS});
+        smem_sg.b_stage, dextents<int, 2>{KS, ColsPerSG}, array<int, 2>{1, KS});
     auto b0 = bt0.slice<KS, ColsPerSG>(0, 0);
-    auto b1 = bt1.slice<KS, ColsPerSG>(0, 0);
     auto a0 = a_tensor.template slice<KS, MTile>(0, 0);
     auto acc = operation.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
     #pragma unroll
@@ -2352,14 +2359,14 @@ static inline void run_nax_grouped_moe_down_v3(
             a.qs_offset, a.qh_offset, a.sm_offset, a.dm_offset, live1, bad);
 #endif
 
-        for (uint step = 0u; step < steps; ++step) {
-            threadgroup half* plane = smem_sg.b_stage[step & 1u];
-            threadgroup half4* dst0 = reinterpret_cast<threadgroup half4*>(plane + uint(local_col) * KS + uint(ai) * 16u);
+        threadgroup half* plane = smem_sg.b_stage;
+        threadgroup half4* dst0 = reinterpret_cast<threadgroup half4*>(plane + uint(local_col) * KS + uint(ai) * 16u);
 #if TOKSPUR_PRIVATE_PLANAR_COLUMN32
-            threadgroup half4* dst1 = dst0 + 4u;
+        threadgroup half4* dst1 = dst0 + 4u;
 #else
-            threadgroup half4* dst1 = reinterpret_cast<threadgroup half4*>(plane + uint(16u + local_col) * KS + uint(ai) * 16u);
+        threadgroup half4* dst1 = reinterpret_cast<threadgroup half4*>(plane + uint(16u + local_col) * KS + uint(ai) * 16u);
 #endif
+        for (uint step = 0u; step < steps; ++step) {
             #pragma unroll
             for (ushort i = 0; i < 4; ++i) { dst0[i] = w0[i]; dst1[i] = w1[i]; }
             simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -2377,8 +2384,10 @@ static inline void run_nax_grouped_moe_down_v3(
 #endif
             }
             auto a_slice = a_tensor.template slice<KS, MTile>(int(step * KS), 0);
-            if ((step & 1u) == 0u) operation.run(a_slice, b0, acc);
-            else operation.run(a_slice, b1, acc);
+            operation.run(a_slice, b0, acc);
+            if (step + 1u < steps) {
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
         }
     }
 

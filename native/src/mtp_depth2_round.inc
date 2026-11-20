@@ -23,7 +23,9 @@ if (mtp && (mtp_depth == 2 || mtp_depth == 3)) {
 #endif
         &mtp_generation.controller_state(), base, round_started, mtp_proposed, mtp_accepted,
         measured_packet_tail, generated, stop_id, job.generate);
-    const uint32_t compute_remaining = is_v2 ? mtp_generation.compute_remaining() : (job.generate - i);
+    const uint32_t max_context_steps = base < shape.attention.capacity ? (shape.attention.capacity - base) : 0u;
+    const uint32_t raw_compute_remaining = is_v2 ? mtp_generation.compute_remaining() : (job.generate - i);
+    const uint32_t compute_remaining = std::min(raw_compute_remaining, max_context_steps);
     const auto context_length = base + 1;
     const bool use_verify_nax_costs = gpu.verify_nax();
     auto& controller = mtp_generation.controller_state();
@@ -44,7 +46,7 @@ if (mtp && (mtp_depth == 2 || mtp_depth == 3)) {
     const bool is_probe_round = !measured_controller && (is_v2 && controller.current_mode == uint8_t(StageAMode::OrdinaryK0) &&
                                  controller.consecutive_ordinary_steps >= StageACostTable::probe_interval - 1 &&
                                  compute_remaining >= 2);
-    const bool is_ordinary_step = measured_controller ? (compute_remaining < 2 || anchor_stop || measured_before.rows == 1) : (is_v2 ? (is_probe_round ? compute_remaining < 2 : compute_remaining < 3) : job.generate - i < mtp_depth + 1) ||
+    const bool is_ordinary_step = measured_controller ? (compute_remaining < 2 || anchor_stop || measured_before.rows == 1) : (is_v2 ? (is_probe_round ? compute_remaining < 2 : compute_remaining < 3) : std::min(job.generate - i, max_context_steps) < mtp_depth + 1) ||
         anchor_stop || (is_v2 && controller.current_mode == uint8_t(StageAMode::OrdinaryK0) && !is_probe_round);
 
     // This declared tail/ordinary policy uses only ordinary target rows. It is not an

@@ -67,7 +67,7 @@ void workers(const std::filesystem::path& executable) {
 #endif
 int TOKSPUR_HTTP_CONCURRENT_TEST_ENTRY(int argc, char** argv) {
     if (argc > 1 && std::string_view(argv[1]) == "target") return mtp_fixture::target(argc, argv);
-    const auto prior = inherited_mtp_wire_entry(argc, argv); if (prior) return prior;
+    if (argc > 1) return inherited_mtp_wire_entry(argc, argv);
     try { metadata(); workers(std::filesystem::canonical(argv[0]));
         std::cout << "concurrent HTTP CPU checks=" << checks << '\n'; return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

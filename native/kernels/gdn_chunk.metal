@@ -108,66 +108,81 @@ kernel void gdn_chunk_fused(device const float* accepted[[buffer(0)]],device con
     const uint qk_off=qk_h*128u+uint(lane)*4u;
     const uint v_base=h*p.value_width+col0;
 
-    float state[C][4];
     uint bad=0u;
     if(c_cnt==C){
+        float4 state4[4];
         #pragma unroll
         for(uint j=0;j<4;++j){
             device const float* a_ptr=accepted+(ulong(h)*128ul+ulong(lane)*4ul+j)*p.value_width+col0;
             const float4 sv=float4(*reinterpret_cast<device const packed_float4*>(a_ptr));
             bad|=nonfin_gdn(sv.x)|nonfin_gdn(sv.y)|nonfin_gdn(sv.z)|nonfin_gdn(sv.w);
-            state[0][j]=sv.x;state[1][j]=sv.y;state[2][j]=sv.z;state[3][j]=sv.w;
+            state4[j]=sv;
         }
-        for(uint t=0;t<p.rows;++t){
-            const float exponent=grow(logg,t,p.gate_stride)[h],b=grow(beta,t,p.gate_stride)[h];
-            if(nonfin_gdn(exponent)||nonfin_gdn(b)||exponent>0.0f||b<0.0f||b>1.0f){bad_gdn(e);return;}
-            const float a=exp(exponent);
-            const float4 kv4=float4(*reinterpret_cast<device const packed_float4*>(grow(k,t,p.input_stride)+qk_off));
-            const float4 qv4=float4(*reinterpret_cast<device const packed_float4*>(grow(q,t,p.input_stride)+qk_off));
-            bad|=nonfin_gdn(kv4.x)|nonfin_gdn(kv4.y)|nonfin_gdn(kv4.z)|nonfin_gdn(kv4.w)|
-                 nonfin_gdn(qv4.x)|nonfin_gdn(qv4.y)|nonfin_gdn(qv4.z)|nonfin_gdn(qv4.w);
-            const float kv[4]={kv4.x,kv4.y,kv4.z,kv4.w};
-            const float qv[4]={qv4.x,qv4.y,qv4.z,qv4.w};
+        if(p.rows>0u){
+            float exp_cur=grow(logg,0u,p.gate_stride)[h],b_cur=grow(beta,0u,p.gate_stride)[h];
+            float4 kv4_cur=float4(*reinterpret_cast<device const packed_float4*>(grow(k,0u,p.input_stride)+qk_off));
+            float4 qv4_cur=float4(*reinterpret_cast<device const packed_float4*>(grow(q,0u,p.input_stride)+qk_off));
+            float4 vc4_cur=float4(*reinterpret_cast<device const packed_float4*>(grow(v,0u,p.auxiliary_stride)+v_base));
 
-            device const float* v_ptr=grow(v,t,p.auxiliary_stride)+v_base;
-            const float v_lane=(lane<C)?v_ptr[lane]:0.0f;
-            if(lane<C)bad|=nonfin_gdn(v_lane);
+            for(uint t=0;t<p.rows;++t){
+                if(nonfin_gdn(exp_cur)||nonfin_gdn(b_cur)||exp_cur>0.0f||b_cur<0.0f||b_cur>1.0f){bad_gdn(e);return;}
+                const float a=exp(exp_cur);
+                bad|=nonfin_gdn(kv4_cur.x)|nonfin_gdn(kv4_cur.y)|nonfin_gdn(kv4_cur.z)|nonfin_gdn(kv4_cur.w)|
+                     nonfin_gdn(qv4_cur.x)|nonfin_gdn(qv4_cur.y)|nonfin_gdn(qv4_cur.z)|nonfin_gdn(qv4_cur.w)|
+                     nonfin_gdn(vc4_cur.x)|nonfin_gdn(vc4_cur.y)|nonfin_gdn(vc4_cur.z)|nonfin_gdn(vc4_cur.w);
+                const float kv[4]={kv4_cur.x,kv4_cur.y,kv4_cur.z,kv4_cur.w};
+                const float qv[4]={qv4_cur.x,qv4_cur.y,qv4_cur.z,qv4_cur.w};
+                const float4 vc4=vc4_cur;
+                const float b=b_cur;
 
-            float my_out=0.0f;
-            #pragma unroll
-            for(uint c=0;c<C;++c){
-                float prediction=0.0f;
+                const bool has_next=(t+1u<p.rows);
+                float exp_nxt=0.0f,b_nxt=0.0f;
+                float4 kv4_nxt(0.0f),qv4_nxt(0.0f),vc4_nxt(0.0f);
+                if(has_next){
+                    const uint tn=t+1u;
+                    exp_nxt=grow(logg,tn,p.gate_stride)[h];
+                    b_nxt=grow(beta,tn,p.gate_stride)[h];
+                    kv4_nxt=float4(*reinterpret_cast<device const packed_float4*>(grow(k,tn,p.input_stride)+qk_off));
+                    qv4_nxt=float4(*reinterpret_cast<device const packed_float4*>(grow(q,tn,p.input_stride)+qk_off));
+                    vc4_nxt=float4(*reinterpret_cast<device const packed_float4*>(grow(v,tn,p.auxiliary_stride)+v_base));
+                }
+
+                float4 pred4(0.0f);
                 #pragma unroll
                 for(uint j=0;j<4;++j){
-                    state[c][j]*=a;
-                    prediction+=state[c][j]*kv[j];
+                    state4[j]*=a;
+                    pred4+=state4[j]*kv[j];
                 }
-                prediction=simd_sum(prediction);
-                const float vc=simd_broadcast(v_lane,ushort(c));
-                const float delta=(vc-prediction)*b;
-                float out=0.0f;
+                pred4=simd_sum(pred4);
+                const float4 delta4=(vc4-pred4)*b;
+                float4 out4(0.0f);
                 #pragma unroll
                 for(uint j=0;j<4;++j){
-                    state[c][j]+=kv[j]*delta;
-                    bad|=nonfin_gdn(state[c][j]);
-                    out+=state[c][j]*qv[j];
+                    state4[j]+=kv[j]*delta4;
+                    bad|=nonfin_gdn(state4[j].x)|nonfin_gdn(state4[j].y)|nonfin_gdn(state4[j].z)|nonfin_gdn(state4[j].w);
+                    out4+=state4[j]*qv[j];
                 }
-                out=simd_sum(out);
-                if(lane==c)my_out=out;
-            }
-            if(lane<C){
-                bad|=nonfin_gdn(my_out);
-                grow(y,t,p.output_stride)[v_base+lane]=my_out;
+                out4=simd_sum(out4);
+                if(!lane){
+                    bad|=nonfin_gdn(out4.x)|nonfin_gdn(out4.y)|nonfin_gdn(out4.z)|nonfin_gdn(out4.w);
+                    *reinterpret_cast<device packed_float4*>(grow(y,t,p.output_stride)+v_base)=packed_float4(out4);
+                }
+
+                if(has_next){
+                    exp_cur=exp_nxt;b_cur=b_nxt;
+                    kv4_cur=kv4_nxt;qv4_cur=qv4_nxt;vc4_cur=vc4_nxt;
+                }
             }
         }
         #pragma unroll
         for(uint j=0;j<4;++j){
             device float* n_ptr=next+(ulong(h)*128ul+ulong(lane)*4ul+j)*p.value_width+col0;
-            const float4 sv(state[0][j],state[1][j],state[2][j],state[3][j]);
+            const float4 sv=state4[j];
             bad|=nonfin_gdn(sv.x)|nonfin_gdn(sv.y)|nonfin_gdn(sv.z)|nonfin_gdn(sv.w);
             *reinterpret_cast<device packed_float4*>(n_ptr)=sv;
         }
     }else{
+        float state[C][4];
         for(uint c=0;c<c_cnt;++c){
             #pragma unroll
             for(uint j=0;j<4;++j){
@@ -272,46 +287,89 @@ kernel void gdn_chunk_proj_gates_f32(device const float* w_alpha[[buffer(0)]],de
     }
 }
 
+inline float gdn_conv4_silu_fast(device const float* history,device const float* x,device const float* w,device float* next,uint rows,uint raw_cols,ulong in_stride,uint t,uint c,thread uint& bad){
+    float a[4];
+    #pragma unroll
+    for(uint j=0;j<4;++j){
+        const uint time=t+j;
+        const float aj=time<3u?history[ulong(time)*raw_cols+c]:grow(x,time-3u,in_stride)[c];
+        bad|=nonfin_gdn(aj);
+        a[j]=aj;
+    }
+    const float4 wv=float4(*reinterpret_cast<device const packed_float4*>(w+4ul*c));
+    bad|=nonfin_gdn(wv.x)|nonfin_gdn(wv.y)|nonfin_gdn(wv.z)|nonfin_gdn(wv.w);
+    float res=a[3]*wv.w;
+    res+=a[0]*wv.x;
+    res+=a[1]*wv.y;
+    res+=a[2]*wv.z;
+    if(!t){
+        #pragma unroll
+        for(uint j=0;j<3;++j){
+            const uint time=rows+j;
+            const float nj=time<3u?history[ulong(time)*raw_cols+c]:grow(x,time-3u,in_stride)[c];
+            bad|=nonfin_gdn(nj);
+            next[ulong(j)*raw_cols+c]=nj;
+        }
+    }
+    if(nonfin_gdn(res)){bad|=1u;return res;}
+    const float out=res*sigmoid_gdn(res);
+    bad|=nonfin_gdn(out);
+    return out;
+}
+
 kernel void gdn_chunk_conv_silu_prepare(device const float* history[[buffer(0)]],device const float* x[[buffer(1)]],device const float* w[[buffer(2)]],device float* next[[buffer(3)]],device float* q[[buffer(4)]],device float* k[[buffer(5)]],device float* v[[buffer(6)]],constant GdnChunkParams& p[[buffer(14)]],device atomic_uint* e[[buffer(7)]],uint g[[threadgroup_position_in_grid]],ushort sg[[simdgroup_index_in_threadgroup]],ushort lane[[thread_index_in_simdgroup]]){
     const uint id=g*4+sg;if(id>=p.rows*p.key_heads)return;
     if(!p.key_heads||(p.heads%p.key_heads)!=0||p.mode>1){bad_gdn(e);return;}
     const uint t=id/p.key_heads,kh=id%p.key_heads,ratio=p.heads/p.key_heads,block=p.key_heads*128,base=kh*128;
     const uint raw_cols=2*block+p.heads*p.value_width;
+    uint bad=0u;
     float qv[4],kv[4],qs=0,ks=0;
+    #pragma unroll
     for(uint i=0;i<4;++i){
         const uint j=lane+i*32;
-        qv[i]=gdn_conv4_silu_channel(history,x,w,next,p.rows,raw_cols,p.input_stride,t,base+j,e);
-        kv[i]=gdn_conv4_silu_channel(history,x,w,next,p.rows,raw_cols,p.input_stride,t,block+base+j,e);
+        qv[i]=gdn_conv4_silu_fast(history,x,w,next,p.rows,raw_cols,p.input_stride,t,base+j,bad);
+        kv[i]=gdn_conv4_silu_fast(history,x,w,next,p.rows,raw_cols,p.input_stride,t,block+base+j,bad);
         qs+=qv[i]*qv[i];ks+=kv[i]*kv[i];
     }
     qs=simd_sum(qs);ks=simd_sum(ks);
     const float qd=p.l2_mode?max(qs,p.l2_epsilon):qs+p.l2_epsilon,kd=p.l2_mode?max(ks,p.l2_epsilon):ks+p.l2_epsilon;
-    if(!isfinite(qs)||!isfinite(ks)||!isfinite(qd)||!isfinite(kd)){bad_gdn(e);}else{
+    if(nonfin_gdn(qs)||nonfin_gdn(ks)||nonfin_gdn(qd)||nonfin_gdn(kd)){bad|=1u;}else{
         const float qi=rsqrt(qd),ki=rsqrt(kd);
+        device float* q_row=grow(q,t,p.output_stride);
+        device float* k_row=grow(k,t,p.output_stride);
         if(p.mode){
+            #pragma unroll
             for(uint i=0;i<4;++i){
                 const uint j=lane+i*32;
-                put_gdn(grow(q,t,p.output_stride),kh*128+j,(qv[i]*qi)*p.query_scale,e);
-                put_gdn(grow(k,t,p.output_stride),kh*128+j,kv[i]*ki,e);
+                const float qo=(qv[i]*qi)*p.query_scale,ko=kv[i]*ki;
+                bad|=nonfin_gdn(qo)|nonfin_gdn(ko);
+                q_row[kh*128+j]=qo;
+                k_row[kh*128+j]=ko;
             }
         }else{
             for(uint r=0;r<ratio;++r){
                 const uint h=r*p.key_heads+kh;
+                #pragma unroll
                 for(uint i=0;i<4;++i){
                     const uint j=lane+i*32;
-                    put_gdn(grow(q,t,p.output_stride),h*128+j,(qv[i]*qi)*p.query_scale,e);
-                    put_gdn(grow(k,t,p.output_stride),h*128+j,kv[i]*ki,e);
+                    const float qo=(qv[i]*qi)*p.query_scale,ko=kv[i]*ki;
+                    bad|=nonfin_gdn(qo)|nonfin_gdn(ko);
+                    q_row[h*128+j]=qo;
+                    k_row[h*128+j]=ko;
                 }
             }
         }
     }
+    device float* v_row=grow(v,t,p.auxiliary_stride);
     for(uint r=0;r<ratio;++r){
         const uint h=r*p.key_heads+kh;
         for(uint j=lane;j<p.value_width;j+=32){
-            const float vv=gdn_conv4_silu_channel(history,x,w,next,p.rows,raw_cols,p.input_stride,t,2*block+h*p.value_width+j,e);
-            put_gdn(grow(v,t,p.auxiliary_stride),h*p.value_width+j,vv,e);
+            const float vv=gdn_conv4_silu_fast(history,x,w,next,p.rows,raw_cols,p.input_stride,t,2*block+h*p.value_width+j,bad);
+            bad|=nonfin_gdn(vv);
+            v_row[h*p.value_width+j]=vv;
         }
     }
+    if(simd_or(bad)&&!lane)bad_gdn(e);
 }
 kernel void gdn_chunk_rms_gate(device const float* x[[buffer(0)]],device const float* gains[[buffer(1)]],device const float* z[[buffer(2)]],device float* y[[buffer(3)]],constant GdnChunkParams& p[[buffer(14)]],device atomic_uint* e[[buffer(7)]],uint g[[threadgroup_position_in_grid]],ushort sg[[simdgroup_index_in_threadgroup]],ushort lane[[thread_index_in_simdgroup]]){
     const uint id=g*4+sg;if(id>=p.rows*p.heads)return;const uint t=id/p.heads,base=(id%p.heads)*p.value_width;
@@ -433,7 +491,6 @@ kernel void gdn_chunk_rms_rows_nax(device const float* x[[buffer(0)]],device con
 }
 // One (row, group) per 128-thread group so small-batch and wide RMS use all GPU cores, cache inputs in registers, and preserve the exact 32-lane graph_rms FMA reduction tree.
 kernel void gdn_chunk_rms_rows_fast(device const float* x[[buffer(0)]],device const float* gains[[buffer(1)]],device float* y[[buffer(2)]],constant GdnChunkParams& p[[buffer(14)]],device atomic_uint* e[[buffer(7)]],uint g[[threadgroup_position_in_grid]],ushort tid[[thread_index_in_threadgroup]],ushort sg[[simdgroup_index_in_threadgroup]],ushort lane[[thread_index_in_simdgroup]]){
-    threadgroup float v_tile[128][32];
     threadgroup float shared_inv;
     threadgroup uint shared_abort;
     threadgroup uint sg_bad[4];
@@ -443,6 +500,51 @@ kernel void gdn_chunk_rms_rows_fast(device const float* x[[buffer(0)]],device co
     const uint t=g/groups,base=(g%groups)*p.value_width;
     device const float* xr=grow(x,t,p.input_stride)+base,*gr=gains+(p.mode?base:0);
     device float* yr=grow(y,t,p.output_stride)+base;
+    if(p.value_width==2560u){
+        float rv[20];
+        uint bad=0u;
+        #pragma unroll
+        for(uint k=0u;k<20u;++k){
+            const float v=xr[k*128u+uint(tid)];
+            bad|=nonfin_gdn(v);
+            rv[k]=v;
+        }
+        const uint sbad=simd_or(bad);
+        if(!lane)sg_bad[sg]=sbad;
+        float sum=0.0f;
+        if(sg==0u){
+            #pragma unroll 8
+            for(uint m=0u;m<80u;++m){
+                const float vm=(m&3u)==0u?rv[m>>2u]:xr[m*32u+uint(lane)];
+                sum+=vm*vm;
+            }
+            sum=simd_sum(sum);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if(sg==0u&&!lane){
+            const uint all_bad=sg_bad[0]|sg_bad[1]|sg_bad[2]|sg_bad[3];
+            const float denom=sum/2560.0f+p.rms_epsilon;
+            const uint abort_flag=(all_bad||nonfin_gdn(sum)||nonfin_gdn(denom))?1u:0u;
+            shared_abort=abort_flag;
+            shared_inv=abort_flag?0.0f:rsqrt(denom);
+            if(abort_flag)bad_gdn(e);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if(shared_abort)return;
+        const float inv=shared_inv;
+        uint wbad=0u;
+        #pragma unroll
+        for(uint k=0u;k<20u;++k){
+            const uint idx=k*128u+uint(tid);
+            const float gn=gr[idx];
+            wbad|=nonfin_gdn(gn);
+            const float out=(rv[k]*inv)*gn;
+            wbad|=nonfin_gdn(out);
+            yr[idx]=out;
+        }
+        if(simd_or(wbad)&&!lane)bad_gdn(e);
+        return;
+    }
     if((p.value_width&127u)!=0u||p.value_width>4096u){
         if(sg==0u){
             uint bad=0u;float sum=0.0f;
@@ -456,47 +558,47 @@ kernel void gdn_chunk_rms_rows_fast(device const float* x[[buffer(0)]],device co
         return;
     }
     const uint chunks128=p.value_width>>7u;
+    float rv_gen[32];
     uint bad=0u;
-    #pragma unroll 4
     for(uint k=0u;k<chunks128;++k){
         const uint idx=k*128u+uint(tid);
         const float v=xr[idx];
         bad|=nonfin_gdn(v);
-        v_tile[k*4u+uint(sg)][lane]=v;
+        rv_gen[k]=v;
     }
     const uint sbad=simd_or(bad);
     if(!lane)sg_bad[sg]=sbad;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sum=0.0f;
     if(sg==0u){
         const uint steps32=chunks128*4u;
-        float sum=0.0f;
-        #pragma unroll 4
-        for(uint m=0u;m<steps32;++m){const float vm=v_tile[m][lane];sum+=vm*vm;}
-        sum=simd_sum(sum);
-        if(!lane){
-            const uint all_bad=sg_bad[0]|sg_bad[1]|sg_bad[2]|sg_bad[3];
-            const float denom=sum/float(p.value_width)+p.rms_epsilon;
-            const uint abort_flag=(all_bad||nonfin_gdn(sum)||nonfin_gdn(denom))?1u:0u;
-            shared_abort=abort_flag;
-            shared_inv=abort_flag?0.0f:rsqrt(denom);
-            if(abort_flag)bad_gdn(e);
+        for(uint m=0u;m<steps32;++m){
+            const float vm=(m&3u)==0u?rv_gen[m>>2u]:xr[m*32u+uint(lane)];
+            sum+=vm*vm;
         }
+        sum=simd_sum(sum);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if(sg==0u&&!lane){
+        const uint all_bad=sg_bad[0]|sg_bad[1]|sg_bad[2]|sg_bad[3];
+        const float denom=sum/float(p.value_width)+p.rms_epsilon;
+        const uint abort_flag=(all_bad||nonfin_gdn(sum)||nonfin_gdn(denom))?1u:0u;
+        shared_abort=abort_flag;
+        shared_inv=abort_flag?0.0f:rsqrt(denom);
+        if(abort_flag)bad_gdn(e);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if(shared_abort)return;
     const float inv=shared_inv;
     uint wbad=0u;
-    #pragma unroll 4
     for(uint k=0u;k<chunks128;++k){
         const uint idx=k*128u+uint(tid);
-        const float rv=v_tile[k*4u+uint(sg)][lane];
         const float gn=gr[idx];
         wbad|=nonfin_gdn(gn);
-        const float out=(rv*inv)*gn;
+        const float out=(rv_gen[k]*inv)*gn;
         wbad|=nonfin_gdn(out);
         yr[idx]=out;
     }
-    if(wbad)bad_gdn(e);
+    if(simd_or(wbad)&&!lane)bad_gdn(e);
 }
 kernel void gdn_chunk_prefix64(device const float* logg[[buffer(0)]],device float* prefix[[buffer(1)]],constant GdnChunkParams& p[[buffer(14)]],device atomic_uint* e[[buffer(7)]],uint h[[thread_position_in_grid]]){
     if(h>=p.heads)return;float sum=0;for(uint i=0;i<p.count;++i){const float g=checked_gdn(grow(logg,p.offset+i,p.gate_stride)[h],e);if(g>0){bad_gdn(e);return;}sum+=g;put_gdn(prefix,h*64+i,sum,e);}

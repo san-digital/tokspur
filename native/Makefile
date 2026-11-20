@@ -725,6 +725,7 @@ coverage-fuzz: $(BUILD)/test-gguf $(BUILD)/coverage-fuzz-gguf
 # Model-free CI component contract suites (replacing obsolete .mk overlays)
 CI_COMPONENT_TESTS = prepared_sampling carrier_diagnostic measured_controller nax_split_policy http_concurrent mtp_wire mtp_sampling mtp_anchor_state mtp_packet64 http_fast_math http_gdn_ported moe_mm_many q8_three_rows probe_pack_census pack_v2_offset_safety derived_pack moe_adversarial_m2 sparse_residual_dual_order shared_kv_checkpoint ssd_checkpoint
 CI_COMPONENT_BINS = $(addprefix $(BUILD)/test-,$(CI_COMPONENT_TESTS))
+# Run the MTP wire and concurrent HTTP suites in their own processes. On macOS 26, retaining the previous suite's allocation stacks can make AddressSanitizer abort in libnotify's fork handler.
 ci-components: $(CI_COMPONENT_BINS)
 	"$(BUILD)/test-carrier_diagnostic"
 	"$(BUILD)/test-measured_controller"
@@ -762,7 +763,7 @@ $(BUILD)/test-probe_pack_census: ../tests/probe_pack_census_challenge.cpp $(OBJE
 $(BUILD)/test-model_pack_fallback_challenge: ../tests/test_model_pack_fallback_challenge.cpp $(OBJECTS) $(OBJDIR)/mtp.o $(BUILD)/.cflags | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) "$<" $(OBJECTS) $(OBJDIR)/mtp.o -o "$@"
 
-$(BUILD)/test-http_concurrent: tests/test_http_concurrent.cpp $(CARRIER_ALL_OBJECTS) $(BUILD)/.cflags | $(BUILD)
+$(BUILD)/test-http_concurrent: tests/test_http_concurrent.cpp tests/test_mtp_wire.cpp $(CARRIER_ALL_OBJECTS) $(BUILD)/.cflags | $(BUILD)
 	$(CXX) $(CARRIER_CPPFLAGS) $(CXXFLAGS) -pthread "$<" $(CARRIER_ALL_OBJECTS) -o "$@"
 
 $(BUILD)/test-mtp_wire: tests/test_mtp_wire.cpp $(CARRIER_ALL_OBJECTS) $(BUILD)/.cflags | $(BUILD)
@@ -777,13 +778,13 @@ $(BUILD)/test-prepared_sampling: tests/test_prepared_sampling.cpp $(OBJDIR)/mtp_
 $(BUILD)/test-mtp_anchor_state: tests/test_mtp_anchor_state.cpp include/tokspur/mtp_anchor_state.hpp $(OBJECTS) $(BUILD)/.cflags | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -pthread "$<" $(OBJECTS) -o "$@"
 
-$(BUILD)/test-mtp_packet64: tests/test_mtp_packet64.cpp $(CARRIER_ALL_OBJECTS) $(BUILD)/.cflags | $(BUILD)
+$(BUILD)/test-mtp_packet64: tests/test_mtp_packet64.cpp tests/test_http_concurrent.cpp tests/test_mtp_wire.cpp $(CARRIER_ALL_OBJECTS) $(BUILD)/.cflags | $(BUILD)
 	$(CXX) $(CARRIER_CPPFLAGS) $(CXXFLAGS) -pthread "$<" $(CARRIER_ALL_OBJECTS) -o "$@"
 
 $(BUILD)/test-http_fast_math: tests/test_http_fast_math.cpp tests/test_http_branch8.cpp tests/test_http_verify8.cpp $(ACTIVE_HTTP_OBJECTS) $(BUILD)/.cflags | $(BUILD)
 	$(CXX) $(CARRIER_CPPFLAGS) $(CXXFLAGS) -pthread "$<" $(ACTIVE_HTTP_OBJECTS) -o "$@"
 
-$(BUILD)/test-http_gdn_ported: tests/test_http_gdn_ported.cpp tests/test_http_qsa_sparse.cpp tests/test_http_prefill_hc_down_window.cpp tests/test_http_prefill_router_window.cpp tests/test_http_prefill_hc_rows.cpp tests/test_http_prefill512.cpp tests/test_mtp_wire.cpp $(CARRIER_ALL_OBJECTS) $(BUILD)/.cflags | $(BUILD)
+$(BUILD)/test-http_gdn_ported: tests/test_http_gdn_ported.cpp tests/test_http_qsa_sparse.cpp tests/test_http_prefill_hc_down_window.cpp tests/test_http_prefill_router_window.cpp tests/test_http_prefill_hc_rows.cpp tests/test_http_prefill512.cpp tests/test_http_concurrent.cpp tests/test_mtp_wire.cpp $(CARRIER_ALL_OBJECTS) $(BUILD)/.cflags | $(BUILD)
 	$(CXX) $(CARRIER_CPPFLAGS) $(CXXFLAGS) -pthread "$<" $(CARRIER_ALL_OBJECTS) -o "$@"
 
 $(BUILD)/test-moe_mm_many: tests/test_moe_mm_many.cpp src/moe_mm_many_plan.cpp src/grouped_mm.cpp $(OBJDIR)/gguf.o $(BUILD)/.cflags | $(BUILD)

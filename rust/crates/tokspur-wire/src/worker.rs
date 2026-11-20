@@ -54,6 +54,7 @@ impl BurstPacing {
 pub enum WorkerError {
     /// `WorkerError`: refused, failed or ambiguous without an inner system/codec error.
     Refused(&'static str),
+    HostMemoryPressure,
     StartupOutput {
         source: Box<WorkerError>,
         stderr: Vec<u8>,
@@ -108,6 +109,7 @@ impl fmt::Debug for WorkerError {
                 .field("bytes", &stderr.len())
                 .finish_non_exhaustive(),
             Self::Refused(reason) => formatter.debug_tuple("Refused").field(reason).finish(),
+            Self::HostMemoryPressure => formatter.write_str("HostMemoryPressure"),
             Self::Channel { create, .. } => formatter
                 .debug_struct("Channel")
                 .field("create", create)
@@ -143,6 +145,9 @@ impl fmt::Display for WorkerError {
         match self {
             Self::StartupOutput { source, .. } => source.fmt(formatter),
             Self::Refused(reason) | Self::Cancelled(reason) => formatter.write_str(reason),
+            Self::HostMemoryPressure => {
+                formatter.write_str("generation stopped because of host memory pressure")
+            }
             Self::Channel { create, source } => formatter.write_str(match source {
                 PairError::Create(_) => create,
                 PairError::Secure(_) => "cannot secure worker pipe descriptor",
@@ -198,7 +203,10 @@ impl std::error::Error for WorkerError {
             Self::CommandInvalidated(Some(error)) => Some(error.as_ref()),
             #[cfg(feature = "verify8")]
             Self::Admission(error) => Some(error),
-            Self::Refused(_) | Self::Cancelled(_) | Self::CommandInvalidated(None) => None,
+            Self::Refused(_)
+            | Self::Cancelled(_)
+            | Self::HostMemoryPressure
+            | Self::CommandInvalidated(None) => None,
         }
     }
 }
@@ -227,6 +235,7 @@ impl WorkerError {
             #[cfg(feature = "verify8")]
             Self::Admission(_) => false,
             Self::Refused(_)
+            | Self::HostMemoryPressure
             | Self::Channel { .. }
             | Self::GuardianLaunch(_)
             | Self::PipeConfigure(_)
@@ -374,6 +383,8 @@ pub struct WorkerOptions {
     pub hc_consumer_fused: Option<bool>,
     pub ple_overlap: Option<bool>,
     pub shared_prefix_cache: Option<bool>,
+    /// Host RAM for whole conversations parked on a lane switch; 0 keeps the single-lane reset.
+    pub parked_lanes_mib: u32,
     pub context_length: u32,
 }
 
@@ -470,6 +481,7 @@ impl Default for WorkerOptions {
             hc_consumer_fused: None,
             ple_overlap: None,
             shared_prefix_cache: None,
+            parked_lanes_mib: 0,
             context_length: 65_536,
         }
     }
@@ -614,6 +626,26 @@ fn worker_number(value: &Json) -> Result<f64> {
         .ok_or(WorkerError::Refused("invalid owned broker numeric field"))
 }
 
+fn host_pressure_refusal(value: &Json, context_length: u32) -> Result<bool> {
+    let Some(code) = value.find("code")? else {
+        return Ok(false);
+    };
+    if code.string()? != b"host_memory_pressure" {
+        return Ok(false);
+    }
+    require(
+        !worker_field(value, "fatal")?.boolean()?
+            && !worker_field(value, "automatic_retry_safe")?.boolean()?
+            && !worker_field(value, "continuation_allowed")?.boolean()?
+            && !worker_field(value, "logits_available")?.boolean()?
+            && worker_field(value, "status")?.string()? == b"error"
+            && worker_field(value, "finish_reason")?.string()? == b"error"
+            && worker_integer(value, "committed_prefix")? <= u64::from(context_length),
+        "invalid host memory pressure refusal",
+    )?;
+    Ok(true)
+}
+
 fn worker_keys(value: &Json, allowed: &[&str]) -> Result<()> {
     for (name, _) in value.object()? {
         require(
@@ -698,6 +730,7 @@ fn milliseconds_until(deadline: Instant, now: Instant) -> i64 {
 }
 
 /// The parent-side channel ends and process/framing state.
+#[cfg_attr(test, derive(Default))]
 struct Io {
     control: Option<OwnedFd>,
     status: Option<OwnedFd>,
@@ -1088,6 +1121,7 @@ pub struct OwnedWorker {
     ready_value: Json,
     last_response: Json,
     needs_reset: bool,
+    resync_after_pressure: bool,
     broker_epoch: u64,
     broker_command: u64,
     broker_lease: u64,
@@ -1137,6 +1171,7 @@ struct Admitted {
 
 /// Failures inside the submitted-command block before its conversion.
 enum CommandError {
+    HostMemoryPressure,
     Cancelled(&'static str),
     Cause(Option<Box<dyn std::error::Error + Send + Sync>>),
 }
@@ -1260,6 +1295,7 @@ impl OwnedWorker {
             ready_value: Json::Null,
             last_response: Json::Null,
             needs_reset: false,
+            resync_after_pressure: false,
             broker_epoch: 0,
             broker_command: 0,
             broker_lease: 0,
@@ -1589,6 +1625,10 @@ impl OwnedWorker {
                 &mut words,
                 &["--shared-prefix-cache", if spc { "on" } else { "off" }],
             );
+        }
+        if o.parked_lanes_mib > 0 {
+            let mib = o.parked_lanes_mib.to_string();
+            text(&mut words, &["--native-parked-lanes-mib", &mib]);
         }
         if o.scalar_channel {
             text(
@@ -2305,7 +2345,7 @@ impl OwnedWorker {
     }
 
     pub fn abort_mtp_generation(&mut self, deadline: Instant) -> Result<()> {
-        if self.io.failed || self.io.closed {
+        if self.io.failed || self.io.closed || self.resync_after_pressure {
             return Ok(());
         }
         let generation = match self.last_response.find("native_mtp_generation") {
@@ -2330,9 +2370,11 @@ impl OwnedWorker {
             ),
         ]);
         let result = self.request(&job, deadline, None, None);
-        if result.is_err() {
-            self.invalidate();
-            return result.map(|_| ());
+        if let Err(error) = result {
+            if !matches!(error, WorkerError::HostMemoryPressure) {
+                self.invalidate();
+            }
+            return Err(error);
         }
         self.needs_reset = true;
         Ok(())
@@ -2407,8 +2449,13 @@ impl OwnedWorker {
         };
         let mut mtp_reply = match &mtp_snapshots {
             Some((ready, previous)) => Some(
-                crate::mtp_wire::MtpWireReply::new(ready, previous, body, false)
-                    .map_err(WorkerError::MtpBeforeSubmit)?,
+                crate::mtp_wire::MtpWireReply::new(
+                    ready,
+                    previous,
+                    body,
+                    self.resync_after_pressure,
+                )
+                .map_err(WorkerError::MtpBeforeSubmit)?,
             ),
             None => None,
         };
@@ -2484,6 +2531,7 @@ impl OwnedWorker {
         }
         match outcome {
             Ok(value) => Ok(value),
+            Err(CommandError::HostMemoryPressure) => Err(WorkerError::HostMemoryPressure),
             Err(CommandError::Cancelled(reason)) => Err(WorkerError::Cancelled(reason)),
             Err(CommandError::Cause(cause)) => {
                 self.invalidate();
@@ -2617,28 +2665,29 @@ impl OwnedWorker {
                     "MTP commands exceed the negotiated input or output bound",
                 )?;
                 if self.options.scalar_channel {
-                    if self.options.mtp_request_carry {
-                        worker_keys(
-                            body,
-                            &[
-                                "tokens",
-                                "generate",
-                                "reset",
-                                "stop_ids",
-                                "sampling",
-                                "seed",
-                                "mtp_generation",
-                                "prefill_final",
-                            ],
-                        )?;
+                    // Parked prompt identity and seed inheritance are negotiated at worker startup.
+                    let lane = if self.options.parked_lanes_mib > 0 {
+                        &["lane_prompt", "lane_inherit_seed"][..]
                     } else {
-                        worker_keys(
-                            body,
-                            &[
-                                "tokens", "generate", "reset", "stop_ids", "sampling", "seed",
-                            ],
-                        )?;
-                    }
+                        &[][..]
+                    };
+                    let base: &[&str] = if self.options.mtp_request_carry {
+                        &[
+                            "tokens",
+                            "generate",
+                            "reset",
+                            "stop_ids",
+                            "sampling",
+                            "seed",
+                            "mtp_generation",
+                            "prefill_final",
+                        ]
+                    } else {
+                        &[
+                            "tokens", "generate", "reset", "stop_ids", "sampling", "seed",
+                        ]
+                    };
+                    worker_keys(body, &[base, lane].concat())?;
                 }
             } else if mtp_abort {
                 require(
@@ -2687,6 +2736,10 @@ impl OwnedWorker {
                 }
             }
         }
+        require(
+            !self.resync_after_pressure || admitted.reset,
+            "host memory pressure requires a fresh input with reset",
+        )?;
         require(
             !self.needs_reset
                 || admitted.reset
@@ -2743,7 +2796,7 @@ struct Submission<'s, 'a> {
 }
 
 impl OwnedWorker {
-    /// The C++ submitted-command `try` block. Any error except a cancellation becomes the caller's invalidating refusal.
+    /// Drains one submitted command. A validated pressure refusal requires a fresh input and preserves the worker.
     fn submit(
         &mut self,
         submission: Submission<'_, '_>,
@@ -2832,6 +2885,16 @@ impl OwnedWorker {
                 value.kind() == Kind::Object,
                 "owned target emitted a nonobject event",
             )?;
+            if self.options.scalar_channel
+                && self.broker_epoch == 0
+                && mtp_reply.is_some()
+                && event_is(&value, "error")?
+                && host_pressure_refusal(&value, self.options.context_length)?
+            {
+                self.io.idle_check()?;
+                self.resync_after_pressure = true;
+                return Err(CommandError::HostMemoryPressure);
+            }
             if let Some(reply) = mtp_reply.as_deref_mut()
                 && !event_is(&value, "done")?
             {
@@ -3003,6 +3066,7 @@ impl OwnedWorker {
                     }
                 }
                 self.needs_reset = false;
+                self.resync_after_pressure = false;
                 self.last_response = value.clone();
                 return Ok(value);
             } else {
@@ -3097,6 +3161,74 @@ mod tests {
     use tokspur_json::parse_json;
 
     use super::*;
+
+    #[test]
+    fn parked_seedless_command_passes_only_the_negotiated_worker_proxy() {
+        // Command admission executes before I/O. The closed fixture has no pipes or process.
+        let mut worker = OwnedWorker {
+            io: Io {
+                closed: true,
+                ..Default::default()
+            },
+            options: WorkerOptions {
+                scalar_channel: true,
+                mtp_sidecar: "mock-sidecar".into(),
+                ..Default::default()
+            },
+            pacing: None,
+            ready_value: Json::Object(Vec::new()),
+            last_response: Json::Null,
+            needs_reset: false,
+            resync_after_pressure: false,
+            broker_epoch: 0,
+            broker_command: 0,
+            broker_lease: 0,
+            broker_position: 0,
+            #[cfg(feature = "verify8")]
+            verify_previous: Json::Null,
+            #[cfg(feature = "verify8")]
+            verify_sampling: Json::Null,
+            #[cfg(feature = "verify8")]
+            verify_seed: 0,
+            #[cfg(feature = "verify8")]
+            verify_position: 0,
+        };
+        let job = parse_json(br#"{"tokens":[42],"generate":0,"reset":true,"seed":7,"sampling":{"temperature":1,"top_k":20,"top_p":0.9,"min_p":0},"lane_inherit_seed":true}"#).unwrap();
+        for carry in [false, true] {
+            worker.options.mtp_request_carry = carry;
+            worker.options.parked_lanes_mib = 0;
+            assert!(worker.admit(&job).is_err());
+            worker.options.parked_lanes_mib = 4096;
+            let admitted = worker.admit(&job).unwrap();
+            assert!(admitted.reset);
+            assert_eq!((admitted.input_count, admitted.output_count), (1, 0));
+        }
+    }
+
+    #[test]
+    fn host_pressure_refusal_requires_a_discarded_context() {
+        let terminal = r#"{"code":"host_memory_pressure","fatal":false,"automatic_retry_safe":false,"continuation_allowed":false,"logits_available":false,"status":"error","finish_reason":"error","committed_prefix":512}"#;
+        let check = |text: &str| host_pressure_refusal(&parse_json(text.as_bytes()).unwrap(), 512);
+        assert!(check(terminal).unwrap());
+        assert!(!check("{}").unwrap());
+        assert!(!check(&terminal.replace("host_memory_pressure", "invalid_request")).unwrap());
+        for field in [
+            "fatal",
+            "automatic_retry_safe",
+            "continuation_allowed",
+            "logits_available",
+        ] {
+            let flag = format!(r#""{field}":false"#);
+            assert!(check(&terminal.replace(&flag, &format!(r#""{field}":true"#))).is_err());
+            assert!(check(&terminal.replace(&(flag + ","), "")).is_err());
+        }
+        assert!(check(&terminal.replace("512", "513")).is_err());
+        assert!(check(&terminal.replace(r#""status":"error""#, r#""status":"ok""#)).is_err());
+        assert!(
+            check(&terminal.replace(r#""finish_reason":"error""#, r#""finish_reason":"stop""#))
+                .is_err()
+        );
+    }
 
     #[test]
     fn burst_pacing_charges_only_work_and_recovers_when_idle() {

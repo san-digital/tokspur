@@ -138,6 +138,8 @@ pub struct ServeCodec {
     pub admission: ResponseAdmission,
     /// Added-token IDs of the response frame markers (`<think>`, `</think>`, `<tool_call>`, `</tool_call>`). Empty keeps the byte-spelled framing.
     pub control_ids: Vec<u32>,
+    /// All added tokens and reserved padding slots, including markers outside response framing.
+    pub nonordinary_ids: Vec<u32>,
 }
 
 impl fmt::Debug for ServeCodec {
@@ -180,6 +182,7 @@ pub struct SessionOptions {
     pub mtp_ready: Json,
     pub mtp_first_output_packet: Option<u32>,
     pub overlap_prefill: bool,
+    pub lane_parking: bool,
     pub context_length: u32,
 }
 
@@ -200,12 +203,20 @@ impl Default for SessionOptions {
             mtp_ready: Json::Null,
             mtp_first_output_packet: None,
             overlap_prefill: false,
+            lane_parking: false,
             context_length: 65_536,
         }
     }
 }
 
 /// One persistent conversation lane over one owned target.
+const MAX_PARKED_REASONING_LANES: usize = 16;
+
+struct ParkedReasoning {
+    committed: Vec<u32>,
+    turns: Vec<(usize, Vec<u8>)>,
+}
+
 pub struct ServeSession {
     codec: ServeCodec,
     alias: Vec<u8>,
@@ -244,8 +255,12 @@ pub struct ServeSession {
     pub mtp_pending: u64,
     pub mtp_stage_a_controller: Option<tokspur_wire::mtp_wire::StageAControllerState>,
     pub overlap_prefill: bool,
+    /// Name the whole prompt on a fresh packet so the worker can park and restore whole conversations.
+    pub lane_parking: bool,
     /// Reasoning this session generated, keyed by the assistant message's ordinal in the request history.
     saved_reasoning: Vec<(usize, Vec<u8>)>,
+    /// Reasoning saved from conversations parked on a lane switch, verified against their exact committed token IDs.
+    parked_reasoning: Vec<ParkedReasoning>,
     /// Off by default; only the opt-in `request_timing` record reads the stamps.
     phase_stamps_enabled: bool,
     phase_stamps: PhaseStamps,
@@ -267,7 +282,16 @@ fn is(value: &Json, expected: &str) -> std::result::Result<bool, JsonError> {
 }
 
 impl ServeSession {
-    pub fn new(codec: ServeCodec, options: SessionOptions) -> Result<Self> {
+    pub fn new(mut codec: ServeCodec, options: SessionOptions) -> Result<Self> {
+        require(
+            codec
+                .nonordinary_ids
+                .iter()
+                .all(|&id| id < codec.admission.vocabulary),
+            "nonordinary token outside vocabulary",
+        )?;
+        codec.nonordinary_ids.sort_unstable();
+        codec.nonordinary_ids.dedup();
         let mtp = !options.mtp_ready.is_null();
         let mut session = Self {
             codec,
@@ -306,7 +330,9 @@ impl ServeSession {
             mtp_pending: 0,
             mtp_stage_a_controller: None,
             overlap_prefill: options.overlap_prefill,
+            lane_parking: options.lane_parking && mtp,
             saved_reasoning: Vec::new(),
+            parked_reasoning: Vec::new(),
             phase_stamps_enabled: false,
             phase_stamps: PhaseStamps::default(),
         };
@@ -436,6 +462,7 @@ impl ServeSession {
     /// Drops reusable state after any failure.
     pub fn invalidate(&mut self) {
         self.saved_reasoning.clear();
+        self.parked_reasoning.clear();
         self.committed.clear();
         self.sampling.clear();
         self.reusable = false;
@@ -456,9 +483,9 @@ impl ServeSession {
         self.committed.len()
     }
 
-    /// The request with this session's own reasoning restored to assistant turns that arrived without it.
-    fn with_saved_reasoning(&self, render: &Json) -> Result<Option<Json>> {
-        if self.saved_reasoning.is_empty() {
+    /// The request with saved reasoning restored to assistant turns that arrived without it.
+    fn fill_saved_reasoning(render: &Json, saved: &[(usize, Vec<u8>)]) -> Result<Option<Json>> {
+        if saved.is_empty() {
             return Ok(None);
         }
         let mut fields = render.object()?.clone();
@@ -473,9 +500,7 @@ impl ServeSession {
                 continue;
             }
             let absent = message.find("reasoning_content")?.is_none_or(Json::is_null);
-            if absent
-                && let Some((_, text)) = self.saved_reasoning.iter().find(|(at, _)| *at == ordinal)
-            {
+            if absent && let Some((_, text)) = saved.iter().find(|(at, _)| *at == ordinal) {
                 let mut entry = message.object()?.clone();
                 entry.retain(|(name, _)| name != b"reasoning_content");
                 entry.push((b"reasoning_content".to_vec(), Json::String(text.clone())));
@@ -490,6 +515,87 @@ impl ServeSession {
         }
         *messages = Json::Array(list);
         Ok(Some(Json::Object(fields)))
+    }
+
+    fn park_active_reasoning(&mut self) {
+        if !self.lane_parking
+            || !self.reusable
+            || self.saved_reasoning.is_empty()
+            || self.committed.is_empty()
+        {
+            return;
+        }
+        let committed = self.committed.clone();
+        let turns = std::mem::take(&mut self.saved_reasoning);
+        self.parked_reasoning.retain(|old| {
+            !(old.committed.len() <= committed.len() && committed.starts_with(&old.committed))
+        });
+        if self.parked_reasoning.len() >= MAX_PARKED_REASONING_LANES {
+            self.parked_reasoning.remove(0);
+        }
+        self.parked_reasoning
+            .push(ParkedReasoning { committed, turns });
+    }
+
+    /// Rebuilds a canonical prompt on the committed token spelling when both spell the same text.
+    ///
+    /// Sampling can commit a token split that re-encoding the same bytes does not reproduce. Reuse requires matching added tokens, reserved padding slots and admission markers, with equal bytes between them. Only the canonical tail after the committed terminal is appended.
+    fn respelled_on_committed(&self, canonical: &[u32]) -> Result<Option<Vec<u32>>> {
+        let admission = self.codec.admission;
+        let frame = |id: u32| {
+            id == admission.im_start
+                || admission.is_stop(id)
+                || self.codec.control_ids.contains(&id)
+                || self.codec.nonordinary_ids.binary_search(&id).is_ok()
+        };
+        let committed = &self.committed;
+        // A committed terminal ends both spellings on a token boundary, so the tail joins cleanly.
+        if !committed.last().is_some_and(|&id| admission.is_stop(id)) {
+            return Ok(None);
+        }
+        let shared = committed
+            .iter()
+            .zip(canonical)
+            .take_while(|(live, fresh)| live == fresh)
+            .count();
+        let (mut live, mut fresh) = (shared, shared);
+        while live < committed.len() {
+            let Some(live_run) = committed[live..].iter().position(|&id| frame(id)) else {
+                return Ok(None);
+            };
+            let Some(fresh_run) = canonical[fresh..].iter().position(|&id| frame(id)) else {
+                return Ok(None);
+            };
+            let (live_end, fresh_end) = (live + live_run, fresh + fresh_run);
+            if committed[live_end] != canonical[fresh_end] {
+                return Ok(None);
+            }
+            let (mut live_changed, mut fresh_changed) = (live_end, fresh_end);
+            while live < live_changed
+                && fresh < fresh_changed
+                && committed[live] == canonical[fresh]
+            {
+                live += 1;
+                fresh += 1;
+            }
+            while live < live_changed
+                && fresh < fresh_changed
+                && committed[live_changed - 1] == canonical[fresh_changed - 1]
+            {
+                live_changed -= 1;
+                fresh_changed -= 1;
+            }
+            if (live < live_changed || fresh < fresh_changed)
+                && (self.codec.decode)(&committed[live..live_changed])?
+                    != (self.codec.decode)(&canonical[fresh..fresh_changed])?
+            {
+                return Ok(None);
+            }
+            (live, fresh) = (live_end + 1, fresh_end + 1);
+        }
+        let mut prompt = committed.clone();
+        prompt.extend_from_slice(&canonical[fresh..]);
+        Ok(Some(prompt))
     }
 
     /// Serves one chat completion. Refusals before worker state can change keep reusable state. Later failures invalidate it.
@@ -522,15 +628,58 @@ impl ServeSession {
             )?;
         }
         let context_cap = self.context_length as usize;
+        let policy = request.sampling.dump()?;
+        let compatible_sampling =
+            self.sampling == policy && request.seed.is_none_or(|seed| seed == self.seed);
         let rendered = (self.codec.render)(&request.render)?;
         let mut prompt = (self.codec.encode)(&rendered)?;
-        if self.reusable
-            && !prompt.starts_with(&self.committed)
-            && let Some(filled) = self.with_saved_reasoning(&request.render)?
+        let mut restored_reasoning: Option<Vec<(usize, Vec<u8>)>> = None;
+        if self.reusable && !prompt.starts_with(&self.committed) {
+            let mut restored = None;
+            if let Some(filled) =
+                Self::fill_saved_reasoning(&request.render, &self.saved_reasoning)?
+            {
+                let candidate = (self.codec.encode)(&(self.codec.render)(&filled)?)?;
+                if candidate.len() < context_cap && candidate.starts_with(&self.committed) {
+                    prompt = candidate;
+                } else {
+                    restored = Some(candidate);
+                }
+            }
+            if compatible_sampling
+                && !prompt.starts_with(&self.committed)
+                && let Some(respelled) =
+                    self.respelled_on_committed(restored.as_deref().unwrap_or(&prompt))?
+                && respelled.len() < context_cap
+            {
+                prompt = respelled;
+            }
+        }
+        if self.lane_parking
+            && (!self.reusable || !prompt.starts_with(&self.committed))
+            && !self.parked_reasoning.is_empty()
         {
-            let candidate = (self.codec.encode)(&(self.codec.render)(&filled)?)?;
-            if candidate.len() < context_cap && candidate.starts_with(&self.committed) {
+            let mut best: Option<(usize, Vec<u32>)> = None;
+            for (idx, lane) in self.parked_reasoning.iter().enumerate() {
+                if let Some((cur, _)) = best
+                    && lane.committed.len() <= self.parked_reasoning[cur].committed.len()
+                {
+                    continue;
+                }
+                let Some(filled) = Self::fill_saved_reasoning(&request.render, &lane.turns)? else {
+                    continue;
+                };
+                let candidate = (self.codec.encode)(&(self.codec.render)(&filled)?)?;
+                if candidate.len() < context_cap
+                    && candidate.len() > lane.committed.len()
+                    && candidate.starts_with(&lane.committed)
+                {
+                    best = Some((idx, candidate));
+                }
+            }
+            if let Some((idx, candidate)) = best {
                 prompt = candidate;
+                restored_reasoning = Some(self.parked_reasoning[idx].turns.clone());
             }
         }
         require(
@@ -549,14 +698,12 @@ impl ServeSession {
                 "rendered token outside vocabulary",
             )?;
         }
-        let policy = request.sampling.dump()?;
         let created = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(AdmissionError::Clock)?
             .as_secs();
         let append = self.reusable
-            && self.sampling == policy
-            && request.seed.is_none_or(|seed| seed == self.seed)
+            && compatible_sampling
             && prompt.len() >= self.committed.len()
             && prompt.starts_with(&self.committed);
         let cached_prefix = if append { self.committed.len() } else { 0 };
@@ -612,6 +759,7 @@ impl ServeSession {
             generated: Vec::with_capacity(maximum_tokens as usize),
             position: 0,
             state_touched: false,
+            restored_reasoning,
             counters: Counters::default(),
         };
         let result = completion.run(self, target, sink);
@@ -709,6 +857,7 @@ struct Completion<'r> {
     generated: Vec<u32>,
     position: usize,
     state_touched: bool,
+    restored_reasoning: Option<Vec<(usize, Vec<u8>)>>,
     counters: Counters,
 }
 
@@ -805,12 +954,12 @@ impl Completion<'_> {
         Ok(())
     }
 
-    fn sampling_matches(&self, value: &Json, prefix: usize) -> Result<()> {
+    fn sampling_matches(&self, value: &Json, prefix: usize, seed: u64) -> Result<()> {
         let sampled = field(value, "sampling")?;
         require(
             field(sampled, "valid")?.boolean()?
                 && field(sampled, "entropy_prefix")?.unsigned_integer()? == prefix as u64
-                && field(sampled, "seed")?.unsigned_integer()? == self.seed,
+                && field(sampled, "seed")?.unsigned_integer()? == seed,
             "worker sampling prefix/seed mismatch",
         )?;
         for (name, value) in self.request.sampling.object()? {
@@ -868,7 +1017,7 @@ impl Completion<'_> {
             prefix <= self.prompt.len() as u64,
             "broker restored beyond future prompt",
         )?;
-        self.sampling_matches(&done, prefix as usize)?;
+        self.sampling_matches(&done, prefix as usize, self.seed)?;
         let logits = field(&done, "logits_available")?.boolean()?;
         let stop = field(&done, "stop_id")?;
         require(
@@ -936,7 +1085,7 @@ impl Completion<'_> {
         )?;
         worker_execution(&done, &session.stack_execution)?;
         self.broker_reply(session, &done, field(&job, "reset")?.boolean()?)?;
-        self.sampling_matches(&done, self.position + 1)?;
+        self.sampling_matches(&done, self.position + 1, self.seed)?;
         let ids = field(&done, "generated_ids")?.array()?;
         require(
             ids.len() == usize::from(decode) && events.len() == ids.len(),
@@ -1052,7 +1201,8 @@ impl Completion<'_> {
         cancelled(sink)?;
         worker_execution(&done, &session.stack_execution)?;
         let committed_prefix = field(&done, "committed_prefix")?.unsigned_integer()?;
-        self.sampling_matches(&done, committed_prefix as usize)?;
+        let seed = reply.lane_seed()?.unwrap_or(self.seed);
+        self.sampling_matches(&done, committed_prefix as usize, seed)?;
         let inputs = field(&job, "tokens")?.array()?;
         if !inputs.is_empty() {
             self.counters.restored_input_tokens += u64::from(reply.restored_input_tokens()?);
@@ -1132,6 +1282,7 @@ impl Completion<'_> {
                 }
             }
         }
+        self.seed = seed;
         self.position = committed_prefix as usize;
         session.mtp_previous = done.clone();
         session.mtp_resync = false;
@@ -1662,6 +1813,7 @@ impl Completion<'_> {
             cached_prefix = self.position;
             began = true;
         } else if !self.append {
+            session.park_active_reasoning();
             session.committed.clear();
         }
         if !self.append {
@@ -1692,13 +1844,36 @@ impl Completion<'_> {
                     job.push((b"sampling".to_vec(), request.sampling.clone()));
                     job.push((b"seed".to_vec(), Json::integer(self.seed)));
                 }
+                if fresh && session.lane_parking && request.seed.is_none() {
+                    job.push((b"lane_inherit_seed".to_vec(), Json::Bool(true)));
+                }
+                let lane_prompt = fresh && session.lane_parking && n < prompt.len();
+                if lane_prompt {
+                    let all = prompt
+                        .iter()
+                        .map(|&id| Json::integer(u64::from(id)))
+                        .collect();
+                    job.push((b"lane_prompt".to_vec(), Json::Array(all)));
+                }
                 if tokspur_wire::mtp_wire::mtp_final_input_logits(&session.mtp_ready)? {
                     job.push((
                         b"prefill_final".to_vec(),
                         Json::Bool(self.position + n == prompt.len()),
                     ));
                 }
+                let packet_end = self.position + n;
                 self.run_mtp(session, target, sink, Json::Object(job))?;
+                if lane_prompt && self.position > packet_end {
+                    // The worker restored a parked conversation past this packet; its tokens are this prompt's prefix.
+                    require(
+                        self.position < prompt.len() && session.committed.len() == packet_end,
+                        "parked-lane restore exceeds the prompt",
+                    )?;
+                    session
+                        .committed
+                        .extend_from_slice(&prompt[packet_end..self.position]);
+                    self.counters.restored_input_tokens += (self.position - packet_end) as u64;
+                }
             }
         } else if session.verify8_mode() {
             #[cfg(feature = "verify8")]
@@ -1971,7 +2146,7 @@ impl Completion<'_> {
         session.seed = self.seed;
         session.reusable = true;
         if !self.append {
-            session.saved_reasoning.clear();
+            session.saved_reasoning = self.restored_reasoning.take().unwrap_or_default();
         }
         if !thinking.is_empty() {
             let mut ordinal = 0;
@@ -2277,6 +2452,7 @@ mod tests {
     fn codec() -> ServeCodec {
         ServeCodec {
             control_ids: Vec::new(),
+            nonordinary_ids: Vec::new(),
             render: Box::new(|_| Err(AdmissionError::Refused("unused").into())),
             encode: Box::new(|_| Ok(Vec::new())),
             decode: Box::new(|_| Ok(Vec::new())),
@@ -2456,5 +2632,321 @@ mod tests {
             assert_eq!(session.committed, before);
             assert!(session.reusable);
         }
+    }
+
+    /// Bytes map to `byte + 4`, `;` is the assistant terminal and `MERGED` spells `Vi` as one token.
+    const MERGED: u32 = 299;
+
+    fn respelling_codec() -> ServeCodec {
+        let mut text = codec();
+        text.encode = Box::new(|raw| {
+            Ok(raw
+                .prompt
+                .iter()
+                .map(|&b| if b == b';' { 1 } else { u32::from(b) + 4 })
+                .collect())
+        });
+        text.decode = Box::new(|ids| {
+            let mut bytes = Vec::new();
+            for &id in ids {
+                match id {
+                    MERGED => bytes.extend_from_slice(b"Vi"),
+                    1 => bytes.push(b';'),
+                    _ => bytes.push((id - 4) as u8),
+                }
+            }
+            Ok(bytes)
+        });
+        text.render = Box::new(|request| {
+            let mut prompt = Vec::new();
+            for message in field(request, "messages")?.array()? {
+                prompt.extend_from_slice(field(message, "content")?.string()?);
+                if field(message, "role")?.string()? == b"assistant" {
+                    prompt.push(b';');
+                }
+            }
+            Ok(RenderedChat {
+                prompt,
+                normalized_messages: Json::Array(Vec::new()),
+                parsed_tool_arguments: 0,
+                hoisted_system_messages: 0,
+                literal_ranges: Vec::new(),
+            })
+        });
+        text
+    }
+
+    /// Admits `A`, the echoed `answer` and `B`, then returns the prefix trace of the refused request.
+    fn respelling_trace(session: &mut ServeSession, answer: &str) -> Json {
+        let input = tokspur_json::parse_json(format!(r#"{{"model":"tokspur","messages":[{{"role":"user","content":"A"}},{{"role":"assistant","content":"{answer}"}},{{"role":"user","content":"B"}}]}}"#).as_bytes()).unwrap();
+        let admitted = admit_chat_with_policies(
+            &input,
+            b"tokspur",
+            ToolEnumValidation::Strict,
+            ToolArgValidation::Strict,
+        )
+        .unwrap();
+        session.sampling = admitted.sampling.dump().unwrap();
+        let mut observed = Json::Null;
+        let mut trace = |value: &Json| {
+            observed = value.clone();
+            Err(AdmissionError::Refused("controlled trace refusal").into())
+        };
+        let mut cancelled = || false;
+        let mut seed = || 42;
+        let mut sink = ServeSink {
+            chunk: None,
+            cancelled: &mut cancelled,
+            new_seed: &mut seed,
+            prefix_trace: Some(&mut trace),
+        };
+        let mut target = |_: &Json, _: TokenCallback<'_>| -> Result<Json> {
+            panic!("prework refusal submitted a worker command")
+        };
+        assert!(
+            session
+                .complete(&input, b"test", &mut target, &mut sink)
+                .is_err()
+        );
+        observed
+    }
+
+    fn trace_ids(trace: &Json) -> Vec<u32> {
+        field(trace, "prompt_ids")
+            .unwrap()
+            .array()
+            .unwrap()
+            .iter()
+            .map(|value| value.unsigned_integer().unwrap() as u32)
+            .collect()
+    }
+
+    /// A live prefix whose answer `Visible` was sampled as `MERGED` plus the remaining bytes.
+    fn respelled_session(terminal: bool) -> ServeSession {
+        let mut session = ServeSession::new(respelling_codec(), SessionOptions::default()).unwrap();
+        session.reusable = true;
+        session.committed = vec![u32::from(b'A') + 4, MERGED];
+        session
+            .committed
+            .extend(b"sible".iter().map(|&b| u32::from(b) + 4));
+        if terminal {
+            session.committed.push(1);
+        }
+        session
+    }
+
+    #[test]
+    fn same_text_in_another_token_spelling_appends_to_the_live_prefix() {
+        // Arrange
+        let mut session = respelled_session(true);
+        let committed = session.committed.clone();
+
+        // Act
+        let trace = respelling_trace(&mut session, "Visible");
+
+        // Assert
+        let mut expected = committed;
+        expected.push(u32::from(b'B') + 4);
+        assert!(field(&trace, "append").unwrap().boolean().unwrap());
+        assert_eq!(trace_ids(&trace), expected);
+    }
+
+    #[test]
+    fn edited_text_does_not_append_to_a_respelled_prefix() {
+        // Arrange
+        let mut session = respelled_session(true);
+
+        // Act
+        let trace = respelling_trace(&mut session, "Visibly");
+
+        // Assert
+        assert!(!field(&trace, "append").unwrap().boolean().unwrap());
+        assert!(!trace_ids(&trace).contains(&MERGED));
+    }
+
+    #[test]
+    fn respelled_prefix_without_a_committed_terminal_does_not_append() {
+        // Arrange
+        let mut session = respelled_session(false);
+
+        // Act
+        let trace = respelling_trace(&mut session, "Visible");
+
+        // Assert
+        assert!(!field(&trace, "append").unwrap().boolean().unwrap());
+        assert!(!trace_ids(&trace).contains(&MERGED));
+    }
+
+    #[test]
+    fn nonordinary_tokens_must_not_match_ordinary_text() {
+        for (marker, spelling) in [
+            (280, "<think>"),
+            (281, "</think>"),
+            (282, "<tool_call>"),
+            (283, "</tool_call>"),
+            (284, "<tool_response>"),
+            (285, "</tool_response>"),
+            (286, "<added>"),
+            (287, "[PAD287]"),
+        ] {
+            let mut text = respelling_codec();
+            text.nonordinary_ids = vec![marker];
+            let decode = text.decode;
+            text.decode = Box::new(move |ids| {
+                let mut bytes = Vec::new();
+                for &id in ids {
+                    if id == marker {
+                        bytes.extend_from_slice(spelling.as_bytes());
+                    } else {
+                        bytes.extend(decode(&[id])?);
+                    }
+                }
+                Ok(bytes)
+            });
+            let mut session = ServeSession::new(text, SessionOptions::default()).unwrap();
+            let mut ordinary = vec![u32::from(b'A') + 4];
+            ordinary.extend(spelling.bytes().map(|b| u32::from(b) + 4));
+            ordinary.push(1);
+            let special = vec![u32::from(b'A') + 4, marker, 1];
+            for (committed, mut canonical) in
+                [(special.clone(), ordinary.clone()), (ordinary, special)]
+            {
+                session.committed = committed;
+                canonical.push(u32::from(b'B') + 4);
+                assert!(
+                    session
+                        .respelled_on_committed(&canonical)
+                        .unwrap()
+                        .is_none(),
+                    "{spelling}"
+                );
+            }
+            session.committed = vec![MERGED, marker, u32::from(b'x') + 4, 1];
+            let canonical = vec![
+                u32::from(b'V') + 4,
+                u32::from(b'i') + 4,
+                marker,
+                u32::from(b'x') + 4,
+                1,
+                u32::from(b'B') + 4,
+            ];
+            let mut expected = session.committed.clone();
+            expected.push(u32::from(b'B') + 4);
+            assert_eq!(
+                session.respelled_on_committed(&canonical).unwrap(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn nonordinary_ids_are_validated_and_sorted() {
+        let mut text = codec();
+        text.nonordinary_ids = vec![285, 280, 285];
+        let session = ServeSession::new(text, SessionOptions::default()).unwrap();
+        assert_eq!(session.codec.nonordinary_ids, vec![280, 285]);
+        let mut invalid = codec();
+        invalid.nonordinary_ids = vec![invalid.admission.vocabulary];
+        assert!(ServeSession::new(invalid, SessionOptions::default()).is_err());
+    }
+
+    fn trace_without_worker(session: &mut ServeSession, input: &Json) -> Json {
+        let mut observed = Json::Null;
+        let mut trace = |value: &Json| {
+            observed = value.clone();
+            Err(AdmissionError::Refused("controlled trace refusal").into())
+        };
+        let mut cancelled = || false;
+        let mut seed = || 42;
+        let mut sink = ServeSink {
+            chunk: None,
+            cancelled: &mut cancelled,
+            new_seed: &mut seed,
+            prefix_trace: Some(&mut trace),
+        };
+        let mut target = |_: &Json, _: TokenCallback<'_>| -> Result<Json> {
+            panic!("unexpected worker request")
+        };
+        assert!(
+            session
+                .complete(input, b"test", &mut target, &mut sink)
+                .is_err()
+        );
+        observed
+    }
+
+    #[test]
+    fn changed_sampling_or_seed_preserves_canonical_prompt_on_reset() {
+        let original = tokspur_json::parse_json(br#"{"model":"tokspur","seed":42,"temperature":0.7,"messages":[{"role":"user","content":"A"},{"role":"assistant","content":"Visible"},{"role":"user","content":"B"}]}"#).unwrap();
+        let admitted = admit_chat_with_policies(
+            &original,
+            b"tokspur",
+            ToolEnumValidation::Strict,
+            ToolArgValidation::Strict,
+        )
+        .unwrap();
+        for (seed, temperature, append) in [(99, 0.7, false), (42, 0.5, false), (42, 0.7, true)] {
+            let input = tokspur_json::parse_json(format!(r#"{{"model":"tokspur","seed":{seed},"temperature":{temperature},"messages":[{{"role":"user","content":"A"}},{{"role":"assistant","content":"Visible"}},{{"role":"user","content":"B"}}]}}"#).as_bytes()).unwrap();
+            let mut session = respelled_session(true);
+            session.sampling = admitted.sampling.dump().unwrap();
+            session.seed = 42;
+            let expected =
+                (session.codec.encode)(&(session.codec.render)(&admitted.render).unwrap()).unwrap();
+            let observed = trace_without_worker(&mut session, &input);
+            assert_eq!(
+                field(&observed, "append").unwrap().boolean().unwrap(),
+                append
+            );
+            let ids = trace_ids(&observed);
+            assert_eq!(ids.contains(&MERGED), append);
+            if !append {
+                assert_eq!(ids, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn identical_tokens_around_changed_spans_do_not_need_decoding() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let decoded = Arc::new(AtomicUsize::new(0));
+        let seen = decoded.clone();
+        let mut session = respelled_session(true);
+        session.codec.decode = Box::new(move |ids| {
+            seen.fetch_add(ids.len(), Ordering::Relaxed);
+            let mut bytes = Vec::new();
+            for &id in ids {
+                if id == MERGED {
+                    bytes.extend_from_slice(b"Vi");
+                } else {
+                    bytes.push((id - 4) as u8);
+                }
+            }
+            Ok(bytes)
+        });
+        let equal = vec![u32::from(b'x') + 4; 20_000];
+        session.committed = vec![MERGED, 1];
+        session.committed.extend(&equal);
+        session.committed.push(1);
+        session.committed.extend(&equal);
+        session.committed.push(MERGED);
+        session.committed.extend(&equal);
+        session.committed.push(1);
+        let mut canonical = vec![u32::from(b'V') + 4, u32::from(b'i') + 4, 1];
+        canonical.extend(&equal);
+        canonical.push(1);
+        canonical.extend(&equal);
+        canonical.extend([u32::from(b'V') + 4, u32::from(b'i') + 4]);
+        canonical.extend(&equal);
+        canonical.extend([1, u32::from(b'B') + 4]);
+        assert!(
+            session
+                .respelled_on_committed(&canonical)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(decoded.load(Ordering::Relaxed), 6);
     }
 }

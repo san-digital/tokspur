@@ -32,6 +32,7 @@ def reviewed_tree(tmp_path, checker):
     paths = [checker.MANIFEST]
     paths.extend(row["path"] for row in manifest["native_files"])
     paths.extend(row["path"] for row in manifest.get("rust_files", []))
+    paths.extend(row["path"] for row in manifest.get("drafter_files", []))
     paths.extend(row["licence_file"] for row in manifest["projects"])
     paths.extend([manifest["model_licence"]["file"], "profiles/flash-next-assets.json"])
     paths.extend(
@@ -117,6 +118,38 @@ def test_rust_records_must_stay_under_the_rust_tree(checker, reviewed_tree):
     manifest["rust_files"][0]["path"] = manifest["native_files"][1]["path"]
     save(root, checker, manifest)
     with pytest.raises(ValueError, match="Rust source path required"):
+        checker.validate(root)
+
+
+def test_a_changed_drafter_file_requires_another_review(checker, reviewed_tree):
+    root, manifest = reviewed_tree
+    path = root / manifest["drafter_files"][0]["path"]
+    path.write_bytes(path.read_bytes() + b"\n# Changed implementation.\n")
+    with pytest.raises(ValueError, match="drafter source review has drifted"):
+        checker.validate(root)
+
+
+def test_omitted_credited_drafter_source_is_refused(checker, reviewed_tree):
+    root, manifest = reviewed_tree
+    manifest["drafter_files"] = manifest["drafter_files"][1:]
+    save(root, checker, manifest)
+    with pytest.raises(ValueError, match="credited drafter source is unrecorded"):
+        checker.validate(root)
+
+
+def test_drafter_records_must_stay_under_the_drafter_tree(checker, reviewed_tree):
+    root, manifest = reviewed_tree
+    manifest["drafter_files"][0]["path"] = manifest["native_files"][1]["path"]
+    save(root, checker, manifest)
+    with pytest.raises(ValueError, match="drafter source path required"):
+        checker.validate(root)
+
+
+def test_runtime_records_cannot_cite_a_source_only_project(checker, reviewed_tree):
+    root, manifest = reviewed_tree
+    manifest["native_files"][1]["sources"].append("DFlash")
+    save(root, checker, manifest)
+    with pytest.raises(ValueError, match="runtime source cites a source-only project"):
         checker.validate(root)
 
 
@@ -266,29 +299,37 @@ def test_notice_the_manifest_and_the_release_licences_agree(checker):
     shipped = set(release.LICENCES.values())
     adapted = {
         name
-        for key in ("native_files", "rust_files")
-        for row in manifest[key]
+        for key in ("native_files", "rust_files", "drafter_files")
+        for row in manifest.get(key, [])
         for name in row["sources"]
     }
+    source_only = set()
     for project in manifest["projects"]:
         name = project["id"]
+        distribution = project.get("distribution", "runtime")
         assert project["revision"] in notice, name
         assert Path(project["licence_file"]).parent.as_posix() in notice, name
-        assert project["licence_file"] in shipped, name
+        assert (project["licence_file"] in shipped) == (distribution == "runtime"), name
+        if distribution == "source-only":
+            source_only.add(name)
         # A pin is a recorded source exactly when a recorded file adapts it.
         assert (project["pin_kind"] == "recorded-source") == (name in adapted), name
+    assert source_only == {"DFlash"}
     assert manifest["model_licence"]["file"] in shipped
     assert manifest["rust_standard_library"]["file"] in shipped
 
-    # NOTICE credits DFlash for drafter/, which no release archive contains, so the manifest and the release licences leave it out and NOTICE says so.
     recorded = {project["revision"] for project in manifest["projects"]}
     unrecorded = [
         line
         for line in notice.splitlines()
         if set(re.findall(r"\b[0-9a-f]{40}\b", line)) - recorded
     ]
-    assert len(unrecorded) == 1 and unrecorded[0].startswith("- DFlash ")
-    assert "drafter/model.py" in unrecorded[0]
-    assert "except DFlash" in notice
+    assert not unrecorded
+    assert "except DFlash" not in notice
     assert (ROOT / "third_party/dflash/LICENSE").is_file()
     assert not any("dflash" in source for source in shipped)
+
+    m5_holder = "Copyright (c) 2026 m5-max-kernels contributors"
+    assert m5_holder in notice
+    assert m5_holder in (ROOT / "native/third_party/m5-max-kernels/LICENSE").read_text()
+    assert m5_holder in (ROOT / "native/kernels/dense_q8_staged_f32.metal").read_text()

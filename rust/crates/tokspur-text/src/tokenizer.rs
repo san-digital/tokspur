@@ -470,6 +470,23 @@ impl fmt::Debug for ByteBpe {
 }
 
 impl ByteBpe {
+    /// Added tokens and reserved padding slots whose IDs must survive text comparisons unchanged.
+    pub fn nonordinary_token_ids(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = self.markers.iter().filter_map(|marker| marker.id).collect();
+        ids.extend(
+            self.vocabulary
+                .iter()
+                .enumerate()
+                .filter_map(|(id, token)| {
+                    (token.starts_with(b"[PAD") && token == format!("[PAD{id}]").as_bytes())
+                        .then_some(id as u32)
+                }),
+        );
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     /// `ByteBpe(BpeData)`: validates the model and builds the merge table and the added-token trie. Checks run in the C++ order, so the first failing check names the refusal.
     pub fn new(data: BpeData) -> Result<Self, TokenizerError> {
         let BpeData {
@@ -887,6 +904,17 @@ mod tests {
             merges,
             added,
         }
+    }
+
+    #[test]
+    fn nonordinary_ids_include_all_added_tokens_and_reserved_padding() {
+        let mut data = fixture();
+        data.vocabulary.push(b"[PAD266]".to_vec());
+        data.vocabulary.push(b"[PAD999]".to_vec());
+        let model = ByteBpe::new(data).unwrap();
+        assert_eq!(model.nonordinary_token_ids(), vec![262, 263, 264, 266]);
+        assert_eq!(model.decode_bytes(&[265], false).unwrap(), b"zz");
+        assert_eq!(model.encode_piece(b"zz").unwrap(), vec![122, 122]);
     }
 
     #[test]

@@ -1,8 +1,7 @@
 name: Release (signed macOS arm64 package)
 
-# Manual only. Keep this workflow disabled in repository settings until the
-# protected release environment and signing/notary secrets are configured.
-# Builds and notarises on the configured xcode-27 runner and creates a draft release.
+# Manual only. Gated by the protected release environment and its required reviewer.
+# Builds, signs and notarises on GitHub's Xcode 27 image and creates a draft release.
 on:
   workflow_dispatch:
     inputs:

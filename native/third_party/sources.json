@@ -1,7 +1,7 @@
 {
   "schema": 1,
-  "reviewed_date": "2026-11-12",
-  "scope": "Source credits, licence notices and hashes for the distributed runtime.",
+  "reviewed_date": "2026-11-16",
+  "scope": "Source credits, licence notices and hashes for the distributed runtime and source-only training code.",
   "projects": [
     {
       "id": "llama.cpp",
@@ -245,6 +245,36 @@
           "lines": 18
         }
       ]
+    },
+    {
+      "id": "DFlash",
+      "repository": "https://github.com/z-lab/dflash",
+      "revision": "95c8aeca5e4b4c4f9c0c967c05ab89fa3ed24f4c",
+      "pin_kind": "recorded-source",
+      "distribution": "source-only",
+      "licence": "MIT",
+      "licence_file": "third_party/dflash/LICENSE",
+      "licence_sha256": "6fd2aebd899c0b48ea9abb845aef043c6dadff00a6726a10a1bc32db528a5422",
+      "files": [
+        {
+          "path": "LICENSE",
+          "sha256": "6fd2aebd899c0b48ea9abb845aef043c6dadff00a6726a10a1bc32db528a5422",
+          "bytes": 1062,
+          "lines": 21
+        },
+        {
+          "path": "dflash/model.py",
+          "sha256": "f55b7fe0a4c0b3073e0f9cdce547cce29f4b8e2168c4d2818760007c43b7651e",
+          "bytes": 25722,
+          "lines": 659
+        },
+        {
+          "path": "dflash/model_mlx.py",
+          "sha256": "2f8598eaca4cb814e63ea69e791c1bdf55ba82280bfd299f9141906356b7cb87",
+          "bytes": 35272,
+          "lines": 907
+        }
+      ]
     }
   ],
   "native_files": [
@@ -287,7 +317,7 @@
     },
     {
       "path": "native/kernels/dense_q8_staged_f32.metal",
-      "sha256": "638030b1076d8bc5eb7af57ebdbb79afcc00c4fdd1c52dc50bcb00ddb96a8bb0",
+      "sha256": "10ebf53937ed853ced398f41a1ce400137ecc421a55915ba34d237aae7776957",
       "sources": [
         "llama.cpp",
         "m5-max-kernels"
@@ -297,7 +327,7 @@
         "grid band ordering after the m5-max-kernels GEMM pattern"
       ],
       "status": "recorded-adaptation",
-      "lines": 256
+      "lines": 190
     },
     {
       "path": "native/kernels/moe_router_f32_batch.metal",
@@ -313,7 +343,7 @@
     },
     {
       "path": "native/kernels/qsa_prefill.metal",
-      "sha256": "25112377d77b05846a31f45fe5e7f16194e6f4938af10e363a366c68511ef163",
+      "sha256": "26fb5474af63565a922eea2dfd6d6b834e824d19d9e2157124a273b4ec08b6dd",
       "sources": [
         "llama.cpp"
       ],
@@ -321,11 +351,11 @@
         "kernel_mul_mm_id tile and quantisation adaptation"
       ],
       "status": "recorded-adaptation",
-      "lines": 391
+      "lines": 459
     },
     {
       "path": "native/kernels/nax_prefill.metal",
-      "sha256": "963f665b279544596800c76e03200842294a22f2612c0489dccd6b9272950f32",
+      "sha256": "392adfbe3e2581a8e1ffd9ffedadc1a916232fc12e51bc122d30a520ba82926b",
       "sources": [
         "llama.cpp",
         "Splash"
@@ -336,7 +366,7 @@
         "shared/gguf_float.metal three-part BF16 weight split and plane matmul"
       ],
       "status": "recorded-adaptation",
-      "lines": 7667
+      "lines": 7673
     },
     {
       "path": "native/kernels/raw_decode.metal",
@@ -364,7 +394,7 @@
     },
     {
       "path": "native/kernels/gdn_chunk.metal",
-      "sha256": "1f41cecc7a341490edbd765025af4a1bf51d182ec7a4705d06fb2734351e03d3",
+      "sha256": "698a3510f2a43cbbdc1aee920bbbc6c732a9ce7e250d74f7e83772f66ba26533",
       "sources": [
         "llama.cpp"
       ],
@@ -372,7 +402,7 @@
         "CS64 delta-net algebra from src/models/delta-net-base.cpp"
       ],
       "status": "recorded-adaptation",
-      "lines": 552
+      "lines": 654
     },
     {
       "path": "native/src/gdn_chunk_math.cpp",
@@ -400,7 +430,7 @@
     },
     {
       "path": "native/kernels/dflash2.metal",
-      "sha256": "ed65730587c439a3403f80879c8e51ff61a257aaf7c161b28121e5105e6b4590",
+      "sha256": "b84420d57bdde6bb479016908f4fadd57009ba0b53db95a23eed29ef93988eb3",
       "sources": [
         "Splash"
       ],
@@ -408,7 +438,7 @@
         "draft convolution, ring attention, candidate selection"
       ],
       "status": "recorded-adaptation",
-      "lines": 1518
+      "lines": 1550
     },
     {
       "path": "native/src/dflash2_drafter.cpp",
@@ -564,6 +594,20 @@
       ],
       "status": "recorded-adaptation",
       "lines": 200
+    }
+  ],
+  "drafter_files": [
+    {
+      "path": "drafter/model.py",
+      "sha256": "f64686273b7e2543529bf3b65d17f7dbdb325be4632648bf402bce55a845b14a",
+      "sources": [
+        "DFlash"
+      ],
+      "routines": [
+        "layer structure, grouped dynamic convolution and candidate selector after dflash/model.py and dflash/model_mlx.py"
+      ],
+      "status": "recorded-adaptation",
+      "lines": 384
     }
   ],
   "unresolved": [],

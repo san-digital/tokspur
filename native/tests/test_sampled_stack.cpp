@@ -291,6 +291,61 @@ void sampled_stack(const char* library, bool reuse, [[maybe_unused]] bool concur
             ledger();
         }
         {
+            // Host-tap mode: failed step following committed step invalidates aliased GPU view while keeping host HC row.
+            const auto base = seed(target, 3); static_cast<void>(seed(serial, 3));
+            require(!target.gpu_final_hc_tap() && target.has_last_final_hc_gpu(), "committed host-tap step missing GPU view");
+            std::vector<float> gpu_hc(128);
+            graph.read(target.last_final_hc_gpu_residual(), std::as_writable_bytes(std::span(gpu_hc)));
+            require(same_bytes(gpu_hc, base.hc), "committed step GPU HC residual differs from host tap");
+            std::vector<std::byte> expected_ssd(size_t(target.ssd_checkpoint_payload_bytes()));
+            require(target.read_ssd_checkpoint_span(0, expected_ssd), "baseline SSD checkpoint span read failed");
+            const auto lookup5 = target.lookup(5);
+            const auto r5 = row(5), m5 = memory(lookup5.rows);
+            reject([&] { static_cast<void>(target.step(shape.vocabulary, r5, m5)); });
+            reject([&] { static_cast<void>(target.step(5, std::span(r5).first(r5.size() - 1), m5)); });
+            require(target.has_last_final_hc_gpu(), "pre-staging step refusal invalidated committed GPU HC view");
+            const auto saved_output = graph.read(f.weights.output.view);
+            auto poisoned_output = saved_output;
+            const uint16_t nan_scale = 0x7e00;
+            std::memcpy(poisoned_output.data(), &nan_scale, sizeof(nan_scale));
+            graph.write(f.weights.output.view, poisoned_output);
+            reject([&] { static_cast<void>(target.step(5, r5, m5)); });
+            graph.write(f.weights.output.view, saved_output);
+            require(target.position() == 3 && target.accepted_snapshot() == base.state &&
+                !target.has_last_final_hc_gpu() && target.last_final_hc_count() == 1 &&
+                same_bytes(target.last_final_hc_residual(), base.hc),
+                "failed step left aliased GPU HC view valid or corrupted host HC tap");
+            reject([&] { static_cast<void>(target.last_final_hc_gpu_rows()); });
+            reject([&] { static_cast<void>(target.last_final_hc_gpu_residual()); });
+            std::vector<std::byte> actual_ssd(expected_ssd.size());
+            require(target.read_ssd_checkpoint_span(0, actual_ssd) && actual_ssd == expected_ssd,
+                "SSD checkpoint span failed to read intact host HC row after failed step");
+
+            // Host-tap mode: failed verify_sampled2 following committed verify_sampled2 invalidates aliased GPU view.
+            static_cast<void>(seed(target, 2)); static_cast<void>(seed(serial, 2));
+            const std::array<uint32_t, 2> ids_a{5, 8}, ids_b{3, 7};
+            std::array<SampledFrame, 2> frames_a{advance(serial, 5), advance(serial, 8)};
+            const auto in_a = inputs(ids_a); Select sel_a{&target, frames_a, 2};
+            const auto committed_a = target.verify_sampled2(in_a.tokens, in_a.rows, in_a.memory, 2, {Select::choose, &sel_a});
+            ++batches;
+            require(committed_a.committed == 2 && target.has_last_final_hc_gpu() &&
+                same_bytes(target.last_final_hc_residual(), frames_a[1].hc), "committed verify_sampled2 missing GPU/host HC");
+            std::vector<std::byte> verify_ssd(size_t(target.ssd_checkpoint_payload_bytes()));
+            require(target.read_ssd_checkpoint_span(0, verify_ssd), "verify_sampled2 SSD checkpoint read failed");
+            std::array<SampledFrame, 2> frames_b{advance(serial, 3), advance(serial, 7)};
+            const auto in_b = inputs(ids_b); Select sel_throw{&target, frames_b, 1}; sel_throw.throwing = true;
+            reject([&] { static_cast<void>(target.verify_sampled2(in_b.tokens, in_b.rows, in_b.memory, 4, {Select::choose, &sel_throw})); });
+            require(!target.has_last_final_hc_gpu() && target.last_final_hc_count() == 2 &&
+                same_bytes(target.last_final_hc_residual(), frames_a[1].hc),
+                "failed verify_sampled2 left aliased GPU HC view valid or corrupted host HC tap");
+            reject([&] { static_cast<void>(target.last_final_hc_gpu_rows()); });
+            reject([&] { static_cast<void>(target.last_final_hc_gpu_residual()); });
+            std::vector<std::byte> verify_ssd_after(verify_ssd.size());
+            require(target.read_ssd_checkpoint_span(0, verify_ssd_after) && verify_ssd_after == verify_ssd,
+                "SSD checkpoint span changed after failed host-tap verify_sampled2");
+            ledger();
+        }
+        {
             target.reset();
             target.configure_gpu_final_hc_tap(true);
             require(target.gpu_final_hc_tap(), "GPU final HC tap toggle failed");
@@ -300,21 +355,191 @@ void sampled_stack(const char* library, bool reuse, [[maybe_unused]] bool concur
             std::array<SampledFrame, 2> frames{advance(serial, 5), advance(serial, 8)};
             const auto in = inputs(ids);
             struct GpuTapSelect {
+                uint32_t commit = 2;
+                uint32_t calls = 0;
+                bool throwing = false;
                 bool saw_gpu_only = false;
                 static uint32_t choose(void* ctx, const StackSampledVerificationRows& rows) {
                     auto& self = *static_cast<GpuTapSelect*>(ctx);
+                    ++self.calls;
                     self.saw_gpu_only = rows.count == 2 && rows.final_hc_rows.empty() &&
                         rows.final_hc_gpu_rows.owner != 0 && rows.final_hc_gpu_rows.bytes == 2 * 128 * sizeof(float);
-                    return 2;
+                    if (self.throwing) throw FormatError("GPU tap selector deliberately refused");
+                    return self.commit;
                 }
             };
-            GpuTapSelect gpu_sel{false};
+            GpuTapSelect gpu_sel{};
             const auto res = target.verify_sampled2(in.tokens, in.rows, in.memory, 3, {GpuTapSelect::choose, &gpu_sel});
+            ++batches;
             require(gpu_sel.saw_gpu_only && res.evaluated.final_hc_rows.empty() && res.evaluated.final_hc_gpu_rows.owner != 0 &&
                 target.has_last_final_hc_gpu(), "GPU final HC tap did not suppress eager host copy");
-            require(same_bytes(target.last_final_hc_residual(), frames[1].hc) &&
-                same_bytes(target.last_final_hc_rows().first(frames[0].hc.size()), frames[0].hc),
-                "GPU final HC tap lazy host materialisation differs");
+            // Keep final_hc_host_valid == false here and verify pre-staging refusals preserve GPU backing.
+            std::vector<float> committed_gpu_hc(128);
+            graph.read(target.last_final_hc_gpu_residual(), std::as_writable_bytes(std::span(committed_gpu_hc)));
+            require(same_bytes(committed_gpu_hc, frames[1].hc), "GPU final HC tap committed residual differs");
+
+            const std::array<uint32_t, 2> next_ids{3, 7};
+            std::array<SampledFrame, 2> next_frames{advance(serial, 3), advance(serial, 7)};
+            const auto next_in = inputs(next_ids);
+            const std::array<uint32_t, 2> bad_ids{shape.vocabulary, 7};
+            reject([&] { static_cast<void>(target.verify_sampled2(bad_ids, next_in.rows, next_in.memory, 5, {GpuTapSelect::choose, &gpu_sel})); });
+            reject([&] { static_cast<void>(target.verify_sampled2(next_in.tokens, std::span(next_in.rows).first(next_in.rows.size() - 1), next_in.memory, 5, {GpuTapSelect::choose, &gpu_sel})); });
+            reject([&] { static_cast<void>(target.verify_sampled2(next_in.tokens, next_in.rows, next_in.memory, 4, {GpuTapSelect::choose, &gpu_sel})); });
+            struct CancelOnce { bool done = false; static bool poll(void* p) { auto& c = *static_cast<CancelOnce*>(p); if (!c.done) { c.done = true; return true; } return false; } };
+            CancelOnce pre_cancel{};
+            reject([&] { static_cast<void>(target.verify_sampled2(next_in.tokens, next_in.rows, next_in.memory, 5, {GpuTapSelect::choose, &gpu_sel}, {CancelOnce::poll, &pre_cancel})); });
+            // verify_greedy8 k=0 mismatch before staging must also preserve committed GPU HC view.
+            const std::array<uint32_t, 2> g8_mismatch_ids{uint32_t((std::max_element(frames[1].logits.begin(), frames[1].logits.end()) - frames[1].logits.begin() + 1) % shape.vocabulary), 0u};
+            const auto g8_mm_in = inputs(g8_mismatch_ids);
+            const auto g8_mm = target.verify_greedy8(g8_mm_in.tokens, g8_mm_in.rows, g8_mm_in.memory, 5, frames[1].logits, 2);
+            require(g8_mm.accepted == 0 && target.has_last_final_hc_gpu() && target.last_final_hc_count() == 2,
+                "pre-staging refusal or early verify_greedy8 exit invalidated GPU final HC tap");
+            std::fill(committed_gpu_hc.begin(), committed_gpu_hc.end(), 0.0f);
+            graph.read(target.last_final_hc_gpu_residual(), std::as_writable_bytes(std::span(committed_gpu_hc)));
+            require(same_bytes(committed_gpu_hc, frames[1].hc), "pre-staging refusal corrupted GPU final HC tap bytes");
+
+            // 1a) Post-staging failure in GPU-tap mode via selector throw (finite candidate rows overwrote v.streams/v.second).
+            GpuTapSelect throw_sel{2, 0, true, false};
+            reject([&] { static_cast<void>(target.verify_sampled2(next_in.tokens, next_in.rows, next_in.memory, 5, {GpuTapSelect::choose, &throw_sel})); });
+            require(throw_sel.calls == 1 && throw_sel.saw_gpu_only && target.position() == 5 &&
+                !target.has_last_final_hc_gpu() && target.last_final_hc_count() == 0 && target.last_final_hc_rows().empty(),
+                "selector throw after staging in GPU-tap mode retained aliased final HC tap");
+            reject([&] { static_cast<void>(target.last_final_hc_residual()); });
+            reject([&] { static_cast<void>(target.last_final_hc_gpu_rows()); });
+            reject([&] { static_cast<void>(target.last_final_hc_gpu_residual()); });
+            std::vector<std::byte> ssd_buf(size_t(target.ssd_checkpoint_payload_bytes()));
+            require(!target.read_ssd_checkpoint_span(0, ssd_buf),
+                "SSD checkpoint span succeeded with invalidated GPU-only final HC tap after selector throw");
+
+            // Valid retry restores committed GPU tap, then post-selection cancellation invalidates it again cleanly.
+            GpuTapSelect commit1_sel{1, 0, false, false};
+            const auto retry1 = target.verify_sampled2(next_in.tokens, next_in.rows, next_in.memory, 5, {GpuTapSelect::choose, &commit1_sel});
+            batches += 1 + bool(retry1.recovery.dispatches);
+            require(retry1.committed == 1 && target.position() == 6 && target.has_last_final_hc_gpu() && target.last_final_hc_count() == 1,
+                "GPU-tap retry after selector throw did not restore GPU HC tap");
+            const std::array<uint32_t, 2> after_ids{7, 2};
+            const auto after_in = inputs(after_ids);
+            GpuTapSelect post_cancel_sel{1, 0, false, false};
+            const auto cancel_after_choose = [](void* value) { return static_cast<GpuTapSelect*>(value)->calls != 0; };
+            reject([&] { static_cast<void>(target.verify_sampled2(after_in.tokens, after_in.rows, after_in.memory, 6,
+                {GpuTapSelect::choose, &post_cancel_sel}, {cancel_after_choose, &post_cancel_sel})); });
+            require(post_cancel_sel.calls == 1 && target.position() == 6 && !target.has_last_final_hc_gpu() &&
+                target.last_final_hc_count() == 0 && target.last_final_hc_rows().empty(),
+                "post-selection cancellation in GPU-tap mode retained aliased final HC tap");
+            reject([&] { static_cast<void>(target.last_final_hc_residual()); });
+            reject([&] { static_cast<void>(target.last_final_hc_gpu_residual()); });
+            ssd_buf.resize(size_t(target.ssd_checkpoint_payload_bytes()));
+            require(!target.read_ssd_checkpoint_span(0, ssd_buf),
+                "SSD checkpoint span succeeded after post-selection cancellation in GPU-tap mode");
+
+            // 1b) Post-staging failure in GPU-tap mode via poisoned nonfinite output weights (NaN and Inf) + valid retry.
+            const auto saved_output = graph.read(f.weights.output.view);
+            for (const uint16_t nonfinite_scale : {uint16_t(0x7e00), uint16_t(0x7c00)}) {
+                static_cast<void>(seed(target, 3));
+                GpuTapSelect setup_sel{2, 0, false, false};
+                static_cast<void>(target.verify_sampled2(in.tokens, in.rows, in.memory, 3, {GpuTapSelect::choose, &setup_sel}));
+                ++batches;
+                require(target.has_last_final_hc_gpu() && target.last_final_hc_count() == 2, "GPU-tap setup missing GPU HC");
+                auto poisoned_output = saved_output;
+                std::memcpy(poisoned_output.data(), &nonfinite_scale, sizeof(nonfinite_scale));
+                graph.write(f.weights.output.view, poisoned_output);
+                GpuTapSelect poisoned_sel{2, 0, false, false};
+                reject([&] { static_cast<void>(target.verify_sampled2(next_in.tokens, next_in.rows, next_in.memory, 5, {GpuTapSelect::choose, &poisoned_sel})); });
+                graph.write(f.weights.output.view, saved_output);
+                require(poisoned_sel.calls == 0 && target.position() == 5 && !target.has_last_final_hc_gpu() &&
+                    target.last_final_hc_count() == 0 && target.last_final_hc_rows().empty(),
+                    "nonfinite verify_sampled2 in GPU-tap mode retained aliased final HC tap");
+                reject([&] { static_cast<void>(target.last_final_hc_residual()); });
+                reject([&] { static_cast<void>(target.last_final_hc_gpu_rows()); });
+                reject([&] { static_cast<void>(target.last_final_hc_gpu_residual()); });
+                ssd_buf.resize(size_t(target.ssd_checkpoint_payload_bytes()));
+                require(!target.read_ssd_checkpoint_span(0, ssd_buf),
+                    "SSD checkpoint span succeeded after nonfinite verify_sampled2 invalidated GPU tap");
+
+                GpuTapSelect retry_sel{2, 0, false, false};
+                const auto ok_retry = target.verify_sampled2(next_in.tokens, next_in.rows, next_in.memory, 5, {GpuTapSelect::choose, &retry_sel});
+                ++batches;
+                require(ok_retry.committed == 2 && target.position() == 7 && target.has_last_final_hc_gpu() &&
+                    target.last_final_hc_count() == 2 && same_bytes(target.last_final_hc_residual(), next_frames[1].hc) &&
+                    same_bytes(target.last_final_hc_rows().first(next_frames[0].hc.size()), next_frames[0].hc),
+                    "GPU final HC tap retry or lazy host materialisation differs after nonfinite output refusal");
+                ssd_buf.resize(size_t(target.ssd_checkpoint_payload_bytes()));
+                require(target.read_ssd_checkpoint_span(0, ssd_buf), "SSD checkpoint span failed after valid GPU-tap retry");
+            }
+
+            // 1c) Also verify_greedy8 post-staging failure invalidates GPU-tap final HC backing from verify_sampled2.
+            {
+                static_cast<void>(seed(target, 3));
+                GpuTapSelect setup_sel{2, 0, false, false};
+                static_cast<void>(target.verify_sampled2(in.tokens, in.rows, in.memory, 3, {GpuTapSelect::choose, &setup_sel}));
+                ++batches;
+                require(target.has_last_final_hc_gpu() && target.last_final_hc_count() == 2, "verify_greedy8 setup missing GPU HC");
+                const uint32_t greedy_first = uint32_t(std::max_element(frames[1].logits.begin(), frames[1].logits.end()) - frames[1].logits.begin());
+                const auto g8_in = inputs(std::array<uint32_t, 2>{greedy_first, 2u});
+                auto poisoned_output = saved_output;
+                const uint16_t nan_scale = 0x7e00;
+                std::memcpy(poisoned_output.data(), &nan_scale, sizeof(nan_scale));
+                graph.write(f.weights.output.view, poisoned_output);
+                reject([&] { static_cast<void>(target.verify_greedy8(g8_in.tokens, g8_in.rows, g8_in.memory, 5, frames[1].logits, 2)); });
+                graph.write(f.weights.output.view, saved_output);
+                require(!target.has_last_final_hc_gpu() && target.last_final_hc_count() == 0 && target.last_final_hc_rows().empty(),
+                    "failed verify_greedy8 retained aliased GPU final HC tap");
+                ssd_buf.resize(size_t(target.ssd_checkpoint_payload_bytes()));
+                require(!target.read_ssd_checkpoint_span(0, ssd_buf),
+                    "SSD checkpoint span succeeded after failed verify_greedy8 invalidated GPU tap");
+            }
+
+            // 1d) step_known in GPU-tap mode followed by failed step_known (nonfinite output weights) + valid retry.
+            {
+                target.reset(); serial.reset();
+                const std::array<uint32_t, 3> known_a{2, 3, 4};
+                const auto lk_a = target.lookups(known_a);
+                std::vector<float> kr_a, km_a;
+                for (size_t i = 0; i < known_a.size(); ++i) {
+                    const auto r = row(known_a[i]), m = memory(lk_a[i].rows);
+                    kr_a.insert(kr_a.end(), r.begin(), r.end()); km_a.insert(km_a.end(), m.begin(), m.end());
+                    static_cast<void>(advance(serial, known_a[i]));
+                }
+                static_cast<void>(target.step_known(known_a, kr_a, km_a));
+                ++batches;
+                require(target.position() == 3 && target.has_last_final_hc_gpu() && target.last_final_hc_count() == 3,
+                    "GPU-tap step_known did not publish GPU HC view");
+
+                const std::array<uint32_t, 2> known_b{5, 6};
+                const auto lk_b = target.lookups(known_b);
+                std::vector<float> kr_b, km_b; SampledFrame serial_last;
+                for (size_t i = 0; i < known_b.size(); ++i) {
+                    const auto r = row(known_b[i]), m = memory(lk_b[i].rows);
+                    kr_b.insert(kr_b.end(), r.begin(), r.end()); km_b.insert(km_b.end(), m.begin(), m.end());
+                    serial_last = advance(serial, known_b[i]);
+                }
+                const std::array<uint32_t, 2> bad_known{shape.vocabulary, 6};
+                reject([&] { static_cast<void>(target.step_known(bad_known, kr_b, km_b)); });
+                require(target.has_last_final_hc_gpu() && target.last_final_hc_count() == 3,
+                    "pre-staging step_known refusal invalidated GPU HC view");
+
+                auto poisoned_output = saved_output;
+                const uint16_t nan_scale = 0x7e00;
+                std::memcpy(poisoned_output.data(), &nan_scale, sizeof(nan_scale));
+                graph.write(f.weights.output.view, poisoned_output);
+                reject([&] { static_cast<void>(target.step_known(known_b, kr_b, km_b)); });
+                graph.write(f.weights.output.view, saved_output);
+                require(target.position() == 3 && !target.has_last_final_hc_gpu() &&
+                    target.last_final_hc_count() == 0 && target.last_final_hc_rows().empty(),
+                    "failed GPU-tap step_known retained aliased final HC tap");
+                reject([&] { static_cast<void>(target.last_final_hc_residual()); });
+                reject([&] { static_cast<void>(target.last_final_hc_gpu_residual()); });
+                ssd_buf.resize(size_t(target.ssd_checkpoint_payload_bytes()));
+                require(!target.read_ssd_checkpoint_span(0, ssd_buf),
+                    "SSD checkpoint span succeeded after failed GPU-tap step_known");
+
+                static_cast<void>(target.step_known(known_b, kr_b, km_b));
+                ++batches;
+                require(target.position() == 5 && target.has_last_final_hc_gpu() && target.last_final_hc_count() == 2 &&
+                    same_bytes(target.last_final_hc_residual(), serial_last.hc),
+                    "valid step_known retry after failed GPU-tap step_known diverged");
+            }
+
             target.reset();
             target.configure_gpu_final_hc_tap(false);
             ledger();
@@ -354,6 +579,73 @@ void sampled_stack(const char* library, bool reuse, [[maybe_unused]] bool concur
         ledger();
     }
     require(graph.memory().live_bytes==weights_only.live_bytes,"sampled stack leaked prepared GPU resources");
+    {
+        const auto row = [&](uint32_t token) { std::vector<float> out(shape.residual.channels);
+            for (size_t i = 0; i < out.size(); ++i) out[i] = float(int((token * 7 + i * 3) % 23) - 11) / 16; return out; };
+        const auto memory = [&](std::span<const uint64_t> ids) { std::vector<float> out(shape.memory.embedding);
+            for (size_t i = 0; i < out.size(); ++i) out[i] = float(int(ids[i / spec.row_width] % 17) - 8) / 32; return out; };
+        {
+            TextStack greedy2_target(graph, f.weights, shape, policy, spec, StackExecution::direct, 8, reuse);
+            TextStack serial(graph, f.weights, shape, policy, spec);
+            greedy2_target.prepare_final_hc_tap(1ull << 20);
+            serial.prepare_final_hc_tap(1ull << 20);
+            greedy2_target.prepare_transient_verification(32ull << 20);
+            const auto g2_resident = graph.memory();
+            const auto advance = [&](TextStack& stack, uint32_t token) {
+                const auto lookup = stack.lookup(token); ++batches;
+                const auto out = stack.step(token, row(token), memory(lookup.rows));
+                return SampledFrame{out.logits, {stack.last_final_hc_residual().begin(), stack.last_final_hc_residual().end()}, stack.accepted_snapshot()};
+            };
+            SampledFrame g2_base;
+            for (uint32_t i = 0; i < 2; ++i) { g2_base = advance(greedy2_target, i); static_cast<void>(advance(serial, i)); }
+            const uint32_t g2_t0 = uint32_t(std::max_element(g2_base.logits.begin(), g2_base.logits.end()) - g2_base.logits.begin());
+            const auto g2_f0 = advance(serial, g2_t0);
+            const uint32_t g2_t1 = uint32_t(std::max_element(g2_f0.logits.begin(), g2_f0.logits.end()) - g2_f0.logits.begin());
+            const auto g2_f1 = advance(serial, g2_t1);
+            const std::array<uint32_t, 2> g2_ids{g2_t0, g2_t1};
+            const auto g2_lookups = greedy2_target.verification_lookups(g2_ids);
+            std::vector<float> g2_rows, g2_mem;
+            for (size_t i = 0; i < 2; ++i) {
+                const auto r = row(g2_ids[i]), m = memory(g2_lookups[i].rows);
+                g2_rows.insert(g2_rows.end(), r.begin(), r.end()); g2_mem.insert(g2_mem.end(), m.begin(), m.end());
+            }
+            const auto g2_committed = greedy2_target.verify_greedy2(g2_ids, g2_rows, g2_mem, 2, g2_base.logits, 2);
+            ++batches;
+            require(g2_committed.accepted == 2 && greedy2_target.has_last_final_hc_gpu() &&
+                same_bytes(greedy2_target.last_final_hc_residual(), g2_f1.hc), "verify_greedy2 HC commit failed");
+            const std::array<uint32_t, 2> mismatch_ids{uint32_t((std::max_element(g2_committed.logits.begin(), g2_committed.logits.end()) - g2_committed.logits.begin() + 1) % shape.vocabulary), 0u};
+            const auto mismatch_lookups = greedy2_target.verification_lookups(mismatch_ids);
+            std::vector<float> mm_rows, mm_mem;
+            for (size_t i = 0; i < 2; ++i) {
+                const auto r = row(mismatch_ids[i]), m = memory(mismatch_lookups[i].rows);
+                mm_rows.insert(mm_rows.end(), r.begin(), r.end()); mm_mem.insert(mm_mem.end(), m.begin(), m.end());
+            }
+            const auto g2_mismatch = greedy2_target.verify_greedy2(mismatch_ids, mm_rows, mm_mem, 4, g2_committed.logits, 2);
+            require(g2_mismatch.accepted == 0 && greedy2_target.has_last_final_hc_gpu(),
+                "verify_greedy2 k=0 early exit invalidated committed GPU HC view");
+            const uint32_t next_t0 = uint32_t(std::max_element(g2_committed.logits.begin(), g2_committed.logits.end()) - g2_committed.logits.begin());
+            const std::array<uint32_t, 2> next_ids{next_t0, 0u};
+            const auto next_lookups = greedy2_target.verification_lookups(next_ids);
+            std::vector<float> next_rows, next_mem;
+            for (size_t i = 0; i < 2; ++i) {
+                const auto r = row(next_ids[i]), m = memory(next_lookups[i].rows);
+                next_rows.insert(next_rows.end(), r.begin(), r.end()); next_mem.insert(next_mem.end(), m.begin(), m.end());
+            }
+            const auto saved_output = graph.read(f.weights.output.view);
+            auto poisoned_output = saved_output;
+            const uint16_t nan_scale = 0x7e00;
+            std::memcpy(poisoned_output.data(), &nan_scale, sizeof(nan_scale));
+            graph.write(f.weights.output.view, poisoned_output);
+            reject([&] { static_cast<void>(greedy2_target.verify_greedy2(next_ids, next_rows, next_mem, 4, g2_committed.logits, 2)); });
+            graph.write(f.weights.output.view, saved_output);
+            require(!greedy2_target.has_last_final_hc_gpu() && same_bytes(greedy2_target.last_final_hc_residual(), g2_f1.hc),
+                "failed verify_greedy2 left aliased GPU HC view valid or corrupted host HC tap");
+            const auto now = graph.memory();
+            require(now.live_bytes == g2_resident.live_bytes && now.allocations == g2_resident.allocations,
+                "verify_greedy2 HC test changed prepared GPU ledger");
+        }
+        require(graph.memory().live_bytes == weights_only.live_bytes, "verify_greedy2 HC test leaked prepared GPU resources");
+    }
 #ifdef TOKSPUR_TEST_Q8_THREE_ROWS
     const auto n3_routes=graph.q8_three_rows_routes();require(n3_routes[0]>0,"sampled state test never dispatched genuine N3");
 #endif

@@ -19,9 +19,7 @@
 #include "tokspur/shared_prefix_restore.hpp"
 #include "tokspur/memory_guard.hpp"
 #include "tokspur/shared_prefix_eviction.hpp"
-#if defined(TOKSPUR_PRIVATE_CACHE_PRESSURE_RECLAIM) && TOKSPUR_PRIVATE_CACHE_PRESSURE_RECLAIM
 #include <malloc/malloc.h>
-#endif
 #ifdef TOKSPUR_PRIVATE_RAW_DECODE
 #include "tokspur/raw_decode_wire.hpp"
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM
@@ -96,6 +94,7 @@
 #include <sys/proc.h>
 #include <sys/resource.h>
 #include <sys/sysctl.h>
+#include <dispatch/dispatch.h>
 #include <unistd.h>
 #if defined(TOKSPUR_PRIVATE_MTP_DISPATCH_PROFILE) || defined(TOKSPUR_PRIVATE_TASK4_PROFILE) || defined(TOKSPUR_PRIVATE_OPERATOR_CHECKPOINTS) || defined(TOKSPUR_PRIVATE_NATIVE_MTP)
 #include <fcntl.h>
@@ -312,11 +311,25 @@ Json describe(Memory m) { return Json(Json::Object{{"physical_footprint_bytes", 
     {"swap_used_bytes", Json::integer(m.swap)}, {"pressure_level", Json::integer(m.pressure)},
     {"resident_size_bytes", Json::integer(m.resident_size)}, {"pageins", Json::integer(m.pageins)},
     {"compressed_bytes", Json::integer(m.compressed)}}); }
-void own_memory_guard() {
-    const auto m = memory();
+class HostMemoryPressure : public FormatError {
+public:
+    using FormatError::FormatError;
+};
+[[noreturn]] void refuse_memory_work(Memory m) {
+    const auto reason = "target process/host memory guard refused further work: " + describe(m).dump();
+    if (m.current <= native_limit && (m.pressure == DISPATCH_MEMORYPRESSURE_WARN || m.pressure == DISPATCH_MEMORYPRESSURE_CRITICAL))
+        throw HostMemoryPressure(reason);
+    throw FormatError(reason);
+}
+void own_memory_guard(const std::function<bool()>& reclaim = {}) {
+    auto m = memory();
+    if (!memory_work_admitted({m.current, m.pressure}, native_limit) && reclaim && reclaim()) {
+        malloc_zone_pressure_relief(nullptr, 0);
+        m = memory();
+    }
     // Lifetime peak remains diagnostic because releasing memory cannot lower it.
     if (!memory_work_admitted({m.current, m.pressure}, native_limit))
-        throw FormatError("target process/host memory guard refused further work: " + describe(m).dump());
+        refuse_memory_work(m);
 }
 void other_workers() {
     // proc_name() yields nothing for processes owned by other users, so a root or
@@ -405,7 +418,15 @@ public:
         value_.swap(prepared); prefix_ = prefix; stop_ = stop; logits_available_ = true;
     }
 };
-struct TargetSampling { SamplingPolicy policy; uint64_t seed = 0; };
+struct TargetSampling {
+    SamplingPolicy policy;
+    uint64_t seed = 0;
+    bool compatible_lane(const TargetSampling& other, bool inherit_seed = false) const {
+        return policy.temperature == other.policy.temperature && policy.top_k == other.policy.top_k &&
+            policy.top_p == other.policy.top_p && policy.min_p == other.policy.min_p &&
+            (inherit_seed || seed == other.seed);
+    }
+};
 double sampling_number(const Json& value, double minimum, double maximum, bool exclude_minimum = false) {
     const auto text = value.number_lexeme(); double out = 0;
     require(text.size() <= 64, "sampling number lexeme exceeds limit");
@@ -1134,15 +1155,68 @@ public:
 [[maybe_unused]] void gdn_old_order_packet(bool selected, size_t inputs) {
     require(!selected || inputs <= 512, "old-order GDN packet exceeds fixed input512 bound");
 }
-struct Request { std::vector<uint32_t> tokens, stops; uint32_t generate, small_splits, block_formats, execution; bool reset, known_prefill, residual_reuse, branch, lookup; bool prefill_final = true, final_logits = false; TargetSampling sampling; };
+enum class ParkedMatch { miss, without_logits, with_logits };
+struct Request {
+    std::vector<uint32_t> tokens, stops, lane_prompt;
+    uint32_t generate, small_splits, block_formats, execution;
+    bool reset, known_prefill, residual_reuse, branch, lookup;
+    bool prefill_final = true, final_logits = false, lane_inherit_seed = false;
+    TargetSampling sampling;
+
+    bool packet_emits_logits() const {
+        return !known_prefill
+#ifdef TOKSPUR_PRIVATE_HTTP_PREFILL512
+            || !final_logits || prefill_final
+#endif
+            ;
+    }
+    ParkedMatch parked_match(std::span<const uint32_t> prefix, bool has_logits, const TargetSampling& saved) const {
+        const auto& prompt = lane_prompt.empty() ? tokens : lane_prompt;
+        if (prefix.empty() || prefix.size() >= prompt.size() || !sampling.compatible_lane(saved, lane_inherit_seed)) return ParkedMatch::miss;
+        const bool expect_logits = prefix.size() == tokens.size() && packet_emits_logits();
+        if ((expect_logits && !has_logits) || !std::equal(prefix.begin(), prefix.end(), prompt.begin())) return ParkedMatch::miss;
+        return expect_logits ? ParkedMatch::with_logits : ParkedMatch::without_logits;
+    }
+};
+template<class Anchor> struct ParkedLanes {
+    std::vector<Anchor> lanes;
+    uint64_t bytes = 0, parks = 0, restores = 0, restored_tokens = 0, evictions = 0, skips = 0;
+
+    uint64_t reclaim() {
+        const uint64_t released = bytes;
+        evictions += lanes.size();
+        std::vector<Anchor>().swap(lanes);
+        bytes = 0;
+        return released;
+    }
+    std::pair<size_t, ParkedMatch> find(const Request& job) const {
+        size_t best = lanes.size();
+        ParkedMatch match = ParkedMatch::miss;
+        bool ambiguous_seed = false;
+        for (size_t i = 0; i < lanes.size(); ++i) {
+            const auto& lane = lanes[i];
+            if (best != lanes.size() && lane.tokens.size() < lanes[best].tokens.size()) continue;
+            const auto candidate = job.parked_match(lane.tokens, lane.has_logits, lane.lane_sampling);
+            if (candidate == ParkedMatch::miss) continue;
+            if (best == lanes.size() || lane.tokens.size() > lanes[best].tokens.size()) {
+                best = i; match = candidate; ambiguous_seed = false;
+            } else if (lane.lane_sampling.seed != lanes[best].lane_sampling.seed) {
+                // The same rendered history can belong to two different stochastic streams.
+                ambiguous_seed = true;
+            }
+        }
+        return ambiguous_seed ? std::pair{lanes.size(), ParkedMatch::miss} : std::pair{best, match};
+    }
+};
 Request request(const Json& data, uint32_t position, uint32_t current_splits, uint32_t current_block_formats, bool allow_kernel_experiments,
                 bool has_logits, bool continuable, bool sampling_matches = true,
                 uint32_t current_execution = 0, bool allow_stack_experiments = false, bool replay_prepared = false,
                 uint32_t known_capacity = 0, bool allow_prefill_experiments = false, bool current_residual_reuse = false,
                 uint32_t checkpoint_slots = 0, bool lookup_prepared = false, bool allow_lookup_experiments = false,
-                bool current_lookup = false, bool final_input_logits = false, uint32_t context_length = 65536) {
+                bool current_lookup = false, bool final_input_logits = false, uint32_t context_length = 65536,
+                bool lane_parking = false, uint32_t pending_overflow = 0) {
     require(context_length == 65536 || context_length == 131072, "unsupported target context length");
-    keys(data, {"tokens", "generate", "reset", "stop_ids", "small_gemv_splits", "block_gemv_formats", "sampling", "seed", "stack_execution", "known_prefill", "known_residual_reuse", "checkpoint_mode", "prompt_lookup"
+    keys(data, {"tokens", "generate", "reset", "stop_ids", "small_gemv_splits", "block_gemv_formats", "sampling", "seed", "stack_execution", "known_prefill", "known_residual_reuse", "checkpoint_mode", "prompt_lookup", "lane_prompt", "lane_inherit_seed"
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
         , "mtp_generation"
 #endif
@@ -1236,7 +1310,23 @@ Request request(const Json& data, uint32_t position, uint32_t current_splits, ui
             "residual reuse override requires explicit startup consent and a fresh prefix");
         out.residual_reuse = reuse->boolean();
     }
-    require(uint64_t(prefix) + out.tokens.size() + out.generate <= context_length, "target request exceeds total context reservation");
+    // An output packet first drains pending overflow, which the committed prefix already holds.
+    const auto drained = (!out.reset && out.tokens.empty()) ? std::min(pending_overflow, prefix) : 0u;
+    require(uint64_t(prefix) - drained + out.tokens.size() + out.generate <= context_length, "target request exceeds total context reservation");
+    if (const auto* inherit = data.find("lane_inherit_seed")) {
+        require(lane_parking && out.reset && out.known_prefill && !out.tokens.empty() && !out.generate &&
+            !out.branch && !out.lookup && inherit->boolean(), "seed inheritance requires a fresh parked conversation input packet");
+        out.lane_inherit_seed = true;
+    }
+    if (const auto* lane = data.find("lane_prompt")) {
+        // The whole rendered prompt of a fresh request, so a parked conversation longer than one input packet can be matched exactly.
+        require(lane_parking && out.reset && !out.tokens.empty() && !out.generate, "lane prompt requires parked-lane consent and a fresh input packet");
+        const auto& all = lane->array();
+        require(all.size() > out.tokens.size() && all.size() < context_length, "lane prompt must extend its first packet within context");
+        out.lane_prompt.reserve(all.size());
+        for (const auto& id : all) { const auto token = id.unsigned_integer(); require(token < 248320, "lane prompt token outside vocabulary"); out.lane_prompt.push_back(uint32_t(token)); }
+        require(std::equal(out.tokens.begin(), out.tokens.end(), out.lane_prompt.begin()), "lane prompt does not begin with the packet tokens");
+    }
     if (const auto* stops = data.find("stop_ids")) {
         require(stops->array().size() <= 16, "too many target stop IDs");
         for (const auto& value : stops->array()) { const auto id = value.unsigned_integer(); require(id < 248320, "stop ID outside vocabulary"); out.stops.push_back(uint32_t(id)); }
@@ -2175,6 +2265,7 @@ int target_cli(int argc, char** argv) {
     PrefillM64Mode prefill_m64 = PrefillM64Mode::off;
     bool prefill_multiseg = false, prefill_swizzle = false, qsa_prefill_fused = false, hc_consumer_fused = false;
     bool ple_overlap = false, shared_prefix_cache_enabled = false;
+    uint64_t parked_lane_budget_bytes = 0;
     std::filesystem::path policy_path; auto library = std::filesystem::absolute(argv[0]).parent_path() / "tokspur-owned.metallib";
     std::vector<std::filesystem::path> paths; std::set<std::string> seen; bool allow = false, dry = false, profiling = false;
 #ifdef TOKSPUR_PRIVATE_OPERATOR_CHECKPOINTS
@@ -2915,6 +3006,12 @@ int target_cli(int argc, char** argv) {
             require(value == "on" || value == "off", "shared prefix cache requires on or off");
             shared_prefix_cache_enabled = value == "on"; candidate_opt_selected = true;
         }
+        else if (option == "--parked-lanes-mib" || option == "--native-parked-lanes-mib") {
+            uint64_t mib = 0;
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), mib);
+            require(parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size() && mib <= 16384, "parked lanes require 0..16384 MiB");
+            parked_lane_budget_bytes = mib << 20; candidate_opt_selected = true;
+        }
 #ifdef TOKSPUR_PRIVATE_RAW_DECODE
         else if (option == "--raw-decode") {
             require(value == "on" || value == "off", "raw routed decode requires on or off"); native_raw_decode = value == "on";
@@ -3625,6 +3722,7 @@ int target_cli(int argc, char** argv) {
     require((prefill_m64 == PrefillM64Mode::off && !prefill_multiseg && !prefill_swizzle && !qsa_prefill_fused && !hc_consumer_fused && !ple_overlap) ||
         (execution == StackExecution::direct && !allow_kernel_experiments && !allow_stack_experiments && !allow_prefill_experiments),
         "exact prefill candidates require fixed direct target execution without request-time overrides");
+    require(!parked_lane_budget_bytes || (shared_prefix_cache_enabled && !checkpoint_ssd), "parked lanes require the shared prefix cache without SSD checkpoints");
     require(!shared_prefix_cache_enabled || (execution == StackExecution::direct && !worker_broker && !checkpoint_slots && !prompt_lookup &&
         !allow_kernel_experiments && !allow_stack_experiments && !allow_prefill_experiments
 #ifdef TOKSPUR_PRIVATE_OPERATOR_CHECKPOINTS
@@ -3897,11 +3995,16 @@ int target_cli(int argc, char** argv) {
 #endif
         indices.emplace(name, slices.size()); slices.push_back({name, 0, 0});
     }
-    // Replace large original Metal resources rather than layering capture aliases
-    // over them. Whole tensor slices stay intact; capped edge pages are charged
-    // for every actual resource. Both same-resident comparators share this plan.
+    constexpr uint64_t pack_buffer_bytes = uint64_t(4) << 30;
+    const uint64_t page = getpagesize();
+    const bool split_pack_weights = pack_v3 && pack_v3->plan.recipe == planar_v3::pack_recipe_v3 &&
+        std::all_of(pack_v3->plan.tensors.begin(), pack_v3->plan.tensors.end(), [&](const auto& tensor) {
+            const auto offset = checked_add(pack_v3->plan.data_offset, tensor.offset);
+            return tensor.bytes <= pack_buffer_bytes - offset % page;
+        });
     const uint64_t mapped_region_limit = (execution == StackExecution::recurrent_replay ||
-        (TOKSPUR_PRIVATE_M5_RESOURCE_SCREEN && execution == StackExecution::direct)) ? uint64_t(1) << 32 : 0;
+        (TOKSPUR_PRIVATE_M5_RESOURCE_SCREEN && execution == StackExecution::direct)) ? pack_buffer_bytes : 0;
+    const uint64_t pack_region_limit = split_pack_weights ? pack_buffer_bytes : mapped_region_limit;
     ImportedWeights imports;
     if (!slices.empty()) {
         imports = gpu.import_weights(source, slices, mapped_region_limit);
@@ -3965,7 +4068,7 @@ int target_cli(int argc, char** argv) {
             packed_slices.push_back({tensor.name, 0, 0});
             packed_plan_indices.push_back(i);
         }
-        const auto packed = gpu.import_weights(pack_v3->model, packed_slices, mapped_region_limit
+        const auto packed = gpu.import_weights(pack_v3->model, packed_slices, pack_region_limit
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
             , true
 #endif
@@ -4079,12 +4182,15 @@ int target_cli(int argc, char** argv) {
         }
     }
     EmbeddingRows cache(files.tensor_bytes(table.name), table.type, 160, layout.ple_storage_rows, layout.ple_addressable_rows, cache_budget, ple_nocache_file.source(), ple_async_gather_enabled);
+    std::function<uint64_t()> reclaim_parked;
 #if defined(TOKSPUR_PRIVATE_CACHE_PRESSURE_RECLAIM) && TOKSPUR_PRIVATE_CACHE_PRESSURE_RECLAIM
     uint64_t cache_reclamations = 0, cache_reclaimed_bytes = 0, cache_allocator_released_bytes = 0;
     std::function<void()> reclaim_shared_prefix;
     const auto reclaim_own_caches = [&]() {
+        gpu.suspend_mapped_weight_residency();
         cache_reclaimed_bytes = checked_add(cache_reclaimed_bytes, cache.reclaim());
         if (reclaim_shared_prefix) reclaim_shared_prefix();
+        if (reclaim_parked) cache_reclaimed_bytes = checked_add(cache_reclaimed_bytes, reclaim_parked());
         cache_allocator_released_bytes = checked_add(cache_allocator_released_bytes, malloc_zone_pressure_relief(nullptr, 0));
         ++cache_reclamations;
     };
@@ -4093,7 +4199,15 @@ int target_cli(int argc, char** argv) {
         const bool admitted = reclaim_before_memory_refusal(native_limit, [&]() {
             observed = memory(); return MemoryGuardReading{observed.current, observed.pressure};
         }, reclaim_own_caches);
-        if (!admitted) throw FormatError("target process/host memory guard refused further work: " + describe(observed).dump());
+        if (!admitted) refuse_memory_work(observed);
+    };
+#else
+    const auto own_memory_guard = [&]() {
+        tokspur::own_memory_guard([&]() {
+            const bool ended = gpu.suspend_mapped_weight_residency();
+            const auto bytes = reclaim_parked ? reclaim_parked() : 0;
+            return ended || bytes > 0;
+        });
     };
 #endif
     uint64_t stateless_prefill_ple_rows = 0;
@@ -4858,6 +4972,7 @@ int target_cli(int argc, char** argv) {
         uint64_t stack_bytes = 0, mtp_bytes = 0;
         uint32_t mtp_first = 1, mtp_rows = 0;
         SamplingRng rng{};
+        TargetSampling lane_sampling{};
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
         StageAControllerState controller_state{};
 #endif
@@ -4885,6 +5000,13 @@ int target_cli(int argc, char** argv) {
         SharedPrefixEvictionCounters evictions{};
 #endif
     } shared_prefix_cache;
+    // Whole conversations parked in host RAM when another conversation takes the single live lane. Exact token keys; the Rust
+    // session names the whole new prompt on its first fresh packet so a lane longer than one input packet can be matched.
+    ParkedLanes<SharedPrefixAnchor> parked;
+    if (parked_lane_budget_bytes) reclaim_parked = [&]() { return parked.reclaim(); };
+    static constexpr uint32_t parked_lane_min_tokens = 2048;
+    std::vector<uint32_t> lane_tokens;
+    bool lane_tokens_valid = false;
     if (shared_prefix_cache_enabled) {
         shared_prefix_cache.active_tokens.reserve(SharedPrefixCacheState::max_prefix_tokens);
     }
@@ -5020,6 +5142,7 @@ int target_cli(int argc, char** argv) {
                 {"imported_weight_backing_bytes", Json::integer(gpu.memory().imported_backing_bytes)},
                 {"row_cache_charged_bytes", Json::integer(cache.charged_bytes())},
                 {"shared_prefix_anchor_bytes", Json::integer(shared_prefix_cache.occupied_bytes)},
+                {"parked_lane_bytes", Json::integer(parked.bytes)},
                 {"ssd_staging_bytes", Json::integer(staging)}, {"reserve_bytes", Json::integer(memory_plan_reserve_bytes)},
                 {"room_bytes", Json::integer(plan.room)}, {"rule", Json(std::string("half_of_room"))},
                 {"would_allow_cache_bytes", Json::integer(plan.would_allow_cache_bytes)},
@@ -5734,7 +5857,17 @@ int target_cli(int argc, char** argv) {
     if (!profiling && std::getenv("TOKSPUR_ALLOW_KNOWN_PROFILE")) {
         counter_sampling = gpu.configure_profiling(16384);
     }
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+    const bool parked_weight_residency = parked_lane_budget_bytes && pack_v3 && !split_pack_weights && mtp && gpu.prepare_mapped_weight_residency();
+#else
+    constexpr bool parked_weight_residency = false;
+#endif
     const auto decorate_ready = [&](Json value) {
+        if (parked_lane_budget_bytes) {
+            auto fields = value.object();
+            fields.emplace_back("parked_weight_residency_enabled", Json(parked_weight_residency));
+            value = Json(std::move(fields));
+        }
         if (target_context_length != 65536) {
             auto fields = value.object();
             fields.emplace_back("context_length", Json::integer(target_context_length));
@@ -5757,7 +5890,7 @@ int target_cli(int argc, char** argv) {
         {"peak_metal_buffer_bytes", Json::integer(gpu.memory().peak_bytes)}, {"gpu_allocation_count", Json::integer(gpu.memory().allocations)},
         {"gpu_buffer_limit_bytes", Json::integer(gpu.memory().budget)}, {"live_captures", Json::integer(gpu.memory().live_captures)},
         {"imported_weight_backing_bytes", Json::integer(gpu.memory().imported_backing_bytes)}, {"imported_regions", Json::integer(imported_region_count)}, {"weight_copy", Json(false)},
-        {"mapped_weight_region_limit_bytes", Json::integer(mapped_region_limit)},
+        {"mapped_weight_region_limit_bytes", Json::integer(pack_region_limit)},
         {"weights_storage", Json("read-only mapped Metal views; first-use page faults are not hidden from request time")},
         {"gpu_profile_mode", Json(profile_mode(counter_sampling))}, {"profile_counter_payload_bytes", Json::integer(gpu.memory().profile_counter_payload_bytes)},
 #ifdef TOKSPUR_PRIVATE_TASK4_PROFILE
@@ -6232,11 +6365,14 @@ int target_cli(int argc, char** argv) {
         }
         advance_known_prepared(tokens, base, emit_logits);
     };
+    bool pressure_reset_required = false;
     const auto emit_error = [&](const std::exception& error, bool fatal) {
 #ifdef TOKSPUR_PRIVATE_ROUTE_LOCK
         if(route_census_only)route_census_failed=true;
 #endif
         const auto position = stack.position();
+        lane_tokens_valid = false;
+        lane_tokens.clear();
         shared_prefix_cache.active_valid = false;
         shared_prefix_cache.active_tokens.clear();
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
@@ -6253,10 +6389,17 @@ int target_cli(int argc, char** argv) {
         if (branches && !branches->matches(position)) { branches->invalidate(); retained.clear(); sampler.invalidate(); }
         reconcile_failure(retained, sampler, position, fatal);
         if (branches && (fatal || !sampler.matches(position) || (position && !retained.matches(position)))) branches->invalidate();
-        std::cout << decorate(Json(Json::Object{{"event", Json("error")}, {"message", Json(error.what())}, {"committed_prefix", Json::integer(position)}, {"automatic_retry_safe", Json(false)},
+        Json::Object fields{{"event", Json("error")}, {"message", Json(error.what())}, {"committed_prefix", Json::integer(position)}, {"automatic_retry_safe", Json(false)},
             {"status", Json("error")}, {"finish_reason", Json("error")}, {"fatal", Json(fatal)}, {"sampling", sampling_json(sampler, position)},
             {"stack_execution", Json(execution_name(stack.execution()))}, {"replay_prepared", Json(stack.replay_prepared())},
-            {"logits_available", Json(retained.matches(position))}, {"continuation_allowed", Json(retained.continuable(position) && sampler.matches(position))}})).dump() << std::endl;
+            {"logits_available", Json(retained.matches(position))}, {"continuation_allowed", Json(retained.continuable(position) && sampler.matches(position))}};
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+        if (!fatal && !broker && has_speculative && dynamic_cast<const HostMemoryPressure*>(&error)) {
+            pressure_reset_required = true;
+            fields.emplace_back("code", Json("host_memory_pressure"));
+        }
+#endif
+        std::cout << decorate(Json(std::move(fields))).dump() << std::endl;
     };
 #ifdef TOKSPUR_PRIVATE_VERIFICATION_COST
 #include "verification_cost_probe.inc"
@@ -6642,6 +6785,77 @@ int target_cli(int argc, char** argv) {
         anchor.last_access_tick = ++shared_prefix_cache.tick;
         return true;
     };
+    const auto park_live_lane = [&]() {
+        if (!parked_lane_budget_bytes || !lane_tokens_valid) return;
+        const uint32_t pfx = stack.position();
+        if (pfx < parked_lane_min_tokens) return;
+        if (lane_tokens.size() != pfx || !sampler.matches(pfx)) { ++parked.skips; return; }
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+        if (mtp && (mtp->deferred_prime_rows() || mtp->next_absolute_position() != pfx)) { ++parked.skips; return; }
+        if (dflash2 && (dflash2->deferred_context() || dflash2->context_len() != pfx)) { ++parked.skips; return; }
+        if (has_speculative && (mtp_generation.active() || mtp_generation.pending_overflow())) { ++parked.skips; return; }
+#endif
+        const uint64_t stack_bytes = stack.ssd_checkpoint_payload_bytes(pfx);
+        uint64_t mtp_bytes = 0;
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+        if (checkpoint_owner) mtp_bytes = checkpoint_owner->ssd_cache_bytes();
+#endif
+        const bool has_logits = retained.matches(pfx);
+        const uint64_t needed = checked_add(checked_add(stack_bytes, mtp_bytes),
+            (has_logits ? uint64_t(shape.vocabulary) * sizeof(float) : 0) + uint64_t(pfx) * sizeof(uint32_t));
+        if (needed > parked_lane_budget_bytes) { ++parked.skips; return; }
+        // Keep a shorter restorable version until all replacement bytes have been copied.
+        const auto supersedes = [&](const SharedPrefixAnchor& old) {
+            return old.lane_sampling.compatible_lane(sampler.options()) && old.tokens.size() <= pfx &&
+                std::equal(old.tokens.begin(), old.tokens.end(), lane_tokens.begin());
+        };
+        uint64_t protected_bytes = 0;
+        for (const auto& old : parked.lanes) if (supersedes(old)) protected_bytes += old.ram_bytes();
+        if (protected_bytes + needed > parked_lane_budget_bytes) { ++parked.skips; return; }
+        while (parked.bytes + needed > parked_lane_budget_bytes) {
+            auto victim = parked.lanes.end();
+            for (auto it = parked.lanes.begin(); it != parked.lanes.end(); ++it) {
+                if (!supersedes(*it) && (victim == parked.lanes.end() || it->last_access_tick < victim->last_access_tick)) victim = it;
+            }
+            parked.bytes -= victim->ram_bytes();
+            parked.lanes.erase(victim);
+            ++parked.evictions;
+        }
+        const auto m = memory();
+        if (!memory_work_admitted({checked_add(m.current, needed), m.pressure}, native_limit)) { ++parked.skips; return; }
+        SharedPrefixAnchor lane{};
+        lane.tokens = lane_tokens;
+        lane.kernel_policy = gpu.kernel_policy();
+        lane.chunk_mode = current_chunk_mode_byte();
+        lane.has_mtp = has_active_mtp();
+        lane.has_logits = has_logits;
+        lane.stack_bytes = stack_bytes;
+        lane.mtp_bytes = mtp_bytes;
+        lane.rng = sampler.random();
+        lane.lane_sampling = sampler.options();
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+        lane.mtp_first = checkpoint_owner ? checkpoint_owner->first_absolute_position() : 1;
+        lane.mtp_rows = checkpoint_owner ? checkpoint_owner->cache_rows() : 0;
+        lane.controller_state = has_speculative ? mtp_generation.controller_state() : StageAControllerState{};
+#endif
+        if (has_logits) lane.logits = retained.get(pfx).logits;
+        lane.payload.resize(size_t(stack_bytes + mtp_bytes));
+        if (!stack.read_ssd_checkpoint_span(0, std::span<std::byte>(lane.payload).first(size_t(stack_bytes)))) { ++parked.skips; return; }
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+        if (mtp_bytes > 0 && (!checkpoint_owner || !checkpoint_owner->read_ssd_cache_span(0,
+                std::span<std::byte>(lane.payload).subspan(size_t(stack_bytes), size_t(mtp_bytes))))) { ++parked.skips; return; }
+#endif
+        lane.last_access_tick = ++shared_prefix_cache.tick;
+        parked.lanes.push_back(std::move(lane));
+        parked.bytes += parked.lanes.back().ram_bytes();
+        for (size_t i = parked.lanes.size() - 1; i-- > 0;) {
+            if (supersedes(parked.lanes[i])) {
+                parked.bytes -= parked.lanes[i].ram_bytes();
+                parked.lanes.erase(parked.lanes.begin() + ptrdiff_t(i));
+            }
+        }
+        ++parked.parks;
+    };
     [[maybe_unused]] bool session_generated_since_reset = false;
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
     bool carrier_component_needs_reset = false, carrier_preparation_sealed = false;
@@ -6716,6 +6930,7 @@ int target_cli(int argc, char** argv) {
                     const auto draft_first = checkpoint_owner->first_absolute_position(), draft_rows = checkpoint_owner->cache_rows();
                     const auto row_cache_bytes = cache.charged_bytes();
                     const auto anchor_count = shared_prefix_cache.anchors.size();
+                    const uint64_t parked_count = parked.lanes.size(), parked_bytes = parked.bytes, evictions = parked.evictions;
                     const auto attempts = cache_reclamations, released = cache_reclaimed_bytes, allocator = cache_allocator_released_bytes;
                     require(row_cache_bytes > 0, "reclamation diagnostic requires a populated row cache");
                     unsigned readings = 0; Memory after{};
@@ -6726,7 +6941,8 @@ int target_cli(int argc, char** argv) {
                     }, reclaim_own_caches);
                     require(readings == 2 && cache_reclamations == attempts + 1 && cache_reclaimed_bytes > released &&
                         cache.charged_bytes() < row_cache_bytes && shared_prefix_cache.anchors.empty() && shared_prefix_cache.recent_prefixes.empty() &&
-                        shared_prefix_cache.active_tokens.empty() && !shared_prefix_cache.active_valid,
+                        shared_prefix_cache.active_tokens.empty() && !shared_prefix_cache.active_valid && parked.lanes.empty() && parked.bytes == 0 &&
+                        parked.evictions == evictions + parked_count && cache_reclaimed_bytes - released >= parked_bytes,
                         "reclamation diagnostic did not release the host caches exactly once");
                     require(stack.position() == position && stack.ssd_checkpoint_payload_bytes() == stack_bytes &&
                         checkpoint_owner->ssd_cache_bytes() == draft_bytes && checkpoint_owner->first_absolute_position() == draft_first && checkpoint_owner->cache_rows() == draft_rows &&
@@ -6742,6 +6958,7 @@ int target_cli(int argc, char** argv) {
                             {"injected_guard_readings", Json(true)}, {"persistent_warning", Json(persistent)}, {"admitted", Json(admitted)},
                             {"guard_readings", Json::integer(readings)}, {"reclamation_attempts", Json::integer(cache_reclamations - attempts)},
                             {"row_cache_bytes_before", Json::integer(row_cache_bytes)}, {"row_cache_bytes_after", Json::integer(cache.charged_bytes())}, {"anchors_before", Json::integer(anchor_count)},
+                            {"parked_lanes_before", Json::integer(parked_count)}, {"parked_bytes_before", Json::integer(parked_bytes)},
                             {"released_accounted_bytes", Json::integer(cache_reclaimed_bytes - released)}, {"allocator_released_bytes", Json::integer(cache_allocator_released_bytes - allocator)},
                             {"memory_before", describe(before)}, {"memory_after", describe(after)},
                             {"stack_bytes", Json::integer(stack_bytes)}, {"drafter_bytes", Json::integer(draft_bytes)},
@@ -6942,8 +7159,12 @@ int target_cli(int argc, char** argv) {
 #else
                 , false
 #endif
-                , target_context_length
+                , target_context_length, parked_lane_budget_bytes > 0 && has_active_mtp()
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+                , mtp_generation.pending_overflow()
+#endif
                 ); files.assert_unchanged();
+            require(!pressure_reset_required || job.reset, "host memory pressure requires a fresh input with reset");
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
             require(!carrier_forced_input || !job.generate, "forced-history components cannot measure live controller decisions");
             require(!carrier_component_needs_reset || job.reset, "target verification component requires an explicit reset before further work");
@@ -7178,6 +7399,7 @@ int target_cli(int argc, char** argv) {
 #endif
             const auto lookup_ledger_before = lookup ? lookup->ledger() : LookupLedger{};
             size_t input_at = 0; double restore_ms = 0, capture_ms = 0;
+            const bool packet_emits_logits = job.packet_emits_logits();
             bool ssd_restored_this_request = false;
             bool shared_prefix_restored_this_request = false;
             bool request_overlap_pipelined = false;
@@ -7260,6 +7482,8 @@ int target_cli(int argc, char** argv) {
                 }
 #endif
                 if (!ssd_restored_this_request && job.reset) {
+                    park_live_lane();
+                    lane_tokens.clear(); lane_tokens_valid = parked_lane_budget_bytes > 0;
                     commit_recent_shared_prefix();
                     shared_prefix_cache.active_tokens.clear();
                     shared_prefix_cache.active_valid = shared_prefix_cache_enabled && !broker;
@@ -7279,6 +7503,8 @@ int target_cli(int argc, char** argv) {
                     if (lookup_active) lookup->reset(); else if (lookup) lookup->invalidate();
                 }
             } else if (job.reset) {
+                park_live_lane();
+                lane_tokens.clear(); lane_tokens_valid = parked_lane_budget_bytes > 0;
                 commit_recent_shared_prefix();
                 shared_prefix_cache.active_tokens.clear();
                 shared_prefix_cache.active_valid = shared_prefix_cache_enabled && !broker;
@@ -7309,11 +7535,6 @@ int target_cli(int argc, char** argv) {
                 ssd_token_history.size() == stack.position()) {
                 std::vector<uint32_t> candidate_history = ssd_token_history;
                 candidate_history.insert(candidate_history.end(), job.tokens.begin(), job.tokens.end());
-                const bool packet_emits_logits = !job.known_prefill
-#ifdef TOKSPUR_PRIVATE_HTTP_PREFILL512
-                    || !job.final_logits || job.prefill_final
-#endif
-                    ;
                 const auto restore_started = Clock::now();
                 const auto opts = job.reset ? job.sampling : sampler.options();
                 // Copied before any restore: an append keeps this exact stream.
@@ -7351,17 +7572,41 @@ int target_cli(int argc, char** argv) {
                 }
             }
 #endif
-            if (shared_prefix_cache_enabled && !ssd_restored_this_request && !job.branch && !broker &&
+            uint32_t lane_restored = 0;
+            if (parked_lane_budget_bytes && job.reset && !job.tokens.empty() && !ssd_restored_this_request && !job.branch && !broker &&
+                stack.position() == 0 && job.known_prefill) {
+                const auto [best, match] = parked.find(job);
+                if (best != parked.lanes.size()) {
+                    const auto restore_started = Clock::now();
+                    auto& lane = parked.lanes[best];
+                    if (restore_shared_prefix_anchor(lane, match == ParkedMatch::with_logits, lane.lane_sampling, nullptr)) {
+                        const uint32_t length = uint32_t(lane.tokens.size());
+                        const size_t in_packet = std::min<size_t>(length, job.tokens.size());
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+                        // Priming counts follow the packet: restored packet rows count as primed, rows beyond the packet do not.
+                        if (mtp || dflash2) mtp_prime_calls += uint32_t(in_packet) - (mtp ? 1u : 0u);
+#endif
+                        parked.bytes -= lane.ram_bytes();
+                        lane_tokens = std::move(lane.tokens); lane_tokens_valid = true;
+                        shared_prefix_cache.active_valid = false;
+                        shared_prefix_cache.active_tokens.clear();
+                        parked.lanes.erase(parked.lanes.begin() + ptrdiff_t(best));
+                        ++parked.restores; parked.restored_tokens += length;
+                        input_at = in_packet;
+                        lane_restored = length;
+                        shared_prefix_restored_this_request = in_packet == job.tokens.size();
+                        restore_ms = milliseconds(restore_started);
+                    } else {
+                        ++parked.skips;
+                    }
+                }
+            }
+            if (shared_prefix_cache_enabled && !ssd_restored_this_request && !job.branch && !broker && !lane_restored &&
                 !job.tokens.empty() && shared_prefix_cache.active_valid &&
                 shared_prefix_cache.active_tokens.size() == stack.position()) {
                 const uint32_t before_pos = stack.position();
                 std::vector<uint32_t> candidate_history = shared_prefix_cache.active_tokens;
                 candidate_history.insert(candidate_history.end(), job.tokens.begin(), job.tokens.end());
-                const bool packet_emits_logits = !job.known_prefill
-#ifdef TOKSPUR_PRIVATE_HTTP_PREFILL512
-                    || !job.final_logits || job.prefill_final
-#endif
-                    ;
                 SharedPrefixAnchor* best_anchor = nullptr;
                 for (auto& anchor : shared_prefix_cache.anchors) {
                     const size_t alen = anchor.tokens.size();
@@ -8190,13 +8435,36 @@ int target_cli(int argc, char** argv) {
                 fields.insert(fields.end(), report.begin(), report.end()); return Json(std::move(fields));
             };
             if (!generated.empty()) session_generated_since_reset = true;
+            if (parked_lane_budget_bytes && lane_tokens_valid) {
+                const size_t skip = lane_restored ? std::min<size_t>(lane_restored, job.tokens.size()) : 0;
+                lane_tokens.insert(lane_tokens.end(), job.tokens.begin() + ptrdiff_t(skip), job.tokens.end());
+                for (const auto& tok : generated) lane_tokens.push_back(uint32_t(tok.unsigned_integer()));
+                // Pending overflow rows may lag the history; a longer history than the committed prefix is never valid.
+                if (lane_tokens.size() > stack.position()) { lane_tokens_valid = false; lane_tokens.clear(); }
+            }
+            const auto lane_report = [&](Json value) {
+                if (!parked_lane_budget_bytes) return value;
+                auto fields = value.object();
+                if (lane_restored && job.lane_inherit_seed) {
+                    fields.emplace_back("lane_seed", Json::integer(sampler.options().seed));
+                    fields.emplace_back("lane_restored_tokens", Json::integer(lane_restored));
+                }
+                if (lane_restored > job.tokens.size()) fields.emplace_back("lane_restored_prefix", Json::integer(lane_restored));
+                fields.emplace_back("parked_lanes", Json(Json::Object{{"count", Json::integer(parked.lanes.size())},
+                    {"bytes", Json::integer(parked.bytes)}, {"budget_bytes", Json::integer(parked_lane_budget_bytes)},
+                    {"parks", Json::integer(parked.parks)}, {"restores", Json::integer(parked.restores)},
+                    {"restored_tokens", Json::integer(parked.restored_tokens)}, {"evictions", Json::integer(parked.evictions)},
+                    {"skips", Json::integer(parked.skips)}}));
+                return Json(std::move(fields));
+            };
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
             if (ssd_manager && ssd_manager->enabled() && !generated.empty() &&
                 ssd_token_history.size() + generated.size() == stack.position()) {
                 for (const auto& tok : generated) ssd_token_history.push_back(uint32_t(tok.unsigned_integer()));
             }
 #endif
-            std::cout << decorate(lookup_report(Json(Json::Object{{"event", Json("done")}, {"generated_ids", Json(std::move(generated))}, {"committed_prefix", Json::integer(stack.position())},
+            if (parked_weight_residency && (!job.tokens.empty() || !generated.empty())) gpu.note_weight_activity();
+            std::cout << decorate(lane_report(lookup_report(Json(Json::Object{{"event", Json("done")}, {"generated_ids", Json(std::move(generated))}, {"committed_prefix", Json::integer(stack.position())},
                 {"status", Json(stop_id ? "stopped" : job.generate ? "length" : "prefilled")}, {"finish_reason", stop_id ? Json("stop") : job.generate ? Json("length") : Json()},
                 {"stop_id", stop_id ? Json::integer(*stop_id) : Json()}, {"continuation_allowed", Json(retained.continuable(stack.position()))},
                 {"prefill_wall_ms", number(prefill_ms)},
@@ -8295,19 +8563,20 @@ int target_cli(int argc, char** argv) {
                 {"gpu_allocation_count", Json::integer(gpu.memory().allocations)}, {"gpu_buffer_limit_bytes", Json::integer(gpu.memory().budget)},
                 {"live_captures", Json::integer(gpu.memory().live_captures)}, {"imported_weight_backing_bytes", Json::integer(gpu.memory().imported_backing_bytes)},
                 {"native_limit_bytes", Json::integer(native_limit)}, {"profile_counter_payload_bytes", Json::integer(gpu.memory().profile_counter_payload_bytes)},
-                {"mapped_weight_region_limit_bytes", Json::integer(mapped_region_limit)},
+                {"mapped_weight_region_limit_bytes", Json::integer(pack_region_limit)},
                 {"block_gemv_formats", Json::integer(block_gemv_formats)},
                 {"sampling", sampling_json(sampler, stack.position())},
                 {"thermal_state", Json::integer(host_thermal_state())},
                 {"ple_cache", Json(Json::Object{{"hits", Json::integer(cache.stats().hits)}, {"misses", Json::integer(cache.stats().misses)}, {"evictions", Json::integer(cache.stats().evictions)}, {"failures", Json::integer(cache.stats().failures)}})},
                 {"stateless_prefill_ple_rows", Json::integer(stateless_prefill_ple_rows)},
-                {"memory", describe(memory())}, {"gpu_profile", (job.tokens.empty() || ((job.branch || ssd_restored_this_request || shared_prefix_restored_this_request) && input_at == job.tokens.size())) && !job.generate ? Json() : profile_json(gpu.last_profile())}, {"timings_qualified", Json(false)}}))).dump() << std::endl;
+                {"memory", describe(memory())}, {"gpu_profile", (job.tokens.empty() || ((job.branch || ssd_restored_this_request || shared_prefix_restored_this_request) && input_at == job.tokens.size())) && !job.generate ? Json() : profile_json(gpu.last_profile())}, {"timings_qualified", Json(false)}})))).dump() << std::endl;
 #ifdef TOKSPUR_PRIVATE_OPERATOR_CHECKPOINTS
             if (fixed_operator_screen && operator_requests == 3) break;
 #endif
 #ifdef TOKSPUR_PRIVATE_KERNEL_SEARCH_CAPTURE
             if (kernel_search_capture_path && ++kernel_search_requests == 3) break;
 #endif
+            pressure_reset_required = false;
         } catch (const FormatError& e) {
             emit_error(e, false);
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC

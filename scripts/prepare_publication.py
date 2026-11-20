@@ -45,6 +45,12 @@ PRIVATE_SUFFIXES = {
 }
 
 
+def excluded_from_publication(path: PurePosixPath) -> bool:
+    return path.parts[:1] == ("private",) or path == PurePosixPath(
+        ".github/workflows/private-lab.yml"
+    )
+
+
 def git(root: Path, *arguments: str, env: dict | None = None) -> bytes:
     return subprocess.check_output(
         ["git", "-C", str(root), "-c", "core.hooksPath=/dev/null", *arguments],
@@ -90,6 +96,8 @@ def prepare(source: Path, output: Path, *, revision: str = "HEAD") -> dict:
         mode, kind, oid = header.decode().split()
         name = name_bytes.decode("utf-8")
         path = PurePosixPath(name)
+        if excluded_from_publication(path):
+            continue
         if (
             mode not in {"100644", "100755"}
             or kind != "blob"
@@ -130,7 +138,12 @@ def prepare(source: Path, output: Path, *, revision: str = "HEAD") -> dict:
         snapshot.mkdir(mode=0o700)
         archive = git(source, "archive", "--format=tar", commit)
         with tarfile.open(fileobj=io.BytesIO(archive)) as stream:
-            stream.extractall(snapshot, filter="data")
+            members = [
+                member
+                for member in stream.getmembers()
+                if not excluded_from_publication(PurePosixPath(member.name))
+            ]
+            stream.extractall(snapshot, members=members, filter="data")
         for name, oid in entries:
             path = snapshot / name
             if not path.is_file() or path.is_symlink():

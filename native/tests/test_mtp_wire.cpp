@@ -551,6 +551,33 @@ void generation_contracts() {
     check(!cleared.find("native_mtp_generation")->find("active")->boolean() &&
         integer(cleared, "native_mtp_discarded_anchors") == integer(done, "native_mtp_discarded_anchors") + 1,
         "new known input did not terminate the generation");
+    {
+        auto v2_ready = with(scoped_ready(), "native_mtp_carry_scope", Json("http-generation-v2"));
+        v2_ready = with(std::move(v2_ready), "native_mtp_generation", Json(Json::Object{
+            {"id", Json::integer(0)}, {"active", Json(false)}, {"remaining", Json::integer(0)}, {"pending", Json(false)},
+            {"committed", Json::integer(0)}, {"emitted", Json::integer(0)}, {"overflow", Json::integer(0)},
+            {"remaining_compute", Json::integer(0)}, {"total_budget", Json::integer(0)},
+            {"continuation_allowed", Json(true)}, {"stop_queued", Json(false)}, {"stop_drained", Json(false)}}));
+        const auto v2_prev = [&](uint64_t overflow) {
+            auto prev = with(done, "native_mtp_carry_scope", Json("http-generation-v2"));
+            prev = with(std::move(prev), "committed_prefix", Json::integer(65536));
+            prev = with(std::move(prev), "sampling", with(*done.find("sampling"), "entropy_prefix", Json::integer(65536)));
+            return with(std::move(prev), "native_mtp_generation", Json(Json::Object{
+                {"id", Json::integer(1)}, {"active", Json(true)}, {"remaining", Json::integer(2)}, {"pending", Json(false)},
+                {"committed", Json::integer(10)}, {"emitted", Json::integer(10 - overflow)}, {"overflow", Json::integer(overflow)},
+                {"remaining_compute", Json::integer(246)}, {"total_budget", Json::integer(256)},
+                {"continuation_allowed", Json(true)}, {"stop_queued", Json(false)}, {"stop_drained", Json(false)}}));
+        };
+        const auto v2_job = [&](uint64_t gen, uint64_t pending) {
+            return with(generation_job(uint32_t(gen)), "mtp_generation", Json(Json::Object{
+                {"id", Json::integer(1)}, {"begin", Json(false)}, {"remaining", Json::integer(2)},
+                {"committed", Json::integer(10)}, {"emitted", Json::integer(9)}, {"pending", Json::integer(pending)},
+                {"remaining_compute", Json::integer(246)}, {"total_budget", Json::integer(256)}}));
+        };
+        { MtpWireReply ok_drain(v2_ready, v2_prev(1), v2_job(1, 1)); ++checks; }
+        refuses([&] { MtpWireReply over_limit(v2_ready, v2_prev(1), v2_job(2, 1)); });
+        refuses([&] { MtpWireReply forged_pending(v2_ready, v2_prev(0), v2_job(1, 1)); });
+    }
 }
 
 void generation_sessions() {

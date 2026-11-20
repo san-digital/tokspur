@@ -13,6 +13,7 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -144,6 +145,26 @@ struct Fixture {
 Json request(bool reset, bool generate = false) {
     return Json(Json::Object{{"tokens", Json(generate ? Json::Array{} : Json::Array{Json::integer(1)})},
         {"generate", Json::integer(generate ? 1 : 0)}, {"reset", Json(reset)}});
+}
+void guardian_killed_before_arming(const std::filesystem::path& executable) {
+    Fixture fixture(executable, "normal");
+    const pid_t controller = fork();
+    check(controller >= 0, "cannot fork guardian startup fixture");
+    if (controller == 0) {
+        if (pthread_atfork(nullptr, nullptr, [] { kill(getpid(), SIGKILL); }) != 0) _exit(1);
+        try {
+            OwnedWorker worker(fixture.options);
+        } catch (const WorkerError& error) {
+            const auto expected = "owned guardian closed its status pipe before arming (signal " + std::to_string(SIGKILL) + ")";
+            _exit(error.what() == expected ? 0 : 2);
+        }
+        _exit(3);
+    }
+    int status = 0;
+    pid_t waited;
+    do { waited = waitpid(controller, &status, 0); } while (waited < 0 && errno == EINTR);
+    check(waited == controller && WIFEXITED(status) && WEXITSTATUS(status) == 0, "guardian startup lost the terminating signal");
+    check(!std::filesystem::exists(fixture.directory / "worker.pid"), "the target ran after its guardian was killed before arming");
 }
 void ordinary(const std::filesystem::path& executable, std::string_view mode, std::string_view execution = "direct") {
     Fixture fixture(executable, mode);
@@ -320,6 +341,7 @@ int main(int argc, char** argv) {
         ordinary(executable, "normal"); ordinary(executable, "fragment");
         ordinary(executable, "normal", "recurrent-replay"); ordinary(executable, "fragment", "recurrent-replay");
         refusal_cases(executable); cancellation_cases(executable); bounded_admission(executable);
+        guardian_killed_before_arming(executable);
         parent_death(executable, false); parent_death(executable, true);
         broker_cases(executable);
         std::cout << "Owned worker CPU fixture checks passed: " << checks << '\n';

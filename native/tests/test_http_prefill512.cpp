@@ -600,7 +600,7 @@ void precision_workers(const std::filesystem::path& executable) {
 #endif
 int TOKSPUR_HTTP_PREFILL512_TEST_ENTRY(int argc, char** argv) {
     if (argc > 1 && std::string_view(argv[1]) == "target") return mtp_fixture::target(argc, argv);
-    const auto inherited = inherited_http_concurrent_entry(argc, argv); if (inherited) return inherited;
+    if (argc > 1) return inherited_http_concurrent_entry(argc, argv);
     try {
 #ifndef TOKSPUR_PRIVATE_PREFILL_HC_DOWN_F32
         prefill512_fixture::hc_down_uncompiled_workers(std::filesystem::canonical(argv[0]));

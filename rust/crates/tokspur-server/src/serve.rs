@@ -1262,6 +1262,9 @@ fn options(args: &[OsString]) -> Result<Options> {
                 )?;
                 out.worker.shared_prefix_cache = Some(value == "on");
             }
+            "--parked-lanes-mib" | "--native-parked-lanes-mib" => {
+                out.worker.parked_lanes_mib = integer(value, 0, 16_384)? as u32;
+            }
             "--context-length" | "--native-context-length" => {
                 let ctx = integer(value, 65_536, 131_072)?;
                 require(
@@ -1804,6 +1807,12 @@ pub fn server_cli(args: &[OsString]) -> Result<()> {
     let fast_channel = config.worker.fast_channel;
     let has_mtp_sidecar = tokspur_wire::worker::has_speculative(&config.worker);
     let overlap_prefill = config.worker.overlap_prefill;
+    require(
+        config.worker.parked_lanes_mib == 0
+            || (has_mtp_sidecar && config.worker.shared_prefix_cache == Some(true)),
+        "parked lanes require a speculative drafter and the shared prefix cache",
+    )?;
+    let lane_parking = config.worker.parked_lanes_mib > 0;
     let requested_pack = config.worker.derived_pack.is_some();
     let mut worker = OwnedWorker::new(std::mem::take(&mut config.worker))?;
     let worker_pid = worker.worker_pid();
@@ -1846,6 +1855,7 @@ pub fn server_cli(args: &[OsString]) -> Result<()> {
         }),
         admission,
         control_ids,
+        nonordinary_ids: tokenizer.nonordinary_token_ids(),
     };
     let mut session = ServeSession::new(
         codec,
@@ -1876,6 +1886,7 @@ pub fn server_cli(args: &[OsString]) -> Result<()> {
             },
             mtp_first_output_packet: config.mtp_first_output_packet,
             overlap_prefill,
+            lane_parking,
             context_length,
         },
     )?;
@@ -2064,7 +2075,12 @@ fn trace_failure(error: &JobError) -> bool {
 
 /// The error type a failed job reports. A trace failure is the server's fault whether or not generation began.
 fn failure_kind(error: &JobError, target_started: bool) -> &'static str {
-    if trace_failure(error) {
+    if matches!(
+        error,
+        JobError::Serve(ServeError::Worker(WorkerError::HostMemoryPressure))
+    ) {
+        "host_memory_pressure"
+    } else if trace_failure(error) {
         "server_error"
     } else if target_started {
         "generation_failed_no_retry"
@@ -2077,6 +2093,11 @@ fn failure_kind(error: &JobError, target_started: bool) -> &'static str {
 fn failure_status(error: &JobError, expired: bool, target_started: bool) -> i32 {
     if expired {
         408
+    } else if matches!(
+        error,
+        JobError::Serve(ServeError::Worker(WorkerError::HostMemoryPressure))
+    ) {
+        503
     } else if trace_failure(error) {
         500
     } else if target_started {
@@ -2201,14 +2222,15 @@ fn run_job(
         }
         Ok(())
     })();
-    let print_timing = |session: &ServeSession, outcome: Outcome| {
+    let print_timing = |session: &ServeSession, outcome: Outcome, error: Option<(&str, &[u8])>| {
         if let Some(timing) = timing.as_ref()
             && emits_record(telemetry_stdout, outcome)
         {
             let id = timed_id.borrow();
-            let record = timing.borrow().record(
+            let record = timing.borrow().record_with_error(
                 id.as_deref().map(str::as_bytes),
                 outcome,
+                error,
                 session.phase_stamps(),
                 Instant::now(),
             );
@@ -2230,7 +2252,7 @@ fn run_job(
         }
     }
     let Err(error) = outcome else {
-        print_timing(session, Outcome::Ok);
+        print_timing(session, Outcome::Ok, None);
         return;
     };
     // Classified before the abort drain, in the order the status below is chosen, and only when the record is on.
@@ -2277,7 +2299,9 @@ fn run_job(
     }
     drop(connection);
     if let Some(failure) = failure {
-        print_timing(session, failure);
+        // The same type and message the error reply carries, whether or not the client was still there to read it.
+        let kind = failure_kind(&error, target_started.get());
+        print_timing(session, failure, Some((kind, error.to_string().as_bytes())));
     }
 }
 
@@ -3476,6 +3500,14 @@ mod tests {
         assert_eq!(failure_kind(&refused, true), "generation_failed_no_retry");
         assert_eq!(failure_status(&refused, false, true), 502);
         assert_eq!(failure_status(&refused, true, true), 408);
+    }
+
+    #[test]
+    fn host_pressure_reports_a_temporary_refusal() {
+        let pressure = JobError::Serve(ServeError::Worker(WorkerError::HostMemoryPressure));
+        assert_eq!(failure_kind(&pressure, true), "host_memory_pressure");
+        assert_eq!(failure_status(&pressure, false, true), 503);
+        assert_eq!(failure_status(&pressure, true, true), 408);
     }
 
     #[test]

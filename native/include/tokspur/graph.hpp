@@ -432,6 +432,10 @@ class MetalGraph {
 public:
     explicit MetalGraph(const std::filesystem::path& owned_library, uint64_t byte_budget);
     ~MetalGraph();
+    // Keep existing immutable weight mappings available between nearby requests.
+    bool prepare_mapped_weight_residency();
+    void note_weight_activity();
+    bool suspend_mapped_weight_residency();
     MetalGraph(const MetalGraph&) = delete;
     MetalGraph& operator=(const MetalGraph&) = delete;
 

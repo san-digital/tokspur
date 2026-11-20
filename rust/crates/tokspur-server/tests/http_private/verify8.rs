@@ -1667,6 +1667,7 @@ pub fn copy_options(options: &WorkerOptions) -> WorkerOptions {
         hc_consumer_fused: options.hc_consumer_fused,
         ple_overlap: options.ple_overlap,
         shared_prefix_cache: options.shared_prefix_cache,
+        parked_lanes_mib: options.parked_lanes_mib,
     }
 }
 
@@ -1957,6 +1958,7 @@ pub fn encode_text(text: &[u8]) -> Vec<u32> {
 pub fn session_codec() -> ServeCodec {
     ServeCodec {
         control_ids: Vec::new(),
+        nonordinary_ids: Vec::new(),
         render: Box::new(|request: &Json| {
             let messages = array(request, "messages");
             let last = messages.last().expect("fixture chat has a message");

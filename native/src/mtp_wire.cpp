@@ -715,10 +715,11 @@ MtpWireReply::MtpWireReply(const Json& ready, const Json& previous, const Json& 
     if (pending_overflow) {
         need(pending_overflow <= (depth_ == 7 ? 7u : depth_) && pending_overflow <= position_, "invalid MTP pending overflow bound");
         position_ -= pending_overflow;
-        pending_tokens_ = pending_overflow;
+        pending_tokens_ = std::min(pending_overflow, maximum_);
         round_end_ = base_;
     }
-    need(uint64_t(base_) + inputs_ + maximum_ <= context_limit, "MTP packet exceeds context reservation");
+    // Measure from the emitted frontier: pending overflow is already inside the committed prefix.
+    need(uint64_t(position_) + inputs_ + maximum_ <= context_limit, "MTP packet exceeds context reservation");
     resync_ = resync; need(!resync_ || (reset_ && inputs_), "MTP counter resync must be a cold input reset");
     if (!reset_) {
         need(get(get(previous_, "sampling"), "valid").boolean() && integer(get(previous_, "sampling"), "entropy_prefix") == base_,
@@ -727,6 +728,9 @@ MtpWireReply::MtpWireReply(const Json& ready, const Json& previous, const Json& 
         last_words_ = integer(get(previous_, "sampling"), "entropy_words");
     }
     if (scoped_) {
+        const auto scope_str = get(ready_, "native_mtp_carry_scope").string();
+        need(get(previous_, "native_mtp_carry_scope").string() == scope_str, "MTP previous carry scope differs");
+        const bool is_v2_scope = scope_str == "http-generation-v2";
         const auto& previous_generation = get(previous_, "native_mtp_generation");
         const auto previous_id = integer(previous_generation, "id"), previous_remaining = integer(previous_generation, "remaining");
         const bool active = get(previous_generation, "active").boolean(), pending = get(previous_generation, "pending").boolean();
@@ -739,11 +743,23 @@ MtpWireReply::MtpWireReply(const Json& ready, const Json& previous, const Json& 
                 need(active && generation_.id == previous_id && !job_.find("stop_ids"), "MTP abort identity differs");
                 discarded_ = pending ? 1 : 0;
             } else {
+                need(generation_.v2 == is_v2_scope, "MTP generation packet version differs from carry scope");
                 need(generation_.remaining >= maximum_, "MTP packet exceeds remaining generation budget");
-                if (generation_.begin) need(!active && generation_.id > previous_id, "MTP overlapping/stale generation begin");
-                else {
+                if (generation_.begin) {
+                    need(!active && generation_.id > previous_id, "MTP overlapping/stale generation begin");
+                    if (generation_.v2)
+                        need(!generation_.committed && !generation_.emitted && !generation_.pending,
+                            "MTP generation begin must start with empty frontier");
+                } else {
                     need(active && generation_.id == previous_id && generation_.remaining == previous_remaining,
-                        "MTP continuation lifetime differs"); carry_ = pending;
+                        "MTP continuation lifetime differs");
+                    if (generation_.v2)
+                        need(generation_.committed == integer(previous_generation, "committed") &&
+                            generation_.emitted == integer(previous_generation, "emitted") &&
+                            generation_.pending == integer(previous_generation, "overflow") &&
+                            generation_.remaining_compute == integer(previous_generation, "remaining_compute"),
+                            "MTP continuation v2 frontier differs");
+                    carry_ = pending;
                 }
             }
         }

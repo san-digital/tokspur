@@ -29,7 +29,12 @@ struct CheckpointDrafter {
     }
     bool matches(uint32_t prefix, uint32_t first, uint32_t rows) const {
         if (dflash) return prefix <= dflash->max_context() && first <= prefix && rows == prefix - first && rows == std::min(prefix, 2048u);
-        return mtp ? first < mtp->max_positions() && rows <= mtp->max_positions() - first : rows == 0;
+        if (mtp) {
+            const uint32_t expected_next = prefix ? prefix : 1u;
+            return first >= 1u && first <= expected_next && rows == expected_next - first &&
+                first < mtp->max_positions() && rows <= mtp->max_positions() - first;
+        }
+        return rows == 0;
     }
 };
 

@@ -104,11 +104,8 @@ struct Fd {
 class PrivateState {
     Fd directory_, lock_;
     std::string key_;
-#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
-    Fd prefix_trace_;
-    uint64_t prefix_trace_bytes_ = 0;
-    bool prefix_trace_failed_ = false;
-#endif
+    std::mutex trace_mutex_;
+    PrefixTraceLog prefix_trace_;
 public:
     explicit PrivateState(const std::filesystem::path& path) {
         require(path.is_absolute(), "state directory must be absolute");
@@ -145,28 +142,34 @@ public:
     }
     [[nodiscard]] const std::string& key() const { return key_; }
     void release_lock() { require(lock_.release_lock() == 0, "cannot release private state lock"); }
-#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+    void write_worker_pid(uint32_t pid) {
+        Fd file(::openat(directory_.value, "worker.pid", O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600));
+        struct stat state{};
+        require(file.value >= 0 && ::fstat(file.value, &state) == 0 && S_ISREG(state.st_mode) &&
+            state.st_uid == geteuid() && state.st_nlink == 1 && (state.st_mode & 0777) == 0600,
+            "cannot open private worker.pid");
+        require(::ftruncate(file.value, 0) == 0 && ::lseek(file.value, 0, SEEK_SET) == 0, "cannot reset worker.pid");
+        const auto content = std::to_string(pid) + "\n";
+        size_t offset = 0;
+        while (offset < content.size()) {
+            const auto n = ::write(file.value, content.data() + offset, content.size() - offset);
+            if (n < 0 && errno == EINTR) continue;
+            require(n > 0, "cannot write worker.pid");
+            offset += size_t(n);
+        }
+        require(::fsync(file.value) == 0 && ::fsync(directory_.value) == 0, "cannot persist worker.pid");
+    }
+    void remove_worker_pid() noexcept {
+        if (directory_.value >= 0) static_cast<void>(::unlinkat(directory_.value, "worker.pid", 0));
+    }
     void enable_prefix_trace() {
-        prefix_trace_.value = ::openat(directory_.value, "prefix-trace.jsonl", O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
-        struct stat info{}; require(prefix_trace_.value >= 0 && ::fstat(prefix_trace_.value, &info) == 0 && S_ISREG(info.st_mode) && info.st_uid == geteuid() && info.st_nlink == 1 && (info.st_mode & 0777) == 0600,
-            "private prefix trace requires a new owned mode0600 file");
-        require(::fsync(directory_.value) == 0, "cannot persist private prefix trace entry");
+        std::lock_guard lock(trace_mutex_);
+        prefix_trace_.enable(directory_.value);
     }
     void prefix_trace(const Json& record) {
-        require(prefix_trace_.value >= 0 && !prefix_trace_failed_, "private prefix trace is unavailable");
-        try {
-            const auto bytes = record.dump(4 * 1024 * 1024) + '\n';
-            require(bytes.size() <= (16ull << 20) - prefix_trace_bytes_, "private prefix trace exceeds16MiB bound");
-            size_t offset = 0;
-            while (offset < bytes.size()) {
-                const auto written = ::write(prefix_trace_.value, bytes.data() + offset, bytes.size() - offset);
-                if (written < 0 && errno == EINTR) continue;
-                require(written > 0, "cannot write private prefix trace"); offset += size_t(written); prefix_trace_bytes_ += uint64_t(written);
-            }
-            require(::fsync(prefix_trace_.value) == 0, "cannot persist private prefix trace");
-        } catch (...) { prefix_trace_failed_ = true; throw; }
+        std::lock_guard lock(trace_mutex_);
+        prefix_trace_.write(record);
     }
-#endif
 };
 std::string template_data(const std::filesystem::path& path) {
     MappedFile file(path); require(file.size() && file.size() <= 65536, "template byte bound");
@@ -187,8 +190,9 @@ struct Options {
     std::string alias = "tokspur";
     ToolEnumValidation tool_enums = ToolEnumValidation::strict;
     ToolArgValidation tool_args = ToolArgValidation::strict;
-#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
     bool prefix_trace = false;
+    bool telemetry_stdout = false;
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
     std::optional<uint32_t> mtp_first_output_packet;
 #endif
 };
@@ -242,9 +246,6 @@ Options options(int argc, char** argv) {
             require(value=="on"||value=="off","native three-row Q8 must be on or off");out.worker.q8_three_rows=value=="on";
         }
 #endif
-        else if (option == "--private-prefix-trace") {
-            require(value == "on" || value == "off", "private prefix trace must be off or on"); out.prefix_trace = value == "on";
-        }
 #ifdef TOKSPUR_PRIVATE_HTTP_PREFILL512
         else if (option == "--native-prefill-input512") {
             require(value == "on" || value == "off", "native input512 must be off or on");
@@ -526,6 +527,12 @@ Options options(int argc, char** argv) {
         else if (option == "--startup-timeout-seconds") out.worker.startup_timeout = std::chrono::seconds(integer(value, 1, 3600));
         else if (option == "--step-timeout-seconds") out.worker.step_timeout = std::chrono::seconds(integer(value, 1, 300));
         else if (option == "--allow-full-model") { require(value == "true", "server requires explicit full-model consent"); allow = true; }
+        else if (option == "--private-prefix-trace") {
+            require(value == "off" || value == "on", "private-prefix-trace must be off or on"); out.prefix_trace = value == "on";
+        }
+        else if (option == "--telemetry-stdout") {
+            require(value == "off" || value == "on", "telemetry-stdout must be off or on"); out.telemetry_stdout = value == "on";
+        }
         else throw FormatError("unknown server option");
     }
     require(allow && out.tokenizer.is_absolute() && out.model_template.is_absolute() && !out.state.empty(), "server requires consent, absolute tokenizer/template/state and owned worker assets");
@@ -696,9 +703,7 @@ int server_cli(int argc, char** argv) {
     config.worker.startup_cancelled = [] { return stopping.load(std::memory_order_relaxed); };
     require(!stopping.load(), "startup cancelled before asset preparation");
     PrivateState state(config.state);
-#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
     if (config.prefix_trace) state.enable_prefix_trace();
-#endif
     http::Listener listener(config.port, 4); // Port and state are reserved before loading a model.
     NativeText tokenizer(config.tokenizer, tokenizer_pin);
     ChatRenderer renderer(extract_flash_next_literals(template_data(config.model_template)));
@@ -710,10 +715,11 @@ int server_cli(int argc, char** argv) {
     // Constructor arms its independent guardian before exec/model loading.
     require(!stopping.load(), "startup cancelled before model launch");
     OwnedWorker worker(config.worker);
+    if (const auto pid = worker.worker_pid()) state.write_worker_pid(*pid);
     validate_worker_ready(worker.ready(), config.worker.stack_execution, config.worker.checkpoint_slots, config.worker.checkpoint_budget_bytes);
     std::cerr << pack_startup_message(worker.ready(), !config.worker.derived_pack.empty());
     ServeSession session({[&](const Json& input) { return renderer.render(input); }, [&](const RenderedChat& input) { return tokenizer.encode(input.prompt, input.literal_ranges); },
-        [&](std::span<const uint32_t> ids) { return tokenizer.decode_bytes(ids); }, admission}, config.alias, config.worker.stack_execution,
+        [&](std::span<const uint32_t> ids) { return tokenizer.decode_bytes(ids); }, admission, tokenizer.nonordinary_token_ids()}, config.alias, config.worker.stack_execution,
         config.worker.checkpoint_slots ? worker.ready() : Json()
 #ifdef TOKSPUR_PRIVATE_HTTP_VERIFY8
         , config.worker.verify8, config.worker.verify8 ? worker.ready() : Json()
@@ -743,20 +749,19 @@ int server_cli(int argc, char** argv) {
     const auto run_job = [&](Job& job) {
         bool streaming = false, target_started = false;
         const auto cancelled = [&] { return shutdown.load() || stopping || Clock::now() >= job.deadline || job.connection.disconnected(); };
+        const auto write_deadline = [&] { return std::min(job.deadline, Clock::now() + std::chrono::seconds(5)); };
         try {
             require(!cancelled(), "queued request cancelled or expired");
             const auto result = session.complete(job.request, "chatcmpl-" + random_hex(16),
                 [&](const Json& request, const auto& on_token) { target_started = true; return worker.request(request, job.deadline, cancelled, on_token); },
                 {[&](const Json& event) {
-                    if (!streaming) { job.connection.begin_sse(job.deadline); streaming = true; }
-                    job.connection.send_sse_data(event.dump(1024 * 1024), job.deadline);
+                    if (!streaming) { job.connection.begin_sse(write_deadline()); streaming = true; }
+                    job.connection.send_sse_data(event.dump(1024 * 1024), write_deadline());
                 }, cancelled, random_word
-#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
                 , config.prefix_trace ? std::function<void(const Json&)>([&](const Json& record) { state.prefix_trace(record); }) : std::function<void(const Json&)>()
-#endif
                 });
-            if (streaming) { job.connection.send_sse_data("[DONE]", job.deadline); job.connection.finish_sse(job.deadline); }
-            else job.connection.send_json(200, result.dump(8 * 1024 * 1024), job.deadline);
+            if (streaming) { job.connection.send_sse_data("[DONE]", write_deadline()); job.connection.finish_sse(write_deadline()); }
+            else job.connection.send_json(200, result.dump(http::json_response_bytes), write_deadline());
         } catch (const std::exception& error) {
             if (target_started) session.invalidate();
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
@@ -768,10 +773,11 @@ int server_cli(int argc, char** argv) {
             available.store(worker.alive());
             if (!job.connection.disconnected() && !shutdown.load() && !stopping) {
                 const auto deadline = Clock::now() + std::chrono::seconds(2);
-                const auto payload = error_json(error.what(), target_started ? "generation_failed_no_retry" : "invalid_request_error").dump(8192);
+                const auto kind = job_failure_kind(error, target_started);
+                const auto payload = error_json(error.what(), kind).dump(8192);
                 try {
                     if (streaming) { job.connection.send_sse_data(payload, deadline); job.connection.finish_sse(deadline); }
-                    else job.connection.send_json(Clock::now() >= job.deadline ? 408 : target_started ? 502 : 400, payload, deadline);
+                    else job.connection.send_json(job_failure_status(error, Clock::now() >= job.deadline, target_started), payload, deadline);
                 } catch (...) { /* Broken clients cannot waive worker draining/cleanup. */ }
             }
         }
@@ -798,6 +804,11 @@ int server_cli(int argc, char** argv) {
             {"checkpoint_slots", Json::integer(config.worker.checkpoint_slots)},
             {"checkpoint_combined_budget_bytes", Json::integer(config.worker.checkpoint_budget_bytes)},
             {"external_engine", Json(false)}, {"tools_executed", Json(false)}, {"performance_qualified", Json(false)}};
+        if (config.telemetry_stdout) {
+            if (const auto pid = worker.worker_pid()) ready.emplace_back("worker_pid", Json::integer(*pid));
+            if (const auto pid = worker.guardian_pid()) ready.emplace_back("guardian_pid", Json::integer(*pid));
+            ready.emplace_back("native_ready", worker.ready());
+        }
 #ifdef TOKSPUR_PRIVATE_LANE_LAYOUT
         if (!config.worker.weight_lanes.empty()) for (const auto name : owned_weight_lane_fields)
             ready.emplace_back(std::string(name), *worker.ready().find(name)); // Validated before startup publication.
@@ -929,41 +940,122 @@ int server_cli(int argc, char** argv) {
         std::cout << Json(std::move(ready)).dump() << std::endl;
         const size_t max_body_bytes = config.worker.context_length > 65536 ? 4 * 1024 * 1024 : 1024 * 1024;
         const size_t max_json_values = config.worker.context_length > 65536 ? 300000 : 150000;
-        while (!stopping) {
+        const auto route_connection = [&](http::Connection connection, Clock::time_point arrival, std::variant<http::Request, http::Error> read) {
             try {
-                http::Limits limits; limits.body_bytes = max_body_bytes;
-                auto connection = listener.accept(Clock::now() + std::chrono::milliseconds(100), limits);
-                const auto arrival = Clock::now();
-                try {
-                    const auto request = connection.read_request(arrival + std::chrono::seconds(5));
-                    const auto answer = [&](int code, Json body) { connection.send_json(code, body.dump(8192), Clock::now() + std::chrono::seconds(2)); };
-                    if (!equal_secret(request.header("authorization"), authorization)) { answer(401, error_json("invalid API credentials", "authentication_error")); continue; }
-                    if (!request.header("origin").empty()) { answer(403, error_json("cross-origin browser access is not enabled; use the trusted local client proxy", "origin_refused")); continue; }
-                    if (request.method == "GET" && request.path == "/health") {
-                        answer(available.load() ? 200 : 503, Json(Json::Object{{"status", Json(available.load() ? "ready" : "worker_failed")}, {"model", Json(config.alias)}})); continue;
-                    }
-                    if (request.method == "GET" && request.path == "/v1/models") {
-                        answer(200, Json(Json::Object{{"object", Json("list")}, {"data", Json(Json::Array{Json(Json::Object{{"id", Json(config.alias)}, {"object", Json("model")}, {"created", Json::integer(0)}, {"owned_by", Json("tokspur")}})})}})); continue;
-                    }
-                    if (request.method != "POST" || request.path != "/v1/chat/completions") { answer(404, error_json("unknown endpoint", "not_found")); continue; }
-                    const auto content_type = request.header("content-type");
-                    if (!json_content_type(content_type)) { answer(415, error_json("application/json required", "unsupported_media_type")); continue; }
-                    if (!available.load()) { answer(503, error_json("owned worker is unavailable; no automatic restart or generation retry", "worker_unavailable")); continue; }
-                    auto input = parse_json(request.body, {max_body_bytes, max_json_values, 32});
-                    static_cast<void>(admit_chat(input, config.alias, config.tool_enums, config.tool_args, config.worker.context_length)); // No mutation on invalid admission.
-                    std::lock_guard lock(mutex);
-                    if (pending) { answer(429, error_json("one waiting request already admitted", "queue_full")); continue; }
-                    pending.emplace(Job{std::move(connection), std::move(input), arrival + std::chrono::seconds(config.request_seconds)}); condition.notify_one();
-                } catch (const http::Error& error) {
-                    if (!error.disconnected()) try { connection.send_json(error.status() ? error.status() : 400, error_json("invalid or timed-out HTTP request", "http_error").dump(), Clock::now() + std::chrono::seconds(1)); } catch (...) {}
-                } catch (const std::exception&) {
-                    try { connection.send_json(400, error_json("invalid chat request", "invalid_request_error").dump(), Clock::now() + std::chrono::seconds(1)); } catch (...) {}
+                if (std::holds_alternative<http::Error>(read)) throw std::get<http::Error>(read);
+                const auto& request = std::get<http::Request>(read);
+                const auto answer = [&](int code, Json body) { connection.send_json(code, body.dump(8192), Clock::now() + std::chrono::seconds(2)); };
+                if (!equal_secret(request.header("authorization"), authorization)) { answer(401, error_json("invalid API credentials", "authentication_error")); return; }
+                if (!request.header("origin").empty()) { answer(403, error_json("cross-origin browser access is not enabled; use the trusted local client proxy", "origin_refused")); return; }
+                if (request.method == "GET" && request.path == "/health") {
+                    answer(available.load() ? 200 : 503, Json(Json::Object{{"status", Json(available.load() ? "ready" : "worker_failed")}, {"model", Json(config.alias)}})); return;
                 }
-            } catch (const http::Error& error) { if (error.status() != 408) throw; }
+                if (request.method == "GET" && request.path == "/v1/models") {
+                    answer(200, Json(Json::Object{{"object", Json("list")}, {"data", Json(Json::Array{Json(Json::Object{{"id", Json(config.alias)}, {"object", Json("model")}, {"created", Json::integer(0)}, {"owned_by", Json("tokspur")}})})}})); return;
+                }
+                if (request.method != "POST" || request.path != "/v1/chat/completions") { answer(404, error_json("unknown endpoint", "not_found")); return; }
+                const auto content_type = request.header("content-type");
+                if (!json_content_type(content_type)) { answer(415, error_json("application/json required", "unsupported_media_type")); return; }
+                if (!available.load()) { answer(503, error_json("owned worker is unavailable; no automatic restart or generation retry", "worker_unavailable")); return; }
+                auto input = parse_json(request.body, {max_body_bytes, max_json_values, 32});
+                static_cast<void>(admit_chat(input, config.alias, config.tool_enums, config.tool_args, config.worker.context_length)); // No mutation on invalid admission.
+                std::lock_guard lock(mutex);
+                if (pending) { answer(429, error_json("one waiting request already admitted", "queue_full")); return; }
+                pending.emplace(Job{std::move(connection), std::move(input), arrival + std::chrono::seconds(config.request_seconds)}); condition.notify_one();
+            } catch (const http::Error& error) {
+                if (!error.disconnected()) try { connection.send_json(error.status() ? error.status() : 400, error_json("invalid or timed-out HTTP request", "http_error").dump(), Clock::now() + std::chrono::seconds(1)); } catch (...) {}
+            } catch (const std::exception&) {
+                try { connection.send_json(400, error_json("invalid chat request", "invalid_request_error").dump(), Clock::now() + std::chrono::seconds(1)); } catch (...) {}
+            }
+        };
+        ArrivalQueue arrivals;
+        std::vector<std::thread> readers;
+        readers.reserve(routing_workers);
+        struct ReaderGuard {
+            ArrivalQueue& queue;
+            std::vector<std::thread>& threads;
+            ~ReaderGuard() {
+                queue.close();
+                for (auto& reader : threads) if (reader.joinable()) reader.join();
+            }
+        } reader_guard{arrivals, readers};
+        for (size_t i = 0; i < routing_workers; ++i) {
+            readers.emplace_back([&] {
+                try {
+                    while (auto next = arrivals.recv()) {
+                        if (stopping.load(std::memory_order_relaxed)) break;
+                        route_connection(std::move(next->connection), next->arrival, std::move(next->read));
+                    }
+                    arrivals.worker_stopped(true);
+                } catch (...) {
+                    arrivals.worker_stopped(false, std::current_exception());
+                }
+            });
+        }
+        http::Limits limits; limits.body_bytes = max_body_bytes;
+        std::vector<std::pair<http::Connection, Clock::time_point>> reading;
+        while (!stopping) {
+            arrivals.check_workers();
+            std::vector<int> handles;
+            handles.reserve(reading.size());
+            for (const auto& [connection, arrival] : reading) {
+                static_cast<void>(arrival);
+                handles.push_back(connection.native_handle());
+            }
+            std::vector<bool> ready_fds;
+            try {
+                ready_fds = listener.poll_input(handles, 100);
+            } catch (const http::Error&) {
+                if (stopping) break;
+                throw;
+            }
+            const auto now = Clock::now();
+            std::vector<std::pair<http::Connection, Clock::time_point>> unfinished;
+            unfinished.reserve(reading.size());
+            bool readers_gone = false;
+            for (size_t i = 0; i < reading.size(); ++i) {
+                auto [connection, arrival] = std::move(reading[i]);
+                const auto deadline = arrival + http_read_seconds;
+                if (!ready_fds[i + 1] && now < deadline) {
+                    unfinished.emplace_back(std::move(connection), arrival);
+                    continue;
+                }
+                std::optional<std::variant<http::Request, http::Error>> outcome;
+                try {
+                    auto polled = connection.poll_request(deadline);
+                    if (!polled) {
+                        unfinished.emplace_back(std::move(connection), arrival);
+                        continue;
+                    }
+                    outcome.emplace(std::move(*polled));
+                } catch (const http::Error& error) {
+                    if (error.disconnected()) continue;
+                    outcome.emplace(error);
+                }
+                if (!arrivals.hand_off(Arrival{std::move(connection), arrival, std::move(*outcome)})) {
+                    readers_gone = true;
+                    break;
+                }
+            }
+            reading = std::move(unfinished);
+            if (readers_gone) {
+                arrivals.check_workers();
+                throw FormatError("HTTP readers stopped");
+            }
+            if (!ready_fds[0]) continue;
+            try {
+                auto connection = listener.accept(Clock::now() + std::chrono::milliseconds(1), limits);
+                admit_reading(reading, std::move(connection), Clock::now());
+            } catch (const http::Error& error) {
+                if (stopping) break;
+                if (error.status() == 408) continue;
+                throw;
+            }
         }
     } catch (...) { failure = std::current_exception(); }
     shutdown.store(true); condition.notify_one(); generation.join();
     worker.close(); // A clean exit is not reported unless the entire owned group drains.
+    state.remove_worker_pid();
     if (failure) std::rethrow_exception(failure);
     state.release_lock();
     std::cout << Json(Json::Object{{"event", Json("end")}, {"owned_worker_exit_verified", Json(true)}, {"tools_executed", Json(false)}}).dump() << std::endl;

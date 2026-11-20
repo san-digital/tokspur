@@ -228,6 +228,10 @@ uint32_t greedy_id(std::span<const float> logits) {
 bool same_view(GpuView a, GpuView b) {
     return a.owner == b.owner && a.slot == b.slot && a.offset == b.offset && a.bytes == b.bytes;
 }
+bool overlaps_view(GpuView a, GpuView b) noexcept {
+    return a.owner != 0 && a.owner == b.owner && a.slot == b.slot &&
+        a.offset < b.offset + b.bytes && b.offset < a.offset + a.bytes;
+}
 void shape_check(StackShape s, StackPolicy p, const NgramSpec& n, size_t layers) {
     validate_recurrent_shape({s.residual, s.recurrent, s.experts});
     validate_qsa_shape(s.attention); validate_qsa_policy(p.attention);
@@ -771,10 +775,11 @@ struct TextStack::Impl {
         auto& tap = *final_hc_tap;
         require(count && count <= tap.capacity, "final HC tap row bound");
         const auto byte_len = checked_mul(checked_mul(uint64_t(count), tap.width), sizeof(float));
-        final_hc_candidate_gpu = g.slice(rows, 0, byte_len);
+        const auto candidate_gpu = g.slice(rows, 0, byte_len);
         auto out = std::span(tap.candidate).first(uint64_t(count) * tap.width);
-        g.read(final_hc_candidate_gpu, std::as_writable_bytes(out));
+        g.read(candidate_gpu, std::as_writable_bytes(out));
         for (auto value : out) require(std::isfinite(value), "nonfinite final HC residual tap");
+        final_hc_candidate_gpu = candidate_gpu;
         final_hc_candidate_host_valid = true;
     }
     void capture_final_hc_gpu_only(GpuView rows, uint32_t count) {
@@ -784,6 +789,20 @@ struct TextStack::Impl {
         const auto byte_len = checked_mul(checked_mul(uint64_t(count), tap.width), sizeof(float));
         final_hc_candidate_gpu = g.slice(rows, 0, byte_len);
         final_hc_candidate_host_valid = false;
+    }
+    void clear_final_hc_candidate() noexcept {
+        final_hc_candidate_gpu = {};
+        final_hc_candidate_host_valid = false;
+    }
+    void invalidate_aliased_final_hc(GpuView a, GpuView b) noexcept {
+        if (!final_hc_tap) return;
+        clear_final_hc_candidate();
+        if ((final_hc_gpu_valid || final_hc_current_gpu.owner != 0) &&
+            (overlaps_view(final_hc_current_gpu, a) || overlaps_view(final_hc_current_gpu, b))) {
+            final_hc_current_gpu = {};
+            final_hc_gpu_valid = false;
+            if (!final_hc_host_valid) final_hc_tap->count = 0;
+        }
     }
     void publish_final_hc(uint32_t count) noexcept {
         if (final_hc_tap) {
@@ -2061,6 +2080,7 @@ StackResult TextStack::step_with_logits(uint32_t token, std::span<const float> r
     require_all_finite(row, "nonfinite token embedding");
     require_all_finite(memory, "nonfinite lookup embedding");
     for (uint32_t b = 0; b < p.shape.residual.branches; ++b) std::copy(row.begin(), row.end(), p.host_streams.begin() + uint64_t(b) * row.size());
+    p.invalidate_aliased_final_hc(p.token_streams, p.second_streams);
     p.g.write(p.token_streams, std::as_bytes(std::span(p.host_streams))); p.g.write(p.embedding, std::as_bytes(memory));
     const auto allocations = p.g.memory().allocations; const auto expected = p.expected_dispatches() - (emit_logits ? 0 : p.final_dispatches()) + p.dflash_tap_dispatches();
 #if defined(TOKSPUR_PRIVATE_CHUNKED_PREFILL) && defined(TOKSPUR_PRIVATE_OPERATOR_CHECKPOINTS) && (defined(TOKSPUR_PRIVATE_QSA_SPARSE) || defined(TOKSPUR_PRIVATE_GDN_PORTED))
@@ -2122,6 +2142,7 @@ StackResult TextStack::step_with_logits(uint32_t token, std::span<const float> r
 #endif
         return {std::move(logits), batch, position, emit_logits};
     } catch (...) {
+        p.clear_final_hc_candidate();
         try { p.g.abort(); } catch (const FormatError&) {}
 #if defined(TOKSPUR_PRIVATE_CHUNKED_PREFILL) && defined(TOKSPUR_PRIVATE_OPERATOR_CHECKPOINTS) && (defined(TOKSPUR_PRIVATE_QSA_SPARSE) || defined(TOKSPUR_PRIVATE_GDN_PORTED))
         if (qsa_route_copies) p.g.copy(std::span(qsa_route_restore).first(qsa_route_copies));
@@ -2153,6 +2174,10 @@ StackResult TextStack::step_known(std::span<const uint32_t> tokens, std::span<co
 #endif
             false) return step_with_logits(tokens.front(), rows, memory, emit_logits);
 #endif
+        static_cast<void>(lookup(tokens.front()));
+        require(rows.size() == p.shape.residual.channels && memory.size() == p.shape.memory.embedding, "stack embedding input shape mismatch");
+        require_all_finite(rows, "nonfinite token embedding");
+        require_all_finite(memory, "nonfinite lookup embedding");
         // A single input uses the same native arithmetic as ordinary decoding. The chunk transaction still owns full physical cache rollback.
         std::array<GraphCopy, 384> save{}, restore{}; const auto count = p.chunked_cache_copies(1, save, restore);
         if (count) p.g.copy(std::span(save).first(count));
@@ -2168,10 +2193,20 @@ StackResult TextStack::step_known(std::span<const uint32_t> tokens, std::span<co
         "known-token flattened embedding input shape mismatch");
     require_all_finite(rows, "nonfinite known-token embedding");
     require_all_finite(memory, "nonfinite known-token lookup embedding");
+    const auto expected = p.known_dispatches(steps) - (emit_logits ? 0 : p.final_dispatches()) + p.dflash_tap_dispatches();
+#ifdef TOKSPUR_PRIVATE_TASK4_PROFILE
+    require(!p.g.task4_profile_reserved() || expected <= 16384, "Task4 full-packet profile exceeds counter capacity; splitting refused");
+#endif
+#ifdef TOKSPUR_PRIVATE_CHUNKED_PREFILL
+    std::array<GraphCopy, 384> cache_save{}, cache_restore{};
+    const auto cache_copies = p.chunked_cache_copies(steps, cache_save, cache_restore);
+#endif
+    std::vector<float> logits(emit_logits ? p.shape.vocabulary : 0);
     for (uint32_t t = 0; t < steps; ++t) for (uint32_t b = 0; b < p.shape.residual.branches; ++b) {
         const auto row = rows.subspan(uint64_t(t) * channels, channels);
         std::copy(row.begin(), row.end(), p.known_host_streams.begin() + uint64_t(t) * width + uint64_t(b) * channels);
     }
+    p.invalidate_aliased_final_hc(p.known_streams, p.known_second);
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
     if (p.g.prefill_dense_nax() || p.g.prefill_grouped_nax()) {
         const uint64_t stream_floats = checked_mul(uint64_t(steps), width);
@@ -2182,14 +2217,8 @@ StackResult TextStack::step_known(std::span<const uint32_t> tokens, std::span<co
         p.g.write(p.known_streams, std::as_bytes(std::span(p.known_host_streams)));
     }
     p.g.write(p.g.slice(p.known_embeddings, 0, checked_mul(memory.size(), 4)), std::as_bytes(memory));
-    const auto allocations = p.g.memory().allocations; const auto expected = p.known_dispatches(steps) - (emit_logits ? 0 : p.final_dispatches()) + p.dflash_tap_dispatches();
-#ifdef TOKSPUR_PRIVATE_TASK4_PROFILE
-    require(!p.g.task4_profile_reserved() || expected <= 16384, "Task4 full-packet profile exceeds counter capacity; splitting refused");
-#endif
-    std::vector<float> logits(emit_logits ? p.shape.vocabulary : 0);
+    const auto allocations = p.g.memory().allocations;
 #ifdef TOKSPUR_PRIVATE_CHUNKED_PREFILL
-    std::array<GraphCopy, 384> cache_save{}, cache_restore{};
-    const auto cache_copies = p.chunked_cache_copies(steps, cache_save, cache_restore);
     if (cache_copies) p.g.copy(std::span(cache_save).first(cache_copies));
 #endif
     try {
@@ -2268,6 +2297,7 @@ StackResult TextStack::step_known(std::span<const uint32_t> tokens, std::span<co
 #endif
         return {std::move(logits), batch, position, emit_logits};
     } catch (...) {
+        p.clear_final_hc_candidate();
         try { p.g.abort(); } catch (const FormatError&) {}
 #ifdef TOKSPUR_PRIVATE_CHUNKED_PREFILL
         if (cache_copies) p.g.copy(std::span(cache_restore).first(cache_copies));
@@ -2433,6 +2463,7 @@ StackVerificationResult TextStack::verify_greedy2(std::span<const uint32_t> toke
         }
         for (uint32_t t = 0; t < 2; ++t) for (uint32_t b = 0; b < p.shape.residual.branches; ++b)
             std::copy_n(rows.begin() + uint64_t(t) * channels, channels, v.host_streams.begin() + uint64_t(t) * width + uint64_t(b) * channels);
+        p.invalidate_aliased_final_hc(v.streams, v.second);
         p.g.write(v.streams, std::as_bytes(std::span(v.host_streams)));
         p.g.write(v.embeddings, std::as_bytes(memory));
         const auto allocations = p.g.memory().allocations;
@@ -2486,7 +2517,7 @@ StackVerificationResult TextStack::verify_greedy2(std::span<const uint32_t> toke
         p.publish_pairs(); p.history = staged[result.accepted - 1].next; p.prefix += result.accepted;
         p.publish_final_hc(result.accepted);
         return result;
-    } catch (...) { try { p.g.abort(); } catch (const FormatError&) {} throw; }
+    } catch (...) { p.clear_final_hc_candidate(); try { p.g.abort(); } catch (const FormatError&) {} throw; }
 }
 #ifdef TOKSPUR_PRIVATE_VERIFY_EIGHT
 void TextStack::prepare_sampled_verification2(uint64_t budget
@@ -2666,6 +2697,7 @@ StackSampledVerificationResult TextStack::verify_sampled_bounded(std::span<const
 #else
             false;
 #endif
+        p.invalidate_aliased_final_hc(v.streams, v.second);
         if (use_verify_nax) {
             const uint64_t stream_floats = uint64_t(steps) * width;
             p.g.write(p.g.slice(v.streams, 0, stream_floats * sizeof(float)),
@@ -2890,6 +2922,7 @@ StackSampledVerificationResult TextStack::verify_sampled_bounded(std::span<const
 #endif
         return result;
     } catch (...) {
+        p.clear_final_hc_candidate();
         try { p.g.abort(); } catch (const FormatError&) {}
 #if defined(TOKSPUR_PRIVATE_CHUNKED_PREFILL) && (defined(TOKSPUR_PRIVATE_KERNEL_QSA_F32) || defined(TOKSPUR_PRIVATE_QSA_SPARSE) || defined(TOKSPUR_PRIVATE_GDN_PORTED))
         if(cache_copies)p.g.copy(std::span(cache_restore).first(cache_copies));
@@ -3109,6 +3142,7 @@ StackVerificationResult8 TextStack::verify_greedy8(std::span<const uint32_t> tok
         if (!steps || tokens[0] != first) { result.wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(); return result; }
         for (uint32_t t = 0; t < steps; ++t) for (uint32_t b = 0; b < p.shape.residual.branches; ++b)
             std::copy_n(rows.begin() + uint64_t(t) * channels, channels, v.host_streams.begin() + uint64_t(t) * width + uint64_t(b) * channels);
+        p.invalidate_aliased_final_hc(v.streams, v.second);
         p.g.write(v.streams, std::as_bytes(std::span(v.host_streams)));
         p.g.write(p.g.slice(v.embeddings, 0, uint64_t(steps) * p.shape.memory.embedding * 4), std::as_bytes(memory.first(uint64_t(steps) * p.shape.memory.embedding)));
         const uint32_t chunks = p.g.q8_many_chunks(steps);
@@ -3229,7 +3263,7 @@ StackVerificationResult8 TextStack::verify_greedy8(std::span<const uint32_t> tok
         if (p.dflash_tap) p.publish_dflash_tap(p.dflash_tap->verify_gpu, result.accepted);
 #endif
         return result;
-    } catch (...) { try { p.g.abort(); } catch (const FormatError&) {} throw; }
+    } catch (...) { p.clear_final_hc_candidate(); try { p.g.abort(); } catch (const FormatError&) {} throw; }
 }
 #endif
 void TextStack::prepare_checkpoints(StackCheckpointConfig config) {
@@ -3382,6 +3416,11 @@ bool TextStack::read_ssd_checkpoint_span(uint64_t offset, std::span<std::byte> t
     const uint64_t total = ssd_checkpoint_payload_bytes(p.prefix);
     if (offset > total || target.size() > total - offset) return false;
     if (target.empty()) return true;
+    if (p.final_hc_tap && p.prefix > 0 &&
+        (p.final_hc_tap->count == 0 ||
+         (!p.final_hc_host_valid && (!p.final_hc_gpu_valid || !p.final_hc_current_gpu.owner)))) {
+        return false;
+    }
     const uint64_t req_end = offset + target.size();
     uint64_t cursor = 0;
     const auto copy_host = [&](std::span<const std::byte> src) {
@@ -3403,7 +3442,10 @@ bool TextStack::read_ssd_checkpoint_span(uint64_t offset, std::span<std::byte> t
     copy_host(std::as_bytes(std::span(&p.prefix, 1)));
     copy_host(std::as_bytes(std::span(p.history.previous)));
     if (p.final_hc_tap && p.prefix > 0) {
-        if (p.final_hc_tap->count == 0) return false;
+        if (p.final_hc_tap->count == 0 ||
+            (!p.final_hc_host_valid && (!p.final_hc_gpu_valid || !p.final_hc_current_gpu.owner))) {
+            return false;
+        }
         p.ensure_final_hc_host();
         const auto rows = std::span<const float>(p.final_hc_tap->current).first(uint64_t(p.final_hc_tap->count) * p.final_hc_tap->width);
         copy_host(std::as_bytes(rows.last(p.final_hc_tap->width)));

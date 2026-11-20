@@ -279,6 +279,7 @@ fn decode(ids: &[u32]) -> Vec<u8> {
 fn codec() -> ServeCodec {
     ServeCodec {
         control_ids: Vec::new(),
+        nonordinary_ids: Vec::new(),
         render: Box::new(|request: &Json| {
             let messages = request.find("messages").unwrap().unwrap().array().unwrap();
             let prompt = messages

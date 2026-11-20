@@ -46,7 +46,7 @@ void wait_fd(int fd, short events, Deadline deadline) {
         const auto now = Clock::now();
         if (now >= deadline) throw Error(408, "HTTP transport deadline exceeded");
         const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
-        const auto millis = std::min<int64_t>(INT_MAX, remaining.count() + 1);
+        const auto millis = std::min<int64_t>(100, remaining.count() + 1);
         pollfd item{fd, events, 0};
         const auto result = poll(&item, 1, static_cast<int>(millis));
         if (result < 0) { if (errno == EINTR) continue; system_error("Poll HTTP socket", true); }
@@ -70,12 +70,13 @@ std::string_view trimmed(std::string_view value) {
     while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) value.remove_suffix(1);
     return value;
 }
-void crlf_only(std::string_view value) {
-    for (size_t i = 0; i < value.size(); ++i) {
+void crlf_only_from(std::string_view value, size_t start) {
+    for (size_t i = start; i < value.size(); ++i) {
         if (value[i] == '\n' && (!i || value[i - 1] != '\r')) throw Error(400, "Bare LF in HTTP headers");
         if (value[i] == '\r' && i + 1 < value.size() && value[i + 1] != '\n') throw Error(400, "Bare CR in HTTP headers");
     }
 }
+void crlf_only(std::string_view value) { crlf_only_from(value, 0); }
 std::string_view reason(int status) {
     switch (status) {
         case 200: return "OK"; case 201: return "Created"; case 202: return "Accepted";
@@ -89,6 +90,16 @@ std::string_view reason(int status) {
         case 504: return "Gateway Timeout"; case 505: return "HTTP Version Not Supported";
         default: throw Error(500, "Unregistered HTTP response status");
     }
+}
+std::string json_head(int status, size_t length) {
+    const auto message = reason(status);
+    const auto extra = status == 405 ? "Allow: GET, POST\r\n"
+        : status == 401 ? "WWW-Authenticate: Bearer realm=\"tokspur\"\r\n"
+        : (status == 429 || status == 503) ? "Retry-After: 5\r\n"
+        : "";
+    return "HTTP/1.1 " + std::to_string(status) + " " + std::string(message) +
+        "\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: " + std::to_string(length) +
+        "\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n" + extra + "\r\n";
 }
 size_t content_length(std::string_view value, size_t maximum) {
     if (value.empty() || (value.size() > 1 && value.front() == '0')) throw Error(400, "Noncanonical Content-Length");
@@ -172,17 +183,28 @@ std::string_view Request::header(std::string_view name) const noexcept {
     }
     return {};
 }
-Connection::Connection(int owned_fd, Limits limits) : fd_(owned_fd), limits_(limits) {
+struct Connection::Partial {
+    std::string wire;
+    std::optional<std::pair<Request, size_t>> head;
+};
+struct Connection::Progress {
+    ProgressKind kind;
+    std::optional<Request> request;
+};
+
+Connection::Connection(int owned_fd, Limits limits) : fd_(owned_fd), limits_(limits), partial_(std::make_unique<Partial>()) {
     try { validate_limits(limits); prepare_fd(fd_); } catch (...) { close(); throw; }
 }
 Connection::~Connection() { close(); }
 Connection::Connection(Connection&& other) noexcept
-    : fd_(std::exchange(other.fd_, -1)), limits_(other.limits_), read_started_(other.read_started_),
-      request_complete_(other.request_complete_), poisoned_(other.poisoned_), response_(other.response_) {}
+    : fd_(std::exchange(other.fd_, -1)), limits_(other.limits_), read_(std::exchange(other.read_, ReadState::done)),
+      partial_(std::move(other.partial_)), request_complete_(other.request_complete_), poisoned_(other.poisoned_),
+      response_(std::exchange(other.response_, Response::finished)) {}
 Connection& Connection::operator=(Connection&& other) noexcept {
     if (this != &other) {
-        close(); fd_ = std::exchange(other.fd_, -1); limits_ = other.limits_; read_started_ = other.read_started_;
-        request_complete_ = other.request_complete_; poisoned_ = other.poisoned_; response_ = other.response_;
+        close(); fd_ = std::exchange(other.fd_, -1); limits_ = other.limits_; read_ = std::exchange(other.read_, ReadState::done);
+        partial_ = std::move(other.partial_); request_complete_ = other.request_complete_; poisoned_ = other.poisoned_;
+        response_ = std::exchange(other.response_, Response::finished);
     }
     return *this;
 }
@@ -203,43 +225,90 @@ bool Connection::disconnected() noexcept {
     }
     return (item.revents & (POLLERR | POLLHUP)) != 0;
 }
-Request Connection::read_request(Deadline deadline) {
-    if (fd_ < 0 || read_started_ || response_ != Response::idle) throw Error(400, "HTTP connection accepts exactly one request");
-    read_started_ = true;
+Connection::Progress Connection::step(std::optional<Deadline> deadline) {
+    if (fd_ < 0 || !partial_) throw Error(400, "HTTP connection accepts exactly one request");
     std::array<char, 8192> buffer{};
-    std::string wire;
-    size_t end = std::string::npos;
-    while (end == std::string::npos) {
-        wait_fd(fd_, POLLIN, deadline);
-        const auto count = recv(fd_, buffer.data(), buffer.size(), 0);
-        if (count < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue; system_error("Read HTTP headers", true); }
-        if (!count) throw Error(wire.empty() ? 0 : 400, "HTTP peer closed before complete headers", true);
-        wire.append(buffer.data(), size_t(count));
-        end = wire.find("\r\n\r\n");
-        if (end == std::string::npos) {
-            crlf_only(wire);
-            if (wire.size() >= limits_.header_bytes) throw Error(431, "HTTP header byte limit exceeded");
-        } else if (end + 4 > limits_.header_bytes) throw Error(431, "HTTP header byte limit exceeded");
-    }
-    size_t length = 0;
-    auto result = parse_headers(std::string_view(wire).substr(0, end), limits_, length);
-    result.body = wire.substr(end + 4);
-    if (result.body.size() > length) throw Error(400, "Unexpected bytes after HTTP request body");
-    result.body.reserve(length);
-    while (result.body.size() < length) {
-        wait_fd(fd_, POLLIN, deadline);
-        const auto count = recv(fd_, buffer.data(), std::min(buffer.size(), length - result.body.size()), 0);
-        if (count < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue; system_error("Read HTTP body", true); }
+    if (partial_->head) {
+        auto& [request, length] = *partial_->head;
+        const auto want = std::min(buffer.size(), length - request.body.size());
+        const auto count = recv(fd_, buffer.data(), want, 0);
+        if (count < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return {ProgressKind::blocked, std::nullopt};
+            system_error("Read HTTP body", true);
+        }
         if (!count) throw Error(400, "HTTP peer closed before complete body", true);
-        result.body.append(buffer.data(), size_t(count));
+        request.body.append(buffer.data(), size_t(count));
+    } else {
+        const auto count = recv(fd_, buffer.data(), buffer.size(), 0);
+        if (count < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return {ProgressKind::blocked, std::nullopt};
+            system_error("Read HTTP headers", true);
+        }
+        if (!count) throw Error(partial_->wire.empty() ? 0 : 400, "HTTP peer closed before complete headers", true);
+        const size_t prior = partial_->wire.size();
+        const size_t scanned = prior >= 3 ? prior - 3 : 0;
+        partial_->wire.append(buffer.data(), size_t(count));
+        const auto end = partial_->wire.find("\r\n\r\n", scanned);
+        if (end == std::string::npos) {
+            crlf_only_from(partial_->wire, prior >= 1 ? prior - 1 : 0);
+            if (partial_->wire.size() >= limits_.header_bytes) throw Error(431, "HTTP header byte limit exceeded");
+            return {ProgressKind::advanced, std::nullopt};
+        }
+        if (end + 4 > limits_.header_bytes) throw Error(431, "HTTP header byte limit exceeded");
+        size_t length = 0;
+        auto request = parse_headers(std::string_view(partial_->wire).substr(0, end), limits_, length);
+        request.body = partial_->wire.substr(end + 4);
+        if (request.body.size() > length) throw Error(400, "Unexpected bytes after HTTP request body");
+        request.body.reserve(length);
+        std::string{}.swap(partial_->wire);
+        partial_->head.emplace(std::move(request), length);
     }
-    if (Clock::now() >= deadline) throw Error(408, "HTTP request deadline exceeded");
+    if (!partial_->head || partial_->head->first.body.size() < partial_->head->second) {
+        return {ProgressKind::advanced, std::nullopt};
+    }
+    if (deadline && Clock::now() >= *deadline) throw Error(408, "HTTP request deadline exceeded");
     char extra = 0;
     const auto tail = recv(fd_, &extra, 1, MSG_PEEK | MSG_DONTWAIT);
     if (tail > 0) { poisoned_ = true; throw Error(400, "HTTP pipelining/trailing bytes refused"); }
     if (tail < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) system_error("Inspect HTTP trailing bytes", true);
+    auto completed = std::move(partial_->head->first);
+    partial_->head.reset();
     request_complete_ = true;
-    return result;
+    return {ProgressKind::complete, std::move(completed)};
+}
+Request Connection::read_request(Deadline deadline) {
+    if (fd_ < 0 || !partial_ || read_ != ReadState::fresh || response_ != Response::idle)
+        throw Error(400, "HTTP connection accepts exactly one request");
+    read_ = ReadState::done;
+    for (;;) {
+        if (fd_ < 0) throw Error(400, "HTTP connection accepts exactly one request");
+        wait_fd(fd_, POLLIN, deadline);
+        auto progress = step(deadline);
+        if (progress.kind == ProgressKind::complete) return std::move(*progress.request);
+    }
+}
+std::optional<Request> Connection::poll_request(Deadline deadline) {
+    if (fd_ < 0 || !partial_ || (read_ != ReadState::fresh && read_ != ReadState::polling) || response_ != Response::idle)
+        throw Error(400, "HTTP connection accepts exactly one request");
+    read_ = ReadState::polling;
+    try {
+        for (;;) {
+            auto progress = step(deadline);
+            if (progress.kind == ProgressKind::advanced) continue;
+            if (progress.kind == ProgressKind::blocked) {
+                if (Clock::now() >= deadline) {
+                    read_ = ReadState::done;
+                    throw Error(408, "HTTP transport deadline exceeded");
+                }
+                return std::nullopt;
+            }
+            read_ = ReadState::done;
+            return std::move(*progress.request);
+        }
+    } catch (...) {
+        read_ = ReadState::done;
+        throw;
+    }
 }
 void Connection::write_all(std::string_view data, Deadline deadline) {
     while (!data.empty()) {
@@ -257,14 +326,28 @@ void Connection::write_all(std::string_view data, Deadline deadline) {
 }
 void Connection::send_json(int status, std::string_view body, Deadline deadline) {
     if (response_ != Response::idle) throw Error(500, "HTTP response already started");
-    if (body.size() > limits_.body_bytes) throw Error(500, "JSON response exceeds configured body limit");
-    const auto message = reason(status);
-    const auto extra = status == 405 ? "Allow: GET, POST\r\n" : status == 401 ? "WWW-Authenticate: Bearer realm=\"tokspur\"\r\n" : (status == 429 || status == 503) ? "Retry-After: 5\r\n" : "";
-    const auto header = "HTTP/1.1 " + std::to_string(status) + " " + std::string(message) +
-        "\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: " + std::to_string(body.size()) +
-        "\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n" + extra + "\r\n";
+    if (body.size() > json_response_bytes) throw Error(500, "JSON response exceeds response byte limit");
+    const auto header = json_head(status, body.size());
     response_ = Response::json;
     write_all(header, deadline); write_all(body, deadline); response_ = Response::finished;
+}
+void Connection::refuse_json(int status, std::string_view body) {
+    if (response_ != Response::idle) throw Error(500, "HTTP response already started");
+    if (body.size() > json_response_bytes) throw Error(500, "JSON response exceeds response byte limit");
+    auto message = json_head(status, body.size());
+    message.append(body);
+    response_ = Response::finished;
+    if (fd_ < 0) throw Error(0, "HTTP peer disconnected or sent unexpected bytes", true);
+    int flags = 0;
+#ifdef MSG_DONTWAIT
+    flags |= MSG_DONTWAIT;
+#endif
+#ifdef MSG_NOSIGNAL
+    flags |= MSG_NOSIGNAL;
+#endif
+    const auto count = send(fd_, message.data(), message.size(), flags);
+    if (count < 0) system_error("Write HTTP response", true);
+    if (size_t(count) != message.size()) throw Error(0, "HTTP response write made no progress", true);
 }
 void Connection::begin_sse(Deadline deadline) {
     if (response_ != Response::idle) throw Error(500, "HTTP response already started");
@@ -286,8 +369,11 @@ void Connection::send_sse_data(std::string_view data, Deadline deadline) {
         start = end + 1;
     }
     event += '\n';
-    const auto prefix = chunk_size(event.size()) + "\r\n";
-    write_all(prefix, deadline); write_all(event, deadline); write_all("\r\n", deadline);
+    std::string frame = chunk_size(event.size()) + "\r\n";
+    frame.reserve(frame.size() + event.size() + 2);
+    frame.append(event);
+    frame.append("\r\n");
+    write_all(frame, deadline);
 }
 void Connection::finish_sse(Deadline deadline) {
     if (response_ != Response::sse) throw Error(500, "SSE response is not active");
@@ -322,6 +408,21 @@ Listener& Listener::operator=(Listener&& other) noexcept {
     return *this;
 }
 void Listener::close() noexcept { if (fd_ >= 0) { ::close(fd_); fd_ = -1; } port_ = 0; }
+std::vector<bool> Listener::poll_input(std::span<const int> handles, int millis) const {
+    if (fd_ < 0) throw Error(0, "HTTP listener is closed");
+    std::vector<pollfd> items;
+    items.reserve(handles.size() + 1);
+    items.push_back(pollfd{fd_, POLLIN, 0});
+    for (const int handle : handles) items.push_back(pollfd{handle, POLLIN, 0});
+    const auto ready = poll(items.data(), nfds_t(items.size()), millis);
+    if (ready < 0) {
+        if (errno == EINTR) return std::vector<bool>(items.size(), false);
+        system_error("Poll HTTP socket", true);
+    }
+    std::vector<bool> out(items.size(), false);
+    for (size_t i = 0; i < items.size(); ++i) out[i] = items[i].revents != 0;
+    return out;
+}
 Connection Listener::accept(Deadline deadline, Limits limits) {
     validate_limits(limits);
     if (fd_ < 0) throw Error(0, "HTTP listener is closed");
@@ -329,12 +430,27 @@ Connection Listener::accept(Deadline deadline, Limits limits) {
         wait_fd(fd_, POLLIN, deadline);
         sockaddr_in peer{}; socklen_t bytes = sizeof(peer);
         const auto accepted = ::accept(fd_, reinterpret_cast<sockaddr*>(&peer), &bytes);
-        if (accepted < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue; system_error("Accept loopback HTTP connection"); }
+        if (accepted < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR || errno == ECONNABORTED
+#ifdef EPROTO
+                || errno == EPROTO
+#endif
+            ) continue;
+            if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
+                if (Clock::now() < deadline) poll(nullptr, 0, 1);
+                continue;
+            }
+            system_error("Accept loopback HTTP connection");
+        }
         if (bytes != sizeof(peer) || peer.sin_family != AF_INET || (ntohl(peer.sin_addr.s_addr) >> 24) != 127) {
             // A local client can bind any host address before connecting to 127.0.0.1; drop it and keep listening.
             ::close(accepted); continue;
         }
-        return Connection(accepted, limits);
+        try {
+            return Connection(accepted, limits);
+        } catch (const Error&) {
+            continue;
+        }
     }
 }
 } // namespace tokspur::http

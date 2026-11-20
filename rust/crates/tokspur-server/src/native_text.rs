@@ -577,6 +577,10 @@ impl NativeText {
         self.bpe.vocabulary_size()
     }
 
+    pub fn nonordinary_token_ids(&self) -> Vec<u32> {
+        self.bpe.nonordinary_token_ids()
+    }
+
     pub fn merge_count(&self) -> usize {
         self.bpe.merge_count()
     }
