@@ -222,9 +222,11 @@ bool planar_v3_kernel(const char* name) {
     return name && (std::strcmp(name, "planar_moe_gate_up_swiglu_m1") == 0 ||
                     std::strcmp(name, "planar_moe_gate_up_swiglu_m4") == 0 ||
                     std::strcmp(name, "planar_moe_gate_up_swiglu_m8") == 0 ||
+                    std::strcmp(name, "planar_moe_gate_up_swiglu_m16") == 0 ||
                     std::strcmp(name, "planar_moe_down_m1") == 0 ||
                     std::strcmp(name, "planar_moe_down_m4") == 0 ||
                     std::strcmp(name, "planar_moe_down_m8") == 0 ||
+                    std::strcmp(name, "planar_moe_down_m16") == 0 ||
                     std::strcmp(name, "nax_grouped_moe_gate_up_swiglu_v3") == 0 ||
                     std::strcmp(name, "nax_grouped_moe_down_v3") == 0);
 }
@@ -233,15 +235,16 @@ NSUInteger planar_v3_weight_binding_limit(const char* name) {
     if (std::strcmp(name, "planar_moe_gate_up_swiglu_m1") == 0 ||
         std::strcmp(name, "planar_moe_gate_up_swiglu_m4") == 0 ||
         std::strcmp(name, "planar_moe_gate_up_swiglu_m8") == 0 ||
+        std::strcmp(name, "planar_moe_gate_up_swiglu_m16") == 0 ||
         std::strcmp(name, "nax_grouped_moe_gate_up_swiglu_v3") == 0) return 2;
     if (std::strcmp(name, "planar_moe_down_m1") == 0 ||
         std::strcmp(name, "planar_moe_down_m4") == 0 ||
         std::strcmp(name, "planar_moe_down_m8") == 0 ||
+        std::strcmp(name, "planar_moe_down_m16") == 0 ||
         std::strcmp(name, "nax_grouped_moe_down_v3") == 0) return 1;
     return 0;
 }
-#ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
-// Kernels that load the error flag and return early once it is set. Every kernel ORs into the flag, so a reader is ordered against every other dispatch. The current-carrier source test checks this list against the MSL.
+// Kernels that load the error flag and return early once it is set. Every kernel ORs into the flag, so a reader is ordered against every other dispatch sharing the same slot. The current-carrier source test checks this list against the MSL.
 constexpr std::array flag_reading_kernels{"qsa_score_accumulate", "qsa_chronological_factors", "qsa_chronological_channels", "qsa_chronological_serial_factors", "qsa_verify_rows_factors", "qsa_verify_rows_channels"
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
     , "graph_capture_routes", "carrier_readback_bytes"
@@ -250,7 +253,6 @@ constexpr std::array flag_reading_kernels{"qsa_score_accumulate", "qsa_chronolog
 bool reads_error_flag(const char* name) {
     return std::any_of(flag_reading_kernels.begin(), flag_reading_kernels.end(), [&](const char* reader) { return std::strcmp(reader, name) == 0; });
 }
-#endif
 std::runtime_error metal_error(const char* operation, NSError* error) {
     return std::runtime_error(std::string(operation) + (error ? ": " + std::string(error.localizedDescription.UTF8String) : " failed"));
 }
@@ -277,7 +279,7 @@ uint32_t pick_nax_m8_q8_splits(uint32_t columns, uint32_t out_cols, uint32_t col
     return 1u;
 }
 
-uint32_t pick_nax_m8_q8_t64_splits(uint32_t columns, uint32_t out_cols, uint32_t cols_per_tile, bool dual_out) {
+uint32_t pick_nax_m8_q8_t64_splits(uint32_t columns, uint32_t out_cols, uint32_t cols_per_tile, bool dual_out, uint32_t rows_cap = 8u) {
     const uint32_t tiles_x = (out_cols + cols_per_tile - 1u) / cols_per_tile;
     const uint32_t blocks = columns / 32u;
     if ((columns % 32u) != 0u || blocks < 8u || tiles_x == 0u || tiles_x >= 160u || tiles_x > 1024u) {
@@ -285,7 +287,7 @@ uint32_t pick_nax_m8_q8_t64_splits(uint32_t columns, uint32_t out_cols, uint32_t
     }
     const uint32_t min_blocks_per_split = (tiles_x <= 32u) ? 2u : 4u;
     const uint64_t p_stride = dual_out ? uint64_t((out_cols + 31u) & ~31u) : uint64_t((out_cols + 63u) & ~63u);
-    const uint64_t per_split_bytes = (dual_out ? 2ull : 1ull) * 8ull * p_stride * sizeof(float);
+    const uint64_t per_split_bytes = (dual_out ? 2ull : 1ull) * uint64_t(rows_cap) * p_stride * sizeof(float);
     for (const uint32_t s : {16u, 12u, 10u, 8u, 6u, 5u, 4u, 3u, 2u}) {
         if (s <= blocks && (blocks % s) == 0u && (blocks / s) >= min_blocks_per_split &&
             uint64_t(tiles_x) * s <= 320ull &&
@@ -416,6 +418,8 @@ struct MetalGraph::Impl {
         uint64_t requested;
         uint64_t charged;
         bool immutable;
+        size_t source_shard = 0;
+        uint64_t source_file_offset = 0;
         // Declared last so aliases die before the buffer and its mapped source.
         std::map<std::pair<uint64_t, uint64_t>, BindingAlias> capture_aliases;
     };
@@ -424,6 +428,34 @@ struct MetalGraph::Impl {
     std::unique_ptr<MappedWeightResidency> mapped_weight_residency;
     id<MTLLibrary> library;
     id<MTLBuffer> error_flag;
+    uint32_t error_flag_capacity = 1, error_flag_slots_used = 0;
+    std::optional<uint32_t> qsa_stage_error_slot;
+    struct QsaStageErrorScope {
+        Impl& impl;
+        std::optional<uint32_t> previous;
+        explicit QsaStageErrorScope(Impl& impl_ref) : impl(impl_ref), previous(impl_ref.qsa_stage_error_slot) {
+            impl.qsa_stage_error_slot = impl.alloc_error_flag_slot();
+        }
+        ~QsaStageErrorScope() {
+            impl.qsa_stage_error_slot = previous;
+        }
+        QsaStageErrorScope(const QsaStageErrorScope&) = delete;
+        QsaStageErrorScope& operator=(const QsaStageErrorScope&) = delete;
+    };
+    uint32_t alloc_error_flag_slot() {
+        if (error_flag_slots_used + 1 < error_flag_capacity) {
+            return error_flag_slots_used++;
+        }
+        error_flag_slots_used = error_flag_capacity;
+        return error_flag_capacity - 1;
+    }
+    uint32_t reduce_error_flag() const {
+        const auto* words = static_cast<const uint32_t*>(error_flag.contents);
+        const uint32_t count = std::min(std::max(1u, error_flag_slots_used), error_flag_capacity);
+        uint32_t acc = 0;
+        for (uint32_t i = 0; i < count; ++i) acc |= words[i];
+        return acc;
+    }
     id<MTLCommandBuffer> command;
     id<MTLComputeCommandEncoder> encoder;
     // Earlier physical commands of the active logical batch, committed by commit_partial() and not yet waited on.
@@ -686,6 +718,122 @@ struct MetalGraph::Impl {
     std::set<uint32_t> planar_down_prepared;
     std::set<uint32_t> planar_nax_gate_up_prepared;
     std::set<uint32_t> planar_nax_down_prepared;
+    struct RouteBoundSpan {
+        size_t slot = 0;
+        uint64_t begin = 0;
+        uint64_t end = 0;
+        uint32_t experts = 0;
+    };
+    struct GpuWriteSpan {
+        size_t slot = 0;
+        uint64_t begin = 0;
+        uint64_t end = 0;
+    };
+    std::vector<RouteBoundSpan> verified_route_spans;
+    std::vector<GpuWriteSpan> gpu_written_spans;
+    template <typename SpanVec>
+    static void erase_span_overlap(SpanVec& vec, size_t slot, uint64_t begin, uint64_t end) {
+        if (begin >= end) return;
+        for (size_t i = 0; i < vec.size();) {
+            auto s = vec[i];
+            if (s.slot != slot || s.end <= begin || end <= s.begin) {
+                ++i;
+                continue;
+            }
+            vec.erase(vec.begin() + std::ptrdiff_t(i));
+            if (s.begin < begin) {
+                auto left = s;
+                left.end = begin;
+                vec.insert(vec.begin() + std::ptrdiff_t(i), left);
+                ++i;
+            }
+            if (end < s.end) {
+                auto right = s;
+                right.begin = end;
+                vec.insert(vec.begin() + std::ptrdiff_t(i), right);
+                ++i;
+            }
+        }
+    }
+    void invalidate_route_spans(size_t slot, uint64_t begin, uint64_t end) {
+        erase_span_overlap(verified_route_spans, slot, begin, end);
+        erase_span_overlap(gpu_written_spans, slot, begin, end);
+    }
+    void record_gpu_write_span(size_t slot, uint64_t begin, uint64_t end) {
+        if (begin >= end) return;
+        erase_span_overlap(verified_route_spans, slot, begin, end);
+        erase_span_overlap(gpu_written_spans, slot, begin, end);
+        for (auto& s : gpu_written_spans) {
+            if (s.slot == slot && (s.end == begin || end == s.begin)) {
+                s.begin = std::min(s.begin, begin);
+                s.end = std::max(s.end, end);
+                return;
+            }
+        }
+        gpu_written_spans.push_back({slot, begin, end});
+    }
+    void record_verified_routes(GpuView indices, uint32_t experts) {
+        if (recording || !indices.bytes) return;
+        const uint64_t begin = indices.offset;
+        const uint64_t end = checked_add(begin, indices.bytes);
+        erase_span_overlap(gpu_written_spans, indices.slot, begin, end);
+        erase_span_overlap(verified_route_spans, indices.slot, begin, end);
+        for (auto& s : verified_route_spans) {
+            if (s.slot == indices.slot && s.experts == experts && (s.end == begin || end == s.begin)) {
+                s.begin = std::min(s.begin, begin);
+                s.end = std::max(s.end, end);
+                return;
+            }
+        }
+        verified_route_spans.push_back({indices.slot, begin, end, experts});
+    }
+    void discharge_routes(GpuView indices, uint32_t route_count, uint32_t experts) const {
+        const auto& storage = allocation(indices);
+        const uint64_t begin = indices.offset;
+        const uint64_t bytes = checked_mul(uint64_t(route_count), 4ull);
+        require(indices.bytes >= bytes && indices.offset % 4 == 0, "planar v3 route span mismatch");
+        const uint64_t end = checked_add(begin, bytes);
+
+        for (const auto& s : verified_route_spans) {
+            if (s.slot == indices.slot && s.begin < end && begin < s.end && s.experts > experts) {
+                throw FormatError("planar v3 GPU route span expert bound exceeds matrix experts (nonfinite)");
+            }
+        }
+
+        const auto span_covered = [&](uint64_t span_begin, uint64_t span_end) {
+            uint64_t covered_until = span_begin;
+            bool progress = true;
+            while (covered_until < span_end && progress) {
+                progress = false;
+                for (const auto& s : verified_route_spans) {
+                    if (s.slot == indices.slot && s.experts <= experts &&
+                        s.begin <= covered_until && s.end > covered_until) {
+                        covered_until = s.end;
+                        progress = true;
+                        break;
+                    }
+                }
+            }
+            return covered_until >= span_end;
+        };
+
+        if (span_covered(begin, end)) return;
+
+        for (const auto& w : gpu_written_spans) {
+            if (w.slot == indices.slot && w.begin < end && begin < w.end) {
+                throw FormatError("planar v3 requires routes from a verified router or host-validated buffer (nonfinite)");
+            }
+        }
+        require(storage.buffer.storageMode == MTLStorageModeShared && storage.buffer.contents != nullptr,
+            "planar v3 host route certification requires CPU-accessible shared storage");
+        const auto* ids = reinterpret_cast<const uint32_t*>(
+            static_cast<const std::byte*>(storage.buffer.contents) + begin);
+        for (uint32_t i = 0; i < route_count; ++i) {
+            const uint64_t elem_begin = begin + uint64_t(i) * 4ull;
+            if (span_covered(elem_begin, elem_begin + 4ull)) continue;
+            require(ids[i] < experts, "planar v3 route index exceeds experts (nonfinite)");
+        }
+    }
     struct Q8MatrixMeta {
         uint32_t columns = 0;
         uint32_t rows = 0;
@@ -985,37 +1133,104 @@ struct MetalGraph::Impl {
     uint64_t capture_executes = 0;
     static constexpr uint32_t capture_bindings = 16, capture_constant_stride = 256;
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
-    // Arm B: byte ranges read and written since the last barrier, and the current dispatch's bindings.
-    struct Span { size_t slot; uint64_t begin, end; };
-    bool concurrent = false, concurrent_locked = false, pending_flag_reader = false, flag_written = false, flag_read = false;
-    // Every range since the last barrier, plus one covering range per slot. A long run of dispatches that write
-    // their own rows never overlaps the earlier rows, so the covering range answers without rescanning the run.
-    struct SpanSet {
-        std::vector<Span> spans, covers;
-        void clear() { spans.clear(); covers.clear(); }
-        void add(const Span& span) {
-            spans.push_back(span);
-            for (auto& cover : covers) if (cover.slot == span.slot) {
-                cover.begin = std::min(cover.begin, span.begin); cover.end = std::max(cover.end, span.end); return;
-            }
-            covers.push_back(span);
-        }
-        // Exactly "some recorded range overlaps": a range outside its slot's cover overlaps none of that slot's ranges.
-        bool touches(const Span& span) const {
-            for (const auto& cover : covers) if (cover.slot == span.slot)
-                return cover.begin < span.end && span.begin < cover.end &&
-                    std::any_of(spans.begin(), spans.end(), [&](const Span& other) { return other.slot == span.slot && other.begin < span.end && span.begin < other.end; });
-            return false;
+    // Phase B: buffered ASAP dependency-level scheduler.
+    struct PendingBinding {
+        NSUInteger index;
+        size_t slot;
+        uint64_t offset;
+        uint64_t bytes;
+        bool output;
+    };
+    struct PendingConstant {
+        NSUInteger index;
+        uint32_t data_offset;
+        uint32_t length;
+    };
+    struct PendingSpan {
+        size_t slot;
+        uint64_t begin;
+        uint64_t end;
+        bool output;
+    };
+    struct PendingTgMem {
+        NSUInteger index;
+        NSUInteger length;
+    };
+    struct PendingDispatch {
+        id<MTLComputePipelineState> pso = nil;
+        bool reads_flag = false;
+        uint32_t flag_slot = 0;
+        uint32_t binding_begin = 0, binding_count = 0;
+        uint32_t const_begin = 0, const_count = 0;
+        uint32_t span_begin = 0, span_count = 0;
+        uint32_t tg_begin = 0, tg_count = 0;
+        bool indirect = false;
+        bool aligned = true;
+        MTLSize grid{};
+        MTLSize group{};
+        size_t indirect_slot = 0;
+        uint64_t indirect_offset = 0;
+#ifdef TOKSPUR_PRIVATE_DISPATCH_GRAPH
+        std::string trace_pipeline_key;
+#endif
+    };
+    struct ActiveSpan {
+        uint64_t begin;
+        uint64_t end;
+        uint32_t level;
+    };
+    struct SlotTrack {
+        std::vector<ActiveSpan> writes;
+        std::vector<ActiveSpan> reads;
+        uint64_t write_min = UINT64_MAX, write_max = 0;
+        uint64_t read_min = UINT64_MAX, read_max = 0;
+        uint32_t write_max_level = 0, read_max_level = 0;
+        void reset() {
+            writes.clear(); reads.clear();
+            write_min = UINT64_MAX; write_max = 0;
+            read_min = UINT64_MAX; read_max = 0;
+            write_max_level = 0; read_max_level = 0;
         }
     };
-    SpanSet span_reads, span_writes;
-    std::vector<std::pair<Span, bool>> span_pending;
+    bool concurrent = true, concurrent_explicit = false, concurrent_locked = false, batch_concurrent = false;
+    std::vector<PendingDispatch> pending_dispatches;
+    std::vector<PendingBinding> pending_bindings;
+    std::vector<PendingConstant> pending_constants;
+    std::vector<std::byte> pending_const_bytes;
+    std::vector<PendingSpan> pending_spans;
+    std::vector<PendingTgMem> pending_tg_mem;
+    std::vector<SlotTrack> slot_tracks;
+    std::vector<size_t> touched_slots;
+    std::vector<int32_t> flag_last_any, flag_last_reader;
+    std::vector<uint32_t> sched_levels, sched_span_levels, sched_flag_levels, sched_level_counts, sched_level_offsets, sched_order;
+    std::vector<uint8_t> sched_flag_only_barrier;
+    bool pending_dispatch_open = false;
+    PendingDispatch draft_dispatch{};
     uint64_t concurrent_barrier_count = 0, completed_concurrent_barriers = 0;
     uint64_t lifetime_dispatch_count = 0, lifetime_command_count = 0, lifetime_barrier_count = 0;
-    void reset_spans() { span_reads.clear(); span_writes.clear(); span_pending.clear(); flag_written = flag_read = pending_flag_reader = false; }
-    // Called before each concurrent dispatch is encoded: RAW and WAW against ranges written since the barrier, WAR against ranges read since it, and the error flag (every kernel ORs it, readers also load it).
-    void concurrent_fence();
+    void clear_pending_concurrent() {
+        pending_dispatches.clear();
+        pending_bindings.clear();
+        pending_constants.clear();
+        pending_const_bytes.clear();
+        pending_spans.clear();
+        pending_tg_mem.clear();
+        draft_dispatch = {};
+        pending_dispatch_open = false;
+    }
+    void flush_concurrent_window();
 #endif
+    void threadgroup_memory(NSUInteger length, NSUInteger index = 0) {
+#ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
+        if (batch_concurrent) {
+            require(pending_dispatch_open, "concurrent threadgroup memory outside a dispatch");
+            pending_tg_mem.push_back({index, length});
+            ++draft_dispatch.tg_count;
+            return;
+        }
+#endif
+        [encoder setThreadgroupMemoryLength:length atIndex:index];
+    }
 #ifdef TOKSPUR_PRIVATE_DISPATCH_GRAPH
     // Dispatch-graph tooling: records only, never changes encoding or bytes.
     std::FILE* trace = nullptr;
@@ -1288,6 +1503,9 @@ struct MetalGraph::Impl {
     void bind(GpuView view, NSUInteger index, bool output = false) {
         TOKSPUR_CARRIER_PHASE(encoding);
         const auto& item = allocation(view, output);
+        if (output && !recording) {
+            record_gpu_write_span(view.slot, view.offset, checked_add(view.offset, view.bytes));
+        }
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM
         if (output && nax_dense_bf16_valid) {
             const uint64_t dense_bf16_end = uint64_t(nax_dense_padded_rows) * uint64_t(nax_dense_columns) * 2ull;
@@ -1366,10 +1584,22 @@ struct MetalGraph::Impl {
             }
             require(offset <= UINT32_MAX, "unsafe captured buffer offset");
             [captured_command() setKernelBuffer:buffer offset:offset atIndex:index];
-        } else [encoder setBuffer:item.buffer offset:view.offset atIndex:index];
+        } else {
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
-        if (concurrent && !recording) span_pending.push_back({{view.slot, view.offset, view.offset + view.bytes}, output});
+            if (batch_concurrent) {
+                require(pending_dispatch_open, "concurrent binding outside a dispatch");
+                pending_bindings.push_back({index, view.slot, view.offset, view.bytes, output});
+                ++draft_dispatch.binding_count;
+                // Immutable allocations cannot be written by any dispatch in this batch.
+                if (!item.immutable) {
+                    pending_spans.push_back({view.slot, view.offset, view.offset + view.bytes, output});
+                    ++draft_dispatch.span_count;
+                }
+                return;
+            }
 #endif
+            [encoder setBuffer:item.buffer offset:view.offset atIndex:index];
+        }
 #ifdef TOKSPUR_PRIVATE_DISPATCH_GRAPH
         if (trace && !recording) {
             require(trace_pending, "traced binding outside a dispatch");
@@ -1447,6 +1677,8 @@ struct MetalGraph::Impl {
                 std::strcmp(name, "nax_m8_dense_q8") == 0 ||
                 std::strcmp(name, "nax_m8_dense_q8_t64") == 0 ||
                 std::strcmp(name, "nax_m8_dense_q8_swiglu_t64") == 0 ||
+                std::strcmp(name, "nax_m16_dense_q8_t64") == 0 ||
+                std::strcmp(name, "nax_m16_dense_q8_swiglu_t64") == 0 ||
                 std::strcmp(name, "nax_repack_q8_tile64") == 0 ||
                 std::strcmp(name, "nax_m8_moe_gate_up_swiglu") == 0 ||
                 std::strcmp(name, "nax_m8_moe_down") == 0 ||
@@ -1455,6 +1687,7 @@ struct MetalGraph::Impl {
             || (minimum_threads == 32 && (std::strcmp(name, "moe_three_build_union") == 0 ||
                 std::strcmp(name, "nax_verify_moe_build_union") == 0 ||
                 std::strcmp(name, "planar_moe_build_union_m8") == 0 ||
+                std::strcmp(name, "planar_moe_build_union_m16") == 0 ||
                 std::strcmp(name, "verify_fused_hc_write_rms_rows") == 0 ||
                 std::strcmp(name, "graph_route_batch") == 0))
             , "unsupported threadgroup capability for the selected kernel");
@@ -1552,11 +1785,42 @@ struct MetalGraph::Impl {
 #ifdef TOKSPUR_PRIVATE_TASK4_PROFILE
         selected.task4_tag = task4_tag;
 #endif
-        [encoder setComputePipelineState:pipeline(name, type, minimum_threads, compatible_pipelines, layout)];
-        [encoder setBuffer:error_flag offset:0 atIndex:7];
+        const bool flag_reader = reads_error_flag(name);
+        uint32_t flag_slot = 0;
+        if (qsa_stage_error_slot.has_value()) {
+            flag_slot = *qsa_stage_error_slot;
+        } else if (flag_reader) {
+            flag_slot = 0;
+            error_flag_slots_used = std::max(error_flag_slots_used, 1u);
+        } else {
+            flag_slot = alloc_error_flag_slot();
+        }
+        const auto state = pipeline(name, type, minimum_threads, compatible_pipelines, layout);
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
-        if (concurrent) { span_pending.clear(); pending_flag_reader = reads_error_flag(name); }
+        if (batch_concurrent) {
+            require(!pending_dispatch_open, "concurrent dispatch left incomplete");
+            draft_dispatch = {};
+            draft_dispatch.pso = state;
+            draft_dispatch.reads_flag = flag_reader;
+            draft_dispatch.flag_slot = flag_slot;
+            draft_dispatch.binding_begin = static_cast<uint32_t>(pending_bindings.size());
+            draft_dispatch.const_begin = static_cast<uint32_t>(pending_constants.size());
+            draft_dispatch.span_begin = static_cast<uint32_t>(pending_spans.size());
+            draft_dispatch.tg_begin = static_cast<uint32_t>(pending_tg_mem.size());
+#ifdef TOKSPUR_PRIVATE_DISPATCH_GRAPH
+            if (trace) {
+                std::string key = std::string(name) + ":" + std::to_string(type);
+                if (layout != uint32_t(-1)) key += ":layout=" + std::to_string(layout);
+                if (minimum_threads != 128) key += ":" + std::to_string(minimum_threads);
+                draft_dispatch.trace_pipeline_key = std::move(key);
+            }
 #endif
+            pending_dispatch_open = true;
+            return;
+        }
+#endif
+        [encoder setComputePipelineState:state];
+        [encoder setBuffer:error_flag offset:uint64_t(flag_slot) * sizeof(uint32_t) atIndex:7];
 #ifdef TOKSPUR_PRIVATE_DISPATCH_GRAPH
         if (trace) {
             require(!trace_pending, "traced dispatch left incomplete");
@@ -1565,7 +1829,8 @@ struct MetalGraph::Impl {
             if (minimum_threads != 128) key += ":" + std::to_string(minimum_threads);
             trace_pending = true; trace_bindings.clear(); trace_constants.clear();
             trace_dispatch = {{"event", Json("dispatch")}, {"pipeline", Json(key)}};
-            trace_bindings.push_back(Json(Json::Object{{"index", Json::integer(7)}, {"buffer", Json("error_flag")}}));
+            trace_bindings.push_back(Json(Json::Object{{"index", Json::integer(7)}, {"buffer", Json("error_flag")},
+                {"offset", Json::integer(uint64_t(flag_slot) * sizeof(uint32_t))}, {"bytes", Json::integer(sizeof(uint32_t))}}));
         }
 #endif
         }
@@ -1580,7 +1845,20 @@ struct MetalGraph::Impl {
             const auto offset = (uint64_t(draft.count) * capture_bindings + index) * capture_constant_stride;
             std::memcpy(static_cast<std::byte*>(draft.parameters.contents) + offset, &value, sizeof(value));
             [captured_command() setKernelBuffer:draft.parameters offset:offset atIndex:index];
-        } else [encoder setBytes:&value length:sizeof(value) atIndex:index];
+        } else {
+#ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
+            if (batch_concurrent) {
+                require(pending_dispatch_open, "concurrent constant outside a dispatch");
+                const uint32_t data_offset = static_cast<uint32_t>(pending_const_bytes.size());
+                const auto* raw = reinterpret_cast<const std::byte*>(&value);
+                pending_const_bytes.insert(pending_const_bytes.end(), raw, raw + sizeof(value));
+                pending_constants.push_back({index, data_offset, static_cast<uint32_t>(sizeof(value))});
+                ++draft_dispatch.const_count;
+                return;
+            }
+#endif
+            [encoder setBytes:&value length:sizeof(value) atIndex:index];
+        }
 #ifdef TOKSPUR_PRIVATE_DISPATCH_GRAPH
         if (trace && !recording) {
             require(trace_pending, "traced constant outside a dispatch");
@@ -1605,7 +1883,7 @@ struct MetalGraph::Impl {
     void after_dispatch() {
         if (recording) { ++draft.count; pending_capture_dispatch = false; ++dispatches; return; }
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
-        if (!concurrent) {
+        if (!batch_concurrent) {
 #endif
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
@@ -1620,9 +1898,6 @@ struct MetalGraph::Impl {
         if (profile_mode == ProfileMode::dispatch_boundary) [encoder sampleCountersInBuffer:counters.at(dispatches / counter_chunk_dispatches) atSampleIndex:(dispatches % counter_chunk_dispatches) * 2 + 1 withBarrier:YES];
         else if (profile_mode == ProfileMode::encoder_boundary) {
             [encoder endEncoding]; encoder = nil;
-#ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
-            if (concurrent) reset_spans();
-#endif
         }
         ++dispatches;
     }
@@ -1633,14 +1908,27 @@ struct MetalGraph::Impl {
         selected.task4_aligned = aligned;
 #endif
         before_dispatch();
-#ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
-        if (concurrent && !recording) concurrent_fence();
-#endif
         if (recording) {
             if (aligned) [captured_command() concurrentDispatchThreadgroups:grid threadsPerThreadgroup:group];
             else [captured_command() concurrentDispatchThreads:grid threadsPerThreadgroup:group];
-        } else if (aligned) [encoder dispatchThreadgroups:grid threadsPerThreadgroup:group];
-        else [encoder dispatchThreads:grid threadsPerThreadgroup:group];
+        } else {
+#ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
+            if (batch_concurrent) {
+                require(pending_dispatch_open, "concurrent dispatch without a pipeline");
+                draft_dispatch.indirect = false;
+                draft_dispatch.aligned = aligned;
+                draft_dispatch.grid = grid;
+                draft_dispatch.group = group;
+                pending_dispatches.push_back(std::move(draft_dispatch));
+                draft_dispatch = {};
+                pending_dispatch_open = false;
+                after_dispatch();
+                return;
+            }
+#endif
+            if (aligned) [encoder dispatchThreadgroups:grid threadsPerThreadgroup:group];
+            else [encoder dispatchThreads:grid threadsPerThreadgroup:group];
+        }
 #ifdef TOKSPUR_PRIVATE_DISPATCH_GRAPH
         if (trace && !recording) {
             require(trace_pending, "traced dispatch without a pipeline");
@@ -1662,10 +1950,23 @@ struct MetalGraph::Impl {
         require((indirect_buffer.offset + offset) % 4 == 0, "indirect buffer offset must be four-byte aligned");
         before_dispatch();
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
-        if (concurrent && !recording) {
-            span_pending.push_back({{indirect_buffer.slot, indirect_buffer.offset + offset,
-                                     indirect_buffer.offset + offset + 12}, false});
-            concurrent_fence();
+        if (batch_concurrent) {
+            require(pending_dispatch_open, "concurrent indirect dispatch without a pipeline");
+            if (!item.immutable) {
+                pending_spans.push_back({indirect_buffer.slot, indirect_buffer.offset + offset,
+                                         indirect_buffer.offset + offset + 12, false});
+                ++draft_dispatch.span_count;
+            }
+            draft_dispatch.indirect = true;
+            draft_dispatch.aligned = true;
+            draft_dispatch.group = group;
+            draft_dispatch.indirect_slot = indirect_buffer.slot;
+            draft_dispatch.indirect_offset = indirect_buffer.offset + offset;
+            pending_dispatches.push_back(std::move(draft_dispatch));
+            draft_dispatch = {};
+            pending_dispatch_open = false;
+            after_dispatch();
+            return;
         }
 #endif
         [encoder dispatchThreadgroupsWithIndirectBuffer:item.buffer
@@ -1676,7 +1977,10 @@ struct MetalGraph::Impl {
             require(trace_pending, "traced indirect dispatch without a pipeline");
             const auto size = [](MTLSize s) { return Json(Json::Array{Json::integer(s.width), Json::integer(s.height), Json::integer(s.depth)}); };
             auto record = std::move(trace_dispatch);
-            record.emplace_back("aligned", Json(true)); record.emplace_back("indirect", Json(true)); record.emplace_back("indirect_offset", Json::integer(indirect_buffer.offset + offset)); record.emplace_back("group", size(group));
+            record.emplace_back("aligned", Json(true)); record.emplace_back("indirect", Json(true));
+            record.emplace_back("indirect_slot", Json::integer(indirect_buffer.slot));
+            record.emplace_back("indirect_offset", Json::integer(indirect_buffer.offset + offset));
+            record.emplace_back("group", size(group));
             record.emplace_back("bindings", Json(std::move(trace_bindings))); record.emplace_back("constants", Json(std::move(trace_constants)));
             trace_pending = false; trace_bindings = {}; trace_constants = {}; trace_dispatch = {};
             trace_record(std::move(record));
@@ -1984,7 +2288,7 @@ struct MetalGraph::Impl {
         if (data) std::memcpy(buffer.contents, data, static_cast<size_t>(bytes));
         else std::memset(buffer.contents, 0, static_cast<size_t>(bytes));
         const auto slot = allocations.size();
-        allocations.push_back({{}, buffer, bytes, charged, immutable, {}});
+        allocations.push_back({{}, buffer, bytes, charged, immutable, 0, 0, {}});
         ledger.live_bytes += charged;
         ledger.peak_bytes = std::max(ledger.peak_bytes, ledger.live_bytes);
         ++ledger.allocations;
@@ -2025,6 +2329,9 @@ MetalGraph::MetalGraph(const std::filesystem::path& owned_library, uint64_t byte
         const uint64_t flag_bytes = std::min(uint64_t(65536), byte_budget);
         p.error_flag = [p.device newBufferWithLength:flag_bytes options:MTLResourceStorageModeShared];
         if (!p.error_flag) throw FormatError("cannot allocate graph error flag");
+        p.error_flag_capacity = static_cast<uint32_t>(
+            std::min<uint64_t>(flag_bytes, p.error_flag.allocatedSize) / sizeof(uint32_t));
+        require(p.error_flag_capacity >= 1, "graph error flag capacity must be at least one word");
         p.ledger.live_bytes = std::max(uint64_t(4), static_cast<uint64_t>(p.error_flag.allocatedSize));
         require(p.ledger.live_bytes <= byte_budget, "graph control allocation exceeds budget");
         p.ledger.peak_bytes = p.ledger.live_bytes;
@@ -2158,7 +2465,7 @@ ImportedWeights MetalGraph::import_weights(std::shared_ptr<const ModelFiles> sou
             const auto charge = std::max(length, uint64_t(buffer.allocatedSize));
             require(charge <= p.ledger.budget - p.ledger.live_bytes, "actual mapped-weight resource exceeds budget");
             buffer.label = @"owned immutable mapped weights";
-            const auto slot = p.allocations.size(); p.allocations.push_back({source, buffer, length, charge, true, {}});
+            const auto slot = p.allocations.size(); p.allocations.push_back({source, buffer, length, charge, true, r.shard, r.begin, {}});
 #ifdef TOKSPUR_PRIVATE_DISPATCH_GRAPH
             p.trace_allocation(slot, "owned immutable mapped weights", "import", false);
 #endif
@@ -2344,6 +2651,7 @@ void MetalGraph::write(GpuView destination, std::span<const std::byte> data) {
     const auto& item = impl_->allocation(destination, true);
     require(data.size() == destination.bytes, "GPU upload span mismatch");
     std::memcpy(static_cast<std::byte*>(item.buffer.contents) + destination.offset, data.data(), data.size());
+    impl_->invalidate_route_spans(destination.slot, destination.offset, checked_add(destination.offset, destination.bytes));
 #ifdef TOKSPUR_PRIVATE_DISPATCH_GRAPH
     impl_->trace_view("host_write", destination, data.data());
 #endif
@@ -2360,6 +2668,8 @@ void MetalGraph::write_bytes(GpuView storage, uint64_t offset, std::span<const s
     require(item.buffer.storageMode == MTLStorageModeShared && item.buffer.contents, "GPU byte upload requires shared storage");
     if (data.empty()) return;
     std::memmove(static_cast<std::byte*>(item.buffer.contents) + storage.offset + offset, data.data(), data.size());
+    impl_->invalidate_route_spans(storage.slot, checked_add(storage.offset, offset),
+        checked_add(checked_add(storage.offset, offset), data.size()));
 #ifdef TOKSPUR_PRIVATE_DISPATCH_GRAPH
     impl_->trace_bytes("host_write", storage, offset, data.size(), data.data());
 #endif
@@ -2521,8 +2831,11 @@ void MetalGraph::copy(std::span<const GraphCopy> copies) {
         lengths[i] = static_cast<size_t>(pair.source.bytes);
     }
     // No validation, allocation or other fallible work follows the first copy.
-    for (size_t i = 0; i < copies.size(); ++i)
+    for (size_t i = 0; i < copies.size(); ++i) {
         std::memcpy(destinations[i], sources[i], lengths[i]);
+        impl_->invalidate_route_spans(copies[i].destination.slot, copies[i].destination.offset,
+            checked_add(copies[i].destination.offset, copies[i].destination.bytes));
+    }
 #ifdef TOKSPUR_PRIVATE_DISPATCH_GRAPH
     if (impl_->trace) {
         Json::Array pairs;
@@ -2553,6 +2866,8 @@ void MetalGraph::release(GpuView full_buffer) {
 #endif
     std::erase_if(impl_->planar_matrices, [&](const auto& entry) { return std::get<0>(entry.first) == full_buffer.slot; });
     impl_->planar_slots.erase(full_buffer.slot);
+    std::erase_if(impl_->verified_route_spans, [&](const auto& s) { return s.slot == full_buffer.slot; });
+    std::erase_if(impl_->gpu_written_spans, [&](const auto& s) { return s.slot == full_buffer.slot; });
     if (impl_->draft_output_parent_.has_value() && std::get<0>(*impl_->draft_output_parent_).slot == full_buffer.slot) {
         impl_->draft_output_parent_.reset();
     }
@@ -2642,28 +2957,208 @@ void MetalGraph::configure_dispatch_trace(const std::filesystem::path& path) {
 }
 #endif
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
-void MetalGraph::Impl::concurrent_fence() {
-    bool hazard = flag_read || (pending_flag_reader && flag_written);
-#ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
-    if (hazard) ++carrier_flag_barriers;
-#endif
-    for (const auto& [span, output] : span_pending) hazard = hazard || span_writes.touches(span) || (output && span_reads.touches(span));
-    if (hazard) {
-        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        span_reads.clear(); span_writes.clear(); flag_written = flag_read = false; ++concurrent_barrier_count;
-#ifdef TOKSPUR_PRIVATE_DISPATCH_GRAPH
-        trace_record({{"event", Json("barrier")}, {"scope", Json("buffers")}});
-#endif
+void MetalGraph::Impl::flush_concurrent_window() {
+    require(!pending_dispatch_open, "incomplete GPU dispatch in concurrent batch");
+    if (!batch_concurrent || pending_dispatches.empty()) return;
+    const size_t count = pending_dispatches.size();
+    if (slot_tracks.size() < allocations.size()) slot_tracks.resize(allocations.size());
+    touched_slots.clear();
+    flag_last_any.assign(error_flag_capacity, -1);
+    flag_last_reader.assign(error_flag_capacity, -1);
+    sched_levels.assign(count, 0);
+    sched_span_levels.assign(count, 0);
+    sched_flag_levels.assign(count, 0);
+
+    uint32_t depth = 1;
+    for (size_t j = 0; j < count; ++j) {
+        const auto& d = pending_dispatches[j];
+        uint32_t span_lvl = 0;
+        for (uint32_t k = 0; k < d.span_count; ++k) {
+            const auto& sp = pending_spans[d.span_begin + k];
+            if (sp.begin >= sp.end) continue;
+            const auto& st = slot_tracks[sp.slot];
+            if (!st.writes.empty() && st.write_max_level + 1 > span_lvl &&
+                st.write_min < sp.end && sp.begin < st.write_max) {
+                for (const auto& w : st.writes) {
+                    if (w.level + 1 > span_lvl && w.begin < sp.end && sp.begin < w.end) {
+                        span_lvl = w.level + 1;
+                    }
+                }
+            }
+            if (sp.output && !st.reads.empty() && st.read_max_level + 1 > span_lvl &&
+                st.read_min < sp.end && sp.begin < st.read_max) {
+                for (const auto& r : st.reads) {
+                    if (r.level + 1 > span_lvl && r.begin < sp.end && sp.begin < r.end) {
+                        span_lvl = r.level + 1;
+                    }
+                }
+            }
+        }
+        uint32_t flag_lvl = 0;
+        const uint32_t fslot = d.flag_slot;
+        if (d.reads_flag) {
+            if (flag_last_any[fslot] >= 0) flag_lvl = static_cast<uint32_t>(flag_last_any[fslot]) + 1;
+        } else {
+            if (flag_last_reader[fslot] >= 0) flag_lvl = static_cast<uint32_t>(flag_last_reader[fslot]) + 1;
+        }
+        const uint32_t lvl = std::max(span_lvl, flag_lvl);
+        sched_levels[j] = lvl;
+        sched_span_levels[j] = span_lvl;
+        sched_flag_levels[j] = flag_lvl;
+        depth = std::max(depth, lvl + 1);
+
+        flag_last_any[fslot] = std::max(flag_last_any[fslot], static_cast<int32_t>(lvl));
+        if (d.reads_flag) flag_last_reader[fslot] = std::max(flag_last_reader[fslot], static_cast<int32_t>(lvl));
+
+        for (uint32_t k = 0; k < d.span_count; ++k) {
+            const auto& sp = pending_spans[d.span_begin + k];
+            if (sp.begin >= sp.end) continue;
+            auto& st = slot_tracks[sp.slot];
+            if (st.writes.empty() && st.reads.empty()) touched_slots.push_back(sp.slot);
+            const bool touches_reads = st.read_min < sp.end && sp.begin < st.read_max;
+            if (sp.output) {
+                if (st.write_min < sp.end && sp.begin < st.write_max) {
+                    std::erase_if(st.writes, [&](const ActiveSpan& w) {
+                        return sp.begin <= w.begin && w.end <= sp.end;
+                    });
+                }
+                if (touches_reads) {
+                    std::erase_if(st.reads, [&](const ActiveSpan& r) {
+                        return sp.begin <= r.begin && r.end <= sp.end;
+                    });
+                }
+                st.writes.push_back({sp.begin, sp.end, lvl});
+                st.write_min = std::min(st.write_min, sp.begin);
+                st.write_max = std::max(st.write_max, sp.end);
+                st.write_max_level = std::max(st.write_max_level, lvl);
+            } else {
+                if (touches_reads) {
+                    if (std::any_of(st.reads.begin(), st.reads.end(), [&](const ActiveSpan& r) {
+                        return r.begin <= sp.begin && sp.end <= r.end && r.level >= lvl;
+                    })) continue;
+                    std::erase_if(st.reads, [&](const ActiveSpan& r) {
+                        return sp.begin <= r.begin && r.end <= sp.end && lvl >= r.level;
+                    });
+                }
+                st.reads.push_back({sp.begin, sp.end, lvl});
+                st.read_min = std::min(st.read_min, sp.begin);
+                st.read_max = std::max(st.read_max, sp.end);
+                st.read_max_level = std::max(st.read_max_level, lvl);
+            }
+        }
     }
-    for (const auto& [span, output] : span_pending) (output ? span_writes : span_reads).add(span);
-    flag_written = true; flag_read = flag_read || pending_flag_reader;
-    span_pending.clear(); pending_flag_reader = false;
+
+    for (const size_t slot : touched_slots) slot_tracks[slot].reset();
+    touched_slots.clear();
+
+    sched_level_counts.assign(depth, 0);
+    sched_flag_only_barrier.assign(depth, 0);
+    for (size_t j = 0; j < count; ++j) {
+        const uint32_t lv = sched_levels[j];
+        ++sched_level_counts[lv];
+        if (lv > 0 && sched_flag_levels[j] == lv && sched_span_levels[j] < lv) {
+            sched_flag_only_barrier[lv] = 1;
+        }
+    }
+    sched_level_offsets.resize(depth);
+    uint32_t cursor = 0;
+    for (uint32_t lv = 0; lv < depth; ++lv) {
+        sched_level_offsets[lv] = cursor;
+        cursor += sched_level_counts[lv];
+    }
+    sched_order.resize(count);
+    for (size_t j = 0; j < count; ++j) {
+        const uint32_t lv = sched_levels[j];
+        sched_order[sched_level_offsets[lv]++] = static_cast<uint32_t>(j);
+    }
+
+    size_t pos = 0;
+    for (uint32_t lv = 0; lv < depth; ++lv) {
+        if (lv > 0) {
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            ++concurrent_barrier_count;
+#ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
+            if (sched_flag_only_barrier[lv]) ++carrier_flag_barriers;
+#endif
+#ifdef TOKSPUR_PRIVATE_DISPATCH_GRAPH
+            if (trace) trace_record({{"event", Json("barrier")}, {"scope", Json("buffers")}});
+#endif
+        }
+        const uint32_t n_at_lv = sched_level_counts[lv];
+        for (uint32_t m = 0; m < n_at_lv; ++m) {
+            const auto& d = pending_dispatches[sched_order[pos++]];
+            [encoder setComputePipelineState:d.pso];
+            [encoder setBuffer:error_flag offset:uint64_t(d.flag_slot) * sizeof(uint32_t) atIndex:7];
+            for (uint32_t b = 0; b < d.binding_count; ++b) {
+                const auto& bd = pending_bindings[d.binding_begin + b];
+                [encoder setBuffer:allocations[bd.slot].buffer offset:bd.offset atIndex:bd.index];
+            }
+            for (uint32_t c = 0; c < d.const_count; ++c) {
+                const auto& ct = pending_constants[d.const_begin + c];
+                [encoder setBytes:pending_const_bytes.data() + ct.data_offset length:ct.length atIndex:ct.index];
+            }
+            for (uint32_t t = 0; t < d.tg_count; ++t) {
+                const auto& tg = pending_tg_mem[d.tg_begin + t];
+                [encoder setThreadgroupMemoryLength:tg.length atIndex:tg.index];
+            }
+            if (d.indirect) {
+                [encoder dispatchThreadgroupsWithIndirectBuffer:allocations[d.indirect_slot].buffer
+                                          indirectBufferOffset:d.indirect_offset
+                                         threadsPerThreadgroup:d.group];
+            } else if (d.aligned) {
+                [encoder dispatchThreadgroups:d.grid threadsPerThreadgroup:d.group];
+            } else {
+                [encoder dispatchThreads:d.grid threadsPerThreadgroup:d.group];
+            }
+#ifdef TOKSPUR_PRIVATE_DISPATCH_GRAPH
+            if (trace) {
+                const auto size = [](MTLSize s) { return Json(Json::Array{Json::integer(s.width), Json::integer(s.height), Json::integer(s.depth)}); };
+                Json::Array bindings;
+                bindings.reserve(1 + d.binding_count);
+                bindings.push_back(Json(Json::Object{
+                    {"index", Json::integer(7)}, {"buffer", Json("error_flag")},
+                    {"offset", Json::integer(uint64_t(d.flag_slot) * sizeof(uint32_t))},
+                    {"bytes", Json::integer(sizeof(uint32_t))}}));
+                for (uint32_t b = 0; b < d.binding_count; ++b) {
+                    const auto& bd = pending_bindings[d.binding_begin + b];
+                    bindings.push_back(Json(Json::Object{
+                        {"index", Json::integer(bd.index)}, {"slot", Json::integer(bd.slot)},
+                        {"offset", Json::integer(bd.offset)}, {"bytes", Json::integer(bd.bytes)},
+                        {"access", Json(bd.output ? "write" : "read")}}));
+                }
+                Json::Array constants;
+                constants.reserve(d.const_count);
+                for (uint32_t c = 0; c < d.const_count; ++c) {
+                    const auto& ct = pending_constants[d.const_begin + c];
+                    constants.push_back(Json(Json::Object{
+                        {"index", Json::integer(ct.index)}, {"bytes", Json::integer(ct.length)},
+                        {"sha256", Json(trace_digest(pending_const_bytes.data() + ct.data_offset, ct.length))}}));
+                }
+                Json::Object record{{"event", Json("dispatch")}, {"pipeline", Json(d.trace_pipeline_key)},
+                    {"aligned", Json(d.aligned)}};
+                if (d.indirect) {
+                    record.emplace_back("indirect", Json(true));
+                    record.emplace_back("indirect_slot", Json::integer(d.indirect_slot));
+                    record.emplace_back("indirect_offset", Json::integer(d.indirect_offset));
+                } else {
+                    record.emplace_back("grid", size(d.grid));
+                }
+                record.emplace_back("group", size(d.group));
+                record.emplace_back("bindings", Json(std::move(bindings)));
+                record.emplace_back("constants", Json(std::move(constants)));
+                trace_record(std::move(record));
+            }
+#endif
+        }
+    }
+    clear_pending_concurrent();
 }
 void MetalGraph::configure_concurrent_dispatch(bool enabled) {
     auto& p = *impl_; p.idle();
     require(!p.concurrent_locked, "concurrent dispatch is fixed before the first batch");
     require(!enabled || p.profile_mode == ProfileMode::disabled, "concurrent dispatch requires unprofiled execution");
     p.concurrent = enabled;
+    p.concurrent_explicit = true;
 }
 bool MetalGraph::concurrent_dispatch() const { impl_->thread_check(); return impl_->concurrent; }
 uint64_t MetalGraph::lifetime_dispatches() const { impl_->thread_check(); return impl_->lifetime_dispatch_count; }
@@ -2687,7 +3182,7 @@ void MetalGraph::begin_carrier_gpu_readback() {
     if (!p.carrier_readback_staging.bytes)
         p.carrier_readback_staging = zeros(16ull << 20, "bounded diagnostic state readback");
     p.carrier_readback_byte_pipeline = p.pipeline("carrier_readback_bytes", uint32_t(-1), 128, false, uint32_t(-1));
-    require(*static_cast<const uint32_t*>(p.error_flag.contents) == 0, "GPU graph is invalid before state inspection");
+    require(!p.reduce_error_flag(), "GPU graph is invalid before state inspection");
     p.carrier_readback_commands = 0; p.carrier_gpu_readback = true;
 }
 void MetalGraph::end_carrier_gpu_readback() noexcept { impl_->carrier_gpu_readback = false; }
@@ -2760,8 +3255,13 @@ void MetalGraph::read_carrier_state_segments(std::span<const CarrierStateRead> r
 }
 void MetalGraph::prepare_carrier_diagnostic(CarrierDiagnosticMode mode, uint32_t actions, bool record_dispatches) {
     auto& p = *impl_; p.idle();
-    require(mode != CarrierDiagnosticMode::dispatch || !p.concurrent,
-        "carrier dispatch diagnostic requires explicitly serial execution");
+#ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
+    if (mode == CarrierDiagnosticMode::dispatch) {
+        require(!p.concurrent_explicit || !p.concurrent,
+            "carrier dispatch diagnostic requires explicitly serial execution");
+        if (!p.concurrent_explicit) p.concurrent = false;
+    }
+#endif
     if (mode == CarrierDiagnosticMode::dispatch) {
         require(!p.profile_capacity && !p.ledger.profile_counter_payload_bytes,
             "carrier diagnostic requires exclusive unallocated counters");
@@ -2877,7 +3377,10 @@ ProfileMode MetalGraph::configure_profiling(uint32_t capacity) {
     @autoreleasepool {
     auto& p = *impl_; p.idle(); require(capacity <= 16384, "GPU profiling capacity limit");
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
-    require(!capacity || !p.concurrent, "concurrent dispatch requires unprofiled execution");
+    if (capacity) {
+        require(!p.concurrent_explicit || !p.concurrent, "concurrent dispatch requires unprofiled execution");
+        if (!p.concurrent_explicit) p.concurrent = false;
+    }
 #endif
 #ifdef TOKSPUR_PRIVATE_TASK4_PROFILE
     require(!p.task4_sink, "reserved Task4 counters are immutable");
@@ -3610,7 +4113,9 @@ void MetalGraph::begin() {
     p.task4_tag = {}; p.task4_encoders = 0;
 #endif
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
-    p.concurrent_locked = true; p.reset_spans(); p.concurrent_barrier_count = 0;
+    p.concurrent_locked = true; p.clear_pending_concurrent(); p.concurrent_barrier_count = 0;
+    p.batch_concurrent = p.concurrent && p.profile_mode == ProfileMode::disabled && !p.recording &&
+        !p.compatible_pipelines && !p.ledger.live_captures && !p.planar_union_profile_active();
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
     p.carrier_flag_barriers = 0; p.carrier_records.clear();
     p.carrier_routes.clear(); p.carrier_route_bytes = 0; p.carrier_row_offset = 0;
@@ -3682,12 +4187,14 @@ void MetalGraph::begin() {
     p.qsa_prefill_fused_locked = true;
     p.hc_consumer_fused_locked = true; p.hc_consumer_fused_pending = 0;
     p.verify_hc_gdn_fused_locked = true;
-    *static_cast<uint32_t*>(p.error_flag.contents) = 0;
+    std::memset(p.error_flag.contents, 0, size_t(p.error_flag_capacity) * sizeof(uint32_t));
+    p.error_flag_slots_used = 0;
+    p.qsa_stage_error_slot.reset();
     p.command = [p.queue commandBuffer];
     if (!p.command) throw FormatError("cannot create owned graph command buffer");
     if (p.profile_mode != ProfileMode::encoder_boundary) {
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
-        p.encoder = p.concurrent ? [p.command computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent] : [p.command computeCommandEncoder];
+        p.encoder = p.batch_concurrent ? [p.command computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent] : [p.command computeCommandEncoder];
 #else
         p.encoder = [p.command computeCommandEncoder];
 #endif
@@ -3764,12 +4271,10 @@ void MetalGraph::begin_indirect_compatible() {
 #endif
     require(p.profile_mode == ProfileMode::disabled, "indirect comparator does not support profiling");
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
-    require(!p.concurrent, "concurrent dispatch covers direct batches only");
+    require(!p.concurrent_explicit || !p.concurrent, "concurrent dispatch covers direct batches only");
+    if (!p.concurrent_explicit) p.concurrent = false;
 #endif
     require(!p.hc_q8.splits, "HC Q8 split policy does not support indirect comparison");
-#ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
-    require(!p.concurrent, "concurrent dispatch covers direct batches only");
-#endif
 #ifdef TOKSPUR_PRIVATE_DISPATCH_GRAPH
     require(!p.trace, "dispatch trace covers direct batches only");
 #endif
@@ -3800,7 +4305,8 @@ void MetalGraph::begin_capture(uint32_t capacity) {
     require(!p.gdn_ported_configured && !p.gdn_prefill_ported_configured && !p.gdn_ported_variants_prepared, "ported GDN kernels refuse captured execution");
 #endif
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
-    require(!p.concurrent, "concurrent dispatch covers direct batches only");
+    require(!p.concurrent_explicit || !p.concurrent, "concurrent dispatch covers direct batches only");
+    if (!p.concurrent_explicit) p.concurrent = false;
 #endif
 #ifdef TOKSPUR_PRIVATE_DISPATCH_GRAPH
     require(!p.trace, "dispatch trace covers direct batches only");
@@ -3894,6 +4400,7 @@ void MetalGraph::execute_capture(GraphCapture handle) {
     const auto& c = p.captures[handle.slot]; require(c.commands != nil, "released capture handle");
     require(c.policy == std::array{p.small_gemv_splits, p.block_gemv_formats, p.gdn_tile_threads}, "capture kernel policy changed");
     require(p.encoder != nil && p.encoder.dispatchType == MTLDispatchTypeSerial, "capture requires a serial parent encoder");
+    p.error_flag_slots_used = std::max(p.error_flag_slots_used, 1u);
     [p.encoder useResources:c.reads.data() count:c.reads.size() usage:MTLResourceUsageRead];
     [p.encoder useResources:c.writes.data() count:c.writes.size() usage:MTLResourceUsageRead | MTLResourceUsageWrite];
     [p.encoder executeCommandsInBuffer:c.commands withRange:NSMakeRange(0, c.count)];
@@ -3965,7 +4472,7 @@ void MetalGraph::abort() {
 #endif
     if (p.recording) { p.clear_draft(); p.dispatches = 0; return; }
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
-    p.reset_spans(); p.concurrent_barrier_count = 0;
+    p.clear_pending_concurrent(); p.concurrent_barrier_count = 0;
 #endif
 #ifdef TOKSPUR_PRIVATE_DISPATCH_GRAPH
     if (p.trace) { p.trace_pending = false; p.trace_record({{"event", Json("abort")}, {"batch", Json::integer(p.trace_batch++)}}); }
@@ -3976,8 +4483,12 @@ void MetalGraph::abort() {
     // Partial commands are already running and cannot be discarded. Wait, so the caller's recovery never races them.
     for (id<MTLCommandBuffer> partial : p.partial_commands) [partial waitUntilCompleted];
     p.partial_commands.clear();
+    std::memset(p.error_flag.contents, 0, size_t(p.error_flag_capacity) * sizeof(uint32_t));
+    p.error_flag_slots_used = 0;
+    p.qsa_stage_error_slot.reset();
     p.dispatches = 0;
     p.compatible_pipelines = false; p.capture_executes = 0;
+    p.verified_route_spans.clear();
     p.marks.clear(); p.profile = {};
 }
 bool MetalGraph::commit_partial() {
@@ -4004,29 +4515,35 @@ bool MetalGraph::commit_partial() {
     // Everything that can fail happens before the commit, so a refusal leaves the batch whole for abort().
     p.partial_commands.reserve(p.partial_commands.size() + 1);
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
+    require(!p.pending_dispatch_open, "incomplete GPU dispatch in concurrent batch");
     const auto next_command_count = checked_add(p.lifetime_command_count, 1);
 #endif
     id<MTLCommandBuffer> next = [p.queue commandBuffer];
     if (!next) throw FormatError("cannot create owned graph command buffer");
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
-    id<MTLComputeCommandEncoder> next_encoder = p.concurrent ? [next computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent] : [next computeCommandEncoder];
+    id<MTLComputeCommandEncoder> next_encoder = p.batch_concurrent ? [next computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent] : [next computeCommandEncoder];
 #else
     id<MTLComputeCommandEncoder> next_encoder = [next computeCommandEncoder];
 #endif
     if (!next_encoder) throw FormatError("cannot create owned graph encoder");
+#ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
+    p.flush_concurrent_window();
+#endif
     [p.encoder endEncoding];
     [p.command commit];
     p.partial_commands.push_back(p.command);
     p.command = next; p.encoder = next_encoder;
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
     // One queue runs its commands in commit order, so nothing encoded before this point is still pending for the next dispatch. Dispatches and barriers stay accumulated until the owner's submit.
-    p.reset_spans();
     p.lifetime_command_count = next_command_count;
 #endif
     return true;
     }
 }
-BatchResult MetalGraph::submit() {
+BatchResult MetalGraph::submit() { return submit(nullptr); }
+BatchResult MetalGraph::submit(std::optional<CommandTiming>* timing) {
+    const auto submit_entered = timing ? Clock::now() : Clock::time_point{};
+    if (timing) timing->reset();
     @autoreleasepool {
     auto& p = *impl_;
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
@@ -4125,6 +4642,9 @@ BatchResult MetalGraph::submit() {
     const bool task4_diagnostic = p.task4_sink && p.task4_active;
     const auto task4_encode_end = task4_diagnostic ? Clock::now() : Clock::time_point{};
 #endif
+#ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
+    p.flush_concurrent_window();
+#endif
     if (p.encoder) [p.encoder endEncoding];
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM
     if (
@@ -4145,10 +4665,19 @@ BatchResult MetalGraph::submit() {
     p.encoder = nil;
     id<MTLCommandBuffer> command = p.command;
     p.command = nil;
+    struct ClearVerifiedRoutesOnFailure {
+        std::vector<Impl::RouteBoundSpan>& spans;
+        bool succeeded = false;
+        ~ClearVerifiedRoutesOnFailure() {
+            if (!succeeded) spans.clear();
+        }
+    } clear_routes_on_failure{p.verified_route_spans};
 #ifdef TOKSPUR_PRIVATE_BATCH_PHASE_CLOCK
     if (trace_phases) phase_points[4] = Clock::now();
 #endif
+    const auto before_commit = timing ? Clock::now() : Clock::time_point{};
     { TOKSPUR_CARRIER_PHASE(submission); [command commit]; }
+    const auto after_commit = timing ? Clock::now() : Clock::time_point{};
 #ifdef TOKSPUR_PRIVATE_TASK4_PROFILE
     const auto task4_submit_end = task4_diagnostic ? Clock::now() : Clock::time_point{};
 #endif
@@ -4181,14 +4710,11 @@ BatchResult MetalGraph::submit() {
 #ifdef TOKSPUR_PRIVATE_BATCH_PHASE_CLOCK
     if (trace_phases) phase_points[6] = Clock::now();
 #endif
-    const auto err_val = *static_cast<const uint32_t*>(p.error_flag.contents);
+    const auto err_val = p.reduce_error_flag();
     require(err_val == 0, "GPU graph produced nonfinite values or invalid gates");
-#ifdef TOKSPUR_PRIVATE_BATCH_PHASE_CLOCK
     const auto wall_end = Clock::now();
-    const BatchResult result{p.dispatches, std::chrono::duration<double, std::milli>(wall_end - p.started).count(), (partial_gpu_seconds + command.GPUEndTime - command.GPUStartTime) * 1000, p.capture_executes};
-#else
-    const BatchResult result{p.dispatches, std::chrono::duration<double, std::milli>(Clock::now() - p.started).count(), (partial_gpu_seconds + command.GPUEndTime - command.GPUStartTime) * 1000, p.capture_executes};
-#endif
+    const auto wall_start = p.started;
+    const BatchResult result{p.dispatches, std::chrono::duration<double, std::milli>(wall_end - wall_start).count(), (partial_gpu_seconds + command.GPUEndTime - command.GPUStartTime) * 1000, p.capture_executes};
     p.collect_profile();
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
     if (p.carrier_diagnostic.active()) {
@@ -4379,9 +4905,21 @@ BatchResult MetalGraph::submit() {
 #else
         static_cast<void>(barriers);
 #endif
-        p.operator_emit("owner", "unclassified_tail", {}, true, &result, total); p.operator_publish_routes(routes); return total;
+        p.operator_emit("owner", "unclassified_tail", {}, true, &result, total); p.operator_publish_routes(routes); clear_routes_on_failure.succeeded = true; return total;
     }
 #endif
+    if (timing && partials.empty()) {
+        const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        auto& sample = timing->emplace();
+        sample.host_record_ms = ms(wall_start, submit_entered);
+        sample.host_flush_ms = ms(submit_entered, before_commit);
+        sample.host_commit_ms = ms(before_commit, after_commit);
+        sample.host_wait_and_check_ms = ms(after_commit, wall_end);
+        const double start = command.kernelStartTime, end = command.kernelEndTime;
+        if (std::isfinite(start) && std::isfinite(end) && start > 0 && end >= start)
+            sample.metal_schedule_ms = (end - start) * 1000;
+    }
+    clear_routes_on_failure.succeeded = true;
     return result;
     }
 }
@@ -4488,7 +5026,7 @@ void MetalGraph::gemv_rows(uint32_t type, GpuView matrix, GpuRowsF32 input, GpuR
     bool staged = false;
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
     // Only where gemv() itself takes the two-stage branch, and only where no row's output can feed another row's input.
-    staged = p.concurrent && !p.recording && !p.compatible_pipelines && count > 1 &&
+    staged = p.batch_concurrent && !p.recording && !p.compatible_pipelines && count > 1 &&
         type == 0 && p.small_gemv_splits > 1 && rows <= 64 && columns >= 1024 && columns <= 65536 &&
         !overlaps(output.view, input.view) && !overlaps(output.view, matrix);
 #ifdef TOKSPUR_PRIVATE_LANE_LAYOUT
@@ -4805,7 +5343,7 @@ void MetalGraph::grouped_mm(uint32_t type, PrefillWeightLayout layout, GpuView m
     p.select(selected_kernel, type, {input.columns, output.columns, experts, tokens}, 128, uint32_t(layout));
     p.bind(matrices, 0); p.bind(input.view, 1); p.bind(output.view, 2, true); p.parameter(args, 3);
     p.bind(indices, 4); p.bind(token_map, 6); p.bind(tasks, 8); p.bind(counts, 9);
-    [p.encoder setThreadgroupMemoryLength:plan.threadgroup_bytes atIndex:0];
+    p.threadgroup_memory(plan.threadgroup_bytes, 0);
     p.groups(MTLSizeMake(plan.grid_x, plan.grid_y, 1));
 #ifdef TOKSPUR_PRIVATE_OPERATOR_CHECKPOINTS
     operator_checkpoint("grouped", selected_kernel, {input.columns, output.columns, experts, tokens});
@@ -4966,7 +5504,7 @@ void MetalGraph::grouped_mm_project(uint32_t type, PrefillWeightLayout layout, G
     p.select(selected_kernel, type, {input.columns, output.columns, experts, tokens}, 128, uint32_t(layout));
     p.bind(matrices, 0); p.bind(input.view, 1); p.bind(output.view, 2, true); p.parameter(args, 3);
     p.bind(indices, 4); p.bind(token_map, 6); p.bind(tasks, 8); p.bind(counts, 9);
-    [p.encoder setThreadgroupMemoryLength:plan.threadgroup_bytes atIndex:0];
+    p.threadgroup_memory(plan.threadgroup_bytes, 0);
     p.groups(MTLSizeMake(plan.grid_x, plan.grid_y, 1));
 #ifdef TOKSPUR_PRIVATE_OPERATOR_CHECKPOINTS
     operator_checkpoint("grouped", selected_kernel, {input.columns, output.columns, experts, tokens});
@@ -5139,6 +5677,9 @@ bool MetalGraph::evaluate_router_margin(uint32_t tokens) {
     auto& p = *impl_; p.active();
     if (!p.router_margins_scratch.bytes || !tokens) return false;
     if (p.encoder != nil) {
+#ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
+        p.flush_concurrent_window();
+#endif
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM
         p.nax_dense_bf16_valid = false;
         p.nax_gathered_broadcast_valid = false;
@@ -5148,7 +5689,7 @@ bool MetalGraph::evaluate_router_margin(uint32_t tokens) {
         p.encoder = nil;
         [p.command commit];
         [p.command waitUntilCompleted];
-        const auto err_val = *static_cast<const uint32_t*>(p.error_flag.contents);
+        const auto err_val = p.reduce_error_flag();
         require(err_val == 0, "GPU graph produced nonfinite values or invalid gates");
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
         // This margin readback closes a physical command buffer inside the logical batch. Dispatches and barriers remain accumulated until the owner's submit.
@@ -5175,14 +5716,11 @@ bool MetalGraph::evaluate_router_margin(uint32_t tokens) {
     p.router_margin_telemetry.total_layers += 1;
     const bool fallback = (violations > 0);
     if (fallback) p.router_margin_telemetry.fallback_layers += 1;
-#ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
-    p.reset_spans();
-#endif
     p.command = [p.queue commandBuffer];
     if (!p.command) throw FormatError("cannot create owned graph command buffer");
     if (p.profile_mode != ProfileMode::encoder_boundary) {
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
-        p.encoder = p.concurrent ? [p.command computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent] : [p.command computeCommandEncoder];
+        p.encoder = p.batch_concurrent ? [p.command computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent] : [p.command computeCommandEncoder];
 #else
         p.encoder = [p.command computeCommandEncoder];
 #endif
@@ -5366,9 +5904,9 @@ void MetalGraph::prepare_verify_nax(std::span<const std::pair<uint32_t, PrefillW
 #ifdef TOKSPUR_PRIVATE_HC_ROWS
     if (p.small_gemv_splits == 16) {
         prepare_hc_rows();
-        if (p.hc_rows_scratch.bytes < 8ull * 4 * 16 * 4) {
+        if (p.hc_rows_scratch.bytes < 16ull * 4 * 16 * 4) {
             if (p.hc_rows_scratch.bytes) release(p.hc_rows_scratch);
-            p.hc_rows_scratch = zeros(8ull * 4 * 16 * 4, "verify NAX HC row injection partials");
+            p.hc_rows_scratch = zeros(16ull * 4 * 16 * 4, "verify NAX HC row injection partials");
         }
     }
 #endif
@@ -5381,8 +5919,12 @@ void MetalGraph::prepare_verify_nax(std::span<const std::pair<uint32_t, PrefillW
     if (q8_tile64_cache_enabled) {
         const auto t64_m8 = p.pipeline("nax_m8_dense_q8_t64", uint32_t(-1), 64);
         const auto t64_sw = p.pipeline("nax_m8_dense_q8_swiglu_t64", uint32_t(-1), 64);
+        const auto t64_m16 = p.pipeline("nax_m16_dense_q8_t64", uint32_t(-1), 64);
+        const auto t64_sw16 = p.pipeline("nax_m16_dense_q8_swiglu_t64", uint32_t(-1), 64);
         require(t64_m8.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength &&
-            t64_sw.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength,
+            t64_sw.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength &&
+            t64_m16.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength &&
+            t64_sw16.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength,
             "verify NAX Q8_tile64 threadgroup memory exceeds device capability");
         p.q8_tile64_ready = true;
         p.ensure_q8_tile64_all();
@@ -5396,7 +5938,7 @@ void MetalGraph::nax_m8_dense_q8(GpuView matrix, GpuRowsF32 input, GpuRowsF32 ou
     const bool allowed = (p.verify_nax && p.verify_nax_prepared && p.verify_nax_scope) || (p.dflash2_prepared && p.dflash2_scope);
     require(allowed && !p.recording && !p.compatible_pipelines,
         "NAX m8 dense requires prepared active verify or DFlash2 scope and direct batches");
-    require(input.rows >= 1 && input.rows <= 8 && input.rows == output.rows &&
+    require(input.rows >= 1 && input.rows <= 16 && input.rows == output.rows &&
         input.columns >= 32 && input.columns <= 65536 && input.columns % 32 == 0 &&
         output.columns >= 1 && output.columns <= 524288,
         "NAX m8 dense geometry mismatch");
@@ -5421,12 +5963,14 @@ void MetalGraph::nax_m8_dense_q8(GpuView matrix, GpuRowsF32 input, GpuRowsF32 ou
     const uint32_t scale_bits = silu_scale != 0.0f ? std::bit_cast<uint32_t>(silu_scale) : 1u;
     if (p.verify_nax_m8) {
         if (const auto* entry = p.q8_tile64_entry(matrix, input.columns, output.columns)) {
+            const uint32_t rows_cap = input.rows <= 8u ? 8u : 16u;
             const uint32_t splits = p.target_split(NaxSplitFamily::q8_t64, input.columns, output.columns, input.rows, 64u, false, (p.verify_nax_split_partials.bytes >= uint64_t(kVerifyNaxSplitSlots) * kVerifyNaxSplitSlotPartialsBytes
-                ? pick_nax_m8_q8_t64_splits(input.columns, output.columns, 64u, false)
+                ? pick_nax_m8_q8_t64_splits(input.columns, output.columns, 64u, false, rows_cap)
                 : 1u));
             const GroupedMmArgs args{input.columns, output.columns, row_bytes, scale_bits, splits, input.rows, 1u, mode,
                 matrix_bytes, input.stride_bytes, output.stride_bytes};
-            p.select("nax_m8_dense_q8_t64", uint32_t(-1), {input.columns, output.columns, input.rows, uint32_t(layout)}, 64);
+            const char* t64_k = input.rows <= 8u ? "nax_m8_dense_q8_t64" : "nax_m16_dense_q8_t64";
+            p.select(t64_k, uint32_t(-1), {input.columns, output.columns, input.rows, uint32_t(layout)}, 64);
             p.bind(entry->plane0, 0); p.bind(entry->meta, 1); p.bind(input.view, 2); p.bind(output.view, 3, true); p.parameter(args, 4);
             if (splits > 1u) {
                 const uint32_t slot = (p.verify_nax_split_cursor++) % kVerifyNaxSplitSlots;
@@ -5446,7 +5990,7 @@ void MetalGraph::nax_m8_dense_q8(GpuView matrix, GpuRowsF32 input, GpuRowsF32 ou
     const uint32_t max_nr = input.rows <= 4u ? 4u : 2u;
     const uint32_t nr = output.columns <= 1024u ? 1u : (output.columns <= 4096u ? 2u : max_nr);
     const uint32_t cols_per_tile = 4u * nr;
-    const uint32_t splits = p.target_split(NaxSplitFamily::q8, input.columns, output.columns, input.rows, cols_per_tile, false, (p.verify_nax_split_partials.bytes >= uint64_t(kVerifyNaxSplitSlots) * kVerifyNaxSplitSlotPartialsBytes
+    const uint32_t splits = input.rows > 8u ? 1u : p.target_split(NaxSplitFamily::q8, input.columns, output.columns, input.rows, cols_per_tile, false, (p.verify_nax_split_partials.bytes >= uint64_t(kVerifyNaxSplitSlots) * kVerifyNaxSplitSlotPartialsBytes
         ? pick_nax_m8_q8_splits(input.columns, output.columns, cols_per_tile, false)
         : 1u));
     const GroupedMmArgs args{input.columns, output.columns, row_bytes, scale_bits, splits, input.rows, 1u, mode,
@@ -5464,7 +6008,7 @@ void MetalGraph::nax_m8_dense_q8(GpuView matrix, GpuRowsF32 input, GpuRowsF32 ou
         p.bind(idle, 4, false);
         p.bind(idle, 5, false);
     }
-    p.dispatch(true, MTLSizeMake((output.columns + cols_per_tile - 1u) / cols_per_tile, splits, 1), MTLSizeMake(128, 1, 1));
+    p.dispatch(true, MTLSizeMake((output.columns + cols_per_tile - 1u) / cols_per_tile, splits, (input.rows + 7u) / 8u), MTLSizeMake(128, 1, 1));
 }
 void MetalGraph::verify_nax_dense_q8(GpuView matrix, GpuRowsF32 input, GpuRowsF32 output, bool swiglu, float silu_scale) {
     auto& p = *impl_; p.active();
@@ -5477,7 +6021,7 @@ void MetalGraph::verify_nax_dense_q8(GpuView matrix, GpuRowsF32 input, GpuRowsF3
     const bool allowed = (p.verify_nax && p.verify_nax_prepared && p.verify_nax_scope) || (p.dflash2_prepared && p.dflash2_scope);
     require(allowed && !p.recording && !p.compatible_pipelines,
         "verify NAX dense requires prepared active verify scope and direct batches");
-    require(input.rows >= 1 && input.rows <= 8 && input.rows == output.rows &&
+    require(input.rows >= 1 && input.rows <= 16 && input.rows == output.rows &&
         input.columns >= 32 && input.columns <= 65536 && input.columns % 32 == 0 &&
         output.columns >= 1 && output.columns <= 524288,
         "verify NAX dense geometry mismatch");
@@ -5508,14 +6052,14 @@ void MetalGraph::verify_nax_dense_q8(GpuView matrix, GpuRowsF32 input, GpuRowsF3
     const uint32_t rows_per_tg = 4u * nr;
     p.select(kname, 8, {input.columns, output.columns, input.rows, uint32_t(layout)}, 128, uint32_t(layout));
     p.bind(matrix, 0); p.bind(input.view, 1); p.bind(output.view, 2, true); p.parameter(args, 3);
-    p.dispatch(true, MTLSizeMake((output.columns + rows_per_tg - 1u) / rows_per_tg, 1, 1), MTLSizeMake(128, 1, 1));
+    p.dispatch(true, MTLSizeMake((output.columns + rows_per_tg - 1u) / rows_per_tg, (input.rows + 7u) / 8u, 1), MTLSizeMake(128, 1, 1));
 }
 void MetalGraph::verify_nax_dense_bf16(GpuView matrix, GpuRowsF32 input, GpuRowsF32 output) {
     auto& p = *impl_; p.active();
     const bool allowed = (p.verify_nax && p.verify_nax_prepared && p.verify_nax_scope) || (p.dflash2_prepared && p.dflash2_scope);
     require(allowed && !p.recording && !p.compatible_pipelines,
         "verify NAX dense BF16 requires prepared active verify scope and direct batches");
-    require(input.rows >= 1 && input.rows <= 8 && input.rows == output.rows &&
+    require(input.rows >= 1 && input.rows <= 16 && input.rows == output.rows &&
         input.columns >= 32 && input.columns <= 65536 && input.columns % 32 == 0 &&
         output.columns >= 1 && output.columns <= 524288,
         "verify NAX dense BF16 geometry mismatch");
@@ -5543,7 +6087,7 @@ void MetalGraph::verify_nax_dense_bf16(GpuView matrix, GpuRowsF32 input, GpuRows
     const uint32_t rows_per_tg = use_r4 ? 32u : 8u;
     p.select(kname, uint32_t(-1), {input.columns, output.columns, input.rows, 30u}, 256);
     p.bind(matrix, 0); p.bind(input.view, 1); p.bind(output.view, 2, true); p.parameter(args, 3);
-    p.dispatch(true, MTLSizeMake((output.columns + rows_per_tg - 1u) / rows_per_tg, 1, 1), MTLSizeMake(256, 1, 1));
+    p.dispatch(true, MTLSizeMake((output.columns + rows_per_tg - 1u) / rows_per_tg, (input.rows + 7u) / 8u, 1), MTLSizeMake(256, 1, 1));
 }
 void MetalGraph::verify_nax_gate_up_swiglu_q8(GpuView gate_matrix, GpuView up_matrix, GpuRowsF32 input, GpuRowsF32 output) {
     verify_nax_dense_q8_swiglu(gate_matrix, up_matrix, input, output);
@@ -5553,7 +6097,7 @@ void MetalGraph::verify_nax_dense_q8_swiglu(GpuView gate_matrix, GpuView up_matr
     const bool allowed = (p.verify_nax && p.verify_nax_prepared && p.verify_nax_scope) || (p.dflash2_prepared && p.dflash2_scope);
     require(allowed && !p.recording && !p.compatible_pipelines,
         "verify NAX dense SwiGLU requires prepared active verify scope and direct batches");
-    require(input.rows >= 1 && input.rows <= 8 && input.rows == output.rows &&
+    require(input.rows >= 1 && input.rows <= 16 && input.rows == output.rows &&
         input.columns >= 32 && input.columns <= 65536 && input.columns % 32 == 0 &&
         output.columns >= 1 && output.columns <= 524288,
         "verify NAX dense SwiGLU geometry mismatch");
@@ -5583,12 +6127,14 @@ void MetalGraph::verify_nax_dense_q8_swiglu(GpuView gate_matrix, GpuView up_matr
         const auto* ge = p.q8_tile64_entry(gate_matrix, input.columns, output.columns);
         const auto* ue = p.q8_tile64_entry(up_matrix, input.columns, output.columns);
         if (ge && ue) {
+            const uint32_t rows_cap = input.rows <= 8u ? 8u : 16u;
             const uint32_t splits = p.target_split(NaxSplitFamily::q8_t64, input.columns, output.columns, input.rows, 32u, true, (p.verify_nax_split_partials.bytes >= uint64_t(kVerifyNaxSplitSlots) * kVerifyNaxSplitSlotPartialsBytes
-                ? pick_nax_m8_q8_t64_splits(input.columns, output.columns, 32u, true)
+                ? pick_nax_m8_q8_t64_splits(input.columns, output.columns, 32u, true, rows_cap)
                 : 1u));
             const GroupedMmArgs args{input.columns, output.columns, row_bytes, 1u, splits, input.rows, 1u, 0u,
                 matrix_bytes, input.stride_bytes, output.stride_bytes};
-            p.select("nax_m8_dense_q8_swiglu_t64", uint32_t(-1), {input.columns, output.columns, input.rows, uint32_t(g_layout)}, 64);
+            const char* t64_k = input.rows <= 8u ? "nax_m8_dense_q8_swiglu_t64" : "nax_m16_dense_q8_swiglu_t64";
+            p.select(t64_k, uint32_t(-1), {input.columns, output.columns, input.rows, uint32_t(g_layout)}, 64);
             p.bind(ge->plane0, 0); p.bind(ge->meta, 1); p.bind(ue->plane0, 2); p.bind(ue->meta, 3);
             p.bind(input.view, 4); p.bind(output.view, 5, true); p.parameter(args, 6);
             if (splits > 1u) {
@@ -5605,7 +6151,7 @@ void MetalGraph::verify_nax_dense_q8_swiglu(GpuView gate_matrix, GpuView up_matr
             p.dispatch(true, MTLSizeMake((output.columns + 31u) / 32u, splits, 1), MTLSizeMake(64, 1, 1));
             return;
         }
-        const uint32_t splits = p.target_split(NaxSplitFamily::q8, input.columns, output.columns, input.rows, 4u, true, (p.verify_nax_split_partials.bytes >= uint64_t(kVerifyNaxSplitSlots) * kVerifyNaxSplitSlotPartialsBytes
+        const uint32_t splits = input.rows > 8u ? 1u : p.target_split(NaxSplitFamily::q8, input.columns, output.columns, input.rows, 4u, true, (p.verify_nax_split_partials.bytes >= uint64_t(kVerifyNaxSplitSlots) * kVerifyNaxSplitSlotPartialsBytes
             ? pick_nax_m8_q8_splits(input.columns, output.columns, 4u, true)
             : 1u));
         const GroupedMmArgs args{input.columns, output.columns, row_bytes, 1u, splits, input.rows, 1u, 0u,
@@ -5623,7 +6169,7 @@ void MetalGraph::verify_nax_dense_q8_swiglu(GpuView gate_matrix, GpuView up_matr
             p.bind(idle, 5, false);
             p.bind(idle, 6, false);
         }
-        p.dispatch(true, MTLSizeMake((output.columns + 3u) / 4u, splits, 1), MTLSizeMake(128, 1, 1));
+        p.dispatch(true, MTLSizeMake((output.columns + 3u) / 4u, splits, (input.rows + 7u) / 8u), MTLSizeMake(128, 1, 1));
         return;
     }
     const GroupedMmArgs args{input.columns, output.columns, row_bytes, 1u, 1u, input.rows, 1u, 0u,
@@ -5631,13 +6177,13 @@ void MetalGraph::verify_nax_dense_q8_swiglu(GpuView gate_matrix, GpuView up_matr
     const char* kname = input.rows <= 4u ? "nax_verify_dense_q8_swiglu_m4" : "nax_verify_dense_q8_swiglu_m8";
     p.select(kname, 8, {input.columns, output.columns, input.rows, uint32_t(g_layout)}, 128, uint32_t(g_layout));
     p.bind(gate_matrix, 0); p.bind(up_matrix, 1); p.bind(input.view, 2); p.bind(output.view, 3, true); p.parameter(args, 4);
-    p.dispatch(true, MTLSizeMake((output.columns + 3u) / 4u, 1, 1), MTLSizeMake(128, 1, 1));
+    p.dispatch(true, MTLSizeMake((output.columns + 3u) / 4u, (input.rows + 7u) / 8u, 1), MTLSizeMake(128, 1, 1));
 }
 void MetalGraph::verify_nax_bf16(GpuView matrix, GpuRowsF32 input, GpuRowsF32 output) {
     auto& p = *impl_; p.active();
     require(p.verify_nax && p.verify_nax_prepared && p.verify_nax_scope && !p.recording && !p.compatible_pipelines,
         "verify NAX BF16 requires prepared active verify scope and direct batches");
-    require(input.rows >= 1 && input.rows <= 8 && input.rows == output.rows &&
+    require(input.rows >= 1 && input.rows <= 16 && input.rows == output.rows &&
         input.columns >= 32 && input.columns <= 65536 && input.columns % 32 == 0 &&
         output.columns >= 1 && output.columns <= 524288,
         "verify NAX BF16 geometry mismatch");
@@ -5657,7 +6203,7 @@ void MetalGraph::verify_nax_bf16(GpuView matrix, GpuRowsF32 input, GpuRowsF32 ou
     p.prefill_weight(matrix, PrefillWeightLayout::gguf, 30, input.columns, output.columns, 1);
     separate(output.view, {matrix, input.view});
     if (p.verify_nax_m8) {
-        const uint32_t splits = p.target_split(NaxSplitFamily::bf16, input.columns, output.columns, input.rows, 32u, false, (p.verify_nax_split_partials.bytes >= uint64_t(kVerifyNaxSplitSlots) * kVerifyNaxSplitSlotPartialsBytes
+        const uint32_t splits = input.rows > 8u ? 1u : p.target_split(NaxSplitFamily::bf16, input.columns, output.columns, input.rows, 32u, false, (p.verify_nax_split_partials.bytes >= uint64_t(kVerifyNaxSplitSlots) * kVerifyNaxSplitSlotPartialsBytes
             ? pick_nax_m8_bf16_splits(input.columns, output.columns)
             : 1u));
         const GroupedMmArgs args{input.columns, output.columns, row_bytes, 1u, splits, input.rows, 1u, 0u,
@@ -5675,7 +6221,7 @@ void MetalGraph::verify_nax_bf16(GpuView matrix, GpuRowsF32 input, GpuRowsF32 ou
             p.bind(idle, 4, false);
             p.bind(idle, 5, false);
         }
-        p.dispatch(true, MTLSizeMake((output.columns + 31u) / 32u, splits, 1), MTLSizeMake(128, 1, 1));
+        p.dispatch(true, MTLSizeMake((output.columns + 31u) / 32u, splits, (input.rows + 7u) / 8u), MTLSizeMake(128, 1, 1));
         return;
     }
     const GroupedMmArgs args{input.columns, output.columns, row_bytes, 1u, 1u, input.rows, 1u, 0u,
@@ -5684,14 +6230,14 @@ void MetalGraph::verify_nax_bf16(GpuView matrix, GpuRowsF32 input, GpuRowsF32 ou
     const uint32_t rows_per_tg = output.columns <= 512u ? 4u : 8u;
     p.select("nax_verify_bf16_m8", uint32_t(-1), {input.columns, output.columns, input.rows, 0}, 128);
     p.bind(matrix, 0); p.bind(input.view, 1); p.bind(output.view, 2, true); p.parameter(args, 3);
-    p.dispatch(true, MTLSizeMake((output.columns + rows_per_tg - 1u) / rows_per_tg, 1, 1), MTLSizeMake(threads_per_tg, 1, 1));
+    p.dispatch(true, MTLSizeMake((output.columns + rows_per_tg - 1u) / rows_per_tg, (input.rows + 7u) / 8u, 1), MTLSizeMake(threads_per_tg, 1, 1));
 }
 void MetalGraph::verify_nax_gdn_gates_f32(GpuView alpha_w, GpuView beta_w, GpuView input,
     GpuView alpha_out, GpuView beta_out, uint32_t columns, uint32_t heads, uint32_t steps) {
     auto& p = *impl_; p.active();
     require(p.verify_nax && p.verify_nax_prepared && p.verify_nax_scope && !p.recording && !p.compatible_pipelines,
         "verify NAX GDN gates require prepared active verify scope and direct batches");
-    require(columns >= 32 && columns <= 65536 && columns % 4 == 0 && heads >= 1 && heads <= 512 && steps >= 1 && steps <= 8,
+    require(columns >= 32 && columns <= 65536 && columns % 4 == 0 && heads >= 1 && heads <= 512 && steps >= 1 && steps <= 16,
         "verify NAX GDN gates geometry mismatch");
     require(p.floats64(alpha_w) == uint64_t(columns) * heads && p.floats64(beta_w) == uint64_t(columns) * heads &&
         p.floats64(input) == uint64_t(steps) * columns &&
@@ -5702,14 +6248,14 @@ void MetalGraph::verify_nax_gdn_gates_f32(GpuView alpha_w, GpuView beta_w, GpuVi
     p.select("nax_verify_gdn_gates_f32", uint32_t(-1), {columns, heads, steps, 0});
     p.bind(alpha_w, 0); p.bind(beta_w, 1); p.bind(input, 2); p.bind(alpha_out, 3, true); p.bind(beta_out, 4, true);
     p.parameter(std::array<uint32_t, 4>{columns, heads, steps, 0}, 5);
-    p.groups(MTLSizeMake(heads * 2u, 1, 1));
+    p.groups(MTLSizeMake(heads * 2u, (steps + 7u) / 8u, 1));
 }
 void MetalGraph::verify_nax_gated_mix_rows(GpuView normalized, GpuView scores, GpuView output,
     uint32_t branches, uint32_t channels, uint32_t steps) {
     auto& p = *impl_; p.active();
     require(p.verify_nax && p.verify_nax_prepared && p.verify_nax_scope && !p.recording && !p.compatible_pipelines,
         "verify NAX gated mix rows require prepared active verify scope and direct batches");
-    require(branches >= 1 && branches <= 64 && channels >= 1 && channels <= 65536 && steps >= 1 && steps <= 8,
+    require(branches >= 1 && branches <= 64 && channels >= 1 && channels <= 65536 && steps >= 1 && steps <= 16,
         "verify NAX gated mix rows geometry mismatch");
     const uint64_t width = uint64_t(branches) * channels;
     require(p.floats64(normalized) == uint64_t(steps) * width && p.floats64(scores) == uint64_t(steps) * width &&
@@ -6197,6 +6743,7 @@ void MetalGraph::prefill_route_batch(GpuView logits, GpuView indices, GpuView we
     validate_disjoint(std::array{logits}, std::array{indices, weights});
     p.select("graph_route_batch", uint32_t(-1), {experts, selected, tokens, uint32_t(mode)}, 32);
     p.bind(logits, 0); p.bind(indices, 1, true); p.bind(weights, 2, true);
+    p.record_verified_routes(indices, experts);
     p.parameter(std::array<uint32_t, 4>{experts, selected, uint32_t(mode), normalise}, 3);
     p.parameter(tokens, 4);
     p.dispatch(true, MTLSizeMake(1, tokens, 1), MTLSizeMake(32, 1, 1));
@@ -6361,7 +6908,7 @@ void MetalGraph::reset_prefill_top10_mixture_telemetry() {
 void MetalGraph::record_verify_nax_moe_ops(uint32_t rows, bool top10, bool batched) {
     auto& p = *impl_; p.thread_check();
     require(p.verify_nax && p.verify_nax_prepared && p.verify_nax_scope &&
-        !p.mtp_priming_scope && !p.dflash2_scope && rows >= 2 && rows <= 8,
+        !p.mtp_priming_scope && !p.dflash2_scope && rows >= 2 && rows <= 16,
         "verify NAX top10/mixture accounting requires isolated verification scope");
     auto& t = p.verify_nax_top10_mixture_telemetry;
     auto& calls = top10 ? t.top10_batched_calls : t.mixture_batched_calls;
@@ -6656,7 +7203,7 @@ void MetalGraph::dense_mm_q8(PrefillWeightLayout layout, GpuView matrix, GpuRows
     }
     p.select(plan.kernel, 8, {input.columns, output.columns, input.rows, uint32_t(layout)}, 128, uint32_t(layout));
     p.bind(matrix, 0); p.bind(input.view, 1); p.bind(output.view, 2, true); p.parameter(plan.args, 3);
-    [p.encoder setThreadgroupMemoryLength:plan.threadgroup_bytes atIndex:0];
+    p.threadgroup_memory(plan.threadgroup_bytes, 0);
     p.groups(MTLSizeMake(plan.grid_x, plan.grid_y, 1));
 }
 void MetalGraph::nax_dense_bf16(GpuView matrix, GpuRowsF32 input, GpuRowsF32 output, bool reuse_bf16) {
@@ -6850,7 +7397,7 @@ void MetalGraph::dense_mm_q8_multiseg2(PrefillWeightLayout l0, GpuView w0, Prefi
     p.select(use_m64 ? "graph_dense_q8_multiseg2_f32_m64" : "graph_dense_q8_multiseg2_f32",
         uint32_t(-1), {input.columns, out0.columns + out1.columns, batches, 2u});
     p.bind(w0s, 0); p.bind(w1s, 1); p.bind(ins, 2); p.bind(o0s, 3, true); p.bind(o1s, 4, true); p.parameter(args, 5);
-    [p.encoder setThreadgroupMemoryLength:(use_m64 ? 16384 : 12288) atIndex:0];
+    p.threadgroup_memory((use_m64 ? 16384 : 12288), 0);
     p.groups(MTLSizeMake(t0 + t1, use_m64 ? (batches + 63) / 64 : (batches + 31) / 32, 1));
     ++p.prefill_multiseg_pending;
     if (use_m64) ++p.prefill_m64_pending;
@@ -6909,7 +7456,7 @@ void MetalGraph::dense_mm_q8_multiseg3(PrefillWeightLayout l0, GpuView w0, Prefi
         uint32_t(-1), {input.columns, out0.columns + out1.columns + out2.columns, batches, 3u});
     p.bind(w0s, 0); p.bind(w1s, 1); p.bind(w2s, 2); p.bind(ins, 3);
     p.bind(o0s, 4, true); p.bind(o1s, 5, true); p.bind(o2s, 6, true); p.parameter(args, 8);
-    [p.encoder setThreadgroupMemoryLength:(use_m64 ? 16384 : 12288) atIndex:0];
+    p.threadgroup_memory((use_m64 ? 16384 : 12288), 0);
     p.groups(MTLSizeMake(t0 + t1 + t2, use_m64 ? (batches + 63) / 64 : (batches + 31) / 32, 1));
     ++p.prefill_multiseg_pending;
     if (use_m64) ++p.prefill_m64_pending;
@@ -7419,7 +7966,7 @@ void MetalGraph::nax_qsa_attention(GpuView query, GpuView bf16_keys, GpuView bf1
     const bool allow_verify = p.verify_nax_prepared && p.verify_nax_scope && verify_nax_qsa_attention_supported(shape);
     require(!p.recording && !p.compatible_pipelines && p.qsa_prefill_prepared && (allow_prefill || allow_verify),
         "NAX QSA attention requires prepared NAX QSA prefill or verify scope and direct batches");
-    const uint32_t max_rows = allow_prefill ? 2048u : 8u;
+    const uint32_t max_rows = allow_prefill ? 2048u : 16u;
     require(rows && rows <= max_rows && base < shape.capacity && rows <= shape.capacity - base &&
         block_budget == shape.token_budget / 4, "NAX QSA attention row/budget geometry");
     const uint32_t q_width = shape.query_heads * 256u;
@@ -7581,7 +8128,7 @@ void MetalGraph::dense_q8_staged(GpuView matrix, GpuView input, GpuView output, 
         // This explicit comparison dispatch bypasses the ordinary raw-tight serial shortcut and the FP32 selector.
         p.select("graph_dense_mm_q8", 8, {columns, rows, batches, 0}, 128, uint32_t(PrefillWeightLayout::gguf));
         p.bind(matrix, 0); p.bind(input, 1); p.bind(output, 2, true); p.parameter(plan.args, 3);
-        [p.encoder setThreadgroupMemoryLength:8192 atIndex:0];
+        p.threadgroup_memory(8192, 0);
         p.groups(MTLSizeMake((rows + 63) / 64, (batches + 31) / 32, 1));
     } else {
         const bool use_m64 = prefill_m64_active(batches);
@@ -7591,7 +8138,7 @@ void MetalGraph::dense_q8_staged(GpuView matrix, GpuView input, GpuView output, 
         p.parameter(std::array<uint32_t, 4>{columns, rows, columns / 32 * 34, batches}, 3);
         const uint32_t layout_val = ((layout == PrefillWeightLayout::q8_lanes_v1) ? 1u : 0u) | (p.prefill_swizzle ? 2u : 0u);
         p.parameter(layout_val, 4);
-        [p.encoder setThreadgroupMemoryLength:(use_m64 ? 16384 : 12288) atIndex:0];
+        p.threadgroup_memory((use_m64 ? 16384 : 12288), 0);
         p.groups(MTLSizeMake((rows + 63) / 64, use_m64 ? (batches + 63) / 64 : (batches + 31) / 32, 1));
         if (use_m64) ++p.prefill_m64_pending;
     }
@@ -7890,6 +8437,7 @@ void MetalGraph::moe_three_route(GpuView logits, GpuView indices, GpuView weight
     separate(indices, {logits, weights}); separate(weights, {logits});
     p.select("moe_three_route", uint32_t(-1), {experts, selected, 3, 0});
     p.bind(logits, 0); p.bind(indices, 1, true); p.bind(weights, 2, true);
+    p.record_verified_routes(indices, experts);
     p.parameter(std::array<uint32_t, 4>{experts, selected, uint32_t(mode), uint32_t(normalize_selected)}, 3);
     p.groups(MTLSizeMake(3, 1, 1));
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
@@ -8269,6 +8817,7 @@ void MetalGraph::route(GpuView logits, GpuView indices, GpuView weights, uint32_
             p.floats(indices, true) == selected && p.floats(weights, true) == selected, "graph router shape/mode mismatch");
     separate(indices, {logits, weights}); separate(weights, {logits});
     p.select("graph_route"); p.bind(logits, 0); p.bind(indices, 1, true); p.bind(weights, 2, true);
+    p.record_verified_routes(indices, uint32_t(experts));
     p.parameter(std::array<uint32_t, 4>{experts, selected, uint32_t(mode), normalize_selected}, 3);
     p.groups(MTLSizeMake(1, 1, 1));
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
@@ -8414,7 +8963,7 @@ void MetalGraph::gdn_silu_prepare_verify_rows(GpuView input, GpuView query, GpuV
     GpuView value, GdnShape shape, GdnPolicy policy, StateTile tile) {
     auto& p = *impl_; p.active();
     validate_gdn_shape(shape); validate_gdn_policy(policy); validate_state_tile(tile);
-    require(tile.steps >= 2 && tile.steps <= 8, "GDN SiLU preparation verify row count mismatch");
+    require(tile.steps >= 2 && tile.steps <= 16, "GDN SiLU preparation verify row count mismatch");
     const auto raw = gdn_qkv_count(shape);
     require(p.floats(input) == uint64_t(tile.capacity) * raw &&
         p.floats(query, true) == uint64_t(tile.capacity) * shape.value_heads * shape.key_width &&
@@ -8433,7 +8982,7 @@ void MetalGraph::gdn_silu_prepare_verify_rows(GpuView input, GpuView query, GpuV
 void MetalGraph::gdn_gates_verify_rows(GpuView alpha, GpuView beta_logits, GpuView rates,
     GpuView bias, GpuView decay, GpuView beta, uint32_t heads, StateTile tile) {
     auto& p = *impl_; p.active(); validate_state_tile(tile);
-    require(tile.steps >= 2 && tile.steps <= 8 && heads && heads <= 64,
+    require(tile.steps >= 2 && tile.steps <= 16 && heads && heads <= 64,
         "GDN gates verify row/head count mismatch");
     const auto count = uint64_t(tile.capacity) * heads;
     require(p.floats(alpha) == count && p.floats(beta_logits) == count &&
@@ -8759,6 +9308,7 @@ void MetalGraph::sparse_attention_stage_v8(GpuView query, GpuView keys, GpuView 
         "QSA score staging requires two available profiling slots");
     const std::array<uint32_t, 4> shape{s.query_heads, s.kv_heads, s.head_width, s.compression};
     const std::array<uint32_t, 4> plan{prefix, qsa_block_budget(s), 0, 0};
+    Impl::QsaStageErrorScope qsa_error_scope(p);
     p.select("qsa_score_stage", uint32_t(-1), {prefix, b.attended_tokens, s.query_heads, s.head_width});
     p.bind(query, 0); p.bind(keys, 1); p.bind(ids, 2); p.bind(scores, 3, true); p.parameter(shape, 5); p.parameter(plan, 6);
     p.groups(MTLSizeMake((b.attended_tokens + 3) / 4, s.query_heads, 1));
@@ -8861,6 +9411,7 @@ void MetalGraph::sparse_attention_rows_chronological(GpuView queries, GpuView ke
         p.qsa_rows_pending[i] <= UINT64_MAX - delta[i] - p.qsa_rows_completed[i], "QSA row route counter overflow");
     const std::array<uint32_t, 4> geometry{shape.query_heads, shape.kv_heads, shape.head_width, shape.compression};
     const std::array<uint32_t, 4> tile{base, qsa_block_budget(shape), rows, qsa_verify_rows_stride};
+    Impl::QsaStageErrorScope qsa_error_scope(p);
     p.select("qsa_verify_rows_score", uint32_t(-1), {base, rows, plan.maximum_attended, shape.head_width});
     p.bind(queries, 0); p.bind(keys, 1); p.bind(ids, 2); p.bind(scores, 3, true); p.parameter(geometry, 5); p.parameter(tile, 6);
     p.groups(MTLSizeMake((plan.maximum_attended + 3) / 4, shape.query_heads, rows));
@@ -8931,14 +9482,17 @@ void MetalGraph::sparse_attention_rows_bn(GpuView queries, GpuView keys, GpuView
 void MetalGraph::prepare_dflash2() {
     auto& p = *impl_; p.idle();
     require([p.device supportsFamily:MTLGPUFamilyMetal4], "DFlash2 requires Metal 4 support");
-    for (const auto& [name, threads] : std::array<std::pair<const char*, uint32_t>, 11>{{
+    for (const auto& [name, threads] : std::array<std::pair<const char*, uint32_t>, 14>{{
         {"dflash2_stream_mean", 256},
         {"dflash2_context_kv_write", 128},
         {"dflash2_conv_f32", 256},
         {"dflash2_conv_finish_rms_f32", 128},
         {"dflash2_qkv_prepare", 128},
+        {"dflash2_qkv_prepare_16", 128},
         {"dflash2_attention_split", 256},
         {"dflash2_attention_reduce", 256},
+        {"dflash2_attention_split_16", 256},
+        {"dflash2_attention_reduce_16", 256},
         {"dflash2_top16_sharded", 256},
         {"dflash2_dense_bf16_m8", 256},
         {"dflash2_dense_bf16_r4_m8", 256},
@@ -9021,8 +9575,12 @@ void MetalGraph::prepare_dflash2() {
     if (q8_tile64_cache_enabled) {
         const auto dflash_t64_m8 = p.pipeline("nax_m8_dense_q8_t64", uint32_t(-1), 64);
         const auto dflash_t64_sw = p.pipeline("nax_m8_dense_q8_swiglu_t64", uint32_t(-1), 64);
+        const auto dflash_t64_m16 = p.pipeline("nax_m16_dense_q8_t64", uint32_t(-1), 64);
+        const auto dflash_t64_sw16 = p.pipeline("nax_m16_dense_q8_swiglu_t64", uint32_t(-1), 64);
         require(dflash_t64_m8.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength &&
-            dflash_t64_sw.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength,
+            dflash_t64_sw.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength &&
+            dflash_t64_m16.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength &&
+            dflash_t64_sw16.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength,
             "DFlash2 Q8_tile64 threadgroup memory exceeds device capability");
         p.q8_tile64_ready = true;
         p.ensure_q8_tile64_all();
@@ -9092,7 +9650,7 @@ void MetalGraph::dflash2_conv_f32(GpuView input, GpuView dynamic, GpuView base, 
     static_assert(sizeof(DFlash2ConvArgs) == 16, "DFlash2 conv ABI");
     auto& p = *impl_; p.active();
     require(p.dflash2_prepared && !p.recording && !p.compatible_pipelines, "DFlash2 conv requires prepared direct startup");
-    require(rows == 8 && group_size == 16 && hidden >= 64 && hidden % group_size == 0, "DFlash2 conv shape mismatch");
+    require((rows == 8 || rows == 16) && group_size == 16 && hidden >= 64 && hidden % group_size == 0, "DFlash2 conv shape mismatch");
     const uint64_t hidden_bytes = uint64_t(rows) * hidden * 4ull;
     const uint64_t dyn_bytes = uint64_t(rows) * 4ull * (hidden / group_size) * 4ull;
     require(input.bytes >= hidden_bytes && output.bytes >= hidden_bytes && residual.bytes >= hidden_bytes &&
@@ -9115,21 +9673,21 @@ void MetalGraph::dflash2_qkv_prepare(GpuView proposal_qkv, GpuView qk_norm_freq,
     static_assert(sizeof(DFlash2QkvArgs) == 16, "DFlash2 QKV ABI");
     auto& p = *impl_; p.active();
     require(p.dflash2_prepared && !p.recording && !p.compatible_pipelines, "DFlash2 QKV prepare requires prepared direct startup");
-    require(rows == 8 && eps > 0.0f && proposal_qkv.bytes >= 8ull * 6144ull * 4ull &&
-        qk_norm_freq.bytes == 320ull * 4ull && queries.bytes == 32ull * 8ull * 128ull * 2ull &&
-        query_keys.bytes == 8ull * 8ull * 128ull * 2ull && query_values.bytes == 8ull * 128ull * 8ull * 2ull,
+    require((rows == 8 || rows == 16) && eps > 0.0f && proposal_qkv.bytes >= uint64_t(rows) * 6144ull * 4ull &&
+        qk_norm_freq.bytes == 320ull * 4ull && queries.bytes >= 32ull * uint64_t(rows) * 128ull * 2ull &&
+        query_keys.bytes >= 8ull * uint64_t(rows) * 128ull * 2ull && query_values.bytes >= 8ull * 128ull * uint64_t(rows) * 2ull,
         "DFlash2 QKV prepare geometry mismatch");
     validate_disjoint(std::array{proposal_qkv, qk_norm_freq}, std::array{queries, query_keys, query_values});
     const DFlash2QkvArgs args{cache_len, rows, eps, 0.0f};
-    const uint32_t groups = std::max<uint32_t>((8u * 1024u + 127u) / 128u, 8u * (32u + 8u));
-    p.select("dflash2_qkv_prepare", uint32_t(-1), {rows, cache_len, 32, 8}, 128);
+    const uint32_t groups = std::max<uint32_t>((rows * 1024u + 127u) / 128u, rows * (32u + 8u));
+    p.select(rows == 8 ? "dflash2_qkv_prepare" : "dflash2_qkv_prepare_16", uint32_t(-1), {rows, cache_len, 32, 8}, 128);
     p.bind(proposal_qkv, 0); p.bind(qk_norm_freq, 1); p.bind(queries, 2, true); p.bind(query_keys, 3, true); p.bind(query_values, 4, true);
     p.parameter(args, 5);
     p.dispatch(true, MTLSizeMake(groups, 1, 1), MTLSizeMake(128, 1, 1));
 }
 
 void MetalGraph::dflash2_attention(GpuView queries, GpuView ring_k, GpuView ring_v, GpuView query_keys,
-    GpuView query_values, GpuView partials, GpuView output, uint32_t cache_len, uint32_t window) {
+    GpuView query_values, GpuView partials, GpuView output, uint32_t cache_len, uint32_t window, uint32_t rows) {
     struct DFlash2AttnArgs {
         uint32_t cache_len, window, splits, reserved;
     };
@@ -9137,22 +9695,33 @@ void MetalGraph::dflash2_attention(GpuView queries, GpuView ring_k, GpuView ring
     auto& p = *impl_; p.active();
     require(p.dflash2_prepared && !p.recording && !p.compatible_pipelines, "DFlash2 attention requires prepared direct startup");
     constexpr uint64_t ring_bytes = 8ull * 2048ull * 128ull * 2ull;
-    constexpr uint64_t partial_bytes = 8ull * 16ull * (32ull * 128ull + 64ull) * 4ull;
-    require(window == 2048 && queries.bytes == 32ull * 8ull * 128ull * 2ull &&
+    const uint64_t partial_bytes = uint64_t(rows) * 16ull * (32ull * 128ull + 64ull) * 4ull;
+    require((rows == 8 || rows == 16) && window == 2048 && queries.bytes >= 32ull * uint64_t(rows) * 128ull * 2ull &&
         ring_k.bytes == ring_bytes && ring_v.bytes == ring_bytes &&
-        query_keys.bytes == 8ull * 8ull * 128ull * 2ull && query_values.bytes == 8ull * 128ull * 8ull * 2ull &&
-        partials.bytes >= partial_bytes && output.bytes >= 8ull * 4096ull * 4ull,
+        query_keys.bytes >= 8ull * uint64_t(rows) * 128ull * 2ull && query_values.bytes >= 8ull * 128ull * uint64_t(rows) * 2ull &&
+        partials.bytes >= partial_bytes && output.bytes >= uint64_t(rows) * 4096ull * 4ull,
         "DFlash2 attention geometry mismatch");
     validate_disjoint(std::array{queries, ring_k, ring_v, query_keys, query_values}, std::array{partials, output});
-    const DFlash2AttnArgs args{cache_len, window, 16u, 0u};
-    p.select("dflash2_attention_split", uint32_t(-1), {cache_len, window, 8, 16}, 256);
-    p.bind(queries, 0); p.bind(ring_k, 1); p.bind(ring_v, 2); p.bind(query_keys, 3); p.bind(query_values, 4);
-    p.bind(partials, 5, true); p.parameter(args, 6);
-    p.dispatch(true, MTLSizeMake(8, 1, 16), MTLSizeMake(256, 1, 1));
+    const DFlash2AttnArgs args{cache_len, window, 16u, rows};
+    if (rows == 8) {
+        p.select("dflash2_attention_split", uint32_t(-1), {cache_len, window, 8, 16}, 256);
+        p.bind(queries, 0); p.bind(ring_k, 1); p.bind(ring_v, 2); p.bind(query_keys, 3); p.bind(query_values, 4);
+        p.bind(partials, 5, true); p.parameter(args, 6);
+        p.dispatch(true, MTLSizeMake(8, 1, 16), MTLSizeMake(256, 1, 1));
 
-    p.select("dflash2_attention_reduce", uint32_t(-1), {cache_len, window, 8, 32}, 256);
-    p.bind(partials, 0); p.bind(output, 1, true); p.parameter(args, 2);
-    p.dispatch(true, MTLSizeMake(8, 1, 1), MTLSizeMake(256, 1, 1));
+        p.select("dflash2_attention_reduce", uint32_t(-1), {cache_len, window, 8, 32}, 256);
+        p.bind(partials, 0); p.bind(output, 1, true); p.parameter(args, 2);
+        p.dispatch(true, MTLSizeMake(8, 1, 1), MTLSizeMake(256, 1, 1));
+    } else {
+        p.select("dflash2_attention_split_16", uint32_t(-1), {cache_len, window, 16, 16}, 256);
+        p.bind(queries, 0); p.bind(ring_k, 1); p.bind(ring_v, 2); p.bind(query_keys, 3); p.bind(query_values, 4);
+        p.bind(partials, 5, true); p.parameter(args, 6);
+        p.dispatch(true, MTLSizeMake(8, 2, 16), MTLSizeMake(256, 1, 1));
+
+        p.select("dflash2_attention_reduce_16", uint32_t(-1), {cache_len, window, 16, 32}, 256);
+        p.bind(partials, 0); p.bind(output, 1, true); p.parameter(args, 2);
+        p.dispatch(true, MTLSizeMake(16, 1, 1), MTLSizeMake(256, 1, 1));
+    }
 }
 
 void MetalGraph::dflash2_select(GpuView logits, GpuView partial_ids, GpuView partial_values, GpuView selector_out,
@@ -9165,13 +9734,14 @@ void MetalGraph::dflash2_select(GpuView logits, GpuView partial_ids, GpuView par
     auto& p = *impl_; p.active();
     require(p.dflash2_prepared && !p.recording && !p.compatible_pipelines, "DFlash2 selector requires prepared direct startup");
     const uint32_t cb_vocab = codebook_vocabulary ? codebook_vocabulary : vocabulary;
-    require(positions >= 1 && positions <= 7 && vocabulary >= 16 && cb_vocab >= vocabulary && anchor < cb_vocab,
+    require(positions >= 1 && positions <= 15 && vocabulary >= 16 && cb_vocab >= vocabulary && anchor < cb_vocab,
         "DFlash2 selector bounds mismatch");
     const uint64_t cb_bytes = uint64_t(cb_vocab) * 256ull * 2ull;
+    const uint64_t max_pos = positions <= 7u ? 7ull : 15ull;
     require(logits.bytes >= uint64_t(positions) * vocabulary * 4ull &&
         partial_ids.bytes >= uint64_t(positions) * 8ull * 16ull * 4ull &&
         partial_values.bytes >= uint64_t(positions) * 8ull * 16ull * 4ull &&
-        selector_out.bytes >= 7ull * 16ull * 8ull + 7ull * 256ull * 4ull &&
+        selector_out.bytes >= max_pos * 16ull * 8ull + max_pos * 256ull * 4ull &&
         selector_hidden.bytes >= uint64_t(positions) * 256ull * 4ull &&
         predecessor_codebook.bytes == cb_bytes && successor_codebook.bytes == cb_bytes,
         "DFlash2 selector buffer span mismatch");
@@ -9244,7 +9814,7 @@ void MetalGraph::dflash2_gate_up_swiglu(GpuView gate_matrix, GpuView up_matrix, 
     auto& p = *impl_; p.active();
     require(p.dflash2_prepared && p.dflash2_scope && !p.recording && !p.compatible_pipelines,
         "DFlash2 fused gate+up+SwiGLU requires prepared direct DFlash2 scope");
-    require(input.rows >= 1 && input.rows <= 8 && input.rows == output.rows &&
+    require(input.rows >= 1 && input.rows <= 16 && input.rows == output.rows &&
         input.columns >= 32 && input.columns <= 65536 && input.columns % 32 == 0 &&
         output.columns >= 1 && output.columns <= 524288,
         "DFlash2 fused gate+up+SwiGLU shape bounds mismatch");
@@ -9273,7 +9843,7 @@ void MetalGraph::dflash2_gate_up_swiglu(GpuView gate_matrix, GpuView up_matrix, 
         };
         p.select("dflash2_gate_up_swiglu_bf16_m8", uint32_t(-1), {input.columns, output.columns, input.rows, 1u}, 256);
         p.bind(gate_matrix, 0); p.bind(up_matrix, 1); p.bind(input.view, 2); p.bind(output.view, 3, true); p.parameter(args, 4);
-        p.dispatch(true, MTLSizeMake((output.columns + 15u) / 16u, 1, 1), MTLSizeMake(256, 1, 1));
+        p.dispatch(true, MTLSizeMake((output.columns + 15u) / 16u, (input.rows + 7u) / 8u, 1), MTLSizeMake(256, 1, 1));
     } else {
         const auto g_layout = prefill_weight_layout(gate_matrix);
         const auto u_layout = prefill_weight_layout(up_matrix);
@@ -9291,14 +9861,16 @@ void MetalGraph::dflash2_gate_up_swiglu(GpuView gate_matrix, GpuView up_matrix, 
             const auto* ge = p.q8_tile64_entry(gate_matrix, input.columns, output.columns);
             const auto* ue = p.q8_tile64_entry(up_matrix, input.columns, output.columns);
             if (ge && ue) {
+                const uint32_t rows_cap = input.rows <= 8u ? 8u : 16u;
                 const uint32_t splits = p.verify_nax_split_partials.bytes >= uint64_t(kVerifyNaxSplitSlots) * kVerifyNaxSplitSlotPartialsBytes
-                    ? pick_nax_m8_q8_t64_splits(input.columns, output.columns, 32u, true)
+                    ? pick_nax_m8_q8_t64_splits(input.columns, output.columns, 32u, true, rows_cap)
                     : 1u;
                 const GroupedMmArgs args{
                     input.columns, output.columns, row_bytes, 1u, splits, input.rows, 1u, 0u,
                     matrix_bytes, input.stride_bytes, output.stride_bytes
                 };
-                p.select("nax_m8_dense_q8_swiglu_t64", uint32_t(-1), {input.columns, output.columns, input.rows, uint32_t(g_layout)}, 64);
+                const char* t64_k = input.rows <= 8u ? "nax_m8_dense_q8_swiglu_t64" : "nax_m16_dense_q8_swiglu_t64";
+                p.select(t64_k, uint32_t(-1), {input.columns, output.columns, input.rows, uint32_t(g_layout)}, 64);
                 p.bind(ge->plane0, 0); p.bind(ge->meta, 1); p.bind(ue->plane0, 2); p.bind(ue->meta, 3);
                 p.bind(input.view, 4); p.bind(output.view, 5, true); p.parameter(args, 6);
                 if (splits > 1u) {
@@ -9316,9 +9888,9 @@ void MetalGraph::dflash2_gate_up_swiglu(GpuView gate_matrix, GpuView up_matrix, 
                 return;
             }
         }
-        const uint32_t splits = p.verify_nax_split_partials.bytes >= uint64_t(kVerifyNaxSplitSlots) * kVerifyNaxSplitSlotPartialsBytes
+        const uint32_t splits = input.rows > 8u ? 1u : (p.verify_nax_split_partials.bytes >= uint64_t(kVerifyNaxSplitSlots) * kVerifyNaxSplitSlotPartialsBytes
             ? pick_nax_m8_q8_splits(input.columns, output.columns, 4u, true)
-            : 1u;
+            : 1u);
         const GroupedMmArgs args{
             input.columns, output.columns, row_bytes, 1u, splits, input.rows, 1u, 0u,
             matrix_bytes, input.stride_bytes, output.stride_bytes
@@ -9336,7 +9908,7 @@ void MetalGraph::dflash2_gate_up_swiglu(GpuView gate_matrix, GpuView up_matrix, 
             p.bind(idle, 5, false);
             p.bind(idle, 6, false);
         }
-        p.dispatch(true, MTLSizeMake((output.columns + 3u) / 4u, splits, 1), MTLSizeMake(128, 1, 1));
+        p.dispatch(true, MTLSizeMake((output.columns + 3u) / 4u, splits, (input.rows + 7u) / 8u), MTLSizeMake(128, 1, 1));
     }
 }
 
@@ -9349,7 +9921,7 @@ void MetalGraph::dflash2_conv_finish_rms_f32(GpuView input, GpuView dynamic, Gpu
     static_assert(sizeof(DFlash2ConvRmsArgs) == 16, "DFlash2 conv+RMS ABI");
     auto& p = *impl_; p.active();
     require(p.dflash2_prepared && !p.recording && !p.compatible_pipelines, "DFlash2 conv+RMS requires prepared direct startup");
-    require(rows == 8 && group_size == 16 && hidden == 2560 && std::isfinite(eps) && eps > 0.0f, "DFlash2 conv+RMS shape mismatch");
+    require((rows == 8 || rows == 16) && group_size == 16 && hidden == 2560 && std::isfinite(eps) && eps > 0.0f, "DFlash2 conv+RMS shape mismatch");
     const uint64_t hidden_bytes = uint64_t(rows) * hidden * 4ull;
     const uint64_t dyn_bytes = uint64_t(rows) * 4ull * (hidden / group_size) * 4ull;
     require(input.bytes >= hidden_bytes && residual.bytes >= hidden_bytes &&
@@ -9395,7 +9967,38 @@ void MetalGraph::register_planar_matrix(GpuView matrix, PlanarMatrixShape shape)
         require(shape.source_type == 8, "q8_planar_v3 requires source_type 8");
     }
     const auto spec = planar_v3::make_expert_spec(shape.source_type, shape.columns, shape.rows);
+    require(planar_v3::discharge_planar_tiling_invariants(shape.source_type, shape.columns, shape.rows, shape.experts),
+        "planar v3 tiling invariant discharge failed");
     require(matrix.bytes == checked_mul(spec.planar_expert_bytes, shape.experts), "planar v3 matrix byte span mismatch");
+    bool certified = false;
+    if (storage.source && storage.source_shard == 0 && !storage.source->shards().empty()) {
+        const uint64_t abs_offset = checked_add(storage.source_file_offset, matrix.offset);
+        const uint64_t data_offset = storage.source->shards()[0].data_offset();
+        if (abs_offset >= data_offset) {
+            const planar_v3::CertifiedPlanarTensor query{
+                abs_offset - data_offset,
+                matrix.bytes,
+                shape.source_type,
+                shape.kind,
+                shape.columns,
+                shape.rows,
+                shape.experts,
+            };
+            const auto status = planar_v3::lookup_certified_planar_tensor(storage.source, query);
+            if (status == planar_v3::CertifiedTensorLookup::exact_match) {
+                certified = true;
+            } else if (status == planar_v3::CertifiedTensorLookup::mismatched_overlap) {
+                throw FormatError("planar v3 matrix shape, kind, or span mismatches certified pack v3 tensor");
+            }
+        }
+    }
+    if (!certified) {
+        require(storage.buffer.storageMode == MTLStorageModeShared && storage.buffer.contents != nullptr,
+            "uncertified planar v3 matrices require CPU-accessible shared storage for static dm certification");
+        const auto bytes = std::span<const std::byte>(
+            static_cast<const std::byte*>(storage.buffer.contents) + matrix.offset, matrix.bytes);
+        planar_v3::certify_planar_matrix_bytes(spec, shape.experts, bytes);
+    }
     for (const auto& [key, previous] : p.planar_matrices) {
         static_cast<void>(previous);
         const auto [slot, offset, bytes] = key;
@@ -9425,18 +10028,20 @@ void MetalGraph::prepare_planar_moe_v3(uint32_t gate_up_encoding, uint32_t down_
             (down_encoding == 7 || down_encoding == 8),
             "unsupported planar v3 encoding pair");
     static_cast<void>(p.pipeline("planar_moe_build_union_m8", uint32_t(-1), 32));
-    for (const auto* gu_k : {"planar_moe_gate_up_swiglu_m1", "planar_moe_gate_up_swiglu_m4", "planar_moe_gate_up_swiglu_m8"}) {
+    static_cast<void>(p.pipeline("planar_moe_build_union_m16", uint32_t(-1), 32));
+    for (const auto* gu_k : {"planar_moe_gate_up_swiglu_m1", "planar_moe_gate_up_swiglu_m4", "planar_moe_gate_up_swiglu_m8", "planar_moe_gate_up_swiglu_m16"}) {
         const auto pipe = p.pipeline(gu_k, gate_up_encoding, 128);
         require(pipe.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength,
             "planar v3 gate/up threadgroup memory exceeds device capability");
     }
-    for (const auto* dn_k : {"planar_moe_down_m1", "planar_moe_down_m4", "planar_moe_down_m8"}) {
+    for (const auto* dn_k : {"planar_moe_down_m1", "planar_moe_down_m4", "planar_moe_down_m8", "planar_moe_down_m16"}) {
         const auto pipe = p.pipeline(dn_k, down_encoding, 128);
         require(pipe.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength,
             "planar v3 down threadgroup memory exceeds device capability");
     }
-    if (!p.planar_union_meta.owner) {
-        p.planar_union_meta = zeros(9280, "planar v3 m8 union metadata");
+    if (p.planar_union_meta.bytes < 20480ull) {
+        if (p.planar_union_meta.owner) release(p.planar_union_meta);
+        p.planar_union_meta = zeros(20480, "planar v3 m16 union metadata");
     }
     p.planar_gate_up_prepared.insert(gate_up_encoding);
     p.planar_down_prepared.insert(down_encoding);
@@ -9505,7 +10110,7 @@ void MetalGraph::planar_moe_gate_up_swiglu_m8(GpuView pair_lo, GpuView pair_hi, 
     require(p.planar_gate_up_prepared.contains(lo_s->source_type), "planar v3 gate/up encoding not prepared");
 
     const uint32_t tokens = input.rows;
-    require(tokens >= 1 && tokens <= 8 && selected >= 1 && selected <= 16 && selected <= experts &&
+    require(tokens >= 1 && tokens <= 16 && selected >= 1 && selected <= 16 && selected <= experts &&
         input.columns == lo_s->columns && expert_hidden.columns == lo_s->rows &&
         expert_hidden.rows == tokens * selected &&
         input.stride_bytes >= uint64_t(input.columns) * 4ull && input.stride_bytes % 4 == 0 &&
@@ -9521,13 +10126,15 @@ void MetalGraph::planar_moe_gate_up_swiglu_m8(GpuView pair_lo, GpuView pair_hi, 
     static_cast<void>(p.allocation(indices));
     static_cast<void>(p.allocation(expert_hidden.view, true));
     validate_disjoint(std::array{pair_lo, pair_hi, input.view, indices}, std::array{expert_hidden.view, p.planar_union_meta});
+    p.discharge_routes(indices, tokens * selected, experts);
 
     const auto gu_spec = planar_v3::make_expert_spec(lo_s->source_type, lo_s->columns, lo_s->rows);
     const bool use_union = tokens > 1u;
-    if (use_union && p.planar_union_profile_active()) require(p.planar_union_profile_binding, "planar union diagnostic requires the complete routed operator");
+    if (use_union && p.planar_union_profile_active()) require(tokens <= 8u && p.planar_union_profile_binding, "planar union diagnostic requires the complete 2..8-row routed operator");
     if (use_union) {
         const PlanarUnionArgs u_args{experts, selected, tokens, lo_s->rows, lo_s->columns, 0u, 0u, 0u};
-        p.select("planar_moe_build_union_m8", uint32_t(-1), {experts, selected, lo_s->rows, lo_s->columns}, 32);
+        const char* union_k = tokens <= 8u ? "planar_moe_build_union_m8" : "planar_moe_build_union_m16";
+        p.select(union_k, uint32_t(-1), {experts, selected, lo_s->rows, lo_s->columns}, 32);
         p.bind(indices, 0); p.bind(p.planar_union_meta, 1, true); p.parameter(u_args, 2);
         p.dispatch(true, MTLSizeMake(1, 1, 1), MTLSizeMake(32, 1, 1));
     }
@@ -9539,7 +10146,7 @@ void MetalGraph::planar_moe_gate_up_swiglu_m8(GpuView pair_lo, GpuView pair_hi, 
     };
     const char* gu_kernel = !use_union
         ? "planar_moe_gate_up_swiglu_m1"
-        : (tokens <= 4u ? "planar_moe_gate_up_swiglu_m4" : "planar_moe_gate_up_swiglu_m8");
+        : (tokens <= 4u ? "planar_moe_gate_up_swiglu_m4" : (tokens <= 8u ? "planar_moe_gate_up_swiglu_m8" : "planar_moe_gate_up_swiglu_m16"));
     p.select(gu_kernel, lo_s->source_type, {lo_s->columns, lo_s->rows, experts, tokens}, 128);
     p.bind(pair_lo, 0); p.bind(pair_hi, 1); p.bind(input.view, 2); p.bind(expert_hidden.view, 3, true);
     p.bind(use_union ? p.planar_union_meta : indices, 4); p.parameter(gu_args, 5);
@@ -9621,7 +10228,7 @@ void MetalGraph::planar_moe_routed_m8(GpuView pair_lo, GpuView pair_hi, GpuView 
     };
     const char* dn_kernel = !use_union
         ? "planar_moe_down_m1"
-        : (tokens <= 4u ? "planar_moe_down_m4" : "planar_moe_down_m8");
+        : (tokens <= 4u ? "planar_moe_down_m4" : (tokens <= 8u ? "planar_moe_down_m8" : "planar_moe_down_m16"));
     p.select(dn_kernel, dn_s->source_type, {dn_s->columns, dn_s->rows, experts, tokens}, 128);
     p.bind(down_weights, 0); p.bind(expert_hidden.view, 1); p.bind(expert_down.view, 2, true);
     p.bind(use_union ? p.planar_union_meta : indices, 3); p.parameter(dn_args, 4);
@@ -9700,6 +10307,7 @@ void MetalGraph::planar_nax_grouped_moe(GpuView pair_lo, GpuView pair_hi, GpuVie
     static_cast<void>(p.allocation(token_map, true));
     static_cast<void>(p.allocation(counts, true));
     static_cast<void>(p.allocation(tasks, true));
+    p.discharge_routes(indices, uint32_t(route_count), experts);
 
     constexpr uint64_t kNaxGroupedScratchBase = 10'485'760ull;
     const bool reuse_x_bf16 = can_reuse_nax_dense_bf16(input);
@@ -9853,7 +10461,8 @@ void MetalGraph::prepare_verify_hc_gdn_fused() {
                              "verify_fused_hc_gated_mix_rows",
                              "verify_fused_hc_write_rows",
                              "verify_fused_gdn_alpha_beta_f32",
-                             "verify_fused_expert_gate_f32"}) {
+                             "verify_fused_expert_gate_f32",
+                             "prefill_exact_router_f32_batch"}) {
         static_cast<void>(p.pipeline(name, uint32_t(-1), 128));
     }
     if (!p.verify_hc_partials_scratch.owner) {
@@ -10116,9 +10725,9 @@ void MetalGraph::verify_fused_expert_gate_f32(GpuView weights, GpuRowsF32 input,
     auto& p = *impl_; p.active();
     require(p.verify_hc_gdn_fused_prepared && !p.recording && !p.compatible_pipelines,
         "fused verify FP32 expert gate requires prepared direct batches");
-    require(input.rows >= 1 && input.rows <= 8 && input.rows == output.rows &&
+    require(input.rows >= 1 && input.rows <= 16 && input.rows == output.rows &&
         input.columns >= 32 && input.columns <= 65536 && input.columns % 32 == 0 &&
-        output.columns >= 1 && output.columns <= 4096 &&
+        output.columns >= 1 && output.columns <= 4096 && (input.rows <= 8 || output.columns > 64) &&
         input.stride_bytes >= uint64_t(input.columns) * 4ull && input.stride_bytes % 4 == 0 &&
         output.stride_bytes >= uint64_t(output.columns) * 4ull && output.stride_bytes % 4 == 0,
         "fused verify FP32 expert gate geometry mismatch");
@@ -10137,13 +10746,23 @@ void MetalGraph::verify_fused_expert_gate_f32(GpuView weights, GpuRowsF32 input,
         "fused verify FP32 expert gate buffer span or alignment mismatch");
     validate_disjoint(std::array{weights, input.view}, std::array{output.view});
 
-    const VerifyFusedRowsF32Args args{
-        input.rows, input.columns, output.columns, 0u,
-        input.stride_bytes, output.stride_bytes
-    };
-    p.select("verify_fused_expert_gate_f32", uint32_t(-1), {input.rows, input.columns, output.columns, 0u}, 128);
-    p.bind(weights, 0); p.bind(input.view, 1); p.bind(output.view, 2, true); p.parameter(args, 3);
-    p.groups(MTLSizeMake((output.columns + 3u) / 4u, 1, 1));
+    if (input.rows <= 8u) {
+        const VerifyFusedRowsF32Args args{
+            input.rows, input.columns, output.columns, 0u,
+            input.stride_bytes, output.stride_bytes
+        };
+        p.select("verify_fused_expert_gate_f32", uint32_t(-1), {input.rows, input.columns, output.columns, 0u}, 128);
+        p.bind(weights, 0); p.bind(input.view, 1); p.bind(output.view, 2, true); p.parameter(args, 3);
+        p.groups(MTLSizeMake((output.columns + 3u) / 4u, 1, 1));
+    } else {
+        const VerifyFusedRowsF32Args args{
+            input.rows, input.columns, output.columns, 1u,
+            input.stride_bytes, output.stride_bytes
+        };
+        p.select("prefill_exact_router_f32_batch", uint32_t(-1), {input.columns, output.columns, input.rows, 0u}, 128);
+        p.bind(weights, 0); p.bind(input.view, 1); p.bind(output.view, 2, true); p.parameter(args, 3);
+        p.dispatch(true, MTLSizeMake((output.columns + 15u) / 16u, (input.rows + 7u) / 8u, 1), MTLSizeMake(128, 1, 1));
+    }
 }
 
 void MetalGraph::verify_fused_shared_logit_f32(GpuView weights, GpuRowsF32 input, GpuRowsF32 output) {
@@ -10155,7 +10774,7 @@ void MetalGraph::verify_fused_shared_logit_f32(GpuView weights, GpuRowsF32 input
     auto& p = *impl_; p.active();
     require(p.verify_hc_gdn_fused_prepared && !p.recording && !p.compatible_pipelines,
         "fused verify FP32 shared logit requires prepared direct batches");
-    require(input.rows >= 1 && input.rows <= 8 && input.rows == output.rows &&
+    require(input.rows >= 1 && input.rows <= 16 && input.rows == output.rows &&
         input.columns >= 32 && input.columns <= 65536 && input.columns % 32 == 0 &&
         output.columns == 1 &&
         input.stride_bytes >= uint64_t(input.columns) * 4ull && input.stride_bytes % 4 == 0 &&

@@ -9,13 +9,8 @@ namespace tokspur {
 
 // A prefill packet may publish an intermediate shared-prefix checkpoint before its final sliding window is complete.
 [[nodiscard]] inline uint64_t dflash2_prefill_remaining_after(uint64_t remaining_after, bool shared_prefix_cache,
-    uint64_t end_position, uint64_t max_prefix_tokens) noexcept {
-#if defined(TOKSPUR_PRIVATE_DFLASH2_CACHE_WORK) && TOKSPUR_PRIVATE_DFLASH2_CACHE_WORK
-    return shared_prefix_cache && end_position <= max_prefix_tokens ? 0 : remaining_after;
-#else
-    (void)end_position; (void)max_prefix_tokens;
-    return shared_prefix_cache ? 0 : remaining_after;
-#endif
+    uint64_t end_position, uint64_t max_prefix_tokens, bool retain_window = false) noexcept {
+    return (retain_window || (shared_prefix_cache && end_position <= max_prefix_tokens)) ? 0 : remaining_after;
 }
 
 [[nodiscard]] inline bool dflash2_checkpoint_identity_required(bool checkpoint_ssd) noexcept {

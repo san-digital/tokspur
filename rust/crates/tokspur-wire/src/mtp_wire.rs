@@ -13,6 +13,7 @@ pub enum MtpWireError {
     MissingField(String),
     Refused(&'static str),
     Json(JsonError),
+    WorkerError(String),
 }
 
 impl fmt::Debug for MtpWireError {
@@ -24,6 +25,10 @@ impl fmt::Debug for MtpWireError {
                 .finish(),
             Self::Refused(reason) => formatter.debug_tuple("Refused").field(reason).finish(),
             Self::Json(error) => formatter.debug_tuple("Json").field(error).finish(),
+            Self::WorkerError(msg) => formatter
+                .debug_struct("WorkerError")
+                .field("message_bytes", &msg.len())
+                .finish(),
         }
     }
 }
@@ -34,6 +39,7 @@ impl fmt::Display for MtpWireError {
             Self::MissingField(name) => write!(formatter, "missing MTP wire field: {name}"),
             Self::Refused(reason) => formatter.write_str(reason),
             Self::Json(error) => error.fmt(formatter),
+            Self::WorkerError(msg) => formatter.write_str(msg),
         }
     }
 }
@@ -42,7 +48,7 @@ impl std::error::Error for MtpWireError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Json(error) => Some(error),
-            Self::MissingField(_) | Self::Refused(_) => None,
+            Self::MissingField(_) | Self::Refused(_) | Self::WorkerError(_) => None,
         }
     }
 }
@@ -503,6 +509,29 @@ pub fn mtp_input_packet(value: &Json) -> Result<u32> {
     }
 }
 
+fn dflash2_max_proposals(value: &Json) -> Result<u32> {
+    let mut cap = 7u32;
+    if value.kind() == Kind::Object {
+        if let Some(md) = value.find("native_dflash2_max_drafts")? {
+            let v = md.unsigned_integer()?;
+            need(
+                (1..=15).contains(&v),
+                "invalid native_dflash2_max_drafts bound",
+            )?;
+            cap = cap.max(v as u32);
+        }
+        if let Some(bd) = value.find("native_dflash2_burst_max_drafts")? {
+            let v = bd.unsigned_integer()?;
+            need(
+                (8..=15).contains(&v),
+                "invalid native_dflash2_burst_max_drafts bound",
+            )?;
+            cap = cap.max(v as u32);
+        }
+    }
+    Ok(cap)
+}
+
 fn validate_runtime_policy_identity(ready: &Json, done: &Json) -> Result<()> {
     for name in [
         "native_controller_policy_digest",
@@ -510,6 +539,7 @@ fn validate_runtime_policy_identity(ready: &Json, done: &Json) -> Result<()> {
         "native_measured_controller",
         "native_measured_timing_schema",
         "native_dflash2_draft_policy",
+        "native_dflash2_burst_max_drafts",
         "native_target_m8_split_digest",
         "native_verify_narrow_rows",
         "native_pack_shared_mapping",
@@ -751,6 +781,28 @@ pub fn mtp_gdn_old_order(value: &Json) -> Result<bool> {
     Ok(count > 0)
 }
 
+fn mapped_weight_limit(value: &Json) -> Result<u64> {
+    let limit = integer(value, "mapped_weight_region_limit_bytes")?;
+    if limit != 0 {
+        let schema = value.find("derived_pack_schema")?;
+        let recipe = value.find("derived_pack_recipe")?;
+        need(
+            limit == 4 << 30
+                && schema.and_then(|v| v.number_lexeme().ok()) == Some("3")
+                && recipe.and_then(|v| v.string().ok()) == Some(b"tokspur-pack-v3"),
+            "MTP unrelated prepared feature",
+        )?;
+    }
+    Ok(limit)
+}
+
+fn validate_mapped_weight_identity(ready: &Json, observed: &Json) -> Result<()> {
+    need(
+        mapped_weight_limit(observed)? == mapped_weight_limit(ready)?,
+        "MTP immutable preparation drift",
+    )
+}
+
 pub fn validate_mtp_ready(
     ready: &Json,
     expected_draft_attention: &str,
@@ -769,10 +821,14 @@ pub fn validate_mtp_ready(
         get(ready, "stack_execution")?.string()? == b"direct",
         "MTP requires direct stack execution",
     )?;
+    mapped_weight_limit(ready)?;
     need(
         mtp_depth(ready)? == expected_depth,
         "MTP depth startup selection differs",
     )?;
+    if expected_depth == 7 {
+        let _ = dflash2_max_proposals(ready)?;
+    }
     need(
         mtp_draft_attention(ready)? == expected_draft_attention,
         "MTP draft-attention startup mode differs",
@@ -875,6 +931,7 @@ fn ready_context_limit(ready: &Json) -> Result<u64> {
 
 impl<'a> MtpWireReply<'a> {
     pub fn new(ready: &'a Json, previous: &'a Json, job: &'a Json, resync: bool) -> Result<Self> {
+        validate_mapped_weight_identity(ready, previous)?;
         validate_prefill_identity(ready, previous)?;
         let depth = mtp_depth(ready)?;
         let scoped = mtp_request_carry(ready)?;
@@ -994,7 +1051,11 @@ impl<'a> MtpWireReply<'a> {
         let mut pending_tokens = 0;
         let mut round_end = 0;
         if pending_overflow > 0 {
-            let max_overflow = if depth == 7 { 7 } else { depth };
+            let max_overflow = if depth == 7 {
+                dflash2_max_proposals(ready)?
+            } else {
+                depth
+            };
             need(
                 pending_overflow <= max_overflow && pending_overflow <= position,
                 "invalid MTP pending overflow bound",
@@ -1188,11 +1249,21 @@ impl<'a> MtpWireReply<'a> {
     }
 
     pub fn event(&mut self, value: &Json) -> Result<()> {
+        need(!self.finished, "MTP unsolicited/excess/post-terminal event")?;
+        let type_val = get(value, "event")?.string()?;
+        if type_val == b"error" {
+            let msg = match value.find("message")? {
+                Some(m) if m.kind() == Kind::String => {
+                    String::from_utf8_lossy(m.string()?).into_owned()
+                }
+                _ => "owned target emitted error event".to_owned(),
+            };
+            return Err(MtpWireError::WorkerError(msg));
+        }
         need(
-            !self.finished && self.maximum > 0 && !self.stopped,
+            self.maximum > 0 && !self.stopped,
             "MTP unsolicited/excess/post-terminal event",
         )?;
-        let type_val = get(value, "event")?.string()?;
         if type_val == b"mtp_round" {
             let count = integer(value, "count")? as u32;
             let accepted = integer(value, "accepted")? as u32;
@@ -1201,6 +1272,15 @@ impl<'a> MtpWireReply<'a> {
             } else {
                 self.depth
             };
+            let max_proposals = if self.depth == 7 {
+                dflash2_max_proposals(self.ready)?
+            } else {
+                self.depth
+            };
+            need(
+                proposals >= 1 && proposals <= max_proposals,
+                "variable-depth round omitted actual proposal count",
+            )?;
             let head_calls_field = value.find("head_calls")?;
             let prime_extra_field = value.find("prime_extra")?;
             need(
@@ -1302,6 +1382,7 @@ impl<'a> MtpWireReply<'a> {
     }
 
     pub fn finish(&mut self, done: &Json) -> Result<()> {
+        validate_mapped_weight_identity(self.ready, done)?;
         validate_runtime_policy_identity(self.ready, done)?;
         validate_measured_timing_packet(
             self.ready,
@@ -1562,10 +1643,10 @@ mod tests {
     #[test]
     fn lookup_bypass_round_accounting_and_refusals() {
         let ready = parse(
-            r#"{"event":"ready","native_mtp_depth":2,"native_mtp_carry_scope":"http-generation-v1","native_mtp_generation":{"id":0,"active":false,"remaining":0,"pending":false}}"#,
+            r#"{"event":"ready","mapped_weight_region_limit_bytes":0,"native_mtp_depth":2,"native_mtp_carry_scope":"http-generation-v1","native_mtp_generation":{"id":0,"active":false,"remaining":0,"pending":false}}"#,
         );
         let prior = parse(
-            r#"{"event":"done","committed_prefix":4,"continuation_allowed":true,"sampling":{"valid":true,"entropy_prefix":4,"entropy_words":0},"native_mtp_generation":{"id":0,"active":false,"remaining":0,"pending":false},"native_mtp_head_calls":0,"native_mtp_prime_calls":3,"native_mtp_rounds":0,"native_mtp_proposed":0,"native_mtp_accepted":0,"native_mtp_recovery_rounds":0,"native_mtp_carried_anchors":0,"native_mtp_discarded_anchors":0}"#,
+            r#"{"event":"done","mapped_weight_region_limit_bytes":0,"committed_prefix":4,"continuation_allowed":true,"sampling":{"valid":true,"entropy_prefix":4,"entropy_words":0},"native_mtp_generation":{"id":0,"active":false,"remaining":0,"pending":false},"native_mtp_head_calls":0,"native_mtp_prime_calls":3,"native_mtp_rounds":0,"native_mtp_proposed":0,"native_mtp_accepted":0,"native_mtp_recovery_rounds":0,"native_mtp_carried_anchors":0,"native_mtp_discarded_anchors":0}"#,
         );
         let job = parse(
             r#"{"tokens":[],"generate":3,"reset":false,"mtp_generation":{"id":1,"begin":true,"remaining":6}}"#,
@@ -1586,7 +1667,7 @@ mod tests {
                 .expect("batched token admitted");
         }
         let done = parse(
-            r#"{"event":"done","committed_prefix":7,"generated_ids":[42,42,42],"status":"length","continuation_allowed":true,"sampling":{"valid":true,"entropy_prefix":7,"entropy_words":0},"native_mtp_generation":{"id":1,"active":true,"remaining":3,"pending":true},"native_mtp_head_calls":0,"native_mtp_prime_calls":6,"native_mtp_rounds":1,"native_mtp_proposed":2,"native_mtp_accepted":2,"native_mtp_recovery_rounds":0,"native_mtp_carried_anchors":0,"native_mtp_discarded_anchors":0}"#,
+            r#"{"event":"done","mapped_weight_region_limit_bytes":0,"committed_prefix":7,"generated_ids":[42,42,42],"status":"length","continuation_allowed":true,"sampling":{"valid":true,"entropy_prefix":7,"entropy_words":0},"native_mtp_generation":{"id":1,"active":true,"remaining":3,"pending":true},"native_mtp_head_calls":0,"native_mtp_prime_calls":6,"native_mtp_rounds":1,"native_mtp_proposed":2,"native_mtp_accepted":2,"native_mtp_recovery_rounds":0,"native_mtp_carried_anchors":0,"native_mtp_discarded_anchors":0}"#,
         );
         reply.finish(&done).expect("lookup-bypass done admitted");
 
@@ -1605,10 +1686,10 @@ mod tests {
     #[test]
     fn dflash2_lookup_bypass_round_accounting_and_refusals() {
         let ready = parse(
-            r#"{"event":"ready","native_mtp_depth":7,"native_mtp_carry_scope":"http-generation-v1","native_mtp_generation":{"id":0,"active":false,"remaining":0,"pending":false}}"#,
+            r#"{"event":"ready","mapped_weight_region_limit_bytes":0,"native_mtp_depth":7,"native_mtp_carry_scope":"http-generation-v1","native_mtp_generation":{"id":0,"active":false,"remaining":0,"pending":false}}"#,
         );
         let prior = parse(
-            r#"{"event":"done","committed_prefix":4,"continuation_allowed":true,"sampling":{"valid":true,"entropy_prefix":4,"entropy_words":0},"native_mtp_generation":{"id":0,"active":false,"remaining":0,"pending":false},"native_mtp_head_calls":0,"native_mtp_prime_calls":4,"native_mtp_rounds":0,"native_mtp_proposed":0,"native_mtp_accepted":0,"native_mtp_recovery_rounds":0,"native_mtp_carried_anchors":0,"native_mtp_discarded_anchors":0}"#,
+            r#"{"event":"done","mapped_weight_region_limit_bytes":0,"committed_prefix":4,"continuation_allowed":true,"sampling":{"valid":true,"entropy_prefix":4,"entropy_words":0},"native_mtp_generation":{"id":0,"active":false,"remaining":0,"pending":false},"native_mtp_head_calls":0,"native_mtp_prime_calls":4,"native_mtp_rounds":0,"native_mtp_proposed":0,"native_mtp_accepted":0,"native_mtp_recovery_rounds":0,"native_mtp_carried_anchors":0,"native_mtp_discarded_anchors":0}"#,
         );
         let job = parse(
             r#"{"tokens":[],"generate":5,"reset":false,"mtp_generation":{"id":1,"begin":true,"remaining":8}}"#,
@@ -1629,7 +1710,7 @@ mod tests {
                 .expect("batched token admitted");
         }
         let done = parse(
-            r#"{"event":"done","committed_prefix":9,"generated_ids":[42,42,42,42,42],"status":"length","continuation_allowed":true,"sampling":{"valid":true,"entropy_prefix":9,"entropy_words":0},"native_mtp_generation":{"id":1,"active":true,"remaining":3,"pending":true},"native_mtp_head_calls":0,"native_mtp_prime_calls":9,"native_mtp_rounds":1,"native_mtp_proposed":4,"native_mtp_accepted":4,"native_mtp_recovery_rounds":0,"native_mtp_carried_anchors":0,"native_mtp_discarded_anchors":0}"#,
+            r#"{"event":"done","mapped_weight_region_limit_bytes":0,"committed_prefix":9,"generated_ids":[42,42,42,42,42],"status":"length","continuation_allowed":true,"sampling":{"valid":true,"entropy_prefix":9,"entropy_words":0},"native_mtp_generation":{"id":1,"active":true,"remaining":3,"pending":true},"native_mtp_head_calls":0,"native_mtp_prime_calls":9,"native_mtp_rounds":1,"native_mtp_proposed":4,"native_mtp_accepted":4,"native_mtp_recovery_rounds":0,"native_mtp_carried_anchors":0,"native_mtp_discarded_anchors":0}"#,
         );
         reply
             .finish(&done)
@@ -1662,8 +1743,62 @@ mod tests {
         };
         let attention = if depth == 7 { "split16" } else { "tiled128" };
         parse(&format!(
-            r#"{{"event":"ready","maximum_generated_tokens":4096,"stack_execution":"direct","native_mtp_input_packet_schema":1,"native_mtp_input_packet_max":{capacity},"native_mtp_depth":{depth},"native_mtp_draft_attention":"{attention}","native_prefill_dense":"{dense}","native_prefill_grouped":"{grouped}","native_mtp_priming_batch_capacity":{priming},"native_mtp_priming_batch_bytes":1024,"native_mtp_priming_batch_submits":0,"native_mtp_carry_scope":"http-generation-v1","native_mtp_generation":{{"id":0,"active":false,"remaining":0,"pending":false}},"native_mtp_head_calls":0,"native_mtp_prime_calls":0,"native_mtp_rounds":0,"native_mtp_proposed":0,"native_mtp_accepted":0,"native_mtp_recovery_rounds":0,"native_mtp_carried_anchors":0,"native_mtp_discarded_anchors":0}}"#
+            r#"{{"event":"ready","maximum_generated_tokens":4096,"stack_execution":"direct","mapped_weight_region_limit_bytes":0,"native_mtp_input_packet_schema":1,"native_mtp_input_packet_max":{capacity},"native_mtp_depth":{depth},"native_mtp_draft_attention":"{attention}","native_prefill_dense":"{dense}","native_prefill_grouped":"{grouped}","native_mtp_priming_batch_capacity":{priming},"native_mtp_priming_batch_bytes":1024,"native_mtp_priming_batch_submits":0,"native_mtp_carry_scope":"http-generation-v1","native_mtp_generation":{{"id":0,"active":false,"remaining":0,"pending":false}},"native_mtp_head_calls":0,"native_mtp_prime_calls":0,"native_mtp_rounds":0,"native_mtp_proposed":0,"native_mtp_accepted":0,"native_mtp_recovery_rounds":0,"native_mtp_carried_anchors":0,"native_mtp_discarded_anchors":0}}"#
         ))
+    }
+
+    #[test]
+    fn split_mapping_requires_pack_v3_and_stays_fixed_across_packets() {
+        let raw = prefill_ready(512, 2, "f32", "f32");
+        let split = with(
+            &raw,
+            "mapped_weight_region_limit_bytes",
+            Json::integer(4 << 30),
+        );
+        let pack = with(
+            &with(&split, "derived_pack_schema", Json::integer(3)),
+            "derived_pack_recipe",
+            Json::from("tokspur-pack-v3"),
+        );
+        for candidate in [&raw, &pack] {
+            validate_mtp_ready(candidate, "tiled128", true, 2).unwrap();
+        }
+        for invalid in [
+            split,
+            with(&pack, "derived_pack_schema", Json::integer(2)),
+            with(&pack, "derived_pack_recipe", Json::from("tokspur-pack-v2")),
+            with(&pack, "mapped_weight_region_limit_bytes", Json::integer(1)),
+        ] {
+            assert_eq!(
+                validate_mtp_ready(&invalid, "tiled128", true, 2)
+                    .unwrap_err()
+                    .to_string(),
+                "MTP unrelated prepared feature"
+            );
+        }
+        let job = parse(
+            r#"{"tokens":[65],"generate":0,"reset":true,"seed":44,"sampling":{"temperature":0,"top_k":0,"top_p":1,"min_p":0}}"#,
+        );
+        let done = with(&pack, "event", Json::from("done"));
+        assert_eq!(
+            MtpWireReply::new(&pack, &raw, &job, false)
+                .err()
+                .unwrap()
+                .to_string(),
+            "MTP immutable preparation drift"
+        );
+        let mut reply = MtpWireReply::new(&pack, &pack, &job, false).unwrap();
+        assert_eq!(
+            reply
+                .finish(&with(
+                    &done,
+                    "mapped_weight_region_limit_bytes",
+                    Json::integer(0)
+                ))
+                .unwrap_err()
+                .to_string(),
+            "MTP immutable preparation drift"
+        );
     }
 
     #[test]
@@ -1895,6 +2030,38 @@ mod tests {
                 .unwrap()
                 .finish(&done)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn worker_error_event_surfaces_message_during_prefill_and_generation() {
+        let ready = prefill_ready(2048, 2, "f32", "f32");
+        let prefill_job = parse(
+            r#"{"tokens":[42],"generate":0,"reset":true,"sampling":{"temperature":0,"top_k":0,"top_p":1,"min_p":0},"seed":0}"#,
+        );
+        let err_event = parse(r#"{"event":"error","message":"memory pressure exceeded"}"#);
+        let mut prefill_reply = MtpWireReply::new(&ready, &ready, &prefill_job, false).unwrap();
+        let err = prefill_reply.event(&err_event).unwrap_err();
+        assert_eq!(
+            err,
+            MtpWireError::WorkerError("memory pressure exceeded".to_owned())
+        );
+        assert_eq!(err.to_string(), "memory pressure exceeded");
+
+        let gen_ready = parse(
+            r#"{"event":"ready","mapped_weight_region_limit_bytes":0,"native_mtp_depth":7,"native_mtp_carry_scope":"http-generation-v1","native_mtp_generation":{"id":0,"active":false,"remaining":0,"pending":false}}"#,
+        );
+        let gen_prior = parse(
+            r#"{"event":"done","mapped_weight_region_limit_bytes":0,"committed_prefix":4,"continuation_allowed":true,"sampling":{"valid":true,"entropy_prefix":4,"entropy_words":0},"native_mtp_generation":{"id":0,"active":false,"remaining":0,"pending":false},"native_mtp_head_calls":0,"native_mtp_prime_calls":4,"native_mtp_rounds":0,"native_mtp_proposed":0,"native_mtp_accepted":0,"native_mtp_recovery_rounds":0,"native_mtp_carried_anchors":0,"native_mtp_discarded_anchors":0}"#,
+        );
+        let gen_job = parse(
+            r#"{"tokens":[],"generate":4,"reset":false,"mtp_generation":{"id":1,"begin":true,"remaining":4}}"#,
+        );
+        let mut gen_reply = MtpWireReply::new(&gen_ready, &gen_prior, &gen_job, false).unwrap();
+        let gen_err = gen_reply.event(&err_event).unwrap_err();
+        assert_eq!(
+            gen_err,
+            MtpWireError::WorkerError("memory pressure exceeded".to_owned())
         );
     }
 }

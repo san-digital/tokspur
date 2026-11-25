@@ -7,8 +7,17 @@
     "source_revision": "34567a4712bc9766c4449e2e98e4468bfa24d915",
     "variant": "Q4_K",
     "files": [
-      {"name": "Qwen3.8-Flash-Next-base.gguf", "size": 29486514464, "sha256": "6e27f395dc7527953671f79f03b9554c6136062dbdc6128116f82e02d3cee36a"},
-      {"name": "Qwen3.8-Flash-Next-Q4_K.tokspur.gguf", "role": "derived_pack", "size": 85889703936, "sha256": "0967101337bbadc937e18a66b695a944bb1194f12d32bada66d6c0080fd51049"}
+      {
+        "name": "Qwen3.8-Flash-Next-base.gguf",
+        "size": 29486514464,
+        "sha256": "6e27f395dc7527953671f79f03b9554c6136062dbdc6128116f82e02d3cee36a"
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-Q4_K.tokspur.gguf",
+        "role": "derived_pack",
+        "size": 85889703936,
+        "sha256": "0967101337bbadc937e18a66b695a944bb1194f12d32bada66d6c0080fd51049"
+      }
     ]
   },
   "draft": {
@@ -17,19 +26,31 @@
     "source_repo": "Qwen/Qwen3.8-Flash-Next",
     "source_revision": "34567a4712bc9766c4449e2e98e4468bfa24d915",
     "files": [
-      {"name": "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf", "size": 2786568256, "sha256": "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6"}
+      {
+        "name": "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+        "size": 2786568256,
+        "sha256": "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6"
+      }
     ]
   },
   "dflash2_draft": {
     "repo": "san-digital/Qwen3.8-Flash-Next-DFlash2",
-    "revision": "dd826e37c887c4b6f360023d0ae855683f51068d",
+    "revision": "1ddcc67fa6916f58136a6ea3e99d2e816da90a0a",
     "source_repo": "Qwen/Qwen3.8-Flash-Next",
     "source_revision": "34567a4712bc9766c4449e2e98e4468bfa24d915",
     "warm_start_repo": "incoai/Qwen3.8-Flash-Next-DFlash2",
     "warm_start_revision": "a22a1744e85c17364dcc54a6a420af7135d4c7f6",
     "files": [
-      {"name": "config.json", "size": 1015, "sha256": "74b388fb752a0b55515b8cc1d47fdf8211e686a38da1086e6b9b0679eeb460e7"},
-      {"name": "model.safetensors", "size": 1206139992, "sha256": "a75fee73e46545c71e40808d3de14f8b45d4237763e768aaf4aa78db914f433c"}
+      {
+        "name": "config.json",
+        "size": 1016,
+        "sha256": "7c51fc53fe84afb0c657e12eae767ec6c0158553fbb4aac2c121d0d2d5a8f8c6"
+      },
+      {
+        "name": "model.safetensors",
+        "size": 1206139992,
+        "sha256": "deb8523c250055a502b758233f5ea527fb981ec19942c76d9454fd13ac01b161"
+      }
     ]
   }
 }

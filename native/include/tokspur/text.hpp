@@ -23,6 +23,7 @@ public:
     [[nodiscard]] std::string decode(std::span<const uint32_t> ids, bool skip_special = false) const;
     [[nodiscard]] size_t vocabulary_size() const;
     [[nodiscard]] size_t merge_count() const;
+    [[nodiscard]] std::optional<uint32_t> added_token(std::string_view content) const;
     [[nodiscard]] std::vector<uint32_t> nonordinary_token_ids() const;
     void verify_gguf(const ModelFiles& model) const;
 

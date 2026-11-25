@@ -8,7 +8,7 @@
 
 namespace tokspur {
 
-inline constexpr uint32_t sampled_path_maximum_proposals = 7;
+inline constexpr uint32_t sampled_path_maximum_proposals = 15;
 // Admit the production top-k20 proposal law without truncating or renormalizing
 // its actual support. The U53 grid and probability/entropy algorithms are unchanged.
 inline constexpr uint32_t sampled_path_maximum_support = 20;

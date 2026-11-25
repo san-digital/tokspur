@@ -34,6 +34,7 @@ struct ServeCodec {
     ResponseDecoder decode;
     ResponseAdmission admission;
     std::vector<uint32_t> nonordinary_ids = {};
+    std::vector<uint32_t> control_ids = {};
 };
 using ServeTarget = std::function<Json(const Json&, const std::function<void(const Json&)>&)>;
 struct ServeSink {
@@ -93,6 +94,7 @@ public:
 #endif
                           , ToolArgValidation tool_args = ToolArgValidation::strict
                           , uint32_t context_length = 65536
+                          , bool lane_parking = false
                           );
     Json complete(const Json& request, std::string_view response_id,
                   const ServeTarget& target, const ServeSink& sink);
@@ -134,6 +136,20 @@ private:
 #ifdef TOKSPUR_PRIVATE_HTTP_BRANCH8
     const bool branch8_;
 #endif
+    static constexpr size_t max_parked_reasoning_lanes = 16;
+    struct ParkedReasoning {
+        std::vector<uint32_t> committed;
+        std::vector<std::pair<size_t, std::string>> turns;
+        std::string sampling;
+        uint64_t seed = 0;
+    };
+    const bool lane_parking_;
+    std::vector<ParkedReasoning> parked_reasoning_;
+    void park_active_reasoning();
+    [[nodiscard]] std::optional<std::vector<uint32_t>> respelled_on_committed(
+        std::span<const uint32_t> committed, std::span<const uint32_t> canonical) const;
+    [[nodiscard]] static std::optional<Json> fill_saved_reasoning(
+        const Json& render, const std::vector<std::pair<size_t, std::string>>& saved);
 };
 
 int server_cli(int argc, char** argv);

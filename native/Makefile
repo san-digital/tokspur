@@ -58,6 +58,7 @@ MEMORY_PLAN_REPORT ?= 0
 SHARED_PREFIX_EVICTION_COUNTERS ?= 0
 # Private diagnostic: write the drafter's target taps to TOKSPUR_DFLASH2_TAP_DUMP_DIR for offline drafter training.
 DFLASH2_TAP_DUMP ?= 0
+DFLASH2_PHASE_TIMING ?= 0
 # Optional host PLE row-cache limit; 0 preserves 512 MiB (256 MiB in the M5 screen).
 PLE_CACHE_MIB ?= 0
 # Optional duplicate Q8 Tile64 storage; original-layout consumers remain available.
@@ -134,6 +135,11 @@ ifeq ($(DFLASH2_TAP_DUMP),1)
 override CXXFLAGS += -DTOKSPUR_PRIVATE_DFLASH2_TAP_DUMP=1
 else ifneq ($(DFLASH2_TAP_DUMP),0)
 $(error DFLASH2_TAP_DUMP must be 0 or 1)
+endif
+ifeq ($(DFLASH2_PHASE_TIMING),1)
+override CXXFLAGS += -DTOKSPUR_PRIVATE_DFLASH2_PHASE_TIMING=1
+else ifneq ($(DFLASH2_PHASE_TIMING),0)
+$(error DFLASH2_PHASE_TIMING must be 0 or 1)
 endif
 ifeq ($(PLE_CACHE_MIB),0)
 else ifeq ($(PLE_CACHE_MIB),256)
@@ -298,7 +304,7 @@ ifeq ($(M5_CPU_CANDIDATES),1)
 override CPPFLAGS += -DTOKSPUR_PRIVATE_M5_CPU_CANDIDATES=1
 endif
 TRACKED_CFLAGS := $(NATIVE_CONFIG) : $(ENABLE_METAL) : m5-cpu-candidates=$(M5_CPU_CANDIDATES) : $(CXX) : $(CPPFLAGS) : $(CXXFLAGS)
-TRACKED_METALFLAGS := $(NATIVE_CONFIG) : metal3.2 : metal4.0 : $(METALFLAGS)
+TRACKED_METALFLAGS := $(NATIVE_CONFIG) : metal3.2(released-per-kernel-v1) : metal4.0(-fno-fast-math -ffp-contract=off) : $(METALFLAGS)
 # Decide before rewriting the stamp. FORCE also handles rapid flag changes on
 # Apple's make, whose timestamp comparisons can have one-second resolution.
 OBJECT_POLICY_PREREQUISITE := $(shell echo '$(TRACKED_CFLAGS)' | cmp -s - '$(OBJDIR)/.cflags' 2>/dev/null || echo FORCE)
@@ -834,6 +840,6 @@ $(PROBE_BUILD):
 $(PROBE_BUILD)/probe: tests/runtime_check_probe.mm | $(PROBE_BUILD)
 	$(CXX) -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -fobjc-arc "$<" -framework Foundation -framework Metal -o "$@"
 $(PROBE_BUILD)/runtime_checks.air: probes/runtime_checks.metal | $(PROBE_BUILD)
-	xcrun metal -std=metal3.2 -fno-fast-math -c "$<" -o "$@"
+	xcrun metal -std=metal3.2 -fno-fast-math -ffp-contract=off -c "$<" -o "$@"
 $(PROBE_BUILD)/tokspur-runtime-check-probe.metallib: $(PROBE_BUILD)/runtime_checks.air
 	xcrun metallib "$<" -o "$@"

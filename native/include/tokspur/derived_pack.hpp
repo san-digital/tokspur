@@ -90,18 +90,24 @@ struct SealScope {
     return {a.target || b.target, a.mtp || b.mtp};
 }
 
+// Static certification level recorded by a local seal.
+enum class SealCertification : uint8_t { none = 0, dm_fp16_v1 = 1 };
+
 // What a local seal records: the manifest of a pack that passed full
-// verification, the identity that pack file had when it passed, and which
-// source files it was compared with.
+// verification, the identity that pack file had when it passed, which
+// source files it was compared with, and any static certification level.
 struct LocalSeal {
     std::string manifest_sha256;
     PackFileIdentity pack;
     SealScope compared;
+    SealCertification certification = SealCertification::none;
     bool operator==(const LocalSeal&) const = default;
 };
 
 // First line of a current seal. The earlier form was the bare manifest hash.
 inline constexpr std::string_view local_seal_format = "tokspur-local-seal-v2";
+inline constexpr std::string_view local_seal_format_v3 = "tokspur-local-seal-v3";
+inline constexpr std::string_view local_seal_certification_dm_fp16_v1 = "dm-fp16-v1";
 inline constexpr size_t max_local_seal_bytes = 4096;
 
 // The one accepted encoding of a seal, eight lines each ending in "\n":
@@ -130,7 +136,8 @@ struct ParsedLocalSeal {
 // equal the ones given and whose scope covers `needed`, the sources this start
 // would compare the pack with. This is the whole acceptance rule of local-seal mode.
 [[nodiscard]] bool local_seal_vouches(std::string_view seal_text, std::string_view manifest_sha256,
-                                      const PackFileIdentity& pack, SealScope needed);
+                                      const PackFileIdentity& pack, SealScope needed,
+                                      SealCertification required_certification = SealCertification::none);
 
 // fstat on an open descriptor. Refuses anything but a regular file.
 [[nodiscard]] PackFileIdentity pack_file_identity(int fd);
@@ -150,15 +157,17 @@ struct LocalSealReading {
     LocalSealForm form = LocalSealForm::malformed;
     bool names_manifest = false;         // current or legacy form carrying the given manifest hash
     SealScope compared;                  // of a current-form seal
+    SealCertification certification = SealCertification::none; // of a current-form seal
     bool names_file = false;             // trusted_file, current form, manifest and every identity field equal; scope aside
-    bool vouches = false;                // names_file and compared.covers(needed)
+    bool vouches = false;                // names_file, compared.covers(needed), and certification meets requirement
 };
 // Reads the seal beside the pack called pack_name and compares it. Never
 // throws for a seal it cannot use: every such case is reported as a seal that
 // does not vouch.
 [[nodiscard]] LocalSealReading read_local_seal(int directory_fd, const std::string& pack_name,
                                                std::string_view manifest_sha256, const PackFileIdentity& pack,
-                                               SealScope needed);
+                                               SealScope needed,
+                                               SealCertification required_certification = SealCertification::none);
 
 // Writes the seal for the pack called pack_name under a temporary name, makes
 // it read-only, syncs it and renames it to the pack's seal name, so no reader
@@ -179,7 +188,8 @@ void publish_local_seal(int directory_fd, const std::string& pack_name, const Lo
 // holds the directory, or when the directory cannot be written.
 [[nodiscard]] bool refresh_local_seal(int directory_fd, const std::string& pack_name, int pack_fd,
                                       std::string_view manifest_sha256, const PackFileIdentity& before,
-                                      SealScope verified) noexcept;
+                                      SealScope verified,
+                                      SealCertification certification = SealCertification::none) noexcept;
 
 // How adoption used the local seal.
 enum class LocalSealUse {

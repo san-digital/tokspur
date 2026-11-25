@@ -117,7 +117,7 @@ struct Fixture {
     }
     void capture(bool with_stream) {
         const auto retain = [&] { return FakeHandle{prefix}; };
-        if (with_stream) branch.capture(prefix, retained, &sampler, nullptr, 1, 0, std::nullopt, 0, retain);
+        if (with_stream) branch.capture(prefix, retained, &sampler, nullptr, 1, 0, std::nullopt, 0, nullptr, retain);
         else branch.capture(prefix, retained, retain);
     }
     void restore(size_t index, TargetSampling options) {
@@ -252,6 +252,7 @@ def build(tmp_path, checks, sha256):
     unit = (
         '#include "tokspur/json.hpp"\n#include "tokspur/gguf.hpp"\n#include "tokspur/sampling.hpp"\n'
         '#include "tokspur/prompt_lookup.hpp"\n#include "tokspur/mtp_anchor_state.hpp"\n'
+        '#include "tokspur/dflash2_drafter.hpp"\n'
         + SHA256
         + "#include <algorithm>\n#include <array>\n#include <charconv>\n#include <cmath>\n"
         "#include <initializer_list>\n#include <iostream>\n#include <limits>\n#include <optional>\n"

@@ -15,9 +15,10 @@ enum class DFlash2Precision : uint32_t { q8_0 = 0, bf16 = 1 };
 
 inline constexpr uint64_t maximum_dflash2_tap_budget_bytes = 256ull << 20;
 
-inline uint64_t dflash2_tap_budget(uint32_t known_capacity) {
+inline uint64_t dflash2_tap_budget(uint32_t known_capacity, uint32_t verify_rows = 8) {
+    if (verify_rows != 8 && verify_rows != 16) throw FormatError("unsupported DFlash2 verify rows");
     switch (known_capacity) {
-    case 0: case 8: return 8ull << 20;
+    case 0: case 8: return (verify_rows == 16 ? 16ull : 8ull) << 20;
     case 512: return 48ull << 20;
     case 1024: return 64ull << 20;
     case 2048: return 160ull << 20;
@@ -31,14 +32,15 @@ struct DFlash2TapPlan {
 };
 
 // Plan both live banks before any Metal allocation. The graph still checks the actual allocated-size charge against this budget.
-inline DFlash2TapPlan dflash2_tap_plan(uint32_t known_capacity, uint32_t slots, uint32_t width, uint64_t budget) {
+inline DFlash2TapPlan dflash2_tap_plan(uint32_t known_capacity, uint32_t slots, uint32_t width, uint64_t budget, uint32_t verify_rows = 8) {
     static_cast<void>(dflash2_tap_budget(known_capacity));
-    if (!slots || slots > 16 || !width || width % 4 || !budget || budget > maximum_dflash2_tap_budget_bytes)
+    if (!slots || slots > 16 || !width || width % 4 || !budget || budget > maximum_dflash2_tap_budget_bytes ||
+        (verify_rows != 8 && verify_rows != 16))
         throw FormatError("invalid DFlash2 tap geometry or budget");
     const uint32_t capacity = known_capacity ? known_capacity : 8;
     // The admitted capacity and slot bounds keep these products within uint64_t even at the largest uint32_t width.
     const uint64_t row_bytes = uint64_t(slots) * width * sizeof(float);
-    const DFlash2TapPlan plan{capacity, uint64_t(capacity) * row_bytes, 8ull * row_bytes};
+    const DFlash2TapPlan plan{capacity, uint64_t(capacity) * row_bytes, uint64_t(verify_rows) * row_bytes};
     if (plan.known_bytes + plan.verify_bytes > budget) throw FormatError("DFlash tap exceeds its explicit GPU budget");
     return plan;
 }
@@ -58,12 +60,14 @@ inline uint32_t parse_native_speculative_depth(std::string_view value) {
 }
 
 inline constexpr uint32_t dflash2_default_max_drafts = 7;
+inline constexpr uint32_t dflash2_maximum_drafts = 15;
 inline constexpr uint32_t dflash2_width4_max_drafts = 3;
 inline constexpr uint32_t dflash2_default_vocab_slice = 32768;
 
 inline uint32_t parse_dflash2_max_drafts(std::string_view value) {
-    if (value.size() == 1 && value[0] >= '1' && value[0] <= '7') return uint32_t(value[0] - '0');
-    throw FormatError("native DFlash2 max_drafts must be an integer in 1..7");
+    if (value.size() == 1 && value[0] >= '1' && value[0] <= '9') return uint32_t(value[0] - '0');
+    if (value.size() == 2 && value[0] == '1' && value[1] >= '0' && value[1] <= '5') return 10u + uint32_t(value[1] - '0');
+    throw FormatError("native DFlash2 max_drafts must be an integer in 1..15");
 }
 
 inline uint32_t parse_dflash2_vocab_slice(std::string_view value) {

@@ -10,9 +10,133 @@
 #include <span>
 
 #include <cmath>
+#include <limits>
 #include <optional>
 
 namespace tokspur {
+
+struct AnchorEntropyMetrics {
+    double entropy_nats = 0.0;
+    double normalized_entropy = 0.0;
+    double top1_prob = 1.0;
+    double top2_prob_margin = 1.0;
+    double top2_logit_margin = 0.0;
+    double top4_logit_margin = 0.0;
+    uint32_t topk_count = 0;
+    bool valid = false;
+    bool operator==(const AnchorEntropyMetrics&) const = default;
+};
+
+[[nodiscard]] inline AnchorEntropyMetrics compute_anchor_entropy_metrics(
+    const GpuLogitTopKRow& row, SamplingPolicy policy = {}) {
+    if (row.vocabulary == 0 || row.vocabulary > maximum_sampling_vocabulary)
+        throw FormatError("anchor entropy sampling vocabulary limit");
+    if ((row.first_nonfinite_col != 0xffffffffu && row.first_nonfinite_col >= row.vocabulary) ||
+        (row.first_subnormal_col != 0xffffffffu && row.first_subnormal_col >= row.vocabulary)) {
+        throw FormatError("corrupted GPU top-k bad-logit index");
+    }
+    if (row.first_nonfinite_col != 0xffffffffu || row.first_subnormal_col != 0xffffffffu) {
+        if (row.first_nonfinite_col <= row.first_subnormal_col)
+            throw FormatError("nonfinite sampling logit");
+        throw FormatError("subnormal sampling logit");
+    }
+    if (!std::isfinite(policy.temperature) || policy.temperature < 0.0)
+        throw FormatError("invalid sampling temperature for anchor entropy");
+    const uint32_t expected = std::min<uint32_t>(gpu_logit_topk_capacity, row.vocabulary);
+    if (row.count != expected)
+        throw FormatError("incomplete GPU top-k summary");
+    const auto canon = [](float val) noexcept -> float { return val == 0.0f ? 0.0f : val; };
+    for (uint32_t k = 0; k < expected; ++k) {
+        const uint32_t id = row.ids[k];
+        const float val = row.logits[k];
+        if (id >= row.vocabulary || !std::isfinite(val) || std::fpclassify(val) == FP_SUBNORMAL)
+            throw FormatError("invalid GPU top-k candidate entry");
+        if (k > 0) {
+            const float prev = canon(row.logits[k - 1]);
+            const float cur = canon(val);
+            const uint32_t prev_id = row.ids[k - 1];
+            if (!(prev > cur || (prev == cur && prev_id < id)))
+                throw FormatError("unsorted or duplicate GPU top-k candidate entry");
+        }
+    }
+
+    const double t_eff = (policy.temperature > 0.0) ? std::max(policy.temperature, 1.0e-3) : 1.0;
+    const double z0 = double(canon(row.logits[0]));
+    const double d12 = (expected >= 2u)
+        ? (z0 - double(canon(row.logits[1])))
+        : std::numeric_limits<double>::infinity();
+    const uint32_t k4 = std::min<uint32_t>(expected, 4u);
+    const double d14 = (expected >= 2u)
+        ? (z0 - double(canon(row.logits[k4 - 1u])))
+        : std::numeric_limits<double>::infinity();
+
+    double z_sum = 1.0;
+    double weighted_diff = 0.0;
+    double w1 = 0.0;
+    for (uint32_t i = 1u; i < expected; ++i) {
+        const double d_i = (z0 - double(canon(row.logits[i]))) / t_eff;
+        const double w_i = std::exp(-d_i);
+        if (i == 1u) w1 = w_i;
+        z_sum += w_i;
+        if (w_i > 0.0) weighted_diff += w_i * d_i;
+    }
+    const double p1 = 1.0 / z_sum;
+    const double p2_margin = (expected >= 2u) ? ((1.0 - w1) / z_sum) : 1.0;
+    const double h_nats = std::max(0.0, std::log(z_sum) + (weighted_diff / z_sum));
+    const double h_norm = (expected >= 2u) ? std::min(1.0, h_nats / std::log(double(expected))) : 0.0;
+    return AnchorEntropyMetrics{
+        .entropy_nats = h_nats,
+        .normalized_entropy = h_norm,
+        .top1_prob = p1,
+        .top2_prob_margin = p2_margin,
+        .top2_logit_margin = d12,
+        .top4_logit_margin = d14,
+        .topk_count = expected,
+        .valid = true,
+    };
+}
+
+[[nodiscard]] inline AnchorEntropyMetrics compute_anchor_entropy_metrics(
+    std::span<const float> logits, SamplingPolicy policy = {}) {
+    return compute_anchor_entropy_metrics(cpu_logit_topk_row(logits), policy);
+}
+
+struct AnchorWidthGate {
+    uint32_t max_mtp_depth = 3;
+    uint32_t max_dflash2_verify_rows = 8;
+    bool allow_lookup = true;
+    uint32_t max_lookup_width = 7;
+};
+
+[[nodiscard]] inline AnchorWidthGate decide_anchor_width_gate(
+    const AnchorEntropyMetrics& m, uint32_t configured_mtp_depth, bool lookup_enabled,
+    uint32_t max_dflash2_rows = 8u) noexcept {
+    const uint32_t full_lookup_w = (configured_mtp_depth == 7u) ? 7u : std::clamp(configured_mtp_depth, 1u, 3u);
+    const uint32_t full_mtp_d = std::clamp(configured_mtp_depth, 1u, 3u);
+    const uint32_t full_dflash_rows = std::clamp(max_dflash2_rows, 2u, 16u);
+    AnchorWidthGate gate{full_mtp_d, full_dflash_rows, lookup_enabled, full_lookup_w};
+    if (!m.valid) return gate;
+
+    const bool high_certainty = m.entropy_nats <= 0.85 && (m.top2_logit_margin >= 1.50 || m.top1_prob >= 0.70);
+    if (high_certainty) {
+        return gate;
+    }
+
+    const bool high_entropy = m.entropy_nats > 1.85 || (m.top2_logit_margin < 0.50 && m.entropy_nats > 1.25);
+    if (high_entropy) {
+        gate.allow_lookup = false;
+        gate.max_lookup_width = 0u;
+        gate.max_mtp_depth = 1u;
+        gate.max_dflash2_verify_rows = (m.entropy_nats > 2.40 && m.top2_logit_margin < 0.40) ? 2u : 3u;
+        return gate;
+    }
+
+    gate.allow_lookup = lookup_enabled && (m.top2_logit_margin >= 0.50 && m.entropy_nats <= 1.50);
+    gate.max_lookup_width = gate.allow_lookup ? ((configured_mtp_depth == 7u) ? 4u : std::min(full_lookup_w, 2u)) : 0u;
+    gate.max_mtp_depth = (m.entropy_nats > 1.25 || m.top2_logit_margin < 1.0) ? std::min(full_mtp_d, 2u) : full_mtp_d;
+    gate.max_dflash2_verify_rows = 4u;
+    return gate;
+}
 
 // Request-local controller state only. A carried terminal is sampled already,
 // but remains invisible and is never counted in the consumed target prefix.
@@ -20,6 +144,7 @@ struct MtpAnchorPublication {
     uint32_t prefix = 0, emitted = 0;
     bool stopped = false;
     std::optional<SampledPathToken> pending;
+    std::optional<AnchorEntropyMetrics> anchor_metrics{};
 };
 
 inline MtpAnchorPublication prepare_mtp_anchor_publication(uint32_t base, const SampledPathDecision& decision, uint32_t context_limit = 65536) {
@@ -89,6 +214,27 @@ inline MtpAnchorPublication prepare_mtp_anchor_publication8(uint32_t base, const
     return {base + count, count, accepted_stop, accepted_stop ? std::optional<SampledPathToken>{} :
         std::optional<SampledPathToken>{decision.tokens[decision.count - 1]}};
 }
+
+inline MtpAnchorPublication prepare_mtp_anchor_publication16(uint32_t base, const SampledPathDecision& decision, uint32_t context_limit = 65536) {
+    if ((context_limit != 65536 && context_limit != 131072) || base >= context_limit || decision.identity.prefix != base + 1 ||
+        decision.active_proposals < 1 || decision.active_proposals > 15 ||
+        decision.accepted > decision.active_proposals || !decision.count ||
+        decision.count > 1 + decision.active_proposals)
+        throw FormatError("invalid bounded-sixteen anchor decision");
+    const bool accepted_stop = decision.terminal == SampledPathTerminal::accepted_stop;
+    if (decision.count != decision.accepted + (accepted_stop ? 0u : 1u) ||
+        (accepted_stop && (!decision.stopped || !decision.accepted)))
+        throw FormatError("bounded-sixteen terminal count/kind differs");
+    for (uint32_t i = 0; i < decision.count; ++i) {
+        const auto& token = decision.tokens[i];
+        if (token.accepted_proposal != (i < decision.accepted) || token.id >= decision.identity.vocabulary ||
+            !std::isfinite(token.source_logit)) throw FormatError("bounded-sixteen token identity differs");
+    }
+    const auto count = 1 + decision.accepted;
+    if (count > context_limit - base) throw FormatError("bounded-sixteen consumed prefix exceeds context");
+    return {base + count, count, accepted_stop, accepted_stop ? std::optional<SampledPathToken>{} :
+        std::optional<SampledPathToken>{decision.tokens[decision.count - 1]}};
+}
 #endif
 
 class MtpAnchorCarry {
@@ -97,15 +243,21 @@ public:
         if (pending_ && prefix != prefix_) throw FormatError("stale MTP carried-anchor prefix");
         return pending_ ? &*pending_ : nullptr;
     }
+    [[nodiscard]] const AnchorEntropyMetrics* peek_metrics(uint32_t prefix) const {
+        if (pending_ && prefix != prefix_) throw FormatError("stale MTP carried-anchor prefix");
+        return (pending_ && metrics_) ? &*metrics_ : nullptr;
+    }
     void publish(const MtpAnchorPublication& publication) noexcept {
         prefix_ = publication.prefix; pending_ = publication.pending;
+        metrics_ = publication.pending ? publication.anchor_metrics : std::nullopt;
     }
     // An output-budget boundary may discard an invisible terminal. Its RNG
     // words remain consumed by the caller's already-published decision RNG.
-    [[nodiscard]] bool clear() noexcept { const bool had = bool(pending_); pending_.reset(); return had; }
+    [[nodiscard]] bool clear() noexcept { const bool had = bool(pending_); pending_.reset(); metrics_.reset(); return had; }
 private:
     uint32_t prefix_ = 0;
     std::optional<SampledPathToken> pending_;
+    std::optional<AnchorEntropyMetrics> metrics_;
 };
 
 // Explicit HTTP-generation lifetime, separate from the legacy packet-local
@@ -524,7 +676,7 @@ private:
     uint64_t id_ = 0;
     uint32_t remaining_ = 0, maximum_ = 0, prefix_ = 0, base_prefix_ = 0;
     uint32_t committed_ = 0, emitted_ = 0, pending_overflow_ = 0, compute_remaining_ = 0, total_budget_ = 0;
-    std::array<OverflowToken, 7> overflow_tokens_{};
+    std::array<OverflowToken, 15> overflow_tokens_{};
     StageAControllerState controller_state_{};
     std::array<uint8_t, 32> expected_policy_ = default_controller_policy_digest;
     std::array<uint32_t, 16> stops_{};

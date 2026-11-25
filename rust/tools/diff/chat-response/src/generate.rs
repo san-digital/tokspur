@@ -1888,6 +1888,83 @@ fn protocol(
 
 fn test_protocol_cases(cases: &mut Vec<Labeled>) {
     let encode = |text: &[u8]| FIXTURE.encode(text);
+    let framed = ResponseAdmission {
+        vocabulary: 263,
+        ..ADMISSION
+    };
+    for (name, ids, tools) in [
+        (
+            "ordinary spelling",
+            encode(b"<think>A</think>B"),
+            J::Arr(vec![]),
+        ),
+        ("added boundaries", vec![259, 65, 260, 66], J::Arr(vec![])),
+        (
+            "literal backtick",
+            vec![259, 96, 65, 260, 66],
+            J::Arr(vec![]),
+        ),
+        (
+            "ordinary close",
+            [vec![259], encode(b"</think>"), vec![260, 66]].concat(),
+            J::Arr(vec![]),
+        ),
+        (
+            "tool markers without tools",
+            vec![261, 65, 262],
+            J::Arr(vec![]),
+        ),
+        (
+            "admitted call",
+            [
+                vec![261],
+                encode(b"<function=run_tests>\n</function>"),
+                vec![262],
+            ]
+            .concat(),
+            protocol_manifest(),
+        ),
+    ] {
+        for n in 0..=ids.len() {
+            protocol(
+                cases,
+                format!("added tokens {name} length {n}"),
+                framed,
+                &envelope(&ids[..n], "length", false, tools.clone(), J::Null),
+                Decoder::ControlTokens,
+            );
+        }
+        let mut stopped = ids;
+        stopped.push(256);
+        protocol(
+            cases,
+            format!("added tokens {name} stop"),
+            framed,
+            &envelope(&stopped, "stop", false, tools, J::Num("256".to_owned())),
+            Decoder::ControlTokens,
+        );
+    }
+    let forced_ids = encode(b"A\n</think>\n\nB<|im_end|>");
+    let mut forced = envelope(
+        &forced_ids,
+        "stop",
+        true,
+        J::Arr(vec![]),
+        J::Num("256".to_owned()),
+    );
+    if let J::Obj(fields) = &mut forced {
+        fields.push((
+            b"forced_thinking_close_index".to_vec(),
+            J::Num("2".to_owned()),
+        ));
+    }
+    protocol(
+        cases,
+        "added tokens with a forced thinking boundary",
+        framed,
+        &forced,
+        Decoder::ControlTokens,
+    );
     let call = "<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/日本🙂.rs\n</parameter>\n</function>\n</tool_call>";
     let batch = format!(
         "Inspecting café\n{call}\n<tool_call><function=run_tests>\n</function></tool_call>"

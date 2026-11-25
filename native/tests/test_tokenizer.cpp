@@ -80,6 +80,8 @@ void alphabet() {
 void merging() {
     const auto data = fixture();
     tokspur::ByteBpe model(data);
+    require(model.added_token("<X>") == 262 && model.added_token("<X>!") == 263 && model.added_token("<Y>") == 264, "added token identities");
+    require(!model.added_token("<X") && !model.added_token("a") && !model.added_token(""), "ordinary bytes and marker prefixes");
     require(model.vocabulary_size() == 266 && model.merge_count() == 6, "BPE geometry");
     auto padded = data;
     padded.vocabulary.emplace_back("[PAD266]");

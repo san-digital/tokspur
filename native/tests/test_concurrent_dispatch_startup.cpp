@@ -8,9 +8,6 @@
 #ifndef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
 #error This test requires the private concurrent-dispatch build.
 #endif
-#if !defined(TOKSPUR_PRIVATE_MOE_ROUTER_WINDOW) || !defined(TOKSPUR_PRIVATE_GROUPED_MM)
-#error This test requires the carrier router-margin path for physical command accounting.
-#endif
 
 namespace {
 void require(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
@@ -22,32 +19,30 @@ template<class F> void refuses(F action) {
 void physical_command_counts(const char* library, bool concurrent) {
     tokspur::MetalGraph graph(library, 64ull << 20);
     graph.configure_concurrent_dispatch(concurrent);
-    graph.configure_prefill_router_window(true);
-    graph.prepare_moe_router_window();
     const std::array<float, 4> values{0.25f, 0.5f, 1.0f, 2.0f};
-    const auto input = graph.upload(std::as_bytes(std::span(values)), "margin counter input");
-    const auto margins = graph.slice(graph.router_margins_scratch(), 0, sizeof(values));
-    const auto output = graph.zeros(sizeof(values), "margin counter output");
+    const auto input = graph.upload(std::as_bytes(std::span(values)), "split counter input");
+    const auto mid = graph.zeros(sizeof(values), "split counter intermediate");
+    const auto output = graph.zeros(sizeof(values), "split counter output");
     require(graph.lifetime_command_buffers() == 0 && graph.lifetime_dispatches() == 0, "startup counted unsubmitted work");
     std::vector<std::byte> split_output;
     for (uint32_t repeat = 0; repeat < 2; ++repeat) {
         graph.begin();
-        require(!graph.evaluate_router_margin(0) && graph.lifetime_command_buffers() == 2 * repeat, "empty margin evaluation submitted a command");
-        graph.activate(input, margins, tokspur::Activation::silu);
-        require(!graph.evaluate_router_margin(values.size()), "generated positive margins requested fallback");
-        require(graph.lifetime_command_buffers() == 2 * repeat + 1, "margin readback omitted its physical command buffer");
-        graph.activate(margins, output, tokspur::Activation::silu);
+        require(!graph.commit_partial() && graph.lifetime_command_buffers() == 2 * repeat, "empty commit_partial submitted a command");
+        graph.activate(input, mid, tokspur::Activation::silu);
+        require(graph.commit_partial(), "commit_partial refused non-empty direct batch");
+        require(graph.lifetime_command_buffers() == 2 * repeat + 1, "commit_partial omitted its physical command buffer");
+        graph.activate(mid, output, tokspur::Activation::silu);
         const auto batch = graph.submit();
         require(batch.dispatches == 2 && graph.lifetime_dispatches() == 2 * (repeat + 1), "split batch double-counted or omitted dispatches");
         require(graph.lifetime_command_buffers() == 2 * (repeat + 1), "split logical batch must count two physical command buffers");
         split_output = graph.read(output);
     }
     graph.begin();
-    graph.activate(input, margins, tokspur::Activation::silu);
-    graph.activate(margins, output, tokspur::Activation::silu);
+    graph.activate(input, mid, tokspur::Activation::silu);
+    graph.activate(mid, output, tokspur::Activation::silu);
     static_cast<void>(graph.submit());
     require(graph.lifetime_command_buffers() == 5 && graph.lifetime_dispatches() == 6, "ordinary batch did not add exactly one physical command");
-    require(graph.read(output) == split_output, "margin command split changed generated results");
+    require(graph.read(output) == split_output, "partial command split changed generated results");
     graph.begin(); graph.abort();
     require(graph.lifetime_command_buffers() == 5 && graph.lifetime_dispatches() == 6, "empty abort changed completed physical counters");
 }

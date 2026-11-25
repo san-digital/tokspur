@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use tokspur_json::{
-    Json, JsonError, JsonLimits, Kind, UnicodeError, parse_json_limited, unicode_scalars,
+    Json, JsonError, JsonLimits, Kind, UnicodeError, parse_json_limited, scalar_str,
 };
 
 use crate::cxx::{FromChars, find, find_from, from_chars_f64};
@@ -212,7 +212,7 @@ fn name(value: &[u8], function: bool) -> Result<(), ResponseError> {
         !value.is_empty() && value.len() <= if function { 64 } else { 1024 },
         "response name length limit",
     )?;
-    unicode_scalars(value).map_err(ResponseError::Text)?;
+    scalar_str(value).map_err(ResponseError::Text)?;
     for &c in value {
         require_name(
             c >= 32 && c != b'<' && c != b'>' && c != 127,

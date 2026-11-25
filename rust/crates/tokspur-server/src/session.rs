@@ -215,6 +215,8 @@ const MAX_PARKED_REASONING_LANES: usize = 16;
 struct ParkedReasoning {
     committed: Vec<u32>,
     turns: Vec<(usize, Vec<u8>)>,
+    sampling: Vec<u8>,
+    seed: u64,
 }
 
 pub struct ServeSession {
@@ -264,6 +266,15 @@ pub struct ServeSession {
     /// Off by default; only the opt-in `request_timing` record reads the stamps.
     phase_stamps_enabled: bool,
     phase_stamps: PhaseStamps,
+    last_req_telemetry: Option<RequestCheckpointTelemetry>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RequestCheckpointTelemetry {
+    ssd_restored: bool,
+    reuse: Option<&'static str>,
+    restored_tokens: u64,
+    replayed_tokens: u64,
 }
 
 impl fmt::Debug for ServeSession {
@@ -335,6 +346,7 @@ impl ServeSession {
             parked_reasoning: Vec::new(),
             phase_stamps_enabled: false,
             phase_stamps: PhaseStamps::default(),
+            last_req_telemetry: None,
         };
         require(!session.alias.is_empty(), "invalid serving codec")?;
         require(
@@ -451,6 +463,63 @@ impl ServeSession {
         &self.phase_stamps
     }
 
+    /// Overlays request-level prefill checkpoint telemetry onto the terminal `done` record.
+    pub fn apply_request_telemetry(&self, done: &Json) -> Json {
+        let Some(tel) = self.last_req_telemetry else {
+            return done.clone();
+        };
+        let Ok(fields) = done.object() else {
+            return done.clone();
+        };
+        let mut out = Vec::with_capacity(fields.len() + 4);
+        let mut has_ssd = false;
+        let mut has_reuse = false;
+        let mut has_restored = false;
+        let mut has_replayed = false;
+        for (key, value) in fields {
+            match key.as_slice() {
+                b"checkpoint_ssd_restored" => {
+                    has_ssd = true;
+                    let val = value.boolean().unwrap_or(false) || tel.ssd_restored;
+                    out.push((key.clone(), Json::Bool(val)));
+                }
+                b"checkpoint_reuse" => {
+                    has_reuse = true;
+                    let val = tel.reuse.map(Json::from).unwrap_or_else(|| value.clone());
+                    out.push((key.clone(), val));
+                }
+                b"checkpoint_restored_tokens" => {
+                    has_restored = true;
+                    out.push((key.clone(), Json::integer(tel.restored_tokens)));
+                }
+                b"replayed_input_tokens" => {
+                    has_replayed = true;
+                    out.push((key.clone(), Json::integer(tel.replayed_tokens)));
+                }
+                _ => out.push((key.clone(), value.clone())),
+            }
+        }
+        if !has_ssd && tel.ssd_restored {
+            out.push((b"checkpoint_ssd_restored".to_vec(), Json::Bool(true)));
+        }
+        if !has_reuse && let Some(reuse) = tel.reuse {
+            out.push((b"checkpoint_reuse".to_vec(), Json::from(reuse)));
+        }
+        if !has_restored {
+            out.push((
+                b"checkpoint_restored_tokens".to_vec(),
+                Json::integer(tel.restored_tokens),
+            ));
+        }
+        if !has_replayed {
+            out.push((
+                b"replayed_input_tokens".to_vec(),
+                Json::integer(tel.replayed_tokens),
+            ));
+        }
+        Json::Object(out)
+    }
+
     /// The first output packet's worker command has returned; `batches` counts packets so far.
     fn stamp_output_packet(&mut self, batches: u64, tokens: usize) {
         if self.phase_stamps_enabled && batches == 1 {
@@ -466,6 +535,7 @@ impl ServeSession {
         self.committed.clear();
         self.sampling.clear();
         self.reusable = false;
+        self.last_req_telemetry = None;
         self.seed = 0;
         self.broker_resync = true;
         self.mtp_resync = true;
@@ -518,29 +588,38 @@ impl ServeSession {
     }
 
     fn park_active_reasoning(&mut self) {
-        if !self.lane_parking
-            || !self.reusable
-            || self.saved_reasoning.is_empty()
-            || self.committed.is_empty()
-        {
+        if !self.lane_parking || !self.reusable || self.committed.is_empty() {
             return;
         }
         let committed = self.committed.clone();
         let turns = std::mem::take(&mut self.saved_reasoning);
+        let sampling = self.sampling.clone();
+        let seed = self.seed;
         self.parked_reasoning.retain(|old| {
-            !(old.committed.len() <= committed.len() && committed.starts_with(&old.committed))
+            !(old.sampling == sampling
+                && old.seed == seed
+                && old.committed.len() <= committed.len()
+                && committed.starts_with(&old.committed))
         });
         if self.parked_reasoning.len() >= MAX_PARKED_REASONING_LANES {
             self.parked_reasoning.remove(0);
         }
-        self.parked_reasoning
-            .push(ParkedReasoning { committed, turns });
+        self.parked_reasoning.push(ParkedReasoning {
+            committed,
+            turns,
+            sampling,
+            seed,
+        });
     }
 
     /// Rebuilds a canonical prompt on the committed token spelling when both spell the same text.
     ///
     /// Sampling can commit a token split that re-encoding the same bytes does not reproduce. Reuse requires matching added tokens, reserved padding slots and admission markers, with equal bytes between them. Only the canonical tail after the committed terminal is appended.
-    fn respelled_on_committed(&self, canonical: &[u32]) -> Result<Option<Vec<u32>>> {
+    fn respelled_on_committed(
+        &self,
+        committed: &[u32],
+        canonical: &[u32],
+    ) -> Result<Option<Vec<u32>>> {
         let admission = self.codec.admission;
         let frame = |id: u32| {
             id == admission.im_start
@@ -548,7 +627,6 @@ impl ServeSession {
                 || self.codec.control_ids.contains(&id)
                 || self.codec.nonordinary_ids.binary_search(&id).is_ok()
         };
-        let committed = &self.committed;
         // A committed terminal ends both spellings on a token boundary, so the tail joins cleanly.
         if !committed.last().is_some_and(|&id| admission.is_stop(id)) {
             return Ok(None);
@@ -593,7 +671,7 @@ impl ServeSession {
             }
             (live, fresh) = (live_end + 1, fresh_end + 1);
         }
-        let mut prompt = committed.clone();
+        let mut prompt = committed.to_vec();
         prompt.extend_from_slice(&canonical[fresh..]);
         Ok(Some(prompt))
     }
@@ -607,6 +685,7 @@ impl ServeSession {
         sink: &mut ServeSink<'_>,
     ) -> Result<Json> {
         let request_start = std::time::Instant::now();
+        self.last_req_telemetry = None;
         if self.phase_stamps_enabled {
             self.phase_stamps = PhaseStamps {
                 request_start: Some(request_start),
@@ -631,55 +710,104 @@ impl ServeSession {
         let policy = request.sampling.dump()?;
         let compatible_sampling =
             self.sampling == policy && request.seed.is_none_or(|seed| seed == self.seed);
+        type CachedReasoningPrompt<'a> = (&'a [(usize, Vec<u8>)], Option<Vec<u32>>);
         let rendered = (self.codec.render)(&request.render)?;
-        let mut prompt = (self.codec.encode)(&rendered)?;
+        let base_prompt = (self.codec.encode)(&rendered)?;
+        let mut prompt = base_prompt.clone();
         let mut restored_reasoning: Option<Vec<(usize, Vec<u8>)>> = None;
+        let mut restored_lane_idx: Option<usize> = None;
+        let mut cached_by_turns: Vec<CachedReasoningPrompt<'_>> = Vec::new();
         if self.reusable && !prompt.starts_with(&self.committed) {
             let mut restored = None;
-            if let Some(filled) =
-                Self::fill_saved_reasoning(&request.render, &self.saved_reasoning)?
-            {
-                let candidate = (self.codec.encode)(&(self.codec.render)(&filled)?)?;
-                if candidate.len() < context_cap && candidate.starts_with(&self.committed) {
-                    prompt = candidate;
+            if !self.saved_reasoning.is_empty() {
+                if let Some(filled) =
+                    Self::fill_saved_reasoning(&request.render, &self.saved_reasoning)?
+                {
+                    let candidate = (self.codec.encode)(&(self.codec.render)(&filled)?)?;
+                    cached_by_turns.push((&self.saved_reasoning, Some(candidate.clone())));
+                    if candidate.len() < context_cap && candidate.starts_with(&self.committed) {
+                        prompt = candidate;
+                    } else {
+                        restored = Some(candidate);
+                    }
                 } else {
-                    restored = Some(candidate);
+                    cached_by_turns.push((&self.saved_reasoning, None));
                 }
             }
             if compatible_sampling
                 && !prompt.starts_with(&self.committed)
-                && let Some(respelled) =
-                    self.respelled_on_committed(restored.as_deref().unwrap_or(&prompt))?
+                && let Some(respelled) = self.respelled_on_committed(
+                    &self.committed,
+                    restored.as_deref().unwrap_or(&prompt),
+                )?
                 && respelled.len() < context_cap
             {
                 prompt = respelled;
             }
         }
         if self.lane_parking
-            && (!self.reusable || !prompt.starts_with(&self.committed))
+            && (!self.reusable || !compatible_sampling || !prompt.starts_with(&self.committed))
             && !self.parked_reasoning.is_empty()
         {
             let mut best: Option<(usize, Vec<u32>)> = None;
+            let mut ambiguous_seed = false;
             for (idx, lane) in self.parked_reasoning.iter().enumerate() {
-                if let Some((cur, _)) = best
-                    && lane.committed.len() <= self.parked_reasoning[cur].committed.len()
+                if let Some((cur, _)) = &best
+                    && lane.committed.len() < self.parked_reasoning[*cur].committed.len()
                 {
                     continue;
                 }
-                let Some(filled) = Self::fill_saved_reasoning(&request.render, &lane.turns)? else {
+                if lane.sampling != policy || request.seed.is_some_and(|seed| seed != lane.seed) {
                     continue;
+                }
+                let candidate: &[u32] = if lane.turns.is_empty() {
+                    &base_prompt
+                } else if let Some(pos) = cached_by_turns
+                    .iter()
+                    .position(|(turns, _)| *turns == lane.turns.as_slice())
+                {
+                    cached_by_turns[pos].1.as_deref().unwrap_or(&base_prompt)
+                } else if let Some(filled) =
+                    Self::fill_saved_reasoning(&request.render, &lane.turns)?
+                {
+                    let encoded = (self.codec.encode)(&(self.codec.render)(&filled)?)?;
+                    let slot = cached_by_turns.len();
+                    cached_by_turns.push((&lane.turns, Some(encoded)));
+                    cached_by_turns[slot].1.as_deref().unwrap_or(&base_prompt)
+                } else {
+                    cached_by_turns.push((&lane.turns, None));
+                    &base_prompt
                 };
-                let candidate = (self.codec.encode)(&(self.codec.render)(&filled)?)?;
-                if candidate.len() < context_cap
-                    && candidate.len() > lane.committed.len()
+                let matched = if candidate.len() > lane.committed.len()
+                    && candidate.len() < context_cap
                     && candidate.starts_with(&lane.committed)
                 {
-                    best = Some((idx, candidate));
+                    candidate.to_vec()
+                } else if let Some(respelled) =
+                    self.respelled_on_committed(&lane.committed, candidate)?
+                    && respelled.len() > lane.committed.len()
+                    && respelled.len() < context_cap
+                {
+                    respelled
+                } else {
+                    continue;
+                };
+                if let Some((cur, _)) = &best {
+                    if lane.committed.len() > self.parked_reasoning[*cur].committed.len() {
+                        best = Some((idx, matched));
+                        ambiguous_seed = false;
+                    } else if lane.seed != self.parked_reasoning[*cur].seed {
+                        ambiguous_seed = true;
+                    }
+                } else {
+                    best = Some((idx, matched));
+                    ambiguous_seed = false;
                 }
             }
-            if let Some((idx, candidate)) = best {
+            if !ambiguous_seed && let Some((idx, candidate)) = best {
                 prompt = candidate;
                 restored_reasoning = Some(self.parked_reasoning[idx].turns.clone());
+                restored_lane_idx = Some(idx);
             }
         }
         require(
@@ -760,9 +888,18 @@ impl ServeSession {
             position: 0,
             state_touched: false,
             restored_reasoning,
+            restored_lane_idx,
             counters: Counters::default(),
         };
         let result = completion.run(self, target, sink);
+        if result.is_ok() && self.mtp && completion.counters.input_batches > 0 {
+            self.last_req_telemetry = Some(RequestCheckpointTelemetry {
+                ssd_restored: completion.counters.ssd_restored,
+                reuse: completion.counters.checkpoint_reuse,
+                restored_tokens: completion.counters.restored_input_tokens,
+                replayed_tokens: completion.counters.replayed_input_tokens,
+            });
+        }
         if self.phase_stamps_enabled {
             self.phase_stamps.output_packets = completion.counters.output_batches;
             self.phase_stamps.max_packet_tokens = completion.counters.output_width as u64;
@@ -779,6 +916,9 @@ impl ServeSession {
 struct Counters {
     input_batches: u64,
     restored_input_tokens: u64,
+    replayed_input_tokens: u64,
+    ssd_restored: bool,
+    checkpoint_reuse: Option<&'static str>,
     output_batches: u64,
     generation_rounds: u64,
     #[allow(dead_code)]
@@ -858,6 +998,7 @@ struct Completion<'r> {
     position: usize,
     state_touched: bool,
     restored_reasoning: Option<Vec<(usize, Vec<u8>)>>,
+    restored_lane_idx: Option<usize>,
     counters: Counters,
 }
 
@@ -1205,7 +1346,37 @@ impl Completion<'_> {
         self.sampling_matches(&done, committed_prefix as usize, seed)?;
         let inputs = field(&job, "tokens")?.array()?;
         if !inputs.is_empty() {
-            self.counters.restored_input_tokens += u64::from(reply.restored_input_tokens()?);
+            let restored_in_pkt = u64::from(reply.restored_input_tokens()?);
+            self.counters.restored_input_tokens += restored_in_pkt;
+            self.counters.replayed_input_tokens +=
+                (inputs.len() as u64).saturating_sub(restored_in_pkt);
+            if let Some(ssd) = done.find("checkpoint_ssd_restored")?
+                && ssd.kind() == Kind::Boolean
+                && ssd.boolean()?
+            {
+                self.counters.ssd_restored = true;
+            }
+            if let Some(reuse) = done.find("checkpoint_reuse")?
+                && reuse.kind() == Kind::String
+            {
+                let candidate = match reuse.string()? {
+                    b"restored" => Some(("restored", 3u8)),
+                    b"ssd_restored" => Some(("ssd_restored", 2u8)),
+                    b"cold_miss" => Some(("cold_miss", 1u8)),
+                    _ => None,
+                };
+                if let Some((label, rank)) = candidate {
+                    let cur_rank = match self.counters.checkpoint_reuse {
+                        Some("restored") => 3u8,
+                        Some("ssd_restored") => 2u8,
+                        Some("cold_miss") => 1u8,
+                        _ => 0u8,
+                    };
+                    if rank > cur_rank {
+                        self.counters.checkpoint_reuse = Some(label);
+                    }
+                }
+            }
             self.counters.input_batches += 1;
             self.counters.input_width = self.counters.input_width.max(inputs.len());
             if let Some(ov) = done.find("prefill_generation_overlap")?
@@ -1813,6 +1984,9 @@ impl Completion<'_> {
             cached_prefix = self.position;
             began = true;
         } else if !self.append {
+            if let Some(idx) = self.restored_lane_idx.take() {
+                session.parked_reasoning.remove(idx);
+            }
             session.park_active_reasoning();
             session.committed.clear();
         }
@@ -2815,7 +2989,7 @@ mod tests {
                 canonical.push(u32::from(b'B') + 4);
                 assert!(
                     session
-                        .respelled_on_committed(&canonical)
+                        .respelled_on_committed(&session.committed, &canonical)
                         .unwrap()
                         .is_none(),
                     "{spelling}"
@@ -2833,7 +3007,9 @@ mod tests {
             let mut expected = session.committed.clone();
             expected.push(u32::from(b'B') + 4);
             assert_eq!(
-                session.respelled_on_committed(&canonical).unwrap(),
+                session
+                    .respelled_on_committed(&session.committed, &canonical)
+                    .unwrap(),
                 Some(expected)
             );
         }
@@ -2943,10 +3119,722 @@ mod tests {
         canonical.extend([1, u32::from(b'B') + 4]);
         assert!(
             session
-                .respelled_on_committed(&canonical)
+                .respelled_on_committed(&session.committed, &canonical)
                 .unwrap()
                 .is_some()
         );
         assert_eq!(decoded.load(Ordering::Relaxed), 6);
+    }
+
+    fn parked_mtp_ready() -> Json {
+        tokspur_json::parse_json(br#"{"event":"ready","maximum_generated_tokens":4096,"stack_execution":"direct","mapped_weight_region_limit_bytes":0,"small_gemv_column_splits":16,"block_gemv_formats":3,"native_mtp_protocol":"native-mtp-depth2-lookahead-v1","native_mtp_depth":2,"native_mtp_draft_attention":"tiled128","native_mtp_input_packet_schema":1,"native_mtp_input_packet_max":512,"native_prefill_dense":"f32","native_prefill_grouped":"f32","native_mtp_priming_batch_capacity":512,"native_mtp_priming_batch_bytes":1024,"native_mtp_priming_batch_submits":0,"native_mtp_carry_scope":"http-generation-v1","native_mtp_generation":{"id":0,"active":false,"remaining":0,"pending":false},"native_mtp_head_calls":0,"native_mtp_prime_calls":0,"native_mtp_rounds":0,"native_mtp_proposed":0,"native_mtp_accepted":0,"native_mtp_recovery_rounds":0,"native_mtp_carried_anchors":0,"native_mtp_discarded_anchors":0}"#).unwrap()
+    }
+
+    fn parked_reasoning_codec() -> ServeCodec {
+        let mut text = codec();
+        text.encode = Box::new(|raw| {
+            let mut out = Vec::new();
+            let s = &raw.prompt;
+            let mut i = 0;
+            while i < s.len() {
+                if s[i..].starts_with(b"</think>") {
+                    out.push(281);
+                    i += b"</think>".len();
+                } else if s[i] == b';' {
+                    out.push(1);
+                    i += 1;
+                } else {
+                    out.push(u32::from(s[i]) + 4);
+                    i += 1;
+                }
+            }
+            Ok(out)
+        });
+        text.decode = Box::new(|ids| {
+            let mut bytes = Vec::new();
+            for &id in ids {
+                match id {
+                    MERGED => bytes.extend_from_slice(b"Vi"),
+                    1 => bytes.extend_from_slice(b"<|im_end|>"),
+                    2 => bytes.extend_from_slice(b"<|endoftext|>"),
+                    3 => bytes.extend_from_slice(b"<|im_start|>"),
+                    281 => bytes.extend_from_slice(b"</think>"),
+                    _ => bytes.push((id - 4) as u8),
+                }
+            }
+            Ok(bytes)
+        });
+        text.render = Box::new(|request| {
+            let mut prompt = Vec::new();
+            for message in field(request, "messages")?.array()? {
+                let assistant = field(message, "role")?.string()? == b"assistant";
+                if assistant
+                    && let Some(reasoning) = message.find("reasoning_content")?
+                    && !reasoning.is_null()
+                {
+                    prompt.extend_from_slice(b"[reasoning:");
+                    prompt.extend_from_slice(reasoning.string()?);
+                    prompt.extend_from_slice(b"</think>");
+                }
+                prompt.extend_from_slice(field(message, "content")?.string()?);
+                if assistant {
+                    prompt.push(b';');
+                }
+            }
+            Ok(RenderedChat {
+                prompt,
+                normalized_messages: Json::Array(Vec::new()),
+                parsed_tool_arguments: 0,
+                hoisted_system_messages: 0,
+                literal_ranges: Vec::new(),
+            })
+        });
+        text.nonordinary_ids = vec![281];
+        text
+    }
+
+    fn sampling_policy_bytes(seed: Option<u64>, temperature: &str) -> Vec<u8> {
+        let seed_part = seed.map_or_else(String::new, |s| format!(r#""seed":{s},"#));
+        let input = tokspur_json::parse_json(
+            format!(
+                r#"{{"model":"tokspur",{seed_part}"temperature":{temperature},"messages":[{{"role":"user","content":"A"}}]}}"#
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        admit_chat_with_policies(
+            &input,
+            b"tokspur",
+            ToolEnumValidation::Strict,
+            ToolArgValidation::Strict,
+        )
+        .unwrap()
+        .sampling
+        .dump()
+        .unwrap()
+    }
+
+    #[test]
+    fn parked_lane_with_enable_thinking_false_parks_and_matches_respelled_prefix() {
+        let mut session = ServeSession::new(
+            parked_reasoning_codec(),
+            SessionOptions {
+                mtp_ready: parked_mtp_ready(),
+                lane_parking: true,
+                ..SessionOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            session
+                .respelled_on_committed(&[], &[u32::from(b'A') + 4])
+                .unwrap()
+                .is_none()
+        );
+
+        let policy = sampling_policy_bytes(Some(42), "0.7");
+        let mut lane_a = vec![u32::from(b'A') + 4, MERGED];
+        lane_a.extend(
+            b"sible;"
+                .iter()
+                .map(|&b| if b == b';' { 1 } else { u32::from(b) + 4 }),
+        );
+        session.reusable = true;
+        session.committed = lane_a.clone();
+        session.sampling = policy.clone();
+        session.seed = 42;
+        assert!(session.saved_reasoning.is_empty());
+
+        // Switching to conversation B parks A even though enable_thinking was false (empty saved_reasoning).
+        session.park_active_reasoning();
+        assert_eq!(session.parked_reasoning.len(), 1);
+        assert!(session.parked_reasoning[0].turns.is_empty());
+        assert_eq!(session.parked_reasoning[0].sampling, policy);
+        assert_eq!(session.parked_reasoning[0].seed, 42);
+
+        // Simulate active conversation B on the live lane.
+        session.committed = vec![u32::from(b'Z') + 4, u32::from(b'B') + 4, 1];
+        session.sampling = sampling_policy_bytes(Some(99), "0.7");
+        session.seed = 99;
+
+        let return_a = tokspur_json::parse_json(
+            br#"{"model":"tokspur","seed":42,"temperature":0.7,"enable_thinking":false,"messages":[{"role":"user","content":"A"},{"role":"assistant","content":"Visible"},{"role":"user","content":"B"}]}"#,
+        )
+        .unwrap();
+        let trace = trace_without_worker(&mut session, &return_a);
+        assert!(!field(&trace, "append").unwrap().boolean().unwrap());
+        let mut expected = lane_a;
+        expected.push(u32::from(b'B') + 4);
+        assert_eq!(trace_ids(&trace), expected);
+    }
+
+    #[test]
+    fn parked_lane_with_echoed_reasoning_falls_back_to_base_prompt_and_respells() {
+        let mut session = ServeSession::new(
+            parked_reasoning_codec(),
+            SessionOptions {
+                mtp_ready: parked_mtp_ready(),
+                lane_parking: true,
+                ..SessionOptions::default()
+            },
+        )
+        .unwrap();
+        let policy = sampling_policy_bytes(Some(42), "0.7");
+        let mut lane_a = Vec::new();
+        lane_a.extend(b"A[reasoning:".iter().map(|&b| u32::from(b) + 4));
+        lane_a.push(MERGED);
+        lane_a.extend(b"s".iter().map(|&b| u32::from(b) + 4));
+        lane_a.push(281); // </think>
+        lane_a.push(MERGED);
+        lane_a.extend(b"sible".iter().map(|&b| u32::from(b) + 4));
+        lane_a.push(1);
+
+        session.reusable = true;
+        session.committed = lane_a.clone();
+        session.saved_reasoning = vec![(0, b"Vis".to_vec())];
+        session.sampling = policy;
+        session.seed = 42;
+        session.park_active_reasoning();
+
+        session.committed = vec![u32::from(b'Z') + 4, 1];
+        session.seed = 99;
+
+        // Client echoes reasoning_content: fill_saved_reasoning returns None, so base_prompt is respelled.
+        let echoed = tokspur_json::parse_json(
+            br#"{"model":"tokspur","seed":42,"temperature":0.7,"messages":[{"role":"user","content":"A"},{"role":"assistant","reasoning_content":"Vis","content":"Visible"},{"role":"user","content":"B"}]}"#,
+        )
+        .unwrap();
+        let trace = trace_without_worker(&mut session, &echoed);
+        let mut expected = lane_a;
+        expected.push(u32::from(b'B') + 4);
+        assert_eq!(trace_ids(&trace), expected);
+
+        // Tampered echoed reasoning_content must miss and stay canonical.
+        let tampered = tokspur_json::parse_json(
+            br#"{"model":"tokspur","seed":42,"temperature":0.7,"messages":[{"role":"user","content":"A"},{"role":"assistant","reasoning_content":"Other","content":"Visible"},{"role":"user","content":"B"}]}"#,
+        )
+        .unwrap();
+        let trace_tampered = trace_without_worker(&mut session, &tampered);
+        assert!(!trace_ids(&trace_tampered).contains(&MERGED));
+    }
+
+    #[test]
+    fn parked_lane_hoists_and_deduplicates_render_and_encode_calls() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let render_calls = Arc::new(AtomicUsize::new(0));
+        let encode_calls = Arc::new(AtomicUsize::new(0));
+        let rc = Arc::clone(&render_calls);
+        let ec = Arc::clone(&encode_calls);
+
+        let mut text = parked_reasoning_codec();
+        let inner_render = text.render;
+        let inner_encode = text.encode;
+        text.render = Box::new(move |req| {
+            rc.fetch_add(1, Ordering::Relaxed);
+            inner_render(req)
+        });
+        text.encode = Box::new(move |rendered| {
+            ec.fetch_add(1, Ordering::Relaxed);
+            inner_encode(rendered)
+        });
+
+        let mut session = ServeSession::new(
+            text,
+            SessionOptions {
+                mtp_ready: parked_mtp_ready(),
+                lane_parking: true,
+                ..SessionOptions::default()
+            },
+        )
+        .unwrap();
+
+        let policy_match = sampling_policy_bytes(Some(42), "0.7");
+        let policy_other = sampling_policy_bytes(Some(42), "0.5");
+        let shared_turns = vec![(0, b"why".to_vec())];
+        let mut exact_a = (session.codec.encode)(
+            &(session.codec.render)(
+                &tokspur_json::parse_json(
+                    br#"{"messages":[{"role":"user","content":"A"},{"role":"assistant","reasoning_content":"why","content":"Visible"}]}"#,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        // Reset counters after fixture setup.
+        render_calls.store(0, Ordering::Relaxed);
+        encode_calls.store(0, Ordering::Relaxed);
+
+        // Case 1: 4 empty-turn lanes + 2 echoed-turn lanes with echoed reasoning -> only 1 render + 1 encode.
+        for s in [10u64, 11, 12, 13] {
+            session.parked_reasoning.push(ParkedReasoning {
+                committed: vec![u32::from(b'X') + 4, 1],
+                turns: Vec::new(),
+                sampling: policy_match.clone(),
+                seed: s,
+            });
+        }
+        session.parked_reasoning.push(ParkedReasoning {
+            committed: vec![u32::from(b'Y') + 4, 1],
+            turns: shared_turns.clone(),
+            sampling: policy_match.clone(),
+            seed: 42,
+        });
+        let echoed_req = tokspur_json::parse_json(
+            br#"{"model":"tokspur","seed":42,"temperature":0.7,"messages":[{"role":"user","content":"A"},{"role":"assistant","reasoning_content":"why","content":"Visible"},{"role":"user","content":"B"}]}"#,
+        )
+        .unwrap();
+        let _ = trace_without_worker(&mut session, &echoed_req);
+        assert_eq!(render_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(encode_calls.load(Ordering::Relaxed), 1);
+
+        // Case 2: Omitted reasoning with 3 lanes sharing identical non-empty turns,
+        // 1 incompatible sampling lane, and 1 shorter lane after a longer match.
+        session.parked_reasoning.clear();
+        let mut respelled_prefix = exact_a.clone();
+        // Replace canonical "Vi" after "</think>" (281) with MERGED.
+        let think_end = respelled_prefix.iter().position(|&id| id == 281).unwrap();
+        respelled_prefix.splice(think_end + 1..think_end + 3, [MERGED]);
+        exact_a.clear();
+        let _ = exact_a;
+
+        // Longer matching lane first (so shorter lanes are skipped by < best_len without rendering).
+        session.parked_reasoning.push(ParkedReasoning {
+            committed: respelled_prefix.clone(),
+            turns: shared_turns.clone(),
+            sampling: policy_match.clone(),
+            seed: 42,
+        });
+        // Same turns, non-matching prefix, same length -> reuses cached_by_turns (0 extra render/encode).
+        let mut non_matching_same_len = respelled_prefix.clone();
+        non_matching_same_len[0] = u32::from(b'Q') + 4;
+        session.parked_reasoning.push(ParkedReasoning {
+            committed: non_matching_same_len,
+            turns: shared_turns.clone(),
+            sampling: policy_match.clone(),
+            seed: 42,
+        });
+        // Different turns, incompatible policy -> filtered before render/encode.
+        session.parked_reasoning.push(ParkedReasoning {
+            committed: respelled_prefix.clone(),
+            turns: vec![(0, b"incompatible".to_vec())],
+            sampling: policy_other,
+            seed: 42,
+        });
+        // Different turns, strictly shorter than best -> filtered before render/encode.
+        session.parked_reasoning.push(ParkedReasoning {
+            committed: vec![u32::from(b'A') + 4, 1],
+            turns: vec![(0, b"shorter".to_vec())],
+            sampling: policy_match,
+            seed: 42,
+        });
+
+        render_calls.store(0, Ordering::Relaxed);
+        encode_calls.store(0, Ordering::Relaxed);
+        let omitted_req = tokspur_json::parse_json(
+            br#"{"model":"tokspur","seed":42,"temperature":0.7,"messages":[{"role":"user","content":"A"},{"role":"assistant","content":"Visible"},{"role":"user","content":"B"}]}"#,
+        )
+        .unwrap();
+        let trace = trace_without_worker(&mut session, &omitted_req);
+        assert_eq!(render_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(encode_calls.load(Ordering::Relaxed), 2);
+        assert!(trace_ids(&trace).contains(&MERGED));
+    }
+
+    #[test]
+    fn parked_lane_respects_per_lane_sampling_seed_and_ambiguous_seed_ties() {
+        let mut session = ServeSession::new(
+            parked_reasoning_codec(),
+            SessionOptions {
+                mtp_ready: parked_mtp_ready(),
+                lane_parking: true,
+                ..SessionOptions::default()
+            },
+        )
+        .unwrap();
+        let policy_07 = sampling_policy_bytes(None, "0.7");
+        let mut respelled_a = vec![u32::from(b'A') + 4, MERGED];
+        respelled_a.extend(b"sible".iter().map(|&b| u32::from(b) + 4));
+        respelled_a.push(1);
+        let mut canonical_a = Vec::new();
+        canonical_a.extend(b"AVisible".iter().map(|&b| u32::from(b) + 4));
+        canonical_a.push(1);
+
+        // Park two lanes with the same text/policy but different seeds (11 vs 22).
+        // Superseding must preserve both because seeds differ.
+        session.reusable = true;
+        session.sampling = policy_07.clone();
+        session.committed = respelled_a.clone();
+        session.seed = 11;
+        session.park_active_reasoning();
+
+        session.committed = respelled_a.clone();
+        session.seed = 22;
+        session.park_active_reasoning();
+        assert_eq!(session.parked_reasoning.len(), 2);
+
+        // Switch live lane to conversation B.
+        session.committed = vec![u32::from(b'Z') + 4, 1];
+        session.seed = 99;
+
+        // With seed omitted, two matching lanes of equal length trigger ambiguous_seed -> miss!
+        let req_no_seed = tokspur_json::parse_json(
+            br#"{"model":"tokspur","temperature":0.7,"enable_thinking":false,"messages":[{"role":"user","content":"A"},{"role":"assistant","content":"Visible"},{"role":"user","content":"B"}]}"#,
+        )
+        .unwrap();
+        let trace_ambig = trace_without_worker(&mut session, &req_no_seed);
+        assert!(!trace_ids(&trace_ambig).contains(&MERGED));
+
+        // Explicit seed=22 disambiguates and hits lane 2 (respelled).
+        let req_seed_22 = tokspur_json::parse_json(
+            br#"{"model":"tokspur","seed":22,"temperature":0.7,"enable_thinking":false,"messages":[{"role":"user","content":"A"},{"role":"assistant","content":"Visible"},{"role":"user","content":"B"}]}"#,
+        )
+        .unwrap();
+        let trace_22 = trace_without_worker(&mut session, &req_seed_22);
+        assert!(trace_ids(&trace_22).contains(&MERGED));
+
+        // Mismatched temperature=0.5 misses both parked lanes.
+        let req_05 = tokspur_json::parse_json(
+            br#"{"model":"tokspur","seed":22,"temperature":0.5,"enable_thinking":false,"messages":[{"role":"user","content":"A"},{"role":"assistant","content":"Visible"},{"role":"user","content":"B"}]}"#,
+        )
+        .unwrap();
+        let trace_05 = trace_without_worker(&mut session, &req_05);
+        assert!(!trace_ids(&trace_05).contains(&MERGED));
+
+        // Adding a strictly longer lane (seed 33) overrides the shorter tie even when seed is omitted.
+        let mut longer = respelled_a.clone();
+        longer.push(u32::from(b'B') + 4);
+        longer.push(u32::from(b'C') + 4);
+        longer.push(1);
+        session.committed = longer.clone();
+        session.seed = 33;
+        session.park_active_reasoning();
+        assert_eq!(session.parked_reasoning.len(), 3);
+
+        // Now complete() end-to-end with seed=None, verifying lane_inherit_seed + lane_seed adoption
+        // + consumed lane removal + live lane parking + subsequent append.
+        session.committed = vec![u32::from(b'Z') + 4, 1];
+        session.seed = 99;
+        let req_longer_no_seed = tokspur_json::parse_json(
+            br#"{"model":"tokspur","temperature":0.7,"max_tokens":16,"enable_thinking":false,"messages":[{"role":"user","content":"A"},{"role":"assistant","content":"Visible"},{"role":"user","content":"B"},{"role":"assistant","content":"C"},{"role":"user","content":"D"}]}"#,
+        )
+        .unwrap();
+        let ready = parked_mtp_ready();
+        let mut saw_inherit_seed = false;
+        let mut resets = 0usize;
+        let mut position = 0u64;
+        let mut primes = 0u64;
+        let mut gen_id = 0u64;
+        let mut out_queue =
+            std::collections::VecDeque::from([u32::from(b'O') + 4, u32::from(b'K') + 4, 1]);
+        let mut target = |job: &Json, event: TokenCallback<'_>| -> Result<Json> {
+            let reset = field(job, "reset")?.boolean()?;
+            if reset {
+                resets += 1;
+                position = 0;
+                if let Some(inherit) = job.find("lane_inherit_seed")?
+                    && inherit.boolean()?
+                {
+                    saw_inherit_seed = true;
+                }
+            }
+            let toks = field(job, "tokens")?.array()?;
+            let inputs = toks.len() as u64;
+            let generate = field(job, "generate")?.unsigned_integer()? as usize;
+            let mut done = ready.clone();
+            let mut put_field = |name: &str, val: Json| {
+                let mut fields = done.object().unwrap().clone();
+                fields.retain(|(k, _)| k != name.as_bytes());
+                fields.push((name.as_bytes().to_vec(), val));
+                done = Json::Object(fields);
+            };
+            put_field("event", Json::from("done"));
+            if inputs > 0 {
+                let first_pkt = position == 0 && reset;
+                position += inputs;
+                primes += inputs - u64::from(reset);
+                put_field("committed_prefix", Json::integer(position));
+                put_field("generated_ids", Json::Array(Vec::new()));
+                put_field("status", Json::from("prefilled"));
+                put_field("continuation_allowed", Json::Bool(true));
+                put_field(
+                    "sampling",
+                    Json::new_object([
+                        ("valid", Json::Bool(true)),
+                        ("seed", Json::integer(33)),
+                        ("entropy_prefix", Json::integer(position)),
+                        ("entropy_words", Json::integer(0)),
+                        ("temperature", Json::integer(0.7 as u64)),
+                    ]),
+                );
+                // Replace sampling with exact policy from job.
+                let mut samp = field(job, "sampling")?.object()?.clone();
+                for (k, v) in [
+                    ("valid", Json::Bool(true)),
+                    ("seed", Json::integer(33)),
+                    ("entropy_prefix", Json::integer(position)),
+                    ("entropy_words", Json::integer(0)),
+                ] {
+                    samp.retain(|(name, _)| name != k.as_bytes());
+                    samp.push((k.as_bytes().to_vec(), v));
+                }
+                put_field("sampling", Json::Object(samp));
+                if first_pkt {
+                    put_field(
+                        "checkpoint_restored_tokens",
+                        Json::integer(longer.len() as u64),
+                    );
+                    put_field(
+                        "replayed_input_tokens",
+                        Json::integer(inputs - longer.len() as u64),
+                    );
+                    put_field("lane_seed", Json::integer(33));
+                    put_field("lane_restored_tokens", Json::integer(longer.len() as u64));
+                } else {
+                    put_field("checkpoint_restored_tokens", Json::integer(0));
+                    put_field("replayed_input_tokens", Json::integer(inputs));
+                }
+                put_field("native_mtp_prime_calls", Json::integer(primes));
+                put_field("native_mtp_priming_batch_submits", Json::integer(1));
+                put_field(
+                    "native_mtp_generation",
+                    Json::new_object([
+                        ("id", Json::integer(gen_id)),
+                        ("active", Json::Bool(false)),
+                        ("remaining", Json::integer(0)),
+                        ("pending", Json::Bool(false)),
+                    ]),
+                );
+            } else {
+                gen_id += 1;
+                let mut emitted = Vec::new();
+                while emitted.len() < generate
+                    && let Some(id) = out_queue.pop_front()
+                {
+                    position += 1;
+                    emitted.push(id);
+                    event(&Json::new_object([
+                        ("event", Json::from("token")),
+                        ("id", Json::integer(u64::from(id))),
+                        ("committed_prefix", Json::integer(position)),
+                        ("entropy_words", Json::integer(0)),
+                    ]))?;
+                    if id == 1 {
+                        break;
+                    }
+                }
+                primes += emitted.len() as u64;
+                let stopped = emitted.last().copied() == Some(1);
+                put_field("committed_prefix", Json::integer(position));
+                put_field(
+                    "generated_ids",
+                    Json::Array(
+                        emitted
+                            .iter()
+                            .map(|&id| Json::integer(u64::from(id)))
+                            .collect(),
+                    ),
+                );
+                put_field(
+                    "status",
+                    Json::from(if stopped { "stopped" } else { "length" }),
+                );
+                put_field(
+                    "finish_reason",
+                    Json::from(if stopped { "stop" } else { "length" }),
+                );
+                put_field(
+                    "stop_id",
+                    if stopped {
+                        Json::integer(1)
+                    } else {
+                        Json::Null
+                    },
+                );
+                put_field("continuation_allowed", Json::Bool(!stopped));
+                let mut samp = tokspur_json::parse_json(
+                    br#"{"temperature":0.7,"top_k":0,"top_p":1,"min_p":0}"#,
+                )
+                .unwrap()
+                .object()
+                .unwrap()
+                .clone();
+                samp.push((b"valid".to_vec(), Json::Bool(true)));
+                samp.push((b"seed".to_vec(), Json::integer(33)));
+                samp.push((b"entropy_prefix".to_vec(), Json::integer(position)));
+                samp.push((b"entropy_words".to_vec(), Json::integer(0)));
+                put_field("sampling", Json::Object(samp));
+                put_field("native_mtp_prime_calls", Json::integer(primes));
+                put_field("native_mtp_priming_batch_submits", Json::integer(1));
+                put_field(
+                    "native_mtp_generation",
+                    Json::new_object([
+                        ("id", Json::integer(gen_id)),
+                        ("active", Json::Bool(false)),
+                        ("remaining", Json::integer(0)),
+                        ("pending", Json::Bool(false)),
+                    ]),
+                );
+            }
+            Ok(done)
+        };
+        let mut cancelled = || false;
+        let mut new_seed = || 777;
+        let mut sink = ServeSink {
+            chunk: None,
+            cancelled: &mut cancelled,
+            new_seed: &mut new_seed,
+            prefix_trace: None,
+        };
+        let resp = session
+            .complete(
+                &req_longer_no_seed,
+                b"resp-parked-1",
+                &mut target,
+                &mut sink,
+            )
+            .unwrap();
+        assert!(saw_inherit_seed);
+        assert_eq!(resets, 1);
+        assert_eq!(session.seed, 33);
+        assert_eq!(
+            field(field(&resp, "usage").unwrap(), "prompt_tokens_details")
+                .unwrap()
+                .find("cached_tokens")
+                .unwrap()
+                .unwrap()
+                .unsigned_integer()
+                .unwrap(),
+            longer.len() as u64
+        );
+        // Consumed lane 2 (seed 33) was removed, and previous live lane (seed 99) was parked!
+        assert_eq!(session.parked_reasoning.len(), 3);
+        assert!(session.parked_reasoning.iter().any(|l| l.seed == 99));
+        assert!(!session.parked_reasoning.iter().any(|l| l.seed == 33));
+
+        // Subsequent turn on the restored conversation with seed=None appends cleanly.
+        let turn_next = tokspur_json::parse_json(
+            br#"{"model":"tokspur","temperature":0.7,"enable_thinking":false,"messages":[{"role":"user","content":"A"},{"role":"assistant","content":"Visible"},{"role":"user","content":"B"},{"role":"assistant","content":"C"},{"role":"user","content":"D"},{"role":"assistant","content":"OK"},{"role":"user","content":"E"}]}"#,
+        )
+        .unwrap();
+        let trace_append = trace_without_worker(&mut session, &turn_next);
+        assert!(field(&trace_append, "append").unwrap().boolean().unwrap());
+    }
+
+    #[test]
+    fn parked_lane_mixed_thinking_and_non_thinking_turns_preserve_ordinals() {
+        let mut session = ServeSession::new(
+            parked_reasoning_codec(),
+            SessionOptions {
+                mtp_ready: parked_mtp_ready(),
+                lane_parking: true,
+                ..SessionOptions::default()
+            },
+        )
+        .unwrap();
+        let policy = sampling_policy_bytes(Some(42), "0.7");
+        // Turn 0 had enable_thinking=false (no reasoning), Turn 1 had thinking "plan" + MERGED content.
+        let rendered_t1 = (session.codec.render)(
+            &tokspur_json::parse_json(
+                br#"{"messages":[{"role":"user","content":"U0"},{"role":"assistant","content":"A0"},{"role":"user","content":"U1"},{"role":"assistant","reasoning_content":"plan","content":"Visible"}]}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut committed_a = (session.codec.encode)(&rendered_t1).unwrap();
+        let vi_pos = committed_a
+            .windows(2)
+            .position(|w| w == [u32::from(b'V') + 4, u32::from(b'i') + 4])
+            .unwrap();
+        committed_a.splice(vi_pos..vi_pos + 2, [MERGED]);
+
+        session.reusable = true;
+        session.committed = committed_a.clone();
+        session.saved_reasoning = vec![(1, b"plan".to_vec())];
+        session.sampling = policy;
+        session.seed = 42;
+        session.park_active_reasoning();
+
+        session.committed = vec![u32::from(b'Z') + 4, 1];
+        session.seed = 99;
+
+        // Return to A with Turn 2 (enable_thinking=false, omitted reasoning_content on both assistant messages).
+        let return_a = tokspur_json::parse_json(
+            br#"{"model":"tokspur","seed":42,"temperature":0.7,"enable_thinking":false,"messages":[{"role":"user","content":"U0"},{"role":"assistant","content":"A0"},{"role":"user","content":"U1"},{"role":"assistant","content":"Visible"},{"role":"user","content":"U2"}]}"#,
+        )
+        .unwrap();
+        let trace = trace_without_worker(&mut session, &return_a);
+        let mut expected = committed_a;
+        expected.push(u32::from(b'U') + 4);
+        expected.push(u32::from(b'2') + 4);
+        assert_eq!(trace_ids(&trace), expected);
+    }
+
+    #[test]
+    fn apply_request_telemetry_overlays_ssd_restore_onto_generation_done() {
+        let mut session = ServeSession::new(
+            parked_reasoning_codec(),
+            SessionOptions {
+                mtp_ready: parked_mtp_ready(),
+                lane_parking: true,
+                ..SessionOptions::default()
+            },
+        )
+        .unwrap();
+        let gen_done = tokspur_json::parse_json(
+            br#"{"event":"done","checkpoint_reuse":"off","checkpoint_ssd_restored":false,"checkpoint_restored_tokens":0,"replayed_input_tokens":0,"hc_exact_final_logit_sha256":"abc"}"#,
+        )
+        .unwrap();
+
+        // Without prior request telemetry, done is returned unchanged.
+        assert_eq!(session.apply_request_telemetry(&gen_done), gen_done);
+
+        session.last_req_telemetry = Some(RequestCheckpointTelemetry {
+            ssd_restored: true,
+            reuse: Some("ssd_restored"),
+            restored_tokens: 61440,
+            replayed_tokens: 12291,
+        });
+        let enriched = session.apply_request_telemetry(&gen_done);
+        assert!(
+            field(&enriched, "checkpoint_ssd_restored")
+                .unwrap()
+                .boolean()
+                .unwrap()
+        );
+        assert_eq!(
+            field(&enriched, "checkpoint_reuse")
+                .unwrap()
+                .string()
+                .unwrap(),
+            b"ssd_restored"
+        );
+        assert_eq!(
+            field(&enriched, "checkpoint_restored_tokens")
+                .unwrap()
+                .unsigned_integer()
+                .unwrap(),
+            61440
+        );
+        assert_eq!(
+            field(&enriched, "replayed_input_tokens")
+                .unwrap()
+                .unsigned_integer()
+                .unwrap(),
+            12291
+        );
+        assert_eq!(
+            field(&enriched, "hc_exact_final_logit_sha256")
+                .unwrap()
+                .string()
+                .unwrap(),
+            b"abc"
+        );
+
+        session.invalidate();
+        assert_eq!(session.apply_request_telemetry(&gen_done), gen_done);
     }
 }

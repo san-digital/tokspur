@@ -31,12 +31,17 @@ pub fn unicode_scalars(utf8: &[u8]) -> Result<Vec<u32>, UnicodeError> {
         return Err(UnicodeError::Decode("Unicode input exceeds limit"));
     }
     let mut output = Vec::with_capacity(utf8.len());
+    visit_scalars(utf8, |point| output.push(point))?;
+    Ok(output)
+}
+
+fn visit_scalars(utf8: &[u8], mut visit: impl FnMut(u32)) -> Result<(), UnicodeError> {
     let mut i = 0;
     while i < utf8.len() {
         let first = utf8[i];
         i += 1;
         if first < 128 {
-            output.push(u32::from(first));
+            visit(u32::from(first));
             continue;
         }
         let tail = match first {
@@ -65,9 +70,9 @@ pub fn unicode_scalars(utf8: &[u8]) -> Result<Vec<u32>, UnicodeError> {
         {
             return Err(UnicodeError::Decode("non-scalar or overlong UTF-8"));
         }
-        output.push(point);
+        visit(point);
     }
-    Ok(output)
+    Ok(())
 }
 
 /// `unicode_scalars` as a check, without building the scalars: the same refusals and messages, as text.
@@ -77,9 +82,9 @@ pub fn scalar_str(utf8: &[u8]) -> Result<&str, UnicodeError> {
     if utf8.len() > WORK_LIMIT {
         return Err(UnicodeError::Decode("Unicode input exceeds limit"));
     }
-    std::str::from_utf8(utf8).map_err(|_| match unicode_scalars(utf8) {
+    std::str::from_utf8(utf8).map_err(|_| match visit_scalars(utf8, |_| {}) {
         Err(error) => error,
-        Ok(_) => UnicodeError::Decode("invalid UTF-8 input"),
+        Ok(()) => UnicodeError::Decode("invalid UTF-8 input"),
     })
 }
 

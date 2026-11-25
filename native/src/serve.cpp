@@ -511,6 +511,10 @@ Options options(int argc, char** argv) {
             require(value == "off" || value == "on", "shared prefix cache must be off or on");
             out.worker.shared_prefix_cache = (value == "on");
         }
+        else if (option == "--parked-lanes-mib" || option == "--native-parked-lanes-mib") {
+            out.worker.parked_lanes_mib = uint32_t(integer(value, 0, 16384));
+            out.worker.parked_lanes_explicit = true;
+        }
         else if (option == "--context-length" || option == "--native-context-length") {
             const auto ctx = integer(value, 65536, 131072);
             require(ctx == 65536 || ctx == 131072, "context-length must be 65536 or 131072");
@@ -712,14 +716,29 @@ int server_cli(int argc, char** argv) {
         const auto ids = tokenizer.encode(text); require(ids.size() == 1 && tokenizer.decode_bytes(ids) == text, "unsupported terminal token identity"); return ids[0];
     };
     const ResponseAdmission admission{uint32_t(tokenizer.vocabulary_size()), marker("<|im_end|>"), marker("<|endoftext|>"), marker("<|im_start|>")};
+    std::vector<uint32_t> control_ids;
+    for (const auto spelling : response_control_markers) {
+        const auto id = tokenizer.added_token(spelling);
+        if (!id) { control_ids.clear(); break; }
+        control_ids.push_back(*id);
+    }
     // Constructor arms its independent guardian before exec/model loading.
     require(!stopping.load(), "startup cancelled before model launch");
+    const bool has_mtp_sidecar =
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+        !config.worker.mtp_sidecar.empty() || !config.worker.dflash2_dir.empty();
+#else
+        false;
+#endif
+    require(config.worker.parked_lanes_mib == 0 || (has_mtp_sidecar && config.worker.shared_prefix_cache == std::optional<bool>(true)),
+        "parked lanes require a speculative drafter and the shared prefix cache");
+    const bool lane_parking = config.worker.parked_lanes_mib > 0;
     OwnedWorker worker(config.worker);
     if (const auto pid = worker.worker_pid()) state.write_worker_pid(*pid);
     validate_worker_ready(worker.ready(), config.worker.stack_execution, config.worker.checkpoint_slots, config.worker.checkpoint_budget_bytes);
     std::cerr << pack_startup_message(worker.ready(), !config.worker.derived_pack.empty());
     ServeSession session({[&](const Json& input) { return renderer.render(input); }, [&](const RenderedChat& input) { return tokenizer.encode(input.prompt, input.literal_ranges); },
-        [&](std::span<const uint32_t> ids) { return tokenizer.decode_bytes(ids); }, admission, tokenizer.nonordinary_token_ids()}, config.alias, config.worker.stack_execution,
+        [&](std::span<const uint32_t> ids) { return tokenizer.decode_bytes(ids); }, admission, tokenizer.nonordinary_token_ids(), std::move(control_ids)}, config.alias, config.worker.stack_execution,
         config.worker.checkpoint_slots ? worker.ready() : Json()
 #ifdef TOKSPUR_PRIVATE_HTTP_VERIFY8
         , config.worker.verify8, config.worker.verify8 ? worker.ready() : Json()
@@ -742,6 +761,7 @@ int server_cli(int argc, char** argv) {
 #endif
         , config.tool_args
         , config.worker.context_length
+        , lane_parking
         );
     std::atomic<bool> shutdown{false}, available{true}; std::mutex mutex; std::condition_variable condition;
     std::optional<Job> pending;

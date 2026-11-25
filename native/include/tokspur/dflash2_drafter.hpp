@@ -18,8 +18,8 @@
 namespace tokspur {
 
 struct DFlash2DraftResult {
-    std::array<SampledProposalRow, 7> proposals{};
-    std::array<float, 7> confidences{};
+    std::array<SampledProposalRow, 15> proposals{};
+    std::array<float, 15> confidences{};
     uint32_t count = 0;
     uint32_t evaluated_proposals = 0;
     uint64_t proposal_begin_words = 0;
@@ -27,10 +27,10 @@ struct DFlash2DraftResult {
     BatchResult batch{};
 };
 
-// Host half of one draft. selector_out is the packed selector result (uint candidates[7*16], float unary[7*16], float edges[7*16*16]) whose candidates are token IDs in the full vocabulary, whichever draft vocabulary produced them. Each proposal carries the actual law it was drawn from; random_after has consumed one word per non-deterministic law.
+// Host half of one draft. selector_out is the packed selector result (uint candidates[max_pos*16], float unary[max_pos*16], float edges[max_pos*16*16], max_pos = 7 or 15) whose candidates are token IDs in the full vocabulary, whichever draft vocabulary produced them. Each proposal carries the actual law it was drawn from; random_after has consumed one word per non-deterministic law.
 struct DFlash2SelectorProposals {
-    std::array<SampledProposalRow, 7> proposals{};
-    std::array<float, 7> confidences{};
+    std::array<SampledProposalRow, 15> proposals{};
+    std::array<float, 15> confidences{};
     SamplingRng random_after{0};
 };
 [[nodiscard]] DFlash2SelectorProposals dflash2_selector_proposals(std::span<const std::byte> selector_out, uint32_t count,
@@ -61,6 +61,12 @@ public:
         bool accepted = false;
     };
 
+    DFlash2VerifyBudget() = default;
+    DFlash2VerifyBudget(const DFlash2VerifyBudget&) = default;
+    DFlash2VerifyBudget& operator=(const DFlash2VerifyBudget&) = default;
+    DFlash2VerifyBudget(DFlash2VerifyBudget&& other) noexcept;
+    DFlash2VerifyBudget& operator=(DFlash2VerifyBudget&& other) noexcept;
+
     static double seed_cost(uint32_t rows);
     static Acceptance fit(std::span<const Label> labels, const Acceptance& start);
 
@@ -74,6 +80,13 @@ public:
 
     void observe(std::span<const float, kPositions> confidences, uint32_t verify_rows, uint32_t accepted,
                  double milliseconds, bool record_labels = true);
+    void reset() noexcept {
+        acceptance_ = Acceptance{};
+        cost_ = CostStats{};
+        labels_.clear();
+        next_label_ = 0;
+        cycles_ = 0;
+    }
 
 private:
     struct CostStats {
@@ -90,10 +103,28 @@ private:
     uint64_t cycles_ = 0;
 };
 
+inline DFlash2VerifyBudget::DFlash2VerifyBudget(DFlash2VerifyBudget&& other) noexcept
+    : acceptance_(std::exchange(other.acceptance_, Acceptance{})),
+      cost_(std::exchange(other.cost_, CostStats{})),
+      labels_(std::move(other.labels_)),
+      next_label_(std::exchange(other.next_label_, 0)),
+      cycles_(std::exchange(other.cycles_, 0)) {}
+
+inline DFlash2VerifyBudget& DFlash2VerifyBudget::operator=(DFlash2VerifyBudget&& other) noexcept {
+    if (this != &other) {
+        acceptance_ = std::exchange(other.acceptance_, Acceptance{});
+        cost_ = std::exchange(other.cost_, CostStats{});
+        labels_ = std::move(other.labels_);
+        next_label_ = std::exchange(other.next_label_, 0);
+        cycles_ = std::exchange(other.cycles_, 0);
+    }
+    return *this;
+}
+
 // The caller owns the fixed scratch allocation. Pending rows never borrow the target's reusable tap storage.
 class DFlash2ContextStage {
 public:
-    void prepare(GpuView storage, uint32_t width);
+    void prepare(GpuView storage, uint32_t width, uint32_t max_rows = 8);
     void stage(MetalGraph& gpu, GpuView source, uint32_t rows, uint32_t start);
     void truncate(uint32_t position) noexcept;
     void clear() noexcept { rows_ = start_ = 0; }
@@ -102,7 +133,7 @@ public:
     [[nodiscard]] uint32_t start() const noexcept { return start_; }
 private:
     GpuView storage_{};
-    uint32_t width_ = 0, rows_ = 0, start_ = 0;
+    uint32_t width_ = 0, rows_ = 0, start_ = 0, max_rows_ = 8;
 };
 
 class DFlash2Drafter {
@@ -128,6 +159,11 @@ public:
     void truncate(uint32_t position);
     void set_max_drafts(uint32_t max_drafts);
     [[nodiscard]] uint32_t max_drafts() const noexcept { return max_drafts_; }
+    [[nodiscard]] uint32_t checkpoint_block_size() const noexcept { return checkpoint_block_size_; }
+    [[nodiscard]] uint32_t effective_max_drafts() const noexcept;
+    [[nodiscard]] uint32_t burst_max_drafts() const noexcept;
+    void reset_burst_streak() noexcept { consecutive_full_accepts_ = 0; }
+    void note_lookup_round(uint32_t proposed, uint32_t accepted, bool stopped) noexcept;
     void configure_draft_vocab_slice(uint32_t slice_vocab);
     [[nodiscard]] uint32_t draft_vocab_slice() const noexcept { return active_output_vocab_ < vocab_size_ ? active_output_vocab_ : 0u; }
     [[nodiscard]] uint32_t active_output_vocabulary() const noexcept { return active_output_vocab_; }
@@ -140,16 +176,26 @@ public:
     BatchResult commit_context(GpuView captured_target_hidden, uint32_t rows, uint32_t start_position,
                                uint64_t remaining_after = 0);
 
+    DFlash2DraftResult draft_block(uint32_t k, uint32_t base_position, uint32_t anchor_id,
+                                   std::span<const float> anchor_row, SamplingPolicy policy,
+                                   const SamplingRng& after_anchor, bool adaptive_budget = true,
+                                   uint32_t max_verify_rows = 8u);
+
     DFlash2DraftResult draft_block8(uint32_t k, uint32_t base_position, uint32_t anchor_id,
                                     std::span<const float> anchor_row, SamplingPolicy policy,
-                                    const SamplingRng& after_anchor, bool adaptive_budget = true);
+                                    const SamplingRng& after_anchor, bool adaptive_budget = true,
+                                    uint32_t max_verify_rows = 8u);
 
     void observe_verify_round(std::span<const float, DFlash2VerifyBudget::kPositions> confidences,
                               uint32_t verify_rows, uint32_t accepted, double milliseconds,
                               bool record_labels = true);
+    void observe_verify_round_any(std::span<const float> confidences,
+                                  uint32_t verify_rows, uint32_t accepted, double milliseconds,
+                                  bool record_labels = true);
 
     [[nodiscard]] const DFlash2VerifyBudget& verify_budget() const noexcept { return verify_budget_; }
-    void reset_verify_budget() { verify_budget_ = DFlash2VerifyBudget{}; }
+    void set_verify_budget(DFlash2VerifyBudget budget) { verify_budget_ = std::move(budget); consecutive_full_accepts_ = 0; }
+    void reset_verify_budget() noexcept { verify_budget_.reset(); consecutive_full_accepts_ = 0; }
     using MeasuredBudget = std::function<uint32_t(uint32_t, std::span<const float, 7>, uint32_t)>;
     void set_measured_budget(MeasuredBudget callback) { measured_budget_ = std::move(callback); }
     void set_adaptive_budget(bool enabled) noexcept { adaptive_budget_ = enabled; }
@@ -157,9 +203,11 @@ public:
 
     [[nodiscard]] DFlash2Precision precision() const noexcept { return precision_; }
     [[nodiscard]] bool deferred_context() const noexcept { return defer_context_; }
+    [[nodiscard]] uint32_t deferred_context_rows() const noexcept { return pending_context_.rows(); }
     [[nodiscard]] std::span<const uint32_t> target_layer_ids() const noexcept { return target_layer_ids_; }
     [[nodiscard]] uint32_t context_len() const noexcept { return context_len_; }
     [[nodiscard]] uint32_t max_context() const noexcept { return max_context_; }
+    [[nodiscard]] uint32_t sliding_window() const noexcept { return sliding_window_; }
     [[nodiscard]] uint32_t mask_token_id() const noexcept { return mask_token_id_; }
     [[nodiscard]] uint32_t vocabulary() const noexcept { return vocab_size_; }
     [[nodiscard]] uint64_t weight_bytes() const noexcept { return weight_bytes_; }
@@ -203,6 +251,8 @@ private:
     GpuView gathered_output_weight_{};
     GpuView draft_row_token_ids_{};
     uint32_t max_drafts_ = 7;
+    uint32_t checkpoint_block_size_ = 8;
+    uint32_t consecutive_full_accepts_ = 0;
 
     uint32_t hidden_size_ = 2560;
     uint32_t intermediate_size_ = 7680;

@@ -1831,6 +1831,8 @@ fn main() {
     check(arguments == br#"{"path":"true"}"#);
     executor_enum_contract();
     executor_arg_contract();
+    generator_schema_keywords();
+    tool_schema_patterns();
     thinking_budget_contract();
     println!(
         "PASS owned serving protocol checks={} (model-free; no tools executed)",
@@ -2036,6 +2038,2114 @@ fn executor_enum_contract() {
 }
 
 /// Execute the production session and response parser in a child process with a generated target, without HTTP, model weights or GPU execution.
+/// The refusal text of one call, or empty when it is admitted.
+fn refusal_text<T, E: std::fmt::Display>(result: Result<T, E>) -> String {
+    match result {
+        Ok(_) => String::new(),
+        Err(error) => error.to_string(),
+    }
+}
+
+/// Checks one table row, naming the row when it differs.
+#[track_caller]
+fn expect_text(actual: String, expected: &str, row: &str) {
+    if actual != expected {
+        eprintln!("schema keyword row {row}: got '{actual}', expected '{expected}'");
+    }
+    check(actual == expected);
+}
+
+/// The same rows as `generator_schema_keywords` in `native/tests/test_serve_protocol.cpp`, with the same refusal text.
+fn generator_schema_keywords() {
+    // Tool declarations: each schema is one property of the parameters object. Empty text means admitted.
+    for (schema, expected) in [
+        (r#"{"type":"number","exclusiveMaximum":1}"#, ""),
+        (
+            r#"{"type":"integer","minimum":0,"exclusiveMaximum":10}"#,
+            "",
+        ),
+        (
+            r#"{"type":"number","exclusiveMinimum":0,"exclusiveMaximum":1}"#,
+            "",
+        ),
+        (r#"{"type":"number","maximum":5,"exclusiveMaximum":5}"#, ""),
+        (r#"{"type":"number","exclusiveMaximum":-1e300}"#, ""),
+        (
+            r#"{"type":"number","minimum":1,"exclusiveMaximum":1.0000000000000000001}"#,
+            "",
+        ),
+        (
+            r#"{"type":"number","exclusiveMaximum":true}"#,
+            "expected JSON number",
+        ),
+        (
+            r#"{"type":"number","exclusiveMaximum":"1"}"#,
+            "expected JSON number",
+        ),
+        (
+            r#"{"type":"number","exclusiveMaximum":1e301}"#,
+            "API number outside supported range",
+        ),
+        (
+            r#"{"type":"string","exclusiveMaximum":0}"#,
+            "numeric bound on other schema type",
+        ),
+        (
+            r#"{"type":"number","minimum":1,"exclusiveMaximum":1}"#,
+            "inverted schema bounds",
+        ),
+        (
+            r#"{"type":"number","minimum":1.0000000000000000001,"exclusiveMaximum":1}"#,
+            "inverted schema bounds",
+        ),
+        (
+            r#"{"type":"number","exclusiveMinimum":1,"exclusiveMaximum":1}"#,
+            "inverted schema bounds",
+        ),
+        (
+            r#"{"type":"number","exclusiveMinimum":2,"exclusiveMaximum":1}"#,
+            "inverted schema bounds",
+        ),
+        (
+            r#"{"type":"number","exclusiveMaximum":0,"minimum":"x"}"#,
+            "expected JSON number",
+        ),
+        (
+            r#"{"anyOf":[{"type":"number"}],"exclusiveMaximum":1}"#,
+            "unsupported API/schema field",
+        ),
+        (r#"{"type":"string","minLength":1,"maxLength":3}"#, ""),
+        (r#"{"type":"string","minLength":0,"maxLength":0}"#, ""),
+        (r#"{"type":"string","minLength":65536}"#, ""),
+        (r#"{"type":"string","maxLength":65537}"#, ""),
+        (
+            r#"{"type":"string","minLength":65536,"maxLength":18446744073709551615}"#,
+            "",
+        ),
+        (
+            r#"{"type":"string","minLength":65537}"#,
+            "minLength exceeds the tool call byte limit",
+        ),
+        (
+            r#"{"type":"string","minLength":65537,"maxLength":2}"#,
+            "minLength exceeds the tool call byte limit",
+        ),
+        (
+            r#"{"type":"string","minLength":3,"maxLength":2}"#,
+            "inverted schema bounds",
+        ),
+        (
+            r#"{"type":"string","minLength":-1}"#,
+            "JSON unsigned integer out of range or nonintegral",
+        ),
+        (
+            r#"{"type":"string","minLength":1.0}"#,
+            "JSON unsigned integer out of range or nonintegral",
+        ),
+        (
+            r#"{"type":"string","minLength":18446744073709551616}"#,
+            "JSON unsigned integer out of range or nonintegral",
+        ),
+        (
+            r#"{"type":"string","maxLength":"2"}"#,
+            "expected JSON unsigned integer",
+        ),
+        (
+            r#"{"type":"string","maxLength":true,"minLength":1.5}"#,
+            "JSON unsigned integer out of range or nonintegral",
+        ),
+        (
+            r#"{"type":"integer","minLength":1}"#,
+            "string schema keyword on other type",
+        ),
+        (
+            r#"{"type":"array","items":{"type":"string"},"maxLength":2}"#,
+            "string schema keyword on other type",
+        ),
+        (
+            r#"{"anyOf":[{"type":"string"}],"minLength":1}"#,
+            "unsupported API/schema field",
+        ),
+        (r#"{"type":"string","enum":["abc"],"minLength":3}"#, ""),
+        (
+            r#"{"type":"string","enum":["ab"],"minLength":3}"#,
+            "tool string below minLength",
+        ),
+        (
+            r#"{"type":"array","items":{"type":"string"},"uniqueItems":true}"#,
+            "",
+        ),
+        (
+            r#"{"type":"array","items":{"type":"string"},"uniqueItems":false}"#,
+            "",
+        ),
+        (
+            r#"{"type":"array","items":{"type":"string"},"uniqueItems":1}"#,
+            "expected JSON boolean",
+        ),
+        (
+            r#"{"type":"array","items":{"type":"string"},"uniqueItems":"true"}"#,
+            "expected JSON boolean",
+        ),
+        (
+            r#"{"type":"array","items":{"type":"string"},"minItems":3,"maxItems":2,"uniqueItems":1}"#,
+            "inverted schema bounds",
+        ),
+        (
+            r#"{"type":"string","uniqueItems":true}"#,
+            "array schema keyword on other type",
+        ),
+        (
+            r#"{"type":"object","properties":{},"uniqueItems":false}"#,
+            "array schema keyword on other type",
+        ),
+        (
+            r#"{"anyOf":[{"type":"array","items":{"type":"string"}}],"uniqueItems":true}"#,
+            "unsupported API/schema field",
+        ),
+        (r#"{"type":"string","const":"a"}"#, ""),
+        (r#"{"type":"integer","const":3}"#, ""),
+        (r#"{"type":"number","const":1.50}"#, ""),
+        (r#"{"type":"boolean","const":true}"#, ""),
+        (r#"{"type":"null","const":null}"#, ""),
+        (r#"{"type":"string","enum":["a"],"const":"a"}"#, ""),
+        (r#"{"type":"string","const":1}"#, "tool value is not string"),
+        (
+            r#"{"type":"boolean","const":"true"}"#,
+            "tool value is not boolean",
+        ),
+        (
+            r#"{"type":"integer","const":1.0}"#,
+            "tool integer must use exact safe-integer syntax",
+        ),
+        (
+            r#"{"type":"integer","const":5,"maximum":3}"#,
+            "tool value above maximum",
+        ),
+        (
+            r#"{"type":"string","const":"abc","maxLength":2}"#,
+            "tool string above maxLength",
+        ),
+        (
+            r#"{"type":"number","const":1e301}"#,
+            "API number outside supported range",
+        ),
+        (
+            r#"{"type":"string","enum":["a","b"],"const":"a"}"#,
+            "tool value differs from const",
+        ),
+        (
+            r#"{"type":"string","enum":["a"],"const":"b"}"#,
+            "tool value differs from const",
+        ),
+        (
+            r#"{"type":"object","properties":{},"const":{}}"#,
+            "unsupported const",
+        ),
+        (
+            r#"{"type":"array","items":{"type":"string"},"const":[]}"#,
+            "unsupported const",
+        ),
+        (
+            r#"{"anyOf":[{"type":"string"}],"const":"a"}"#,
+            "unsupported API/schema field",
+        ),
+        (r#"{"type":"integer","multipleOf":5}"#, ""),
+        (r#"{"type":"number","multipleOf":0.01}"#, ""),
+        (r#"{"type":"number","multipleOf":1e-7}"#, ""),
+        (r#"{"type":"number","multipleOf":0.30000000000000004}"#, ""),
+        (r#"{"type":"number","multipleOf":123456789012345678}"#, ""),
+        (r#"{"type":"number","multipleOf":1234567890123456780}"#, ""),
+        (
+            r#"{"type":"number","multipleOf":1234567890123456789}"#,
+            "multipleOf digit bound",
+        ),
+        (
+            r#"{"type":"number","multipleOf":0}"#,
+            "multipleOf must be positive",
+        ),
+        (
+            r#"{"type":"number","multipleOf":0.0}"#,
+            "multipleOf must be positive",
+        ),
+        (
+            r#"{"type":"number","multipleOf":-2}"#,
+            "multipleOf must be positive",
+        ),
+        (
+            r#"{"type":"number","multipleOf":"2"}"#,
+            "expected JSON number",
+        ),
+        (
+            r#"{"type":"number","multipleOf":1e301}"#,
+            "API number outside supported range",
+        ),
+        (
+            r#"{"type":"number","minimum":2,"maximum":1,"multipleOf":0}"#,
+            "inverted schema bounds",
+        ),
+        (
+            r#"{"type":"string","multipleOf":2}"#,
+            "numeric bound on other schema type",
+        ),
+        (
+            r#"{"anyOf":[{"type":"integer"}],"multipleOf":2}"#,
+            "unsupported API/schema field",
+        ),
+        (r#"{"type":"integer","enum":[4,6],"multipleOf":2}"#, ""),
+        (
+            r#"{"type":"integer","enum":[4,5],"multipleOf":2}"#,
+            "tool value is not a multiple of multipleOf",
+        ),
+        (
+            r#"{"type":"integer","enum":[4],"multipleOf":0}"#,
+            "multipleOf must be positive",
+        ),
+    ] {
+        let declaration = tools().array().unwrap()[0].clone();
+        let function = with(
+            declaration.find("function").unwrap().unwrap(),
+            "parameters",
+            parse(&format!(
+                r#"{{"type":"object","properties":{{"p":{schema}}}}}"#
+            )),
+        );
+        let tools = Json::Array(vec![with(&declaration, "function", function)]);
+        expect_text(
+            refusal_text(admit_chat(&with(&plain("A"), "tools", tools), b"tokspur")),
+            expected,
+            schema,
+        );
+    }
+    // Strict validation of one value against one schema.
+    let validation: &[(&str, &[(&str, &str)])] = &[
+        (
+            r#"{"type":"number","minimum":0,"exclusiveMaximum":1}"#,
+            &[
+                (r#"0"#, ""),
+                (r#"-0.0"#, ""),
+                (r#"0.5"#, ""),
+                (r#"9.9e-1"#, ""),
+                (r#"0.99999999999999999999"#, ""),
+                (r#"1"#, "tool value at or above exclusive maximum"),
+                (r#"1.0"#, "tool value at or above exclusive maximum"),
+                (r#"1e0"#, "tool value at or above exclusive maximum"),
+                (
+                    r#"1.00000000000000000001"#,
+                    "tool value at or above exclusive maximum",
+                ),
+                (r#"2"#, "tool value at or above exclusive maximum"),
+                (r#"-0.1"#, "tool value below minimum"),
+            ],
+        ),
+        (
+            r#"{"type":"integer","exclusiveMinimum":1,"exclusiveMaximum":4}"#,
+            &[
+                (r#"2"#, ""),
+                (r#"3"#, ""),
+                (r#"1"#, "tool value at or below exclusive minimum"),
+                (r#"4"#, "tool value at or above exclusive maximum"),
+            ],
+        ),
+        (
+            r#"{"type":"number","maximum":1,"exclusiveMaximum":2}"#,
+            &[
+                (r#"1"#, ""),
+                (r#"1.5"#, "tool value above maximum"),
+                (r#"2"#, "tool value above maximum"),
+            ],
+        ),
+        (
+            r#"{"type":"number","exclusiveMaximum":-1.5}"#,
+            &[
+                (r#"-1.6"#, ""),
+                (r#"-1.5"#, "tool value at or above exclusive maximum"),
+                (r#"-1.50"#, "tool value at or above exclusive maximum"),
+                (r#"-1.4"#, "tool value at or above exclusive maximum"),
+            ],
+        ),
+        (
+            r#"{"type":"string","minLength":2,"maxLength":3}"#,
+            &[
+                (r#""ab""#, ""),
+                (r#""abc""#, ""),
+                (r#""""#, "tool string below minLength"),
+                (r#""a""#, "tool string below minLength"),
+                (r#""abcd""#, "tool string above maxLength"),
+                (r#""é""#, "tool string below minLength"),
+                (r#""éé""#, ""),
+                (r#""日本語""#, ""),
+                (r#""日本語x""#, "tool string above maxLength"),
+                (r#""😀""#, "tool string below minLength"),
+                (r#""😀😀""#, ""),
+                (r#""😀😀😀""#, ""),
+                (r#""😀😀😀😀""#, "tool string above maxLength"),
+                (r#""\ud83d\ude00""#, "tool string below minLength"),
+                (r#""\u0061\u0062""#, ""),
+                (
+                    r#""\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00""#,
+                    "tool string above maxLength",
+                ),
+                (r#""e\u0301""#, ""),
+                (r#"5"#, "tool value is not string"),
+            ],
+        ),
+        (
+            r#"{"type":"string","minLength":0,"maxLength":0}"#,
+            &[(r#""""#, ""), (r#""a""#, "tool string above maxLength")],
+        ),
+        (
+            r#"{"type":"array","items":{"type":"number"},"uniqueItems":true}"#,
+            &[
+                (r#"[]"#, ""),
+                (r#"[1]"#, ""),
+                (r#"[1,2,3]"#, ""),
+                (r#"[1,1.00000000000000000001]"#, ""),
+                (r#"[1,1]"#, "tool array repeats an item"),
+                (r#"[1,2,1]"#, "tool array repeats an item"),
+                (r#"[1,1.0]"#, "tool array repeats an item"),
+                (r#"[1,1e0]"#, "tool array repeats an item"),
+                (r#"[10,1e1]"#, "tool array repeats an item"),
+                (r#"[0,-0.0]"#, "tool array repeats an item"),
+                (r#"[1.5,15e-1]"#, "tool array repeats an item"),
+                (r#"[1,1,"x"]"#, "expected JSON number"),
+            ],
+        ),
+        (
+            r#"{"type":"array","items":{"type":"number"},"uniqueItems":false}"#,
+            &[(r#"[1,1]"#, "")],
+        ),
+        (
+            r#"{"type":"array","items":{"type":"integer"},"minItems":2,"uniqueItems":true}"#,
+            &[
+                (r#"[1,2]"#, ""),
+                (r#"[1]"#, "tool array below minItems"),
+                (r#"[1,1]"#, "tool array repeats an item"),
+            ],
+        ),
+        (
+            r#"{"type":"array","items":{"type":"string"},"uniqueItems":true}"#,
+            &[
+                (r#"["a","b"]"#, ""),
+                (r#"["a","A"]"#, ""),
+                (r#"["é","e\u0301"]"#, ""),
+                (r#"["a","a"]"#, "tool array repeats an item"),
+                (r#"["\u0061","a"]"#, "tool array repeats an item"),
+            ],
+        ),
+        (
+            r#"{"type":"array","items":{"anyOf":[{"type":"integer"},{"type":"string"},{"type":"boolean"},{"type":"null"}]},"uniqueItems":true}"#,
+            &[
+                (r#"[1,"1",true,null]"#, ""),
+                (r#"[1,"1e0"]"#, ""),
+                (r#"[0,false]"#, ""),
+                (r#"["true",true]"#, ""),
+                (r#"["null",null]"#, ""),
+                (r#"[null,null]"#, "tool array repeats an item"),
+                (r#"[true,true]"#, "tool array repeats an item"),
+                (r#"[1,"1",1]"#, "tool array repeats an item"),
+            ],
+        ),
+        (
+            r#"{"type":"array","items":{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"string"}}},"uniqueItems":true}"#,
+            &[
+                (r#"[{"a":1,"b":"x"},{"a":1,"b":"y"}]"#, ""),
+                (r#"[{"a":1},{"b":"1"}]"#, ""),
+                (r#"[{"a":1},{}]"#, ""),
+                (
+                    r#"[{"a":1,"b":"x"},{"b":"x","a":1.0}]"#,
+                    "tool array repeats an item",
+                ),
+                (r#"[{},{}]"#, "tool array repeats an item"),
+            ],
+        ),
+        (
+            r#"{"type":"array","items":{"type":"array","items":{"type":"number"}},"uniqueItems":true}"#,
+            &[
+                (r#"[[1,2],[2,1]]"#, ""),
+                (r#"[[1],[1,1]]"#, ""),
+                (r#"[[],[0]]"#, ""),
+                (r#"[[1,2],[1.0,2e0]]"#, "tool array repeats an item"),
+                (r#"[[],[]]"#, "tool array repeats an item"),
+            ],
+        ),
+        (
+            r#"{"type":"string","const":"a"}"#,
+            &[
+                (r#""a""#, ""),
+                (r#""\u0061""#, ""),
+                (r#""b""#, "tool value differs from const"),
+                (r#""A""#, "tool value differs from const"),
+                (r#"1"#, "tool value is not string"),
+            ],
+        ),
+        (
+            r#"{"type":"number","const":1.50}"#,
+            &[
+                (r#"1.5"#, ""),
+                (r#"15e-1"#, ""),
+                (r#"1.50000000000000000001"#, "tool value differs from const"),
+                (r#"1"#, "tool value differs from const"),
+            ],
+        ),
+        (
+            r#"{"type":"integer","const":0}"#,
+            &[
+                (r#"0"#, ""),
+                (r#"-0"#, ""),
+                (r#"1"#, "tool value differs from const"),
+            ],
+        ),
+        (
+            r#"{"type":"boolean","const":true}"#,
+            &[
+                (r#"true"#, ""),
+                (r#"false"#, "tool value differs from const"),
+            ],
+        ),
+        (
+            r#"{"type":"null","const":null}"#,
+            &[(r#"null"#, ""), (r#"0"#, "tool value is not null")],
+        ),
+        (
+            r#"{"type":"integer","multipleOf":5}"#,
+            &[
+                (r#"0"#, ""),
+                (r#"5"#, ""),
+                (r#"-10"#, ""),
+                (r#"7"#, "tool value is not a multiple of multipleOf"),
+                (r#"-3"#, "tool value is not a multiple of multipleOf"),
+            ],
+        ),
+        (
+            r#"{"type":"number","multipleOf":0.01}"#,
+            &[
+                (r#"1.23"#, ""),
+                (r#"0.1"#, ""),
+                (r#"1e2"#, ""),
+                (r#"-4.5"#, ""),
+                (r#"0.0"#, ""),
+                (r#"1.234"#, "tool value is not a multiple of multipleOf"),
+                (r#"1e-3"#, "tool value is not a multiple of multipleOf"),
+            ],
+        ),
+        (
+            r#"{"type":"number","multipleOf":0.1}"#,
+            &[
+                (r#"0.3"#, ""),
+                (r#"1e300"#, ""),
+                (
+                    r#"0.30000000000000004"#,
+                    "tool value is not a multiple of multipleOf",
+                ),
+            ],
+        ),
+        (
+            r#"{"type":"number","multipleOf":1.5}"#,
+            &[
+                (r#"3"#, ""),
+                (r#"4.5"#, ""),
+                (r#"3e1"#, ""),
+                (r#"1.5e299"#, ""),
+                (r#"1"#, "tool value is not a multiple of multipleOf"),
+                (r#"1e1"#, "tool value is not a multiple of multipleOf"),
+            ],
+        ),
+        (
+            r#"{"type":"number","multipleOf":2.5}"#,
+            &[
+                (r#"5"#, ""),
+                (r#"7.5"#, ""),
+                (r#"1e1"#, ""),
+                (r#"1"#, "tool value is not a multiple of multipleOf"),
+            ],
+        ),
+        (
+            r#"{"type":"number","multipleOf":8}"#,
+            &[
+                (r#"1e3"#, ""),
+                (r#"1e300"#, ""),
+                (r#"1e2"#, "tool value is not a multiple of multipleOf"),
+                (r#"4"#, "tool value is not a multiple of multipleOf"),
+            ],
+        ),
+        (
+            r#"{"type":"number","multipleOf":3}"#,
+            &[
+                (r#"3e299"#, ""),
+                (r#"9007199254740993"#, ""),
+                (
+                    r#"9007199254740992"#,
+                    "tool value is not a multiple of multipleOf",
+                ),
+                (r#"1e300"#, "tool value is not a multiple of multipleOf"),
+            ],
+        ),
+        (
+            r#"{"type":"number","multipleOf":1e-7}"#,
+            &[
+                (r#"0.0000001"#, ""),
+                (r#"1"#, ""),
+                (
+                    r#"0.00000005"#,
+                    "tool value is not a multiple of multipleOf",
+                ),
+            ],
+        ),
+        (
+            r#"{"type":"number","multipleOf":123456789012345678}"#,
+            &[
+                (r#"123456789012345678"#, ""),
+                (r#"246913578024691356"#, ""),
+                (r#"1234567890123456780"#, ""),
+                (
+                    r#"123456789012345679"#,
+                    "tool value is not a multiple of multipleOf",
+                ),
+            ],
+        ),
+        (
+            r#"{"type":"number","multipleOf":576460752303423488}"#,
+            &[
+                (r#"1e59"#, ""),
+                (r#"1e60"#, ""),
+                (r#"1e58"#, "tool value is not a multiple of multipleOf"),
+            ],
+        ),
+        (
+            r#"{"type":"number","multipleOf":298023223876953125}"#,
+            &[
+                (r#"1e25"#, ""),
+                (r#"1e24"#, "tool value is not a multiple of multipleOf"),
+            ],
+        ),
+        (
+            r#"{"type":"number","multipleOf":999999999999999999}"#,
+            &[
+                (r#"999999999999999999"#, ""),
+                (r#"122999999999999999877"#, ""),
+                (r#"999999999999999999e40"#, ""),
+                (
+                    r#"999999999999999998999999999999999998"#,
+                    "tool value is not a multiple of multipleOf",
+                ),
+            ],
+        ),
+        (
+            r#"{"type":"integer","minimum":0,"exclusiveMaximum":100,"multipleOf":25}"#,
+            &[
+                (r#"75"#, ""),
+                (r#"0"#, ""),
+                (r#"100"#, "tool value at or above exclusive maximum"),
+                (r#"30"#, "tool value is not a multiple of multipleOf"),
+                (r#"50.0"#, "tool integer must use exact safe-integer syntax"),
+                (r#"-25"#, "tool value below minimum"),
+            ],
+        ),
+    ];
+    for (schema, rows) in validation {
+        let parsed = parse(schema);
+        for (value, expected) in *rows {
+            expect_text(
+                refusal_text(validate_tool_value(&parsed, &parse(value))),
+                expected,
+                &format!("{schema} {value}"),
+            );
+        }
+    }
+    // A value built in memory can hold bytes that are not UTF-8. Its length cannot be counted, so it is refused as the JSON codec refuses it.
+    expect_text(
+        refusal_text(validate_tool_value(
+            &parse(r#"{"type":"string","maxLength":4}"#),
+            &Json::String(vec![b'a', 0xff]),
+        )),
+        "invalid UTF-8 input",
+        "bytes that are not UTF-8",
+    );
+    // With enum validation deferred to the executor only const is deferred with it; every bound is still enforced.
+    for (schema, value, expected) in [
+        (r#"{"type":"string","const":"a"}"#, r#""b""#, ""),
+        (
+            r#"{"type":"string","const":"a"}"#,
+            r#"1"#,
+            "tool value is not string",
+        ),
+        (
+            r#"{"type":"number","const":1,"exclusiveMaximum":2}"#,
+            r#"1.5"#,
+            "",
+        ),
+        (
+            r#"{"type":"number","const":1,"exclusiveMaximum":2}"#,
+            r#"2"#,
+            "tool value at or above exclusive maximum",
+        ),
+        (
+            r#"{"type":"integer","multipleOf":5}"#,
+            r#"7"#,
+            "tool value is not a multiple of multipleOf",
+        ),
+        (
+            r#"{"type":"string","maxLength":1}"#,
+            r#""ab""#,
+            "tool string above maxLength",
+        ),
+        (
+            r#"{"type":"array","items":{"type":"integer"},"uniqueItems":true}"#,
+            r#"[1,1]"#,
+            "tool array repeats an item",
+        ),
+    ] {
+        expect_text(
+            refusal_text(validate_tool_value_with_policy(
+                &parse(schema),
+                &parse(value),
+                ToolEnumValidation::Executor,
+            )),
+            expected,
+            &format!("{schema} {value}"),
+        );
+    }
+    // A recorded call: strict argument validation refuses each violation with its own text, and executor validation defers all of them.
+    let declared = parse(
+        r#"[{"type":"function","function":{"name":"save","parameters":{"type":"object","properties":{"name":{"type":"string","minLength":2,"maxLength":4},"tags":{"type":"array","items":{"type":"string"},"uniqueItems":true},"ratio":{"type":"number","exclusiveMaximum":1},"step":{"type":"integer","multipleOf":5},"kind":{"type":"string","const":"file"}},"additionalProperties":false}}}]"#,
+    );
+    for (arguments, strict, deferred_enum) in [
+        (
+            r#"{"name":"ab","tags":["a","b"],"ratio":0.5,"step":10,"kind":"file"}"#,
+            "",
+            "",
+        ),
+        (
+            r#"{"name":"a"}"#,
+            "tool string below minLength",
+            "tool string below minLength",
+        ),
+        (
+            r#"{"name":"abcde"}"#,
+            "tool string above maxLength",
+            "tool string above maxLength",
+        ),
+        (
+            r#"{"tags":["a","a"]}"#,
+            "tool array repeats an item",
+            "tool array repeats an item",
+        ),
+        (
+            r#"{"ratio":1}"#,
+            "tool value at or above exclusive maximum",
+            "tool value at or above exclusive maximum",
+        ),
+        (
+            r#"{"step":7}"#,
+            "tool value is not a multiple of multipleOf",
+            "tool value is not a multiple of multipleOf",
+        ),
+        (r#"{"kind":"dir"}"#, "tool value differs from const", ""),
+    ] {
+        let history = parse(&format!(
+            r#"[{{"role":"user","content":"save it"}},{{"role":"assistant","tool_calls":[{{"id":"call_1","type":"function","function":{{"name":"save","arguments":{arguments}}}}}]}},{{"role":"tool","tool_call_id":"call_1","content":"saved"}},{{"role":"user","content":"again"}}]"#
+        ));
+        let job = with(
+            &with(&plain("A"), "tools", declared.clone()),
+            "messages",
+            history,
+        );
+        expect_text(
+            refusal_text(admit_chat(&job, b"tokspur")),
+            strict,
+            arguments,
+        );
+        expect_text(
+            refusal_text(admit_chat_with_policy(
+                &job,
+                b"tokspur",
+                ToolEnumValidation::Executor,
+            )),
+            deferred_enum,
+            arguments,
+        );
+        expect_text(
+            refusal_text(admit_chat_with_policies(
+                &job,
+                b"tokspur",
+                ToolEnumValidation::Strict,
+                ToolArgValidation::Executor,
+            )),
+            "",
+            arguments,
+        );
+    }
+    // A generated call takes the same validator: the strict session refuses with its text and the executor session passes the call on.
+    let job = with(&plain("A"), "tools", declared);
+    let mut cancelled = || false;
+    let mut seed = || 44u64;
+    let mut sink = ServeSink {
+        chunk: None,
+        cancelled: &mut cancelled,
+        new_seed: &mut seed,
+        prefix_trace: None,
+    };
+    for (parameter, value, expected) in [
+        ("name", r#"abc"#, ""),
+        ("name", r#"a"#, "tool string below minLength"),
+        ("name", r#"abcde"#, "tool string above maxLength"),
+        ("tags", r#"["a","a"]"#, "tool array repeats an item"),
+        ("ratio", r#"1"#, "tool value at or above exclusive maximum"),
+        ("step", r#"7"#, "tool value is not a multiple of multipleOf"),
+        ("kind", r#"dir"#, "tool value differs from const"),
+    ] {
+        let frame = format!(
+            "<tool_call><function=save><parameter={parameter}>\n{value}\n</parameter></function></tool_call><|im_end|>"
+        );
+        let mut strict = ServeSession::new(codec(), SessionOptions::default()).unwrap();
+        let rejected = RefCell::new(Fake::new());
+        rejected.borrow_mut().reply(&frame);
+        let mut rejected_call =
+            |command: &Json, event: Event<'_>| rejected.borrow_mut().call(command, event);
+        expect_text(
+            refusal_text(strict.complete(&job, b"strict-keyword", &mut rejected_call, &mut sink)),
+            expected,
+            &frame,
+        );
+        let mut executor = ServeSession::new(
+            codec(),
+            SessionOptions {
+                tool_args: ToolArgValidation::Executor,
+                ..SessionOptions::default()
+            },
+        )
+        .unwrap();
+        let accepted = RefCell::new(Fake::new());
+        accepted.borrow_mut().reply(&frame);
+        let mut accepted_call =
+            |command: &Json, event: Event<'_>| accepted.borrow_mut().call(command, event);
+        let result = executor
+            .complete(&job, b"executor-keyword", &mut accepted_call, &mut sink)
+            .unwrap();
+        check(
+            message(&result)
+                .find("tool_calls")
+                .unwrap()
+                .unwrap()
+                .array()
+                .unwrap()
+                .len()
+                == 1,
+        );
+    }
+}
+
+/// The same rows as `tool_schema_patterns` in `native/tests/test_serve_protocol.cpp`, with the same refusal text. Both are written from one table.
+fn tool_schema_patterns() {
+    // Tool declarations: each schema is one property of the parameters object. Empty text means admitted.
+    for (schema, expected) in [
+        (
+            r#"{"type":"string","pattern":"^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"}"#,
+            "",
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?=.{1,253}\\.?$)[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\\.[a-zA-Z0-9](?:[-0-9a-zA-Z]{0,61}[0-9a-zA-Z])?)*\\.?$"}"#,
+            "",
+        ),
+        (
+            r#"{"type":"string","pattern":"^P(?:(\\d+W)|(?!.*W)(?=\\d|T\\d)(\\d+Y)?(\\d+M)?(\\d+D)?(T(?=\\d)(\\d+H)?(\\d+M)?(\\d+([.,]\\d+)?S)?)?)$"}"#,
+            "",
+        ),
+        (
+            r#"{"type":"string","pattern":"^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"}"#,
+            "",
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])$"}"#,
+            "",
+        ),
+        (
+            r#"{"type":"string","pattern":"^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))$"}"#,
+            "",
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"}"#,
+            "",
+        ),
+        (
+            r#"{"type":"string","pattern":"^$|^(?:[0-9a-zA-Z+/]{4})*(?:(?:[0-9a-zA-Z+/]{2}==)|(?:[0-9a-zA-Z+/]{3}=))?$"}"#,
+            "",
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"}"#,
+            "",
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?!^[-+.]*$)[+-]?0*(?:\\d{0,3}|(?=[\\d.]{1,6}0*$)\\d{0,3}\\.\\d{0,2}0*$)"}"#,
+            "",
+        ),
+        (
+            r#"{"type":"string","pattern":"^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))\\/(12[0-8]|1[01][0-9]|[1-9]?[0-9])$"}"#,
+            "",
+        ),
+        (
+            r#"{"type":"string","pattern":"^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"}"#,
+            "",
+        ),
+        (r#"{"type":"string","pattern":"^[a-zA-Z0-9_-]{21}$"}"#, ""),
+        (r#"{"type":"string","pattern":"^[cC][^\\s-]{8,}$"}"#, ""),
+        (r#"{"type":"string","pattern":"^[0-9a-z]+$"}"#, ""),
+        (
+            r#"{"type":"string","pattern":"^[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{26}$"}"#,
+            "",
+        ),
+        (r#"{"type":"string","pattern":"^[0-9a-vA-V]{20}$"}"#, ""),
+        (
+            r#"{"type":"string","pattern":"^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\\/([0-9]|[1-2][0-9]|3[0-2])$"}"#,
+            "",
+        ),
+        (
+            r#"{"type":"string","pattern":"^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|::|([0-9a-fA-F]{1,4})?::([0-9a-fA-F]{1,4}:?){0,6})\\/(12[0-8]|1[01][0-9]|[1-9]?[0-9])$"}"#,
+            "",
+        ),
+        (r#"{"type":"string","pattern":"^[A-Za-z0-9_-]*$"}"#, ""),
+        (
+            r#"{"type":"string","pattern":"^\\+(?:[0-9]){6,14}[0-9]$"}"#,
+            "",
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?$"}"#,
+            "",
+        ),
+        (
+            r#"{"type":"string","pattern":"^https:\\/\\/a b_c-d\\..*"}"#,
+            "",
+        ),
+        (r#"{"type":"string","pattern":".*\\.json$"}"#, ""),
+        (r#"{"type":"string","pattern":"a\\+b \\(c\\)"}"#, ""),
+        (
+            r#"{"type":"string","pattern":"^id--?\\d+(?:\\.\\d+)?-(a|b)$"}"#,
+            "",
+        ),
+        (r#"{"type":"string","pattern":"^[^A-Z]*$"}"#, ""),
+        (
+            r#"{"type":"string","pattern":"^[0-9a-fA-F]{8}\\b-[0-9a-fA-F]{4}\\b-[0-9a-fA-F]{4}\\b-[0-9a-fA-F]{4}\\b-[0-9a-fA-F]{12}$"}"#,
+            "",
+        ),
+        (
+            r#"{"type":"string","pattern":"^(([a-f0-9]{1,4}:){7}|::([a-f0-9]{1,4}:){0,6}|([a-f0-9]{1,4}:){1}:([a-f0-9]{1,4}:){0,5}|([a-f0-9]{1,4}:){2}:([a-f0-9]{1,4}:){0,4}|([a-f0-9]{1,4}:){3}:([a-f0-9]{1,4}:){0,3}|([a-f0-9]{1,4}:){4}:([a-f0-9]{1,4}:){0,2}|([a-f0-9]{1,4}:){5}:([a-f0-9]{1,4}:){0,1})([a-f0-9]{1,4}|(((25[0-5])|(2[0-4][0-9])|(1[0-9]{2})|([0-9]{1,2}))\\.){3}((25[0-5])|(2[0-4][0-9])|(1[0-9]{2})|([0-9]{1,2})))$"}"#,
+            "",
+        ),
+        (
+            r#"{"type":"string","pattern":"^([0-9a-zA-Z-_]{4})*(([0-9a-zA-Z-_]{2}(==)?)|([0-9a-zA-Z-_]{3}(=)?))?$"}"#,
+            "",
+        ),
+        (
+            r#"{"type":"string","pattern":"^[A-Za-z0-9-_]+\\.[A-Za-z0-9-_]+\\.[A-Za-z0-9-_]*$"}"#,
+            "",
+        ),
+        (
+            r#"{"type":"string","pattern":"^https\\:\\/\\/a\\ b\\_c\\-d\\."}"#,
+            "",
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?!^[-+.]*$)[+-]?0*(?:\\d{0,8}|(?=[\\d.]{1,9}0*$)\\d*\\.\\d*0*$)"}"#,
+            "",
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d{0,3}0*$"}"#,
+            "",
+        ),
+        (
+            r#"{"type":"string","pattern":"^\\s*(\\d*\\.?\\d+)\\s*(\\w+)?"}"#,
+            "",
+        ),
+        (
+            r#"{"type":"string","pattern":"^\\d{3}-\\d{2}-\\d{4}$"}"#,
+            "",
+        ),
+        (r#"{"type":"string","pattern":"^[a-z_][a-z0-9_]*$"}"#, ""),
+        (
+            r#"{"type":"string","pattern":"^(\\p{Extended_Pictographic}|\\p{Emoji_Component})+$"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?P<area>\\d{3})-\\d{4}$"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"(a)\\1"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\1"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\9"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"(?<n>a)"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"(?<n>a)\\k<n>"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\k<n>"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\p{L}"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\P{Lu}"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"[\\p{L}]"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"(?i)a"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"(?i:a)"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"(?#c)a"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\uD83D"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\uDE00"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\uD83Dx"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\uD83D\\u0041"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\u{D800}"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\\ud83d\ude00"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"[\\\ud83d\ude00]"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\a"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\e"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\A"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\Z"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\z"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\G"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\Q"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"[\\B]"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"[\\1]"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"[\\c1]"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\c1"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\c"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\00"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\01"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\x1"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\xg0"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\u12"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\u{}"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\u{110000}"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"\\u{1F600"}"#,
+            "unsupported pattern",
+        ),
+        (r#"{"type":"string","pattern":"\\"}"#, "unsupported pattern"),
+        (r#"{"type":"string","pattern":"*"}"#, "unsupported pattern"),
+        (r#"{"type":"string","pattern":"+a"}"#, "unsupported pattern"),
+        (r#"{"type":"string","pattern":"?"}"#, "unsupported pattern"),
+        (
+            r#"{"type":"string","pattern":"a**"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"a+*"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"a*??"}"#,
+            "unsupported pattern",
+        ),
+        (r#"{"type":"string","pattern":"a{"}"#, "unsupported pattern"),
+        (
+            r#"{"type":"string","pattern":"a{1"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"a{,2}"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"a{1,2"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"a{2,1}"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"a{x}"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"{1}"}"#,
+            "unsupported pattern",
+        ),
+        (r#"{"type":"string","pattern":"a}"}"#, "unsupported pattern"),
+        (r#"{"type":"string","pattern":"a]"}"#, "unsupported pattern"),
+        (r#"{"type":"string","pattern":"^*"}"#, "unsupported pattern"),
+        (r#"{"type":"string","pattern":"$+"}"#, "unsupported pattern"),
+        (
+            r#"{"type":"string","pattern":"\\b?"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"(?=a)*"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"(?<!a){2}"}"#,
+            "unsupported pattern",
+        ),
+        (r#"{"type":"string","pattern":"("}"#, "unsupported pattern"),
+        (r#"{"type":"string","pattern":")"}"#, "unsupported pattern"),
+        (r#"{"type":"string","pattern":"(a"}"#, "unsupported pattern"),
+        (r#"{"type":"string","pattern":"a)"}"#, "unsupported pattern"),
+        (r#"{"type":"string","pattern":"(?"}"#, "unsupported pattern"),
+        (
+            r#"{"type":"string","pattern":"(?a)"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"(?<"}"#,
+            "unsupported pattern",
+        ),
+        (r#"{"type":"string","pattern":"["}"#, "unsupported pattern"),
+        (r#"{"type":"string","pattern":"[a"}"#, "unsupported pattern"),
+        (
+            r#"{"type":"string","pattern":"[a-"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"[b-a]"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"[\\d-z]"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"[a-\\w]"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"[a--]"}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"a{4096}"}"#,
+            "pattern exceeds the tool pattern bound",
+        ),
+        (
+            r#"{"type":"string","pattern":"(?:a{64}){64}"}"#,
+            "pattern exceeds the tool pattern bound",
+        ),
+        (
+            r#"{"type":"string","pattern":"a{0,2048}"}"#,
+            "pattern exceeds the tool pattern bound",
+        ),
+        (
+            r#"{"type":"string","pattern":"(?:(?:(?:a{20}){20}){20}){20}"}"#,
+            "pattern exceeds the tool pattern bound",
+        ),
+        (
+            r#"{"type":"string","pattern":"(){4097}"}"#,
+            "pattern exceeds the tool pattern bound",
+        ),
+        (
+            r#"{"type":"string","pattern":"a{5000,4000}"}"#,
+            "pattern exceeds the tool pattern bound",
+        ),
+        (
+            r#"{"type":"string","pattern":"a{99999999999999999999999999}"}"#,
+            "pattern exceeds the tool pattern bound",
+        ),
+        (
+            r#"{"type":"string","pattern":"a{4096,}"}"#,
+            "pattern exceeds the tool pattern bound",
+        ),
+        (
+            r#"{"type":"string","pattern":"(((((((((((((((((((((((((((((((((a)))))))))))))))))))))))))))))))))"}"#,
+            "pattern exceeds the tool pattern bound",
+        ),
+        (
+            r#"{"type":"string","pattern":"(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=a"}"#,
+            "pattern exceeds the tool pattern bound",
+        ),
+        (
+            r#"{"type":"string","pattern":"(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)"}"#,
+            "pattern exceeds the tool pattern bound",
+        ),
+        (
+            r#"{"type":"string","pattern":"(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})"}"#,
+            "pattern exceeds the tool pattern bound",
+        ),
+        (r#"{"type":"string","pattern":"a{4095}"}"#, ""),
+        (r#"{"type":"string","pattern":"(?:a{63}){65}"}"#, ""),
+        (r#"{"type":"string","pattern":"a{0,2047}"}"#, ""),
+        (r#"{"type":"string","pattern":"(?:(?:(?:a*)*)*)*"}"#, ""),
+        (r#"{"type":"string","pattern":"(){4096}"}"#, ""),
+        (
+            r#"{"type":"string","pattern":"((((((((((((((((((((((((((((((((a))))))))))))))))))))))))))))))))"}"#,
+            "",
+        ),
+        (
+            r#"{"type":"string","pattern":"(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)"}"#,
+            "",
+        ),
+        (r#"{"type":"string","pattern":7}"#, "expected JSON string"),
+        (
+            r#"{"type":"string","pattern":null}"#,
+            "expected JSON string",
+        ),
+        (
+            r#"{"type":"integer","pattern":"^1"}"#,
+            "string schema keyword on other type",
+        ),
+        (
+            r#"{"type":"array","items":{"type":"string"},"pattern":"a"}"#,
+            "string schema keyword on other type",
+        ),
+        (
+            r#"{"type":"array","items":{"type":"string","pattern":"^a"}}"#,
+            "",
+        ),
+        (
+            r#"{"anyOf":[{"type":"string"}],"pattern":"a"}"#,
+            "unsupported API/schema field",
+        ),
+        (
+            r#"{"anyOf":[{"type":"number"},{"type":"string","pattern":"^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"}]}"#,
+            "",
+        ),
+        (
+            r#"{"anyOf":[{"type":"number"},{"type":"string","pattern":"(a)\\1"}]}"#,
+            "unsupported pattern",
+        ),
+        (r#"{"type":"string","pattern":"^a","enum":["ab","ac"]}"#, ""),
+        (
+            r#"{"type":"string","pattern":"^a","enum":["ab","b"]}"#,
+            "tool string does not match pattern",
+        ),
+        (r#"{"type":"string","pattern":"^a","const":"ab"}"#, ""),
+        (
+            r#"{"type":"string","pattern":"^a","const":"b"}"#,
+            "tool string does not match pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"(","minLength":3,"maxLength":2}"#,
+            "inverted schema bounds",
+        ),
+        (
+            r#"{"type":"string","pattern":"(","minLength":65537}"#,
+            "minLength exceeds the tool call byte limit",
+        ),
+        (
+            r#"{"type":"string","pattern":"(","enum":[1]}"#,
+            "unsupported pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"^b","enum":["abc"],"minLength":4}"#,
+            "tool string below minLength",
+        ),
+        (
+            r#"{"type":"string","pattern":"^b","enum":["abc"],"minLength":3}"#,
+            "tool string does not match pattern",
+        ),
+    ] {
+        let declaration = tools().array().unwrap()[0].clone();
+        let function = with(
+            declaration.find("function").unwrap().unwrap(),
+            "parameters",
+            parse(&format!(
+                r#"{{"type":"object","properties":{{"p":{schema}}}}}"#
+            )),
+        );
+        let tools = Json::Array(vec![with(&declaration, "function", function)]);
+        expect_text(
+            refusal_text(admit_chat(&with(&plain("A"), "tools", tools), b"tokspur")),
+            expected,
+            schema,
+        );
+    }
+    // The pattern text is bounded too, whatever it compiles to: a class of 16382 members is one step.
+    for (members, expected) in [
+        (16382, ""),
+        (16383, "pattern exceeds the tool pattern bound"),
+    ] {
+        let schema = Json::Object(vec![
+            (b"type".to_vec(), Json::String(b"string".to_vec())),
+            (
+                b"pattern".to_vec(),
+                Json::String(format!("[{}]", "a".repeat(members)).into_bytes()),
+            ),
+        ]);
+        expect_text(
+            refusal_text(validate_tool_value(&schema, &Json::String(b"a".to_vec()))),
+            expected,
+            "pattern text length",
+        );
+    }
+    // Strict validation of one string against one pattern: the strings it matches, then the strings it does not.
+    let matching: &[(&str, &[&str], &[&str])] = &[
+        (
+            r#"{"type":"string","pattern":"b"}"#,
+            &[r#""b""#, r#""abc""#],
+            &[r#""""#, r#""a""#, r#""B""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^b"}"#,
+            &[r#""b""#, r#""bc""#],
+            &[r#""ab""#, r#""a\nb""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"b$"}"#,
+            &[r#""b""#, r#""ab""#],
+            &[r#""ba""#, r#""b\n""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^$"}"#,
+            &[r#""""#],
+            &[r#""a""#, r#""\n""#],
+        ),
+        (
+            r#"{"type":"string","pattern":""}"#,
+            &[r#""""#, r#""a""#],
+            &[],
+        ),
+        (
+            r#"{"type":"string","pattern":"^a|b$"}"#,
+            &[r#""ax""#, r#""xb""#],
+            &[r#""xa""#, r#""bx""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"a^b"}"#,
+            &[],
+            &[r#""ab""#, r#""a\nb""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"a$b"}"#,
+            &[],
+            &[r#""ab""#, r#""a\nb""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^[a-c]$"}"#,
+            &[r#""a""#, r#""c""#],
+            &[r#""d""#, r#""-""#, r#""ab""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^[^a-c]$"}"#,
+            &[r#""d""#, r#""\n""#, r#""\ud83d\ude00""#],
+            &[r#""a""#, r#""""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^[-a]$"}"#,
+            &[r#""-""#, r#""a""#],
+            &[r#""b""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^[a-]$"}"#,
+            &[r#""-""#, r#""a""#],
+            &[r#""b""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^[a\\-c]$"}"#,
+            &[r#""a""#, r#""-""#, r#""c""#],
+            &[r#""b""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^[+--]$"}"#,
+            &[r#""+""#, r#"",""#, r#""-""#],
+            &[r#"".""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^[a-c-e]$"}"#,
+            &[r#""b""#, r#""-""#, r#""e""#],
+            &[r#""d""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^[A-Za-z0-9-_]$"}"#,
+            &[r#""Q""#, r#""5""#, r#""-""#, r#""_""#],
+            &[r#""+""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^[\\d-]$"}"#,
+            &[r#""7""#, r#""-""#],
+            &[r#""a""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^[\\w.]$"}"#,
+            &[r#""a""#, r#""_""#, r#"".""#],
+            &[r#""-""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^[^\\s-]$"}"#,
+            &[r#""a""#],
+            &[r#"" ""#, r#""-""#, r#""\t""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^[\\b]$"}"#,
+            &[r#""\b""#],
+            &[r#""b""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^[.*+?(){}|^$\\[\\]\\\\]$"}"#,
+            &[r#"".""#, r#""{""#, r#""^""#, r#""[""#, r#""]""#, r#""\\""#],
+            &[r#""a""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^[]$"}"#,
+            &[],
+            &[r#""""#, r#""a""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^[^]$"}"#,
+            &[r#""a""#, r#""\n""#, r#""\udbff\udfff""#],
+            &[r#""""#, r#""ab""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^\\d$"}"#,
+            &[r#""0""#, r#""9""#],
+            &[r#""\u0663""#, r#""a""#, r#""\uff11""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^\\D$"}"#,
+            &[r#""\u0663""#, r#""a""#, r#""\n""#],
+            &[r#""0""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^\\w$"}"#,
+            &[r#""a""#, r#""Z""#, r#""0""#, r#""_""#],
+            &[r#""\u00e9""#, r#""-""#, r#""\u017f""#, r#""\u212a""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^\\W$"}"#,
+            &[r#""\u00e9""#, r#""-""#, r#"" ""#],
+            &[r#""a""#, r#""_""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^\\s$"}"#,
+            &[
+                r#""\t""#,
+                r#""\n""#,
+                r#""\u000b""#,
+                r#""\f""#,
+                r#""\r""#,
+                r#"" ""#,
+                r#""\u00a0""#,
+                r#""\u1680""#,
+                r#""\u2000""#,
+                r#""\u200a""#,
+                r#""\u2028""#,
+                r#""\u2029""#,
+                r#""\u202f""#,
+                r#""\u205f""#,
+                r#""\u3000""#,
+                r#""\ufeff""#,
+            ],
+            &[
+                r#""\u0085""#,
+                r#""\u180e""#,
+                r#""\u200b""#,
+                r#""\u2060""#,
+                r#""a""#,
+                r#""\u001c""#,
+            ],
+        ),
+        (
+            r#"{"type":"string","pattern":"^\\S$"}"#,
+            &[r#""\u0085""#, r#""\u180e""#, r#""\u200b""#, r#""a""#],
+            &[r#"" ""#, r#""\u00a0""#, r#""\u2028""#, r#""\ufeff""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^.$"}"#,
+            &[
+                r#""a""#,
+                r#""\u0085""#,
+                r#""\t""#,
+                r#""\u000b""#,
+                r#""\ud83d\ude00""#,
+            ],
+            &[r#""\n""#, r#""\r""#, r#""\u2028""#, r#""\u2029""#, r#""""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^.{2}$"}"#,
+            &[r#""e\u0301""#, r#""\ud83d\ude00a""#],
+            &[r#""\ud83d\ude00""#, r#""\u00e9""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^\ud83d\ude00+$"}"#,
+            &[r#""\ud83d\ude00""#, r#""\ud83d\ude00\ud83d\ude00""#],
+            &[r#""""#, r#""\ud83d\ude01""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^[\ud83d\ude00-\ud83d\ude4f]$"}"#,
+            &[r#""\ud83d\ude00""#, r#""\ud83d\ude4f""#],
+            &[r#""\ud83d\ude50""#, r#""a""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^\\u{1F600}\\uD83D\\uDE00$"}"#,
+            &[r#""\ud83d\ude00\ud83d\ude00""#],
+            &[r#""\ud83d\ude00""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^\\u00e9\\xe9\\u{0000e9}$"}"#,
+            &[r#""\u00e9\u00e9\u00e9""#],
+            &[r#""eee""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^\\t\\n\\v\\f\\r\\0\\cJ\\cj$"}"#,
+            &[r#""\t\n\u000b\f\r\u0000\n\n""#],
+            &[r#""\t\n\u000b\f\r0\n\n""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^a*$"}"#,
+            &[r#""""#, r#""aaa""#],
+            &[r#""b""#, r#""ab""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^a+?$"}"#,
+            &[r#""a""#, r#""aaa""#],
+            &[r#""""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^a??b$"}"#,
+            &[r#""b""#, r#""ab""#],
+            &[r#""aab""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^a{2}$"}"#,
+            &[r#""aa""#],
+            &[r#""a""#, r#""aaa""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^a{2,}$"}"#,
+            &[r#""aa""#, r#""aaaaa""#],
+            &[r#""a""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^a{1,3}?$"}"#,
+            &[r#""a""#, r#""aaa""#],
+            &[r#""""#, r#""aaaa""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^a{0}b$"}"#,
+            &[r#""b""#],
+            &[r#""ab""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^a{0,0}$"}"#,
+            &[r#""""#],
+            &[r#""a""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^(ab|c)+$"}"#,
+            &[r#""ab""#, r#""c""#, r#""abcab""#],
+            &[r#""a""#, r#""ac""#, r#""""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?:a|)b$"}"#,
+            &[r#""ab""#, r#""b""#],
+            &[r#""aab""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^(|a|)$"}"#,
+            &[r#""""#, r#""a""#],
+            &[r#""aa""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^()*a(?:)+$"}"#,
+            &[r#""a""#],
+            &[r#""""#, r#""aa""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^(a*)*$"}"#,
+            &[r#""""#, r#""aaaa""#],
+            &[r#""b""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^(a*)+b$"}"#,
+            &[r#""b""#, r#""aab""#],
+            &[r#""a""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^(a|ab)(c|bcd)(d*)$"}"#,
+            &[r#""abcd""#, r#""ac""#, r#""abc""#, r#""acdd""#],
+            &[r#""ab""#, r#""abd""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^((a)|(b))*?c$"}"#,
+            &[r#""c""#, r#""abbac""#],
+            &[r#""abd""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?:a{2}){2,3}$"}"#,
+            &[r#""aaaa""#, r#""aaaaaa""#],
+            &[r#""aa""#, r#""aaaaa""#, r#""aaaaaaaa""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"\\bcat\\b"}"#,
+            &[r#""cat""#, r#""a cat.""#, r#""cat-flap""#],
+            &[r#""cats""#, r#""concat""#, r#""\u00e9cat_""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"\\Bcat"}"#,
+            &[r#""concat""#, r#""_cat""#],
+            &[r#""cat""#, r#"" cat""#, r#""\u00e9cat""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^\\b"}"#,
+            &[r#""a""#],
+            &[r#""""#, r#""-a""#, r#""\u00e9""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"\\b$"}"#,
+            &[r#""a""#, r#""-a""#],
+            &[r#""""#, r#""a-""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^\\B$"}"#,
+            &[r#""""#],
+            &[r#""a""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?=.*\\d)(?=.*[a-z]).{4,}$"}"#,
+            &[r#""ab12""#, r#""1a..""#],
+            &[r#""abcd""#, r#""1234""#, r#""a1""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?!ab)\\w+$"}"#,
+            &[r#""ba""#, r#""a""#, r#""aab""#],
+            &[r#""ab""#, r#""abc""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"a(?=b)"}"#,
+            &[r#""ab""#, r#""xab""#],
+            &[r#""a""#, r#""ac""#, r#""ba""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"a(?!b)"}"#,
+            &[r#""a""#, r#""ac""#, r#""aba""#],
+            &[r#""ab""#, r#""xab""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"(?<=a)b"}"#,
+            &[r#""ab""#, r#""xab""#],
+            &[r#""b""#, r#""cb""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"(?<!a)b"}"#,
+            &[r#""b""#, r#""cb""#, r#""abb""#],
+            &[r#""ab""#, r#""xab""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?=a$)a$"}"#,
+            &[r#""a""#],
+            &[r#""aa""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^a(?<=^a)$"}"#,
+            &[r#""a""#],
+            &[r#""aa""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?:(?=a)\\w|-)+$"}"#,
+            &[r#""a-a""#, r#""-""#, r#""aa""#],
+            &[r#""ab""#, r#""b""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?=(?!ab)a)\\w+$"}"#,
+            &[r#""ac""#, r#""a""#],
+            &[r#""ab""#, r#""b""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?=a(?<=^a)b)ab$"}"#,
+            &[r#""ab""#],
+            &[r#""abb""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"(?<=(?<!x)a)b"}"#,
+            &[r#""ab""#],
+            &[r#""xab""#, r#""b""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?!)"}"#,
+            &[],
+            &[r#""""#, r#""a""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?=)$"}"#,
+            &[r#""""#],
+            &[r#""a""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"(?=\\b)a"}"#,
+            &[r#""a""#, r#"" a""#],
+            &[r#""ba""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?=(a|b)*c)\\w+$"}"#,
+            &[r#""abc""#, r#""c""#, r#""cab""#],
+            &[r#""abd""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"(?<=\\d{2})-(?=\\d{2})"}"#,
+            &[r#""12-34""#, r#""x99-00y""#],
+            &[r#""1-23""#, r#""12-3""#, r#""ab-cd""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^https\\:\\/\\/a\\ b\\_c\\-d\\.$"}"#,
+            &[r#""https://a b_c-d.""#],
+            &[r#""https://a b_c-dx""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^\\@\\#\\%\\&\\,\\;\\<\\=\\>\\~\\`\\!\\'\\\"$"}"#,
+            &[r#""@#%&,;<=>~`!'\"""#],
+            &[r#""@""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^na\\\u00efve\\\u2028$"}"#,
+            &[r#""na\u00efve\u2028""#],
+            &[r#""naive""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^[\\ -\\~]+$"}"#,
+            &[r#""a b~""#],
+            &[r#""\t""#, r#""\u00e9""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^\\^\\$\\\\\\.\\*\\+\\?\\(\\)\\[\\]\\{\\}\\|$"}"#,
+            &[r#""^$\\.*+?()[]{}|""#],
+            &[r#""^""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"}"#,
+            &[
+                r#""a@b.co""#,
+                r#""first.last+tag@sub.example.org""#,
+                r#""o'neil@x-y.io""#,
+            ],
+            &[
+                r#"".a@b.co""#,
+                r#""a..b@c.de""#,
+                r#""a.@b.co""#,
+                r#""a@b""#,
+                r#""a@-b.co""#,
+                r#""a b@c.de""#,
+                r#""a@b.c""#,
+            ],
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?=.{1,253}\\.?$)[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\\.[a-zA-Z0-9](?:[-0-9a-zA-Z]{0,61}[0-9a-zA-Z])?)*\\.?$"}"#,
+            &[
+                r#""example.com""#,
+                r#""a""#,
+                r#""x-1.y.""#,
+                r#""localhost""#,
+            ],
+            &[
+                r#""""#,
+                r#""-a.com""#,
+                r#""a-.com""#,
+                r#""a..b""#,
+                r#""a_b.com""#,
+                r#""aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa""#,
+            ],
+        ),
+        (
+            r#"{"type":"string","pattern":"^P(?:(\\d+W)|(?!.*W)(?=\\d|T\\d)(\\d+Y)?(\\d+M)?(\\d+D)?(T(?=\\d)(\\d+H)?(\\d+M)?(\\d+([.,]\\d+)?S)?)?)$"}"#,
+            &[
+                r#""P1W""#,
+                r#""P1Y2M3D""#,
+                r#""PT1H""#,
+                r#""P1DT2H3M4.5S""#,
+                r#""PT0,5S""#,
+            ],
+            &[
+                r#""P""#,
+                r#""PT""#,
+                r#""P1WT1H""#,
+                r#""P1S""#,
+                r#""1Y""#,
+                r#""P1Y2W""#,
+            ],
+        ),
+        (
+            r#"{"type":"string","pattern":"^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"}"#,
+            &[
+                r#""123e4567-e89b-12d3-a456-426614174000""#,
+                r#""00000000-0000-0000-0000-000000000000""#,
+            ],
+            &[
+                r#""123e4567-e89b-02d3-a456-426614174000""#,
+                r#""123e4567e89b12d3a456426614174000""#,
+                r#""""#,
+            ],
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])$"}"#,
+            &[r#""0.0.0.0""#, r#""192.168.1.255""#],
+            &[
+                r#""256.1.1.1""#,
+                r#""1.2.3""#,
+                r#""01.2.3.4""#,
+                r#""1.2.3.4 ""#,
+            ],
+        ),
+        (
+            r#"{"type":"string","pattern":"^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))$"}"#,
+            &[
+                r#""::""#,
+                r#""::1""#,
+                r#""2001:db8::8a2e:370:7334""#,
+                r#""1:2:3:4:5:6:7:8""#,
+            ],
+            &[
+                r#""1:2:3:4:5:6:7""#,
+                r#"":::""#,
+                r#""g::1""#,
+                r#""1::2::3""#,
+            ],
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"}"#,
+            &[
+                r#""2024-02-29T23:59:59Z""#,
+                r#""2025-12-31T00:00:00.123+05:30""#,
+                r#""2000-01-01T12:30Z""#,
+            ],
+            &[
+                r#""2023-02-29T00:00:00Z""#,
+                r#""2024-13-01T00:00:00Z""#,
+                r#""2024-01-01 00:00:00Z""#,
+                r#""2024-01-01T24:00:00Z""#,
+                r#""2024-01-01T00:00:00""#,
+            ],
+        ),
+        (
+            r#"{"type":"string","pattern":"^$|^(?:[0-9a-zA-Z+/]{4})*(?:(?:[0-9a-zA-Z+/]{2}==)|(?:[0-9a-zA-Z+/]{3}=))?$"}"#,
+            &[r#""""#, r#""QUJD""#, r#""QUI=""#, r#""QQ==""#],
+            &[r#""QUJ""#, r#""QQ=""#, r#""QU JD""#, r#""QUJD==""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"}"#,
+            &[r#""1""#, r#""-1.5""#, r#""+.5""#, r#""007""#, r#""1.""#],
+            &[
+                r#""""#,
+                r#""-""#,
+                r#""+.""#,
+                r#"".""#,
+                r#""1.2.3""#,
+                r#""1e5""#,
+                r#""--1""#,
+            ],
+        ),
+        (
+            r#"{"type":"string","pattern":"^(?!^[-+.]*$)[+-]?0*(?:\\d{0,3}|(?=[\\d.]{1,6}0*$)\\d{0,3}\\.\\d{0,2}0*$)"}"#,
+            &[r#""123""#, r#""123.45""#, r#""-0.5""#, r#""1.50""#],
+            &[r#""-""#, r#"".""#, r#""+""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^[cC][^\\s-]{8,}$"}"#,
+            &[r#""cjld2cjxh0000qzrmn831i7rn""#, r#""C12345678""#],
+            &[r#""c1234567""#, r#""c1234 5678""#, r#""djld2cjxh0000""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^id--?\\d+(?:\\.\\d+)?-(a|b)$"}"#,
+            &[r#""id-1-a""#, r#""id--2.5-b""#],
+            &[r#""id-1-c""#, r#""id-1.-a""#],
+        ),
+        (
+            r#"{"type":"string","pattern":"^https\\:\\/\\/a\\ b\\_c\\-d\\."}"#,
+            &[r#""https://a b_c-d.x""#],
+            &[r#""http://a b_c-d.""#],
+        ),
+    ];
+    for (schema, yes, no) in matching {
+        let parsed = parse(schema);
+        for (values, expected) in [(*yes, ""), (*no, "tool string does not match pattern")] {
+            for value in values {
+                expect_text(
+                    refusal_text(validate_tool_value(&parsed, &parse(value))),
+                    expected,
+                    &format!("{schema} {value}"),
+                );
+            }
+        }
+    }
+    // Matching follows every thread at once, so nested quantifiers that would take a backtracking matcher longer than this suite runs are answered at once.
+    let long = Json::String("a".repeat(20000).into_bytes());
+    for (schema, expected) in [
+        (
+            r#"{"type":"string","pattern":"^(a*)*b$"}"#,
+            "tool string does not match pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"^(a|a)*b$"}"#,
+            "tool string does not match pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"^(a+)+b$"}"#,
+            "tool string does not match pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"(.*a){12}b"}"#,
+            "tool string does not match pattern",
+        ),
+        (r#"{"type":"string","pattern":"^(?=(a*)*$)(a|aa)+$"}"#, ""),
+        (
+            r#"{"type":"string","pattern":"^(?!(a+)+$)"}"#,
+            "tool string does not match pattern",
+        ),
+        (r#"{"type":"string","pattern":"(?<=(a*)*)a$"}"#, ""),
+        (r#"{"type":"string","pattern":"^(?:a{64}){63}a{0,31}"}"#, ""),
+    ] {
+        expect_text(
+            refusal_text(validate_tool_value(&parse(schema), &long)),
+            expected,
+            schema,
+        );
+    }
+    // A value built in memory can hold bytes that are not UTF-8. It cannot be read as code points, so it is refused as the JSON codec refuses it.
+    expect_text(
+        refusal_text(validate_tool_value(
+            &parse(r#"{"type":"string","pattern":"a"}"#),
+            &Json::String(b"a\xff".to_vec()),
+        )),
+        "invalid UTF-8 input",
+        "bytes that are not UTF-8",
+    );
+    // With enum validation deferred to the executor a pattern is still enforced.
+    for (schema, value, expected) in [
+        (
+            r#"{"type":"string","pattern":"^a","enum":["ab"]}"#,
+            r#""ac""#,
+            "",
+        ),
+        (
+            r#"{"type":"string","pattern":"^a","enum":["ab"]}"#,
+            r#""b""#,
+            "tool string does not match pattern",
+        ),
+        (
+            r#"{"type":"string","pattern":"^a","const":"ab"}"#,
+            r#""ac""#,
+            "",
+        ),
+        (
+            r#"{"type":"string","pattern":"^a","const":"ab"}"#,
+            r#""b""#,
+            "tool string does not match pattern",
+        ),
+    ] {
+        expect_text(
+            refusal_text(validate_tool_value_with_policy(
+                &parse(schema),
+                &parse(value),
+                ToolEnumValidation::Executor,
+            )),
+            expected,
+            &format!("{schema} {value}"),
+        );
+    }
+    // A recorded call: strict argument validation refuses a string that does not match, and executor validation defers it.
+    let declared = parse(
+        r#"[{"type":"function","function":{"name":"tag","parameters":{"type":"object","properties":{"slug":{"type":"string","pattern":"^[a-z]+(?:-[a-z]+)*$","maxLength":12},"email":{"type":"string","pattern":"^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"},"amount":{"anyOf":[{"type":"number"},{"type":"string","pattern":"^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"}]}},"additionalProperties":false}}}]"#,
+    );
+    for (arguments, strict) in [
+        (r#"{"slug":"ab-cd","email":"a@b.co","amount":"1.5"}"#, ""),
+        (r#"{"slug":"ab--cd"}"#, "tool string does not match pattern"),
+        (r#"{"slug":"Ab"}"#, "tool string does not match pattern"),
+        (
+            r#"{"slug":"ab-cd-ef-gh-ij"}"#,
+            "tool string above maxLength",
+        ),
+        (
+            r#"{"email":"a..b@c.de"}"#,
+            "tool string does not match pattern",
+        ),
+        (r#"{"amount":2}"#, ""),
+        (
+            r#"{"amount":"-."}"#,
+            "tool value matches no schema alternative",
+        ),
+    ] {
+        let history = parse(&format!(
+            r#"[{{"role":"user","content":"tag it"}},{{"role":"assistant","tool_calls":[{{"id":"call_1","type":"function","function":{{"name":"tag","arguments":{arguments}}}}}]}},{{"role":"tool","tool_call_id":"call_1","content":"tagged"}},{{"role":"user","content":"again"}}]"#
+        ));
+        let job = with(
+            &with(&plain("A"), "tools", declared.clone()),
+            "messages",
+            history,
+        );
+        expect_text(
+            refusal_text(admit_chat(&job, b"tokspur")),
+            strict,
+            arguments,
+        );
+        expect_text(
+            refusal_text(admit_chat_with_policy(
+                &job,
+                b"tokspur",
+                ToolEnumValidation::Executor,
+            )),
+            strict,
+            arguments,
+        );
+        expect_text(
+            refusal_text(admit_chat_with_policies(
+                &job,
+                b"tokspur",
+                ToolEnumValidation::Strict,
+                ToolArgValidation::Executor,
+            )),
+            "",
+            arguments,
+        );
+    }
+    // A generated call takes the same validator: the strict session refuses with its text and the executor session passes the call on.
+    let job = with(&plain("A"), "tools", declared);
+    let mut cancelled = || false;
+    let mut seed = || 44u64;
+    let mut sink = ServeSink {
+        chunk: None,
+        cancelled: &mut cancelled,
+        new_seed: &mut seed,
+        prefix_trace: None,
+    };
+    for (parameter, value, expected) in [
+        ("slug", "ab-cd", ""),
+        ("slug", "ab--cd", "tool string does not match pattern"),
+        ("slug", "ab-cd-ef-gh-ij", "tool string above maxLength"),
+        ("email", "a@b.co", ""),
+        ("email", ".a@b.co", "tool string does not match pattern"),
+    ] {
+        let frame = format!(
+            "<tool_call><function=tag><parameter={parameter}>\n{value}\n</parameter></function></tool_call><|im_end|>"
+        );
+        let mut strict = ServeSession::new(codec(), SessionOptions::default()).unwrap();
+        let rejected = RefCell::new(Fake::new());
+        rejected.borrow_mut().reply(&frame);
+        let mut rejected_call =
+            |command: &Json, event: Event<'_>| rejected.borrow_mut().call(command, event);
+        expect_text(
+            refusal_text(strict.complete(&job, b"strict-pattern", &mut rejected_call, &mut sink)),
+            expected,
+            &frame,
+        );
+        let mut executor = ServeSession::new(
+            codec(),
+            SessionOptions {
+                tool_args: ToolArgValidation::Executor,
+                ..SessionOptions::default()
+            },
+        )
+        .unwrap();
+        let accepted = RefCell::new(Fake::new());
+        accepted.borrow_mut().reply(&frame);
+        let mut accepted_call =
+            |command: &Json, event: Event<'_>| accepted.borrow_mut().call(command, event);
+        let result = executor
+            .complete(&job, b"executor-pattern", &mut accepted_call, &mut sink)
+            .unwrap();
+        check(
+            message(&result)
+                .find("tool_calls")
+                .unwrap()
+                .unwrap()
+                .array()
+                .unwrap()
+                .len()
+                == 1,
+        );
+    }
+}
+
 fn response_failure_trace_cases() {
     use tokspur_text::response::{ResponseLimits, ResponseParser, ResponseStatus};
     // Nonstreaming still cross-checks incremental text against the final decode.

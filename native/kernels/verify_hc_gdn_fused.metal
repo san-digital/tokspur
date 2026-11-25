@@ -430,10 +430,10 @@ kernel void verify_fused_hc_read_rows(
                 const float4 n = float4(*reinterpret_cast<device const packed_float4*>(normalized + at));
                 const float4 s = float4(*reinterpret_cast<device const packed_float4*>(scores + at));
                 ok = ok && isfinite(n) && isfinite(s);
-                total.x += n.x * verify_fused_detail::sigmoid_fused(s.x);
-                total.y += n.y * verify_fused_detail::sigmoid_fused(s.y);
-                total.z += n.z * verify_fused_detail::sigmoid_fused(s.z);
-                total.w += n.w * verify_fused_detail::sigmoid_fused(s.w);
+                total.x = fma(n.x, verify_fused_detail::sigmoid_fused(s.x), total.x);
+                total.y = fma(n.y, verify_fused_detail::sigmoid_fused(s.y), total.y);
+                total.z = fma(n.z, verify_fused_detail::sigmoid_fused(s.z), total.z);
+                total.w = fma(n.w, verify_fused_detail::sigmoid_fused(s.w), total.w);
             }
         } else {
             for (uint b = 0u; b < branches; ++b) {
@@ -441,10 +441,10 @@ kernel void verify_fused_hc_read_rows(
                 const float4 n = float4(*reinterpret_cast<device const packed_float4*>(normalized + at));
                 const float4 s = float4(*reinterpret_cast<device const packed_float4*>(scores + at));
                 ok = ok && isfinite(n) && isfinite(s);
-                total.x += n.x * verify_fused_detail::sigmoid_fused(s.x);
-                total.y += n.y * verify_fused_detail::sigmoid_fused(s.y);
-                total.z += n.z * verify_fused_detail::sigmoid_fused(s.z);
-                total.w += n.w * verify_fused_detail::sigmoid_fused(s.w);
+                total.x = fma(n.x, verify_fused_detail::sigmoid_fused(s.x), total.x);
+                total.y = fma(n.y, verify_fused_detail::sigmoid_fused(s.y), total.y);
+                total.z = fma(n.z, verify_fused_detail::sigmoid_fused(s.z), total.z);
+                total.w = fma(n.w, verify_fused_detail::sigmoid_fused(s.w), total.w);
             }
         }
         const float4 out4 = total / float(branches);
@@ -504,7 +504,7 @@ kernel void verify_fused_hc_read_rows(
                 lane_ok = false;
                 break;
             }
-            total += n * verify_fused_detail::sigmoid_fused(s);
+            total = fma(n, verify_fused_detail::sigmoid_fused(s), total);
         }
         if (!lane_ok) continue;
         verify_fused_detail::checked_write(output, ulong(token) * channels + channel, total / float(branches), error);
@@ -552,10 +552,10 @@ kernel void verify_fused_hc_gated_mix_rows(
                 const float4 n = float4(*reinterpret_cast<device const packed_float4*>(normalized + at));
                 const float4 s = float4(*reinterpret_cast<device const packed_float4*>(scores + at));
                 ok = ok && isfinite(n) && isfinite(s);
-                total.x += n.x * verify_fused_detail::sigmoid_fused(s.x);
-                total.y += n.y * verify_fused_detail::sigmoid_fused(s.y);
-                total.z += n.z * verify_fused_detail::sigmoid_fused(s.z);
-                total.w += n.w * verify_fused_detail::sigmoid_fused(s.w);
+                total.x = fma(n.x, verify_fused_detail::sigmoid_fused(s.x), total.x);
+                total.y = fma(n.y, verify_fused_detail::sigmoid_fused(s.y), total.y);
+                total.z = fma(n.z, verify_fused_detail::sigmoid_fused(s.z), total.z);
+                total.w = fma(n.w, verify_fused_detail::sigmoid_fused(s.w), total.w);
             }
         } else {
             for (uint b = 0u; b < branches; ++b) {
@@ -563,10 +563,10 @@ kernel void verify_fused_hc_gated_mix_rows(
                 const float4 n = float4(*reinterpret_cast<device const packed_float4*>(normalized + at));
                 const float4 s = float4(*reinterpret_cast<device const packed_float4*>(scores + at));
                 ok = ok && isfinite(n) && isfinite(s);
-                total.x += n.x * verify_fused_detail::sigmoid_fused(s.x);
-                total.y += n.y * verify_fused_detail::sigmoid_fused(s.y);
-                total.z += n.z * verify_fused_detail::sigmoid_fused(s.z);
-                total.w += n.w * verify_fused_detail::sigmoid_fused(s.w);
+                total.x = fma(n.x, verify_fused_detail::sigmoid_fused(s.x), total.x);
+                total.y = fma(n.y, verify_fused_detail::sigmoid_fused(s.y), total.y);
+                total.z = fma(n.z, verify_fused_detail::sigmoid_fused(s.z), total.z);
+                total.w = fma(n.w, verify_fused_detail::sigmoid_fused(s.w), total.w);
             }
         }
         const float4 out4 = total / float(branches);
@@ -596,7 +596,7 @@ kernel void verify_fused_hc_gated_mix_rows(
                 lane_ok = false;
                 break;
             }
-            total += n * verify_fused_detail::sigmoid_fused(s);
+            total = fma(n, verify_fused_detail::sigmoid_fused(s), total);
         }
         if (lane_ok) {
             verify_fused_detail::checked_write(output, ulong(token) * channels + channel, total / float(branches), error);
@@ -997,7 +997,7 @@ kernel void verify_fused_shared_logit_f32(
     ushort sg [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]]) {
     threadgroup float s_part[32];
-    if (!a.tokens || a.tokens > 8u ||
+    if (!a.tokens || a.tokens > 16u ||
         a.columns < 32u || a.columns > 65536u || (a.columns % 32u) != 0u ||
         a.outputs != 1u || a.splits > 32u ||
         (a.input_stride_bytes % 4u) != 0u || (a.output_stride_bytes % 4u) != 0u) {

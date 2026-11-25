@@ -38,6 +38,49 @@ void stack_compare(std::span<const float> a, std::span<const float> b) {
     for (size_t i = 0; i < a.size(); ++i) { require(std::isfinite(a[i]) && std::isfinite(b[i]), "nonfinite chunked stack logits"); const double d = double(a[i]) - b[i]; error += d * d; signal += double(b[i]) * b[i]; }
     require(signal > 0 && error / signal <= 1e-6, "chunked generated stack fixed NMSE gate"); worst = std::max(worst, error / signal);
 }
+#ifdef TOKSPUR_PRIVATE_PREFILL_CHUNK
+void tiled_prefill_case(MetalGraph& g, const StackWeights& weights, StackShape shape, StackPolicy policy, const NgramSpec& spec) {
+    constexpr std::array<uint32_t, 6> tokens{0, 3, 6, 9, 12, 2};
+    std::vector<float> rows(tokens.size() * 256), memory(tokens.size() * 4);
+    for (size_t i = 0; i < rows.size(); ++i) rows[i] = float(int(i % 31) - 15) / 997;
+    for (size_t i = 0; i < memory.size(); ++i) memory[i] = float(int(i % 13) - 6) / 32;
+    TextStack reference(g, weights, shape, policy, spec);
+    std::array<std::vector<float>, 2> expected;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        auto r = reference.step(tokens[i], std::span(rows).subspan(i * 256, 256), std::span(memory).subspan(i * 4, 4));
+        if (i % 3 == 2) expected[i / 3] = std::move(r.logits);
+    }
+    std::vector<std::byte> first_state;
+    for (bool by_layer : {false, true}) {
+        TextStack tiled(g, weights, shape, policy, spec, StackExecution::direct, 512);
+        const auto before = g.memory();
+        tiled.configure_known_layer_submissions(by_layer);
+        if (by_layer) {
+            tiled.prepare_tiled_prefill512();
+            const auto prepared = g.memory().allocations;
+            tiled.prepare_tiled_prefill512();
+            require(prepared == before.allocations + 32 && g.memory().allocations == prepared, "tiled prefill preparation changed its allocation count");
+        }
+        for (size_t at : {0u, 3u}) {
+            std::optional<CommandTiming> timing{std::in_place};
+            auto r = tiled.step_known(std::span(tokens).subspan(at, 3), std::span(rows).subspan(at * 256, 3 * 256),
+                std::span(memory).subspan(at * 4, 3 * 4), true, &timing);
+            require(r.position == at && tiled.position() == at + 3 && timing.has_value() == !by_layer, "tiled prefill position or command timing differs");
+            require(g.memory().allocations == before.allocations + 32, "tiled prefill allocated scratch more than once");
+            stack_compare(r.logits, expected[at / 3]);
+        }
+        if (by_layer) {
+            require(tiled.accepted_snapshot() == first_state, "per-layer submission changed committed tiled state");
+            tiled.reset();
+            tiled.configure_known_layer_submissions(false);
+            tiled.prepare_chunked_prefill(GdnChunkMode::fused, 512ull << 20);
+            require(g.memory().live_bytes == before.live_bytes + tiled.chunked_prefill_bytes(), "switching to chunked prefill retained tiled scratch");
+        } else {
+            first_state = tiled.accepted_snapshot();
+        }
+    }
+}
+#endif
 void chunked_case(MetalGraph& g, GdnChunkMode mode, bool legacy_order = false) {
     const StackShape shape{{2,256,32},{256,1,2,128,32,4},{256,4,2,32,2,32,32,4,16,1024},{256,64,16,10},{2,256,4,4,3},13,1};
     const NgramSpec spec{3,2,1,13,11,12,{3,5,7},{0,7,18,31},{7,11,13,17}};
@@ -74,12 +117,17 @@ void chunked_case(MetalGraph& g, GdnChunkMode mode, bool legacy_order = false) {
 #endif
         reject([&]{candidate.prepare_transient_verification(64ull<<20);});reject([&]{candidate.prepare_transient_verification8(64ull<<20);});
         reject([&]{candidate.prepare_checkpoints({1,64ull<<20});});reject([&]{candidate.configure_known_layer_submissions(true);});
+        reject([&] { candidate.prepare_tiled_prefill512(); });
         reject([&]{candidate.configure_known_grouped_ffn(false);});reject([&]{candidate.prepare_chunked_prefill(mode,512ull<<20);});
         constexpr uint32_t count=1024;std::vector<uint32_t> tokens(count);std::vector<float> rows(uint64_t(count)*256),memory(uint64_t(count)*4);auto history=empty_ngram_history(spec);
         for(uint32_t t=0;t<count;++t){tokens[t]=(t*3)%13;const auto ids=ngram_step(spec,policy.ngram,history,tokens[t]);history=ids.next;
             for(uint32_t j=0;j<256;++j)rows[uint64_t(t)*256+j]=float(int((t*13+j*7)%131)-65)/997;
             for(uint32_t j=0;j<4;++j)memory[uint64_t(t)*4+j]=float(int(ids.rows[j]%17)-8)/32;}
-        const auto run=[&](uint32_t at,uint32_t n){return candidate.step_known(std::span(tokens).subspan(at,n),std::span(rows).subspan(uint64_t(at)*256,uint64_t(n)*256),std::span(memory).subspan(uint64_t(at)*4,uint64_t(n)*4));};
+        std::optional<CommandTiming> timing;
+        const auto run = [&](uint32_t at, uint32_t n) {
+            return candidate.step_known(std::span(tokens).subspan(at, n), std::span(rows).subspan(uint64_t(at) * 256, uint64_t(n) * 256),
+                std::span(memory).subspan(uint64_t(at) * 4, uint64_t(n) * 4), true, &timing);
+        };
         const auto original_head=g.read(f.weights.output.view);auto bad=original_head;
 #ifdef TOKSPUR_PRIVATE_HTTP_PREFILL512
         const uint16_t inf=0x7c00;std::memcpy(bad.data(),&inf,2);
@@ -91,13 +139,20 @@ void chunked_case(MetalGraph& g, GdnChunkMode mode, bool legacy_order = false) {
             reject([&]{static_cast<void>(run(at,n));});require(candidate.position()==at&&candidate.accepted_snapshot()==accepted,"failed chunked stack published state/history");
             require(candidate.chunked_cache_snapshot()==physical,"failed chunked stack did not restore full physical cache capacity");g.write(f.weights.output.view,original_head);
             const auto allocations=g.memory().allocations;const auto result=run(at,n);require(result.position==at&&candidate.position()==at+n&&g.memory().allocations==allocations,"chunked commit/allocation invariant");
+            require(timing && timing->host_record_ms >= 0 && timing->host_flush_ms >= 0 && timing->host_commit_ms >= 0 && timing->host_wait_and_check_ms >= 0, "invalid single-command host intervals");
+            const double host_ms = timing->host_record_ms + timing->host_flush_ms + timing->host_commit_ms + timing->host_wait_and_check_ms;
+            require(std::abs(host_ms - result.batch.wall_ms) < 1e-6, "prefill command intervals do not account for stack wall time");
+            require(!timing->metal_schedule_ms || (std::isfinite(*timing->metal_schedule_ms) && *timing->metal_schedule_ms >= 0), "invalid Metal scheduling interval");
             StackResult expected;for(uint32_t t=at;t<at+n;++t)expected=serial.step(tokens[t],std::span(rows).subspan(uint64_t(t)*256,256),std::span(memory).subspan(uint64_t(t)*4,4));
             stack_compare(result.logits,expected.logits);
         }
         candidate.reset();require(candidate.position()==0,"chunked reset prefix");const auto rerun=run(0,3);require(rerun.position==0&&candidate.position()==3,"chunked reset reuse");
         const auto single_accepted=candidate.accepted_snapshot(),single_physical=candidate.chunked_cache_snapshot();g.write(f.weights.output.view,bad);
         reject([&]{static_cast<void>(run(3,1));});require(candidate.position()==3&&candidate.accepted_snapshot()==single_accepted&&candidate.chunked_cache_snapshot()==single_physical,"ordinary single-input path lost physical rollback");
+        require(!timing, "failed prefill retained command timing");
+        timing.emplace();
         g.write(f.weights.output.view,original_head);const auto single=run(3,1);require(single.position==3&&candidate.position()==4,"ordinary single-input publication");
+        require(!timing, "single-token fallback reported batched prefill clocks");
         serial.reset();StackResult single_reference;for(uint32_t t=0;t<4;++t)single_reference=serial.step(tokens[t],std::span(rows).subspan(uint64_t(t)*256,256),std::span(memory).subspan(uint64_t(t)*4,4));
         stack_compare(single.logits,single_reference.logits);
 #ifdef TOKSPUR_PRIVATE_HTTP_PREFILL512
@@ -181,6 +236,10 @@ void chunked_case(MetalGraph& g, GdnChunkMode mode, bool legacy_order = false) {
 
 #endif
     }
+#ifdef TOKSPUR_PRIVATE_PREFILL_CHUNK
+    if (mode == GdnChunkMode::fused && !legacy_order && std::get<RecurrentWeights>(f.weights.layers.front()).ffn.gate.encoding == 8)
+        tiled_prefill_case(g, f.weights, shape, policy, spec);
+#endif
     require(g.memory().live_bytes==base,"chunked stack resource leak");
 }
 #if defined(TOKSPUR_PRIVATE_PREFILL_HC_DOWN_F32) && defined(TOKSPUR_PRIVATE_HTTP_PREFILL512)

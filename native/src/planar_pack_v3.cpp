@@ -21,6 +21,7 @@
 #include <fcntl.h>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -820,6 +821,178 @@ void unpack_sm16(std::span<const std::byte, 16> in_sm, std::span<std::byte, 12> 
     }
 }
 
+namespace {
+
+inline bool fp16_bits_finite(uint16_t bits) noexcept {
+    return (bits & 0x7c00u) != 0x7c00u;
+}
+
+inline bool f32_fits_fp16(float wf) noexcept {
+    return std::isfinite(wf) && std::fabs(wf) < 65520.0f;
+}
+
+struct CertifiedPackEntry {
+    std::weak_ptr<const ModelFiles> model;
+    std::vector<CertifiedPlanarTensor> tensors;
+};
+
+std::mutex g_certified_models_mutex;
+std::vector<CertifiedPackEntry> g_certified_models;
+
+void register_certified_pack_model(const std::shared_ptr<const ModelFiles>& model,
+                                 std::vector<CertifiedPlanarTensor> tensors) {
+    if (!model) return;
+    std::lock_guard<std::mutex> lock(g_certified_models_mutex);
+    std::erase_if(g_certified_models, [](const CertifiedPackEntry& e) { return e.model.expired(); });
+    for (auto& existing : g_certified_models) {
+        if (existing.model.lock() == model) {
+            existing.tensors = std::move(tensors);
+            return;
+        }
+    }
+    g_certified_models.push_back(CertifiedPackEntry{model, std::move(tensors)});
+}
+
+} // namespace
+
+bool is_certified_pack_model(const std::shared_ptr<const ModelFiles>& model) noexcept {
+    if (!model) return false;
+    std::lock_guard<std::mutex> lock(g_certified_models_mutex);
+    bool found = false;
+    std::erase_if(g_certified_models, [&](const CertifiedPackEntry& e) {
+        const auto locked = e.model.lock();
+        if (!locked) return true;
+        if (locked == model) found = true;
+        return false;
+    });
+    return found;
+}
+
+CertifiedTensorLookup lookup_certified_planar_tensor(
+    const std::shared_ptr<const ModelFiles>& model,
+    const CertifiedPlanarTensor& query) noexcept {
+    if (!model) return CertifiedTensorLookup::not_certified_model;
+    std::lock_guard<std::mutex> lock(g_certified_models_mutex);
+    const CertifiedPackEntry* match = nullptr;
+    std::erase_if(g_certified_models, [&](const CertifiedPackEntry& e) {
+        return e.model.expired();
+    });
+    for (const auto& entry : g_certified_models) {
+        if (entry.model.lock() == model) {
+            match = &entry;
+            break;
+        }
+    }
+    if (!match) return CertifiedTensorLookup::not_certified_model;
+    for (const auto& t : match->tensors) {
+        if (t == query) return CertifiedTensorLookup::exact_match;
+    }
+    if (query.bytes > 0 && query.bytes <= UINT64_MAX - query.pack_data_offset) {
+        const uint64_t q_end = query.pack_data_offset + query.bytes;
+        for (const auto& t : match->tensors) {
+            if (t.bytes > 0 && t.bytes <= UINT64_MAX - t.pack_data_offset) {
+                const uint64_t t_end = t.pack_data_offset + t.bytes;
+                if (t.pack_data_offset < q_end && query.pack_data_offset < t_end) {
+                    return CertifiedTensorLookup::mismatched_overlap;
+                }
+            }
+        }
+    }
+    return CertifiedTensorLookup::not_found;
+}
+
+void certify_expert_planar_v3(const PlanarExpertSpec& spec, std::span<const std::byte> planar_expert) {
+    require(planar_expert.size() == spec.planar_expert_bytes, "certify_expert_planar_v3 span size mismatch");
+    const uint64_t total_blocks = static_cast<uint64_t>(spec.rows) * spec.blocks_per_row;
+    const std::byte* base = planar_expert.data();
+
+    if (spec.source_type == 12 || spec.source_type == 13) {
+        const float q_max = (spec.source_type == 13) ? 31.0f : 15.0f;
+        for (uint64_t blk = 0; blk < total_blocks; ++blk) {
+            const std::byte* dm = base + spec.dm_offset + blk * 4;
+            const uint16_t d_bits = load_u16_le(dm);
+            const uint16_t m_bits = load_u16_le(dm + 2);
+            require(fp16_bits_finite(d_bits) && fp16_bits_finite(m_bits),
+                    "nonfinite planar v3 Q4_K/Q5_K super-scale");
+            const auto* sm = reinterpret_cast<const uint8_t*>(base + spec.sm_offset + blk * 16);
+            uint64_t sm_lo = 0, sm_hi = 0;
+            std::memcpy(&sm_lo, sm, 8);
+            std::memcpy(&sm_hi, sm + 8, 8);
+            require(((sm_lo | sm_hi) & 0xc0c0c0c0c0c0c0c0ULL) == 0ULL,
+                    "nonfinite planar v3 scale/min factor exceeds 6-bit [0, 63] range");
+
+            const float d = binary16(d_bits);
+            const float dmin = binary16(m_bits);
+            if (std::fabs(d) * (63.0f * q_max) + std::fabs(dmin) * 63.0f < 65519.0f) continue;
+
+            const std::byte* qs = base + spec.qs_offset + blk * 128;
+            const std::byte* qh = (spec.source_type == 13) ? (base + spec.qh_offset + blk * 32) : nullptr;
+            for (uint32_t grp = 0; grp < 8; ++grp) {
+                const float dl = d * static_cast<float>(sm[grp]);
+                const float ml = dmin * static_cast<float>(sm[8 + grp]);
+                if (std::fabs(dl) * q_max + std::fabs(ml) < 65519.0f) continue;
+                const uint32_t pair = grp >> 1;
+                const uint32_t shift = (grp & 1u) * 4u;
+                const auto* q_pair = reinterpret_cast<const uint8_t*>(qs + pair * 32);
+                for (uint32_t l = 0; l < 32; ++l) {
+                    uint32_t q = (q_pair[l] >> shift) & 15u;
+                    if (qh) {
+                        const uint8_t hb = std::to_integer<uint8_t>(qh[l]);
+                        q |= ((static_cast<uint32_t>(hb) >> grp) & 1u) << 4u;
+                    }
+                    const float wf = dl * static_cast<float>(q) - ml;
+                    require(f32_fits_fp16(wf), "nonfinite FP16 staging overflow in planar v3 Q4_K/Q5_K weight");
+                }
+            }
+        }
+    } else if (spec.source_type == 7) {
+        for (uint64_t blk = 0; blk < total_blocks; ++blk) {
+            const std::byte* dm = base + spec.dm_offset + blk * 4;
+            const uint16_t d_bits = load_u16_le(dm);
+            const uint16_t m_bits = load_u16_le(dm + 2);
+            require(fp16_bits_finite(d_bits) && fp16_bits_finite(m_bits),
+                    "nonfinite planar v3 Q5_1 scale");
+            const float d = binary16(d_bits);
+            const float m = binary16(m_bits);
+            if (std::fabs(d) * 31.0f + std::fabs(m) < 65519.0f) continue;
+
+            const auto* qs = reinterpret_cast<const uint8_t*>(base + spec.qs_offset + blk * 16);
+            const uint32_t qh = load_u32_le(base + spec.qh_offset + blk * 4);
+            for (uint32_t i = 0; i < 32; ++i) {
+                const uint32_t low = (qs[i % 16] >> (4 * (i / 16))) & 15u;
+                const uint32_t high = (qh >> i) & 1u;
+                const float wf = d * static_cast<float>(low | (high << 4u)) + m;
+                require(f32_fits_fp16(wf), "nonfinite FP16 staging overflow in planar v3 Q5_1 weight");
+            }
+        }
+    } else if (spec.source_type == 8) {
+        for (uint64_t blk = 0; blk < total_blocks; ++blk) {
+            const uint16_t d_bits = load_u16_le(base + spec.dm_offset + blk * 2);
+            require(fp16_bits_finite(d_bits), "nonfinite planar v3 Q8_0 scale");
+            if ((d_bits & 0x7fffu) < 0x6000u) continue;
+
+            const float d = binary16(d_bits);
+            const auto* qs = reinterpret_cast<const int8_t*>(base + spec.qs_offset + blk * 32);
+            for (uint32_t i = 0; i < 32; ++i) {
+                const float wf = d * static_cast<float>(qs[i]);
+                require(f32_fits_fp16(wf), "nonfinite FP16 staging overflow in planar v3 Q8_0 weight");
+            }
+        }
+    } else {
+        throw FormatError("unsupported encoding in certify_expert_planar_v3");
+    }
+}
+
+void certify_planar_matrix_bytes(const PlanarExpertSpec& spec, uint32_t experts, std::span<const std::byte> matrix_bytes) {
+    require(experts >= 1 && matrix_bytes.size() == checked_mul(spec.planar_expert_bytes, experts),
+            "certify_planar_matrix_bytes span size mismatch");
+    for (uint32_t e = 0; e < experts; ++e) {
+        certify_expert_planar_v3(spec, matrix_bytes.subspan(
+            static_cast<size_t>(e) * static_cast<size_t>(spec.planar_expert_bytes),
+            static_cast<size_t>(spec.planar_expert_bytes)));
+    }
+}
+
 void pack_expert_planar_v3(const PlanarExpertSpec& spec, std::span<const std::byte> gguf_expert, std::span<std::byte> planar_expert) {
     require(gguf_expert.size() == spec.source_expert_bytes && planar_expert.size() == spec.planar_expert_bytes,
             "pack_expert_planar_v3 span size mismatch");
@@ -860,6 +1033,7 @@ void pack_expert_planar_v3(const PlanarExpertSpec& spec, std::span<const std::by
     } else {
         throw FormatError("unsupported encoding in pack_expert_planar_v3");
     }
+    certify_expert_planar_v3(spec, planar_expert);
 }
 
 void unpack_expert_planar_v3(const PlanarExpertSpec& spec, std::span<const std::byte> planar_expert, std::span<std::byte> gguf_expert) {
@@ -1256,6 +1430,8 @@ PackPlanV3 build_pack_v3_from_plan(
                             static_cast<size_t>(spec.planar_expert_bytes));
                         unpack_expert_planar_v3(spec, g_rb, restored_gate);
                         unpack_expert_planar_v3(spec, u_rb, restored_up);
+                        certify_expert_planar_v3(spec, g_rb);
+                        certify_expert_planar_v3(spec, u_rb);
                         const auto g_in = gate_orig.subspan(static_cast<size_t>(exp_id * spec.source_expert_bytes),
                                                             static_cast<size_t>(spec.source_expert_bytes));
                         const auto u_in = up_orig.subspan(static_cast<size_t>(exp_id * spec.source_expert_bytes),
@@ -1314,6 +1490,7 @@ PackPlanV3 build_pack_v3_from_plan(
                         static_cast<size_t>(k * spec.planar_expert_bytes),
                         static_cast<size_t>(spec.planar_expert_bytes));
                     unpack_expert_planar_v3(spec, exp_rb, restored_exp);
+                    certify_expert_planar_v3(spec, exp_rb);
                     const auto exp_in = orig.subspan(static_cast<size_t>(exp_id * spec.source_expert_bytes),
                                                      static_cast<size_t>(spec.source_expert_bytes));
                     require(std::ranges::equal(exp_in, restored_exp), "down planar v3 inverse byte proof failed");
@@ -1541,7 +1718,8 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
     const derived_pack::SealScope scope{!cpu_base_only, mtp_sidecar != nullptr};
     const bool seal_valid = seal_consulted &&
         derived_pack::read_local_seal(location.directory.value, location.name,
-                                      manifest_sha256, identity_before, scope).vouches;
+                                      manifest_sha256, identity_before, scope,
+                                      derived_pack::SealCertification::dm_fp16_v1).vouches;
 
     // Build authentication tasks (co-located gate+up pairs form a single atomic verification unit).
     std::vector<size_t> units;
@@ -1626,6 +1804,8 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
                                                     static_cast<size_t>(spec.planar_expert_bytes));
                 unpack_expert_planar_v3(spec, g_pk, restored_gate);
                 unpack_expert_planar_v3(spec, u_pk, restored_up);
+                certify_expert_planar_v3(spec, g_pk);
+                certify_expert_planar_v3(spec, u_pk);
                 if (!pack_only_pair) {
                     const auto g_in = gate_orig.read(static_cast<size_t>(e * spec.source_expert_bytes),
                                                         static_cast<size_t>(spec.source_expert_bytes));
@@ -1684,6 +1864,7 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
                 const auto exp_pk = packed_bytes.subspan(static_cast<size_t>(e * spec.planar_expert_bytes),
                                                          static_cast<size_t>(spec.planar_expert_bytes));
                 unpack_expert_planar_v3(spec, exp_pk, restored);
+                certify_expert_planar_v3(spec, exp_pk);
                 if (!pack_only_tensor) {
                     const auto exp_in = orig.read(static_cast<size_t>(e * spec.source_expert_bytes),
                                                      static_cast<size_t>(spec.source_expert_bytes));
@@ -1783,7 +1964,8 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
     } else if (seal_consulted) {
         // The full verification above has passed for this descriptor.
         seal_use = derived_pack::refresh_local_seal(location.directory.value, location.name, fd.value,
-                                                    manifest_sha256, identity_before, scope)
+                                                    manifest_sha256, identity_before, scope,
+                                                    derived_pack::SealCertification::dm_fp16_v1)
             ? derived_pack::LocalSealUse::refreshed : derived_pack::LocalSealUse::not_refreshed;
     }
     const std::string_view source_read_mode = !source_read.load(std::memory_order_relaxed) ? "not_read" :
@@ -1792,6 +1974,26 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
 #else
         "mapped";
 #endif
+    std::vector<CertifiedPlanarTensor> certified_tensors;
+    certified_tensors.reserve(plan.tensors.size());
+    for (const auto& t : plan.tensors) {
+        if (!is_planar_v3_kind(t.kind)) continue;
+        require(t.source_dimensions.size() == 3 &&
+                t.source_dimensions[0] <= UINT32_MAX &&
+                t.source_dimensions[1] <= UINT32_MAX &&
+                t.source_dimensions[2] <= UINT32_MAX,
+                "pack v3 certified planar tensor dimensions mismatch");
+        certified_tensors.push_back(CertifiedPlanarTensor{
+            t.offset,
+            t.bytes,
+            t.source_type,
+            static_cast<uint32_t>(t.kind),
+            static_cast<uint32_t>(t.source_dimensions[0]),
+            static_cast<uint32_t>(t.source_dimensions[1]),
+            static_cast<uint32_t>(t.source_dimensions[2]),
+        });
+    }
+    register_certified_pack_model(model, std::move(certified_tensors));
     return {std::move(model), std::move(plan), manifest_sha256, effective_workers, source_read_mode,
             seal_use, derived_pack::pack_file_identity(fd.value),
             seal_valid ? derived_pack::SealScope{} : scope};
@@ -1875,9 +2077,13 @@ PublishedPackV3 build_or_verify_pack_v3(
     // The seal names the file the full verification above just read, by the
     // identity taken from that same descriptor after the last change to it,
     // and the sources that verification compared it with (here always both).
-    const derived_pack::LocalSeal seal{verified.manifest_sha256, verified.pack_identity, verified.compared};
+    const derived_pack::LocalSeal seal{
+        verified.manifest_sha256, verified.pack_identity, verified.compared,
+        derived_pack::SealCertification::dm_fp16_v1
+    };
     const auto vouches = [&] {
-        return derived_pack::read_local_seal(dir, location.name, seal.manifest_sha256, seal.pack, seal.compared);
+        return derived_pack::read_local_seal(dir, location.name, seal.manifest_sha256, seal.pack, seal.compared,
+                                             derived_pack::SealCertification::dm_fp16_v1);
     };
     if (!seal_exists) {
         derived_pack::publish_local_seal(dir, location.name, seal, false);

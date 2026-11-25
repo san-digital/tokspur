@@ -267,6 +267,10 @@ inline bool wide_q8_many_startup_allowed(bool enabled, uint32_t execution, bool 
 using GdnPortedRoutes = std::array<uint64_t, 5>;
 #endif
 
+struct CommandTiming {
+    double host_record_ms = 0, host_flush_ms = 0, host_commit_ms = 0, host_wait_and_check_ms = 0;
+    std::optional<double> metal_schedule_ms;
+};
 struct BatchResult {
     uint64_t dispatches = 0;
     double wall_ms = 0;
@@ -651,7 +655,7 @@ public:
 #endif
 
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
-    // Arm B of the phase B dispatch-graph measurement, private build only: each direct batch uses one concurrent compute encoder and the same dispatches in the same order, with a buffer barrier only before a dispatch that reads or writes a byte range written since the last barrier or writes one read since it. Off keeps the barrier after every dispatch. Startup-only (before the first batch), direct unprofiled batches.
+    // Phase B topological ASAP level-scheduling (default on): buffers direct unprofiled dispatches per window, assigns ASAP dependency levels, and emits depth - 1 buffer barriers across levels. Off keeps the barrier after every dispatch. Startup-only (before the first batch), direct unprofiled batches.
     void configure_concurrent_dispatch(bool enabled);
     [[nodiscard]] bool concurrent_dispatch() const;
     [[nodiscard]] uint64_t lifetime_dispatches() const;
@@ -718,6 +722,8 @@ public:
     void begin_indirect_compatible();
     void abort(); // Discards an unsubmitted batch; not rollback after execution.
     [[nodiscard]] BatchResult submit(); // Waits once, checks completion/error flag.
+    // A single completed command reports elapsed host phases and Metal's CPU scheduling interval. Multi-command batches have no single interval.
+    [[nodiscard]] BatchResult submit(std::optional<CommandTiming>* timing);
     // Commits the dispatches encoded so far without waiting and continues the same logical batch in a new physical command buffer, so the GPU starts while the host encodes the rest. Returns false and changes nothing for an empty, recorded, profiled or diagnostic batch. submit() and abort() wait for every part.
     bool commit_partial();
 
@@ -1161,7 +1167,7 @@ public:
     void dflash2_qkv_prepare(GpuView proposal_qkv, GpuView qk_norm_freq, GpuView queries, GpuView query_keys,
                              GpuView query_values, uint32_t cache_len, uint32_t rows = 8, float eps = 1e-6f);
     void dflash2_attention(GpuView queries, GpuView ring_k, GpuView ring_v, GpuView query_keys, GpuView query_values,
-                           GpuView partials, GpuView output, uint32_t cache_len, uint32_t window = 2048);
+                           GpuView partials, GpuView output, uint32_t cache_len, uint32_t window = 2048, uint32_t rows = 8);
     void dflash2_select(GpuView logits, GpuView partial_ids, GpuView partial_values, GpuView selector_out,
                         GpuView selector_hidden, GpuView predecessor_codebook, GpuView successor_codebook,
                         uint32_t positions, uint32_t vocabulary, uint32_t anchor,

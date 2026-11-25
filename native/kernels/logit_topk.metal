@@ -32,18 +32,17 @@ inline bool topk_beats(float va, uint ida, float vb, uint idb) {
     return (ca > cb) || (ca == cb && ida < idb);
 }
 
-inline void simd_best_head(float val, uint id, ushort lane, thread float& out_val, thread uint& out_id) {
-    const bool valid = (id != 0xffffffffu);
-    if (!simd_any(valid)) {
+inline void simd_best_head(float val, uint id, thread float& out_val, thread uint& out_id) {
+    const bool valid = id != 0xffffffffu;
+    const float best = simd_max(valid ? val : -INFINITY);
+    if (best == -INFINITY) {
         out_val = -INFINITY;
         out_id = 0xffffffffu;
         return;
     }
-    const float clean = valid ? ((val == 0.0f) ? 0.0f : val) : -INFINITY;
-    const float max_clean = simd_max(clean);
-    out_id = simd_min((valid && clean == max_clean) ? id : 0xffffffffu);
-    const ushort win_lane = simd_min((valid && id == out_id) ? lane : ushort(32));
-    out_val = simd_shuffle(val, win_lane);
+    out_id = simd_min(val == best ? id : 0xffffffffu);
+    // Each token ID occurs in one lane. The winning lane supplies every bit, including the sign of zero.
+    out_val = as_type<float>(simd_or(id == out_id ? as_type<uint>(val) : 0u));
 }
 
 template <uint Count>
@@ -183,7 +182,7 @@ kernel void logit_topk_stage1(
         const uint cur_id = local_ids[0];
         float simd_val;
         uint simd_id;
-        logit_topk_detail::simd_best_head(cur_val, cur_id, lane, simd_val, simd_id);
+        logit_topk_detail::simd_best_head(cur_val, cur_id, simd_val, simd_id);
         if (simd_id == 0xffffffffu) break;
         if (!lane) {
             sg_vals[sg][r] = simd_val;
@@ -223,7 +222,7 @@ kernel void logit_topk_stage1(
             const uint id = active ? sg_ids[lane][cur] : 0xffffffffu;
             float best_val;
             uint best_id;
-            logit_topk_detail::simd_best_head(v, id, lane, best_val, best_id);
+            logit_topk_detail::simd_best_head(v, id, best_val, best_id);
             if (best_id == 0xffffffffu) break;
             if (uint(lane) == rank) {
                 out_i0 = best_id;
@@ -302,7 +301,7 @@ kernel void logit_topk_stage2(
             const uint cur_id = (cursor < tile_count) ? row_parts[tid].ids[cursor] : 0xffffffffu;
             float simd_val;
             uint simd_id;
-            logit_topk_detail::simd_best_head(cur_val, cur_id, lane, simd_val, simd_id);
+            logit_topk_detail::simd_best_head(cur_val, cur_id, simd_val, simd_id);
             if (simd_id == 0xffffffffu) break;
             if (!lane) {
                 sg_vals[sg][r] = simd_val;
@@ -341,7 +340,7 @@ kernel void logit_topk_stage2(
             const uint id = active ? sg_ids[lane][cur] : 0xffffffffu;
             float best_val;
             uint best_id;
-            logit_topk_detail::simd_best_head(v, id, lane, best_val, best_id);
+            logit_topk_detail::simd_best_head(v, id, best_val, best_id);
             if (best_id == 0xffffffffu) break;
             if (uint(lane) == rank) {
                 out_i0 = best_id;

@@ -5,6 +5,7 @@
 pub mod admission;
 pub mod http;
 pub mod native_text;
+mod pattern;
 pub mod request_timing;
 pub mod serve;
 pub mod session;

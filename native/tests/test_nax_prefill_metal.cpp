@@ -1877,7 +1877,7 @@ void test_verify_nax_routed_moe_all_encodings(const char* metallib) {
     }
     for (const bool use_m8 : {false, true}) {
         for (const auto rc : cases) {
-            MetalGraph g(metallib, 256ull << 20);
+            MetalGraph g(metallib, 512ull << 20);
             g.configure_verify_nax(true);
             if (use_m8) g.configure_verify_nax_m8(true);
             Arena a{g, {}};
@@ -1905,7 +1905,7 @@ void test_verify_nax_routed_moe_all_encodings(const char* metallib) {
             }
             const std::array<std::pair<uint32_t, PrefillWeightLayout>, 1> moe_layouts{{{rc.type, rc.layout}}};
             g.prepare_verify_nax(moe_layouts);
-            for (const uint32_t m_u : {2u, 8u}) {
+                    for (const uint32_t m_u : {2u, 8u}) {
                 const uint32_t s_u = 4u, out_rows = m_u * s_u;
                 std::vector<uint32_t> ids(out_rows);
                 for (uint32_t rid = 0; rid < out_rows; ++rid) {
@@ -1957,7 +1957,7 @@ void test_verify_nax_routed_moe_all_encodings(const char* metallib) {
 }
 
 void test_dflash2_kernels(const char* metallib) {
-    MetalGraph g(metallib, 256ull << 20);
+    MetalGraph g(metallib, 512ull << 20);
     g.prepare_dflash2();
     Arena a{g, {}};
     std::mt19937 rng(20261102);
@@ -1993,9 +1993,10 @@ void test_dflash2_kernels(const char* metallib) {
         }
     }
 
-    // 2. dflash2_conv_f32: dynamic grouped 2-tap conv (rows=8, channels=2560, group_size=16) for finish=false and finish=true
+    // 2. dflash2_conv_f32: dynamic grouped 2-tap conv (rows=8 and rows=16, channels=2560, group_size=16) for finish=false and finish=true
+    for (uint32_t rows : {8u, 16u}) {
     for (bool finish : {false, true}) {
-        const uint32_t rows = 8, c = 2560, gs = 16, cg_count = c / gs, dyn_w = 4 * cg_count;
+        const uint32_t c = 2560, gs = 16, cg_count = c / gs, dyn_w = 4 * cg_count;
         std::vector<float> x(rows * c), dyn(rows * dyn_w), base(4 * c), res(rows * c);
         for (auto& v : x) v = float(int(rng() % 1999) - 999) / 701.0f;
         for (auto& v : dyn) v = float(int(rng() % 997) - 498) / 997.0f;
@@ -2024,10 +2025,12 @@ void test_dflash2_kernels(const char* metallib) {
         }
         need(nmse_f32(got, ref) <= 1e-11, "dflash2_conv_f32 NMSE exceeded 1e-11");
     }
+    }
 
-    // 3. dflash2_select: sharded top-16 + edge score table across M=7 rows, V=4096
-    {
-        const uint32_t m = 7, v = 4096, rank = 256, anchor = 42;
+    // 3. dflash2_select: sharded top-16 + edge score table across M=7 and M=15 rows, V=4096
+    for (uint32_t m : {7u, 15u}) {
+        const uint32_t v = 4096, rank = 256, anchor = 42;
+        const uint64_t max_pos = m <= 7u ? 7ull : 15ull;
         std::vector<float> logits(m * v), sel_hid(m * rank);
         for (uint32_t r = 0; r < m; ++r) {
             for (uint32_t col = 0; col < v; ++col) {
@@ -2056,9 +2059,9 @@ void test_dflash2_kernels(const char* metallib) {
         const auto hid_v = a.floats(sel_hid);
         const auto pred_v = a.upload(std::as_bytes(std::span(pred_cb)));
         const auto succ_v = a.upload(std::as_bytes(std::span(succ_cb)));
-        const auto pid_v = a.zeros(7ull * 8ull * 16ull * sizeof(uint32_t));
-        const auto pval_v = a.zeros(7ull * 8ull * 16ull * sizeof(float));
-        const uint64_t out_bytes = 7ull * 16ull * (sizeof(uint32_t) + sizeof(float)) + 7ull * 256ull * sizeof(float);
+        const auto pid_v = a.zeros(max_pos * 8ull * 16ull * sizeof(uint32_t));
+        const auto pval_v = a.zeros(max_pos * 8ull * 16ull * sizeof(float));
+        const uint64_t out_bytes = max_pos * 16ull * (sizeof(uint32_t) + sizeof(float)) + max_pos * 256ull * sizeof(float);
         const auto sel_out_v = a.zeros(out_bytes);
 
         g.set_dflash2_scope(true);
@@ -2071,8 +2074,8 @@ void test_dflash2_kernels(const char* metallib) {
         std::vector<std::byte> out_buf(out_bytes);
         g.read(sel_out_v, out_buf);
         const auto* cands = reinterpret_cast<const uint32_t*>(out_buf.data());
-        const auto* unary = reinterpret_cast<const float*>(out_buf.data() + 7ull * 16ull * sizeof(uint32_t));
-        const auto* edges = reinterpret_cast<const float*>(out_buf.data() + 7ull * 16ull * (sizeof(uint32_t) + sizeof(float)));
+        const auto* unary = reinterpret_cast<const float*>(out_buf.data() + max_pos * 16ull * sizeof(uint32_t));
+        const auto* edges = reinterpret_cast<const float*>(out_buf.data() + max_pos * 16ull * (sizeof(uint32_t) + sizeof(float)));
 
         for (uint32_t r = 0; r < m; ++r) {
             need(cands[r * 16] == 300 + r * 37, "dflash2_select rank-0 id mismatch");
@@ -2089,10 +2092,10 @@ void test_dflash2_kernels(const char* metallib) {
         }
     }
 
-    // 4. dflash2_context_kv_write + dflash2_qkv_prepare + dflash2_attention across 2048-token ring wraparound (cache_len = 2052)
-    {
+    // 4. dflash2_context_kv_write + dflash2_qkv_prepare(_16) + dflash2_attention(_16) across 2048-token ring wraparound
+    for (uint32_t prop_rows : {8u, 16u}) {
         const uint32_t window = 2048u, c1 = 2040u, c2 = 12u, cache_len = c1 + c2;
-        const uint32_t q_heads = 32u, kv_heads = 8u, head_dim = 128u, prop_rows = 8u;
+        const uint32_t q_heads = 32u, kv_heads = 8u, head_dim = 128u;
         const float eps = 1e-6f;
         const auto to_bf16 = [](float x) -> uint16_t {
             uint32_t bits = 0;
@@ -2126,7 +2129,7 @@ void test_dflash2_kernels(const char* metallib) {
         const auto queries_v = a.zeros(uint64_t(q_heads) * prop_rows * head_dim * sizeof(uint16_t));
         const auto qkeys_v = a.zeros(uint64_t(kv_heads) * prop_rows * head_dim * sizeof(uint16_t));
         const auto qvals_v = a.zeros(uint64_t(kv_heads) * head_dim * prop_rows * sizeof(uint16_t));
-        const auto partials_v = a.zeros(8ull * 16ull * (32ull * 128ull + 64ull) * sizeof(float));
+        const auto partials_v = a.zeros(uint64_t(prop_rows) * 16ull * (32ull * 128ull + 64ull) * sizeof(float));
         const auto out_v = a.zeros(uint64_t(prop_rows) * q_heads * head_dim * sizeof(float));
 
         g.set_dflash2_scope(true);
@@ -2134,7 +2137,7 @@ void test_dflash2_kernels(const char* metallib) {
         g.dflash2_context_kv_write(ctx1_v, qknf_v, ring_k_v, ring_v_v, c1, 0u, window, eps);
         g.dflash2_context_kv_write(ctx2_v, qknf_v, ring_k_v, ring_v_v, c2, c1, window, eps);
         g.dflash2_qkv_prepare(pqkv_v, qknf_v, queries_v, qkeys_v, qvals_v, cache_len, prop_rows, eps);
-        g.dflash2_attention(queries_v, ring_k_v, ring_v_v, qkeys_v, qvals_v, partials_v, out_v, cache_len, window);
+        g.dflash2_attention(queries_v, ring_k_v, ring_v_v, qkeys_v, qvals_v, partials_v, out_v, cache_len, window, prop_rows);
         const auto b = g.submit();
         g.set_dflash2_scope(false);
         need(b.dispatches == 5, "dflash2 wraparound attention batch expected 5 dispatches");

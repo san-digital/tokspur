@@ -16,11 +16,19 @@ FROZEN := --frozen
 FEATURES ?= fast-math
 FEATURE_LEVELS := verify8 branch8 qsa-stage-v8 fast-math
 ARM := $(if $(FEATURES),$(FEATURES),ordinary)
-RUST_SERVER_DIR := ../build/rust-$(ARM)
+RUST_SERVER_DIR ?= ../build/rust-$(ARM)
 CPP_BUILD ?= ../build/owned-native
 CPP_FAST_MATH ?= ../build/http-fast-math
 DIFF_WORK ?= ../build/rust-diff
+DIFF_RUST_DIR ?= $(DIFF_WORK)/rust-$(ARM)
 PYTHON ?= python3
+RUST_RECEIPT_CACHE ?= 1
+RUST_RECEIPT_CACHE_DIR ?= ../build/rust-receipt-cache
+RECEIPT_RUN = $(PYTHON) -I ../scripts/rust_receipt_cache.py \
+	--repo-root $(abspath ..) \
+	--cache-dir "$(abspath $(RUST_RECEIPT_CACHE_DIR))" \
+	--enabled "$(RUST_RECEIPT_CACHE)" \
+	--cpp-oracle "$(CPP_ORACLE)"
 
 # Pinned supply-chain tools built with --locked into build/rust-tools.
 #   cargo install --locked --root build/rust-tools cargo-audit@0.22.0 cargo-deny@0.20.2 cargo-vet@0.10.2
@@ -33,19 +41,28 @@ CPP_ORACLE ?= 1
 
 rust-check:
 	cd $(RUST_DIR) && $(CARGO) fmt --all --check
-	cd $(RUST_DIR) && $(CARGO) clippy $(FROZEN) --workspace --all-targets -- -D warnings
-	if [ "$(CPP_ORACLE)" = 1 ]; then cd $(RUST_DIR) && \
-		$(CARGO) clippy $(FROZEN) -p tokspur-fuzz --all-targets --features cpp-oracle -- -D warnings; fi
-	cd $(RUST_DIR) && for level in $(FEATURE_LEVELS); do \
-		$(CARGO) clippy $(FROZEN) -p tokspur-wire -p tokspur-server -p tokspur-fuzz --all-targets --features $$level -- -D warnings || exit 1; \
+	$(RECEIPT_RUN) --action clippy --arm ordinary --features "" -- \
+		$(CARGO) clippy $(FROZEN) --workspace --all-targets -- -D warnings
+	if [ "$(CPP_ORACLE)" = 1 ]; then \
+		$(RECEIPT_RUN) --action clippy --arm cpp-oracle --features cpp-oracle -- \
+			$(CARGO) clippy $(FROZEN) -p tokspur-fuzz --all-targets --features cpp-oracle -- -D warnings; \
+	fi
+	for level in $(FEATURE_LEVELS); do \
+		$(RECEIPT_RUN) --action clippy --arm "$$level" --features "$$level" -- \
+			$(CARGO) clippy $(FROZEN) -p tokspur-wire -p tokspur-server -p tokspur-fuzz --all-targets --features "$$level" -- -D warnings || exit 1; \
 	done
 	$(MAKE) -f rust.mk rust-test
 
 rust-test:
-	cd $(RUST_DIR) && $(CARGO) test $(FROZEN) --workspace
-	if [ "$(CPP_ORACLE)" = 1 ]; then cd $(RUST_DIR) && $(CARGO) test $(FROZEN) -p tokspur-fuzz --features cpp-oracle; fi
-	cd $(RUST_DIR) && for level in $(FEATURE_LEVELS); do \
-		$(CARGO) test $(FROZEN) -p tokspur-wire -p tokspur-server -p tokspur-fuzz --features $$level || exit 1; \
+	$(RECEIPT_RUN) --action test --arm ordinary --features "" -- \
+		$(CARGO) test $(FROZEN) --workspace
+	if [ "$(CPP_ORACLE)" = 1 ]; then \
+		$(RECEIPT_RUN) --action test --arm cpp-oracle --features cpp-oracle -- \
+			$(CARGO) test $(FROZEN) -p tokspur-fuzz --features cpp-oracle; \
+	fi
+	for level in $(FEATURE_LEVELS); do \
+		$(RECEIPT_RUN) --action test --arm "$$level" --features "$$level" -- \
+			$(CARGO) test $(FROZEN) -p tokspur-wire -p tokspur-server -p tokspur-fuzz --features "$$level" || exit 1; \
 	done
 
 rust-server:
@@ -59,8 +76,9 @@ rust-release: rust-server
 # Builds the C++ http-fast-math oracle into $(CPP_FAST_MATH) and runs the byte-level server differential into $(DIFF_WORK).
 SERVER_DIFF = $(PYTHON) -I $(RUST_DIR)/tools/diff/server_diff.py \
 	--cpp $(CPP_FAST_MATH)/tokspur-server --fake $(CPP_FAST_MATH)/test-http_fast_math \
-	--rust $(RUST_SERVER_DIR)/release/tokspur-server
-rust-diff: rust-server
+	--rust $(DIFF_RUST_DIR)/release/tokspur-server
+rust-diff:
+	$(MAKE) -f rust.mk rust-server RUST_SERVER_DIR="$(DIFF_RUST_DIR)"
 	$(MAKE) -C . http-fast-math HTTP_FAST_MATH_BUILD="$(CPP_FAST_MATH)"
 	for arm in channel staged; do \
 		$(SERVER_DIFF) --channel $$arm --work $(DIFF_WORK)/server-$$arm \
@@ -84,8 +102,9 @@ rust-supply:
 COHORT_TARGET ?= $(CPP_BUILD)/tokspur-native
 COHORT_LIBRARY ?= $(CPP_BUILD)/tokspur-owned.metallib
 .PHONY: rust-cohort
-rust-cohort: rust-server
+rust-cohort:
 	test -n "$(COHORT_POLICY)" || { echo "rust-cohort needs COHORT_POLICY"; exit 2; }
+	$(MAKE) -f rust.mk rust-server RUST_SERVER_DIR="$(DIFF_RUST_DIR)"
 	$(SERVER_DIFF) --channel channel --target $(COHORT_TARGET) --policy $(COHORT_POLICY) \
 		--library $(COHORT_LIBRARY) --work ../build/rust-diff/cohort --report ../build/rust-diff/cohort-report.json
 
@@ -108,12 +127,16 @@ FUZZ_BINS := json json_diff http gguf gguf_diff response response_diff bpe
 FUZZ_TARGETS ?= $(FUZZ_BINS) $(addprefix wire-,$(FEATURE_LEVELS))
 
 rust-fuzz-build:
-	$(FUZZ_BUILD) --features cpp-oracle $(addprefix --bin ,$(FUZZ_BINS))
-	mkdir -p $(FUZZ_DIR)/bin
-	for bin in $(FUZZ_BINS); do cp $(FUZZ_OUT)/$$bin $(FUZZ_DIR)/bin/$$bin || exit 1; done
+	$(RECEIPT_RUN) --action fuzz-build --arm cpp-oracle --features cpp-oracle \
+		--fuzz-dir "$(FUZZ_DIR)" --fuzz-out "$(FUZZ_OUT)" \
+		--fuzz-bins "$(FUZZ_BINS)" --fuzz-triple "$(FUZZ_TRIPLE)" \
+		--fuzz-rustflags="$(FUZZ_RUSTFLAGS)" -- \
+		$(CARGO) build $(FROZEN) --release -p tokspur-fuzz --target $(FUZZ_TRIPLE) --target-dir $(FUZZ_DIR)/target --features cpp-oracle $(addprefix --bin ,$(FUZZ_BINS))
 	for level in $(FEATURE_LEVELS); do \
-		$(FUZZ_BUILD) --bin wire --features $$level && \
-		cp $(FUZZ_OUT)/wire $(FUZZ_DIR)/bin/wire-$$level || exit 1; \
+		$(RECEIPT_RUN) --action fuzz-build --arm "$$level" --features "$$level" \
+			--fuzz-dir "$(FUZZ_DIR)" --fuzz-out "$(FUZZ_OUT)" \
+			--fuzz-triple "$(FUZZ_TRIPLE)" --fuzz-rustflags="$(FUZZ_RUSTFLAGS)" -- \
+			$(CARGO) build $(FROZEN) --release -p tokspur-fuzz --target $(FUZZ_TRIPLE) --target-dir $(FUZZ_DIR)/target --bin wire --features "$$level" || exit 1; \
 	done
 
 rust-fuzz-seeds:

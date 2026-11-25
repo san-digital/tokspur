@@ -1,6 +1,6 @@
-//! The data dependencies of one batch. Two dispatches conflict when they touch overlapping bytes of one allocation and at least one writes them. The error flag (`buffer(7)`) is shared by every kernel: all OR into it with relaxed atomics, which commute, but the kernels in [`FLAG_READERS`] also load it and return early once it is set, so a flag reader is ordered against every other dispatch (and two readers against each other only through the writes they both make). `tests/kernels.rs` checks the list against the MSL sources.
+//! Dispatches depend on earlier writes to overlapping bytes and on earlier reads of bytes they overwrite. Atomic OR operations on the error flag commute. A kernel in [`FLAG_READERS`] also loads its flag, so it depends on operations that share its slot. A legacy trace without slot ranges treats the whole flag buffer as shared.
 
-use crate::trace::{Access, Batch, Dispatch, Target};
+use crate::trace::{Access, Batch, Dispatch, Range, Target};
 
 /// Kernels that load the error flag (`atomic_load_explicit(error, ...)`).
 pub const FLAG_READERS: [&str; 6] = [
@@ -16,18 +16,47 @@ pub fn reads_flag(dispatch: &Dispatch) -> bool {
     FLAG_READERS.contains(&dispatch.function())
 }
 
-fn touches_flag(dispatch: &Dispatch) -> bool {
-    dispatch
-        .bindings
-        .iter()
-        .any(|binding| binding.target == Target::ErrorFlag)
+fn flag_conflicts(a: Target, b: Target) -> bool {
+    match (a, b) {
+        (Target::ErrorFlag, Target::ErrorFlag | Target::ErrorFlagSlot { .. })
+        | (Target::ErrorFlagSlot { .. }, Target::ErrorFlag) => true,
+        (
+            Target::ErrorFlagSlot {
+                offset: a_off,
+                bytes: a_bytes,
+            },
+            Target::ErrorFlagSlot {
+                offset: b_off,
+                bytes: b_bytes,
+            },
+        ) => a_off < b_off.saturating_add(b_bytes) && b_off < a_off.saturating_add(a_bytes),
+        _ => false,
+    }
+}
+
+fn span_conflicts(
+    first: Range,
+    first_access: Access,
+    second: Range,
+    second_access: Access,
+) -> bool {
+    (first_access == Access::Write || second_access == Access::Write) && first.overlaps(&second)
 }
 
 /// Whether `later` must stay ordered after `earlier`.
 pub fn conflicts(earlier: &Dispatch, later: &Dispatch) -> bool {
-    // Every flag-bound kernel writes the flag; ordering matters only when one side also reads it.
-    if touches_flag(earlier) && touches_flag(later) && (reads_flag(earlier) || reads_flag(later)) {
-        return true;
+    // Every flag-bound kernel writes its assigned flag slot; ordering matters only when one side also reads an overlapping slot.
+    if reads_flag(earlier) || reads_flag(later) {
+        for a in &earlier.bindings {
+            if !matches!(a.target, Target::ErrorFlag | Target::ErrorFlagSlot { .. }) {
+                continue;
+            }
+            for b in &later.bindings {
+                if flag_conflicts(a.target, b.target) {
+                    return true;
+                }
+            }
+        }
     }
     for a in &earlier.bindings {
         let Target::Range(first, first_access) = a.target else {
@@ -37,9 +66,22 @@ pub fn conflicts(earlier: &Dispatch, later: &Dispatch) -> bool {
             let Target::Range(second, second_access) = b.target else {
                 continue;
             };
-            if (first_access == Access::Write || second_access == Access::Write)
-                && first.overlaps(&second)
-            {
+            if span_conflicts(first, first_access, second, second_access) {
+                return true;
+            }
+        }
+        if let Some(second) = later.indirect
+            && span_conflicts(first, first_access, second, Access::Read)
+        {
+            return true;
+        }
+    }
+    if let Some(first) = earlier.indirect {
+        for b in &later.bindings {
+            let Target::Range(second, second_access) = b.target else {
+                continue;
+            };
+            if span_conflicts(first, Access::Read, second, second_access) {
                 return true;
             }
         }
@@ -107,10 +149,14 @@ mod tests {
     use super::*;
     use crate::trace::{Binding, Range};
 
-    fn dispatch(function: &str, bindings: &[(u64, u64, u64, Access)]) -> Dispatch {
+    fn dispatch_with_flag(
+        function: &str,
+        flag_target: Target,
+        bindings: &[(u64, u64, u64, Access)],
+    ) -> Dispatch {
         let mut all = vec![Binding {
             index: 7,
-            target: Target::ErrorFlag,
+            target: flag_target,
         }];
         for (index, &(slot, offset, bytes, access)) in bindings.iter().enumerate() {
             all.push(Binding {
@@ -132,7 +178,12 @@ mod tests {
             group: [128, 1, 1],
             bindings: all,
             constants: Vec::new(),
+            indirect: None,
         }
+    }
+
+    fn dispatch(function: &str, bindings: &[(u64, u64, u64, Access)]) -> Dispatch {
+        dispatch_with_flag(function, Target::ErrorFlag, bindings)
     }
 
     #[test]
@@ -183,5 +234,64 @@ mod tests {
         // Assert
         assert_eq!(found, vec![(0, 2), (1, 3), (2, 3)]);
         assert_eq!(level, vec![0, 0, 1, 2]);
+    }
+
+    #[test]
+    fn disjoint_error_flag_slots_decouple_flag_readers() {
+        let writer_slot0 = dispatch_with_flag(
+            "rms_norm",
+            Target::ErrorFlagSlot {
+                offset: 0,
+                bytes: 4,
+            },
+            &[(0, 0, 16, Access::Write)],
+        );
+        let qsa_pass1 = dispatch_with_flag(
+            "qsa_score_stage",
+            Target::ErrorFlagSlot {
+                offset: 4,
+                bytes: 4,
+            },
+            &[(1, 0, 16, Access::Write)],
+        );
+        let qsa_pass2_reader = dispatch_with_flag(
+            "qsa_score_accumulate",
+            Target::ErrorFlagSlot {
+                offset: 4,
+                bytes: 4,
+            },
+            &[(2, 0, 16, Access::Write)],
+        );
+        let legacy_writer = dispatch("rms_norm", &[(3, 0, 16, Access::Write)]);
+
+        // Disjoint ErrorFlagSlot ranges do not conflict even with FLAG_READERS.
+        assert!(!conflicts(&writer_slot0, &qsa_pass2_reader));
+        assert!(!conflicts(&qsa_pass2_reader, &writer_slot0));
+        // Same ErrorFlagSlot orders reader with writer on that slot.
+        assert!(conflicts(&qsa_pass1, &qsa_pass2_reader));
+        assert!(conflicts(&qsa_pass2_reader, &qsa_pass1));
+        // Legacy Target::ErrorFlag conservatively conflicts with any ErrorFlagSlot when a reader is present.
+        assert!(conflicts(&legacy_writer, &qsa_pass2_reader));
+        assert!(!conflicts(&legacy_writer, &writer_slot0));
+    }
+
+    #[test]
+    fn indirect_dispatch_conflicts_on_12_byte_args_span() {
+        let writer = dispatch("prep", &[(0, 16, 12, Access::Write)]);
+        let mut indirect_consumer = dispatch("run", &[(1, 0, 64, Access::Write)]);
+        indirect_consumer.indirect = Some(Range {
+            slot: 0,
+            offset: 16,
+            bytes: 12,
+        });
+        let mut indirect_disjoint = dispatch("run", &[(1, 0, 64, Access::Write)]);
+        indirect_disjoint.indirect = Some(Range {
+            slot: 0,
+            offset: 28,
+            bytes: 12,
+        });
+
+        assert!(conflicts(&writer, &indirect_consumer));
+        assert!(!conflicts(&writer, &indirect_disjoint));
     }
 }

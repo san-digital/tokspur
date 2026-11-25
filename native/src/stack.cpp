@@ -165,13 +165,14 @@ struct DFlashTap {
 #endif
 #ifdef TOKSPUR_PRIVATE_VERIFY_EIGHT
 struct VerificationStore8 {
+    uint32_t capacity = 8;
     RecurrentScratch recurrent{};
     GdnCoreReplayScratch replay{};
     std::vector<GdnCoreTape> tapes;
     std::vector<GpuView> prefix_sums, owned;
     GpuView streams{}, second{}, memory_streams{}, embeddings{}, prefix_memory{}, mixed{}, logits{}, topk_scratch{}, topk_rows{};
-    std::vector<float> host_streams, host_logits; // Nine fixed rows: base, then1..8.
-    std::array<std::vector<uint64_t>, 8> lookup_rows;
+    std::vector<float> host_streams, host_logits; // Capacity + 1 fixed rows: base, then 1..capacity.
+    std::array<std::vector<uint64_t>, 16> lookup_rows;
     uint64_t gpu_charged_bytes = 0, host_charged_bytes = 0, tape_payload_bytes = 0;
     std::array<uint32_t, 2> kernel_policy{};
     bool residual_reuse = false;
@@ -672,6 +673,12 @@ struct TextStack::Impl {
         require(offset == storage.bytes, "checkpoint packed-state geometry mismatch");
         return count;
     }
+    void prepare_known_tile_scratch() {
+        if (known_recurrent.residual.input.owner) return;
+        owned.reserve(owned.size() + known_recurrent.views().size());
+        known_recurrent = allocate_recurrent_tile_scratch(g, {shape.residual, shape.recurrent, shape.experts}, known_capacity);
+        keep(known_recurrent.views());
+    }
     void prepare_known(uint64_t memory_count) {
         const auto width = uint64_t(shape.residual.branches) * shape.residual.channels;
         const auto streams = checked_mul(known_capacity, width);
@@ -693,14 +700,7 @@ struct TextStack::Impl {
                 "known-token recurrent prefill requires Q8/F32 core projections");
             recurrent = true;
         }
-        if (known_capacity < 512 && (recurrent
-#ifdef TOKSPUR_PRIVATE_PREFILL_CHUNK
-            || known_capacity == 512
-#endif
-            )) {
-            known_recurrent = allocate_recurrent_tile_scratch(g, {shape.residual, shape.recurrent, shape.experts}, known_capacity);
-            keep(known_recurrent.views());
-        }
+        if (known_capacity < 512 && recurrent) prepare_known_tile_scratch();
         if (recurrent
 #ifdef TOKSPUR_PRIVATE_PREFILL_CHUNK
             || known_capacity >= 512
@@ -1098,7 +1098,7 @@ struct TextStack::Impl {
         float next_epsilon = 0.0f;
     };
     Verify8BoundaryFusion verify8_boundary_fusion(size_t i, uint32_t steps) const {
-        if (!verification8 || !g.verify_nax() || steps < 2 || steps > 8 || weights.layers.empty() || i >= weights.layers.size()) {
+        if (!verification8 || !g.verify_nax() || steps < 2 || steps > verification8->capacity || weights.layers.empty() || i >= weights.layers.size()) {
             return {};
         }
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
@@ -1508,7 +1508,7 @@ struct TextStack::Impl {
             const auto encode_tile = [&] {
                 encode_recurrent_layer_tile(g, *w, scratch, state.current, state.next, input, output,
                     {shape.residual, shape.recurrent, shape.experts}, policy.recurrent, policy.router,
-                    policy.normalize_selected, {8, steps}, residual_reuse
+                    policy.normalize_selected, {v.capacity, steps}, residual_reuse
 #ifdef TOKSPUR_PRIVATE_PREFILL_CHUNK
                     , nullptr, false
 #endif
@@ -1764,7 +1764,16 @@ void TextStack::prepare_chunked_prefill(GdnChunkMode mode, uint64_t budget, bool
         }
     }
     store->charged = p.g.memory().live_bytes - before; require(store->charged <= budget, "chunked prefill exceeds its explicit GPU budget");
-    p.g.validate_disjoint(p.owned, store->owned); p.chunked = std::move(store);
+    p.g.validate_disjoint(p.owned, store->owned);
+    if (p.known_recurrent.residual.input.owner) {
+        const auto tiled_views = p.known_recurrent.views();
+        release_recurrent_scratch(p.g, p.known_recurrent);
+        std::erase_if(p.owned, [&](GpuView v) {
+            return std::any_of(tiled_views.begin(), tiled_views.end(), [&](GpuView tiled) { return tiled.slot == v.slot; });
+        });
+        p.known_recurrent = {};
+    }
+    p.chunked = std::move(store);
 #ifdef TOKSPUR_PRIVATE_HTTP_PREFILL512
     p.grouped_known_enabled = false;
 #endif
@@ -1788,7 +1797,7 @@ bool TextStack::sampled_logit_topk() const { impl_->check_thread(); return impl_
 void TextStack::read_verified_committed_logits(uint32_t committed_1based, std::span<float> destination) {
     auto& p = *impl_; p.check_thread(); p.check_verification8_policy();
     const uint32_t vocabulary = p.shape.vocabulary;
-    require(p.sampled_verification_prepared && committed_1based >= 1 && committed_1based <= 8 &&
+    require(p.sampled_verification_prepared && committed_1based >= 1 && committed_1based <= p.verification8->capacity &&
         destination.size() == vocabulary, "invalid committed verification logit row readback");
     auto& v = *p.verification8;
     if (p.sampled_logit_views) {
@@ -1804,9 +1813,11 @@ void TextStack::read_verified_committed_logits(uint32_t committed_1based, std::s
     }
 }
 #endif
-void TextStack::prepare_final_hc_tap(uint64_t budget) {
+void TextStack::prepare_final_hc_tap(uint64_t budget, uint32_t minimum_capacity) {
     auto& p = *impl_; p.check_thread();
-    uint32_t tap_capacity = 8; uint64_t tap_budget = maximum_stack_final_hc_tap_budget;
+    require(minimum_capacity == 8 || minimum_capacity == 16, "unsupported final HC tap capacity");
+    uint32_t tap_capacity = minimum_capacity;
+    uint64_t tap_budget = minimum_capacity == 16 ? (32ull << 20) : maximum_stack_final_hc_tap_budget;
 #ifdef TOKSPUR_PRIVATE_HTTP_PREFILL512
     if (p.known_capacity >= 512 && p.chunked) {
         tap_capacity = p.known_capacity;
@@ -1897,7 +1908,7 @@ GpuView TextStack::last_final_hc_gpu_residual() const {
     return p.g.slice(rows, uint64_t(p.final_hc_tap->count - 1) * row_bytes, row_bytes);
 }
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
-void TextStack::prepare_dflash_tap(std::span<const uint32_t> layer_ids, uint64_t budget) {
+void TextStack::prepare_dflash_tap(std::span<const uint32_t> layer_ids, uint64_t budget, uint32_t verify_rows) {
     auto& p = *impl_; p.check_thread();
     require(!p.dflash_tap && !p.prefix && !p.checkpoints && !p.verification &&
         p.execution == StackExecution::direct && !p.replay_prepared &&
@@ -1916,7 +1927,7 @@ void TextStack::prepare_dflash_tap(std::span<const uint32_t> layer_ids, uint64_t
     }
     const uint32_t slot_count = uint32_t(layer_ids.size());
     const uint32_t slot_width = p.shape.residual.channels;
-    const auto plan = dflash2_tap_plan(p.known_capacity, slot_count, slot_width, budget);
+    const auto plan = dflash2_tap_plan(p.known_capacity, slot_count, slot_width, budget, verify_rows);
     p.g.prepare_dflash2();
     const auto before = p.g.memory().live_bytes;
     auto tap = std::make_unique<DFlashTap>();
@@ -1924,7 +1935,7 @@ void TextStack::prepare_dflash_tap(std::span<const uint32_t> layer_ids, uint64_t
     tap->slot_count = slot_count;
     tap->slot_width = slot_width;
     tap->known_capacity = plan.known_capacity;
-    tap->verify_capacity = 8u;
+    tap->verify_capacity = verify_rows;
     try {
         tap->known_gpu = p.g.zeros(plan.known_bytes, "DFlash known tap rows");
         tap->owned.push_back(tap->known_gpu);
@@ -1988,6 +1999,11 @@ StackKnownQsaRowsMemory TextStack::known_qsa_rows_memory() const {
 }
 #endif
 #ifdef TOKSPUR_PRIVATE_PREFILL_CHUNK
+void TextStack::prepare_tiled_prefill512() {
+    auto& p = *impl_;
+    p.check_large_known_selector();
+    p.prepare_known_tile_scratch();
+}
 bool TextStack::known_grouped_ffn() const { impl_->check_thread(); return impl_->grouped_known_enabled; }
 void TextStack::configure_known_grouped_ffn(bool enabled) {
     auto& p = *impl_; p.check_large_known_selector();
@@ -2133,6 +2149,12 @@ StackResult TextStack::step_with_logits(uint32_t token, std::span<const float> r
             require_all_finite(logits, "nonfinite target logits");
         }
         p.capture_final_hc(streams, 1);
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+        if (p.dflash_tap) {
+            require_all_finite(std::span<const float>(p.g.host_floats(p.dflash_tap->verify_gpu),
+                uint64_t(p.dflash_tap->slot_count) * p.dflash_tap->slot_width), "nonfinite DFlash2 tap");
+        }
+#endif
         // No fallible work after publication. Returning/moving the prepared
         // vector, view swaps, scalar prefix and fixed-array assignment cannot throw.
         const auto position = p.prefix; p.publish_pairs(); p.history = candidate.next; p.kernel_policy = kernel_policy; ++p.prefix;
@@ -2151,6 +2173,10 @@ StackResult TextStack::step_with_logits(uint32_t token, std::span<const float> r
     }
 }
 StackResult TextStack::step_known(std::span<const uint32_t> tokens, std::span<const float> rows, std::span<const float> memory, bool emit_logits) {
+    return step_known(tokens, rows, memory, emit_logits, nullptr);
+}
+StackResult TextStack::step_known(std::span<const uint32_t> tokens, std::span<const float> rows, std::span<const float> memory, bool emit_logits, std::optional<CommandTiming>* timing) {
+    if (timing) timing->reset();
     auto& p = *impl_; p.check_thread();
 #ifdef TOKSPUR_PRIVATE_HTTP_PREFILL512
     const bool has_prefill_tap = bool(p.final_hc_tap)
@@ -2217,6 +2243,13 @@ StackResult TextStack::step_known(std::span<const uint32_t> tokens, std::span<co
         p.g.write(p.known_streams, std::as_bytes(std::span(p.known_host_streams)));
     }
     p.g.write(p.g.slice(p.known_embeddings, 0, checked_mul(memory.size(), 4)), std::as_bytes(memory));
+#ifdef TOKSPUR_PRIVATE_PREFILL_CHUNK
+    if (p.known_capacity == 512
+#ifdef TOKSPUR_PRIVATE_CHUNKED_PREFILL
+        && !p.chunked
+#endif
+    ) p.prepare_known_tile_scratch();
+#endif
     const auto allocations = p.g.memory().allocations;
 #ifdef TOKSPUR_PRIVATE_CHUNKED_PREFILL
     if (cache_copies) p.g.copy(std::span(cache_save).first(cache_copies));
@@ -2256,11 +2289,11 @@ StackResult TextStack::step_known(std::span<const uint32_t> tokens, std::span<co
             p.g.gemv(p.weights.output.encoding, p.weights.output.view, p.m.mixed, p.logits, channels, p.shape.vocabulary);
         }
 #ifdef TOKSPUR_PRIVATE_PREFILL_CHUNK
-        accumulate(p.g.submit());
+        accumulate(p.g.submit(p.known_layer_submit ? nullptr : timing));
         if (p.known_layer_submit)
             batch.wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - logical_started).count();
 #else
-        batch = p.g.submit();
+        batch = p.g.submit(timing);
 #endif
         if (p.g.last_profile().timings_valid && std::getenv("TOKSPUR_DUMP_VERIFY_PROFILE")) {
             std::map<std::string, std::pair<uint32_t, double>> agg;
@@ -2284,10 +2317,18 @@ StackResult TextStack::step_known(std::span<const uint32_t> tokens, std::span<co
             require_all_finite(logits, "nonfinite known-token target logits");
         }
         if (p.final_hc_gpu_mode) {
+            require_all_finite(std::span<const float>(p.g.host_floats(last_streams), uint64_t(steps) * width),
+                "nonfinite final HC residual tap");
             p.capture_final_hc_gpu_only(last_streams, steps);
         } else {
             p.capture_final_hc(last_streams, steps);
         }
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+        if (p.dflash_tap) {
+            require_all_finite(std::span<const float>(p.g.host_floats(p.dflash_tap->known_gpu),
+                uint64_t(steps) * p.dflash_tap->slot_count * p.dflash_tap->slot_width), "nonfinite DFlash2 tap");
+        }
+#endif
         // Every candidate is complete. No fallible operation may follow this
         // all-N publication; no partial acceptance/verification contract exists.
         const auto position = p.prefix; p.publish_pairs(); p.history = staged.back().next; p.prefix += steps;
@@ -2297,6 +2338,7 @@ StackResult TextStack::step_known(std::span<const uint32_t> tokens, std::span<co
 #endif
         return {std::move(logits), batch, position, emit_logits};
     } catch (...) {
+        if (timing) timing->reset();
         p.clear_final_hc_candidate();
         try { p.g.abort(); } catch (const FormatError&) {}
 #ifdef TOKSPUR_PRIVATE_CHUNKED_PREFILL
@@ -2624,6 +2666,54 @@ StackSampledVerificationResult TextStack::verify_sampled8(std::span<const uint32
     StackSampledVerificationSelector selector, StackVerificationCancellation cancellation) {
     return verify_sampled_bounded(tokens, rows, memory, committed_prefix, selector, cancellation, 8);
 }
+void TextStack::prepare_sampled_verification16(uint64_t budget
+#ifdef TOKSPUR_PRIVATE_VERIFY_QSA_ROWS
+    , QsaVerifyRowsConfig qsa_rows
+#endif
+    ) {
+    auto& p = *impl_; p.check_thread();
+    const bool has_verify_tap = bool(p.final_hc_tap)
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+        || bool(p.dflash_tap)
+#endif
+        ;
+    require(has_verify_tap && (!p.final_hc_tap || p.final_hc_tap->capacity >= 16) &&
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+        (!p.dflash_tap || p.dflash_tap->verify_capacity >= 16) &&
+#endif
+        !p.sampled_verification_prepared && !p.preparing_sampled_verification &&
+        !p.checkpoints && !p.verification && !p.verification8 && !p.prefix && (p.known_capacity == 8
+#ifdef TOKSPUR_PRIVATE_HTTP_PREFILL512
+        || ((p.known_capacity == 512 || p.known_capacity == 1024 || p.known_capacity == 2048) && p.chunked && p.residual_reuse)
+#endif
+        ),
+        "sampled verification16 requires capacity>=16 final HC or DFlash tap and empty exclusive stack");
+    p.preparing_sampled_verification = true;
+    struct Preparing { bool& value; ~Preparing() { value = false; } } preparing{p.preparing_sampled_verification};
+    prepare_transient_verification8_impl(budget
+#ifdef TOKSPUR_PRIVATE_VERIFY_QSA_ROWS
+        , qsa_rows
+#endif
+        , 16u, maximum_stack_verification16_budget);
+    p.sampled_verification_prepared = true;
+}
+std::array<StackVerificationLookup, 16> TextStack::sampled_verification16_lookups(std::span<const uint32_t> tokens) const {
+    const auto& p = *impl_; p.check_thread(); p.check_verification8_policy();
+    require(p.sampled_verification_prepared && p.verification8->capacity >= 16 && !tokens.empty() && tokens.size() <= 16 &&
+        p.prefix <= p.shape.attention.capacity && tokens.size() <= p.shape.attention.capacity - p.prefix,
+        "sampled verification16 requires one to sixteen inputs within context");
+    std::array<StackVerificationLookup, 16> out{}; auto history = p.history;
+    for (size_t t = 0; t < tokens.size(); ++t) {
+        history = ngram_step(p.spec, p.policy.ngram, history, tokens[t], p.verification8->lookup_rows[t]);
+        out[t] = {history, p.verification8->lookup_rows[t]};
+    }
+    return out;
+}
+StackSampledVerificationResult TextStack::verify_sampled16(std::span<const uint32_t> tokens,
+    std::span<const float> rows, std::span<const float> memory, uint32_t committed_prefix,
+    StackSampledVerificationSelector selector, StackVerificationCancellation cancellation) {
+    return verify_sampled_bounded(tokens, rows, memory, committed_prefix, selector, cancellation, 16);
+}
 #endif
 
 StackSampledVerificationResult TextStack::verify_sampled_bounded(std::span<const uint32_t> tokens,
@@ -2633,8 +2723,16 @@ StackSampledVerificationResult TextStack::verify_sampled_bounded(std::span<const
     auto& p = *impl_; p.check_thread(); p.check_verification8_policy();
     require(!tokens.empty() && tokens.size() <= maximum_rows, "sampled transaction input count exceeds its explicit entry bound");
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP_DEPTH2
-    require(maximum_rows == 2 || maximum_rows == 3 || maximum_rows == 4 || maximum_rows == 8, "invalid sampled verification entry bound");
-    const auto staged = sampled_verification8_lookups(tokens);
+    require(maximum_rows == 2 || maximum_rows == 3 || maximum_rows == 4 || maximum_rows == 8 ||
+        (maximum_rows == 16 && p.verification8->capacity >= 16), "invalid sampled verification entry bound");
+    const auto staged = maximum_rows == 16
+        ? sampled_verification16_lookups(tokens)
+        : [&] {
+            std::array<StackVerificationLookup, 16> w{};
+            const auto s8 = sampled_verification8_lookups(tokens);
+            std::copy(s8.begin(), s8.end(), w.begin());
+            return w;
+        }();
 #elif defined(TOKSPUR_PRIVATE_SAMPLED_VERIFICATION_COST)
     require(maximum_rows == 2 || maximum_rows == 3, "invalid sampled COST entry bound");
     const auto staged = sampled_verification_cost_lookups(tokens);
@@ -2725,7 +2823,6 @@ StackSampledVerificationResult TextStack::verify_sampled_bounded(std::span<const
         p.g.set_mtp_profile_phase(MtpProfilePhase::verification);
 #endif
         const auto streams = p.weights.layers.size() % 2 ? v.second : v.streams;
-        bool gpu_checked_final = false;
         BatchResult capture_parts{};
         uint64_t route_snapshot_dispatches = 0;
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
@@ -2768,7 +2865,6 @@ StackSampledVerificationResult TextStack::verify_sampled_bounded(std::span<const
                 const bool final_prenorm = !p.weights.layers.empty() && p.verify8_boundary_fusion(p.weights.layers.size() - 1, steps).enabled;
                 encode_verify_nax_final_logits(p.g, p.weights.mixer, p.weights.output, v.recurrent.residual,
                     streams, v.mixed, v.logits, p.shape.residual, vocabulary, steps, p.policy.attention.rms_epsilon, final_prenorm);
-                gpu_checked_final = true;
             } else
 #endif
             {
@@ -2835,7 +2931,7 @@ StackSampledVerificationResult TextStack::verify_sampled_bounded(std::span<const
                 std::as_writable_bytes(std::span(v.host_logits).subspan(vocabulary, uint64_t(steps) * vocabulary)));
             for (uint32_t t = 0; t < steps; ++t) {
                 const auto row_logits = shared_logits ? std::span<const float>(shared_logits + uint64_t(t) * vocabulary, vocabulary) : logits(t + 1);
-                if (!gpu_checked_final) {
+                {
                     TOKSPUR_CARRIER_PHASE(numerical);
                     for (size_t base = 0; base < row_logits.size(); base += 4096) {
                         poll();
@@ -2858,6 +2954,8 @@ StackSampledVerificationResult TextStack::verify_sampled_bounded(std::span<const
 #endif
         if (p.final_hc_tap) {
             if (p.final_hc_gpu_mode) {
+                require_all_finite(std::span<const float>(p.g.host_floats(streams), uint64_t(steps) * width),
+                    "nonfinite final HC residual tap");
                 p.capture_final_hc_gpu_only(streams, steps);
                 result.evaluated.final_hc_gpu_rows = p.final_hc_candidate_gpu;
             } else {
@@ -2866,6 +2964,12 @@ StackSampledVerificationResult TextStack::verify_sampled_bounded(std::span<const
                 result.evaluated.final_hc_rows = std::span<const float>(p.final_hc_tap->candidate).first(uint64_t(steps) * width);
             }
         }
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+        if (p.dflash_tap) {
+            require_all_finite(std::span<const float>(p.g.host_floats(p.dflash_tap->verify_gpu),
+                uint64_t(steps) * p.dflash_tap->slot_count * p.dflash_tap->slot_width), "nonfinite DFlash2 tap");
+        }
+#endif
         poll();
         result.committed = selector.choose(selector.context, result.evaluated);
         require(result.committed && result.committed <= steps, "sampled selector returned an invalid consumed prefix");
@@ -2880,7 +2984,7 @@ StackSampledVerificationResult TextStack::verify_sampled_bounded(std::span<const
                 p.g.begin();
                 for (size_t i = 0; i < p.states.size(); ++i) if (const auto* r = std::get_if<RecurrentPair>(&p.states[i]))
                     encode_gdn_core_tape_prefix(p.g, std::get<RecurrentWeights>(p.weights.layers[i]).attention.convolution,
-                        v.tapes[i], r->current, r->next, v.replay, p.shape.recurrent, {8, result.committed});
+                        v.tapes[i], r->current, r->next, v.replay, p.shape.recurrent, {v.capacity, result.committed});
                 result.recovery = p.g.submit();
                 require(result.recovery.dispatches == 2 * recurrent_layers && !result.recovery.capture_executes &&
                     p.g.memory().allocations == allocations, "sampled verification prefix recovery invariant failed");
@@ -2950,6 +3054,18 @@ void TextStack::prepare_transient_verification8(uint64_t budget
     , QsaVerifyRowsConfig qsa_rows
 #endif
     ) {
+    prepare_transient_verification8_impl(budget
+#ifdef TOKSPUR_PRIVATE_VERIFY_QSA_ROWS
+        , qsa_rows
+#endif
+        , 8u, maximum_stack_verification_budget);
+}
+void TextStack::prepare_transient_verification8_impl(uint64_t budget
+#ifdef TOKSPUR_PRIVATE_VERIFY_QSA_ROWS
+    , QsaVerifyRowsConfig qsa_rows
+#endif
+    , uint32_t capacity, uint64_t budget_limit) {
+    require(capacity == 8 || capacity == 16, "unsupported transient verification capacity");
     auto& p = *impl_; p.check_thread();
 #ifdef TOKSPUR_PRIVATE_CHUNKED_PREFILL
     require(!p.chunked
@@ -2989,15 +3105,17 @@ void TextStack::prepare_transient_verification8(uint64_t budget
         || ((p.known_capacity == 512 || p.known_capacity == 1024 || p.known_capacity == 2048) && p.chunked && p.preparing_sampled_verification)
 #endif
         ) &&
-        !p.hc_q8_splits && budget && budget <= maximum_stack_verification_budget,
+        !p.hc_q8_splits && budget && budget <= budget_limit,
         "verification8 requires empty exclusive capacity8 direct preparation and bounded budget");
     if (p.checkpoints) p.check_checkpoint_policy();
     require(p.weights.output.encoding == 8 && p.shape.residual.channels % 32 == 0,
         "verification8 requires an original Q8 vocabulary head");
     const auto width = uint64_t(p.shape.residual.branches) * p.shape.residual.channels;
-    const auto host_minimum = checked_add(sizeof(VerificationStore8), checked_mul(9ull * p.shape.vocabulary + 8 * width, 4));
+    const auto host_minimum = checked_add(sizeof(VerificationStore8),
+        checked_mul(uint64_t(capacity + 1) * p.shape.vocabulary + uint64_t(capacity) * width, 4));
     require(host_minimum < budget, "verification8 host rows exceed explicit combined budget");
     auto store = std::make_unique<VerificationStore8>();
+    store->capacity = capacity;
     store->tapes.resize(p.states.size()); store->prefix_sums.resize(p.states.size());
     store->owned.reserve(p.states.size() * 7 + 52
 #ifdef TOKSPUR_PRIVATE_VERIFY_QSA_ROWS
@@ -3007,8 +3125,8 @@ void TextStack::prepare_transient_verification8(uint64_t budget
         + 3
 #endif
         );
-    store->host_streams.resize(8 * width); store->host_logits.resize(9ull * p.shape.vocabulary);
-    for (auto& row : store->lookup_rows) row.resize(p.spec.offsets.size());
+    store->host_streams.resize(uint64_t(capacity) * width); store->host_logits.resize(uint64_t(capacity + 1) * p.shape.vocabulary);
+    for (uint32_t r = 0; r < capacity; ++r) store->lookup_rows[r].resize(p.spec.offsets.size());
     store->host_charged_bytes = sizeof(VerificationStore8) + store->tapes.capacity() * sizeof(GdnCoreTape) +
         (store->prefix_sums.capacity() + store->owned.capacity()) * sizeof(GpuView) +
         (store->host_streams.capacity() + store->host_logits.capacity()) * sizeof(float);
@@ -3032,31 +3150,31 @@ void TextStack::prepare_transient_verification8(uint64_t budget
         const auto view = p.g.zeros(bytes, label); store->owned.push_back(view); admit(); return view;
     };
     try {
-        store->streams = zeros(8 * width, "verification8 branch rows");
-        store->second = zeros(8 * width, "verification8 alternating rows");
-        store->memory_streams = zeros(8 * width, "verification8 PLE rows");
-        store->embeddings = zeros(8ull * p.shape.memory.embedding, "verification8 lookup embeddings");
-        store->prefix_memory = zeros(7 * (p.current_memory.bytes / 4), "verification8 PLE prefix histories");
-        store->mixed = zeros(8ull * p.shape.residual.channels, "verification8 mixed head inputs");
-        store->logits = zeros(8ull * p.shape.vocabulary, "verification8 full vocabulary rows");
+        store->streams = zeros(uint64_t(capacity) * width, "verification8 branch rows");
+        store->second = zeros(uint64_t(capacity) * width, "verification8 alternating rows");
+        store->memory_streams = zeros(uint64_t(capacity) * width, "verification8 PLE rows");
+        store->embeddings = zeros(uint64_t(capacity) * p.shape.memory.embedding, "verification8 lookup embeddings");
+        store->prefix_memory = zeros(uint64_t(capacity - 1) * (p.current_memory.bytes / 4), "verification8 PLE prefix histories");
+        store->mixed = zeros(uint64_t(capacity) * p.shape.residual.channels, "verification8 mixed head inputs");
+        store->logits = zeros(uint64_t(capacity) * p.shape.vocabulary, "verification8 full vocabulary rows");
         if (p.sampled_logit_topk) {
-            store->topk_scratch = zeros_bytes(MetalGraph::logit_topk_scratch_bytes(8, p.shape.vocabulary),
+            store->topk_scratch = zeros_bytes(MetalGraph::logit_topk_scratch_bytes(capacity, p.shape.vocabulary),
                 "verification8 logit top-k partial scratch");
-            store->topk_rows = zeros_bytes(MetalGraph::logit_topk_output_bytes(8),
+            store->topk_rows = zeros_bytes(MetalGraph::logit_topk_output_bytes(capacity),
                 "verification8 logit top-k output rows");
         }
         bool recurrent = false;
         for (size_t i = 0; i < p.states.size(); ++i) {
             if (std::holds_alternative<RecurrentPair>(p.states[i])) {
-                recurrent = true; store->tapes[i] = allocate_gdn_core_tape(p.g, p.shape.recurrent, 8);
+                recurrent = true; store->tapes[i] = allocate_gdn_core_tape(p.g, p.shape.recurrent, capacity);
                 keep(store->tapes[i].views());
                 for (auto view : store->tapes[i].views()) store->tape_payload_bytes += view.bytes;
-            } else store->prefix_sums[i] = zeros(7ull * p.shape.attention.index_width, "verification8 QSA prefix sums");
+            } else store->prefix_sums[i] = zeros(uint64_t(capacity - 1) * p.shape.attention.index_width, "verification8 QSA prefix sums");
         }
         if (recurrent) {
-            store->recurrent = allocate_recurrent_tile_scratch(p.g, {p.shape.residual, p.shape.recurrent, p.shape.experts}, 8);
+            store->recurrent = allocate_recurrent_tile_scratch(p.g, {p.shape.residual, p.shape.recurrent, p.shape.experts}, capacity);
             keep(store->recurrent.views());
-            store->replay = allocate_gdn_core_replay_scratch(p.g, p.shape.recurrent, 8);
+            store->replay = allocate_gdn_core_replay_scratch(p.g, p.shape.recurrent, capacity);
             keep(std::array{store->replay.convolution_output, store->replay.delta_output});
             p.g.prepare_gdn_tiles(32);
         }
@@ -3064,7 +3182,7 @@ void TextStack::prepare_transient_verification8(uint64_t budget
         store->qsa_rows_memory.config = qsa_rows;
         if (qsa_rows.prepared) {
             const auto prior = p.g.memory();
-            store->qsa_rows = allocate_attention_tile_qsa_scratch(p.g, {p.shape.residual, p.shape.attention, p.shape.experts});
+            store->qsa_rows = allocate_attention_tile_qsa_scratch(p.g, {p.shape.residual, p.shape.attention, p.shape.experts}, capacity);
             // Register ALL newly returned owners before admission may throw.
             // Reserved capacity covers26 entries, so failed admission releases all.
             for (auto view : store->qsa_rows.views()) store->owned.push_back(view);

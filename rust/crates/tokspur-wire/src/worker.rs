@@ -173,6 +173,16 @@ impl fmt::Display for WorkerError {
             Self::MtpBeforeSubmit(_) => {
                 formatter.write_str("MTP command refused before submission")
             }
+            Self::CommandInvalidated(Some(source))
+                if source
+                    .downcast_ref::<crate::mtp_wire::MtpWireError>()
+                    .is_some() =>
+            {
+                write!(
+                    formatter,
+                    "owned command failed or became ambiguous; worker invalidated without retry: {source}"
+                )
+            }
             Self::CommandInvalidated(_) => formatter.write_str(
                 "owned command failed or became ambiguous; worker invalidated without retry",
             ),
@@ -385,6 +395,7 @@ pub struct WorkerOptions {
     pub shared_prefix_cache: Option<bool>,
     /// Host RAM for whole conversations parked on a lane switch; 0 keeps the single-lane reset.
     pub parked_lanes_mib: u32,
+    pub parked_lanes_explicit: bool,
     pub context_length: u32,
 }
 
@@ -482,6 +493,7 @@ impl Default for WorkerOptions {
             ple_overlap: None,
             shared_prefix_cache: None,
             parked_lanes_mib: 0,
+            parked_lanes_explicit: false,
             context_length: 65_536,
         }
     }
@@ -751,6 +763,9 @@ struct Io {
     worker_status: i32,
     guardian_status: i32,
     stderr_bytes: usize,
+    forward_profile_stderr: bool,
+    profile_stderr_line: Vec<u8>,
+    profile_stderr_oversized: bool,
     startup_stderr: Vec<u8>,
     pending: Vec<u8>,
     notice_bytes: Vec<u8>,
@@ -877,6 +892,17 @@ impl Io {
                 if self.starting {
                     let keep = (4096 - self.startup_stderr.len()).min(n);
                     self.startup_stderr.extend_from_slice(&data[..keep]);
+                }
+                if self.forward_profile_stderr {
+                    let mut stderr = std::io::stderr().lock();
+                    forward_profile_stderr_chunk(
+                        &mut self.profile_stderr_line,
+                        &mut self.profile_stderr_oversized,
+                        &data[..n],
+                        |line| {
+                            drop(std::io::Write::write_all(&mut stderr, line));
+                        },
+                    );
                 }
             }
         }
@@ -1276,6 +1302,9 @@ impl OwnedWorker {
             worker_status: -1,
             guardian_status: -1,
             stderr_bytes: 0,
+            forward_profile_stderr: profile_stderr_forwarding_enabled(),
+            profile_stderr_line: Vec::new(),
+            profile_stderr_oversized: false,
             startup_stderr: Vec::new(),
             pending: Vec::new(),
             notice_bytes: Vec::new(),
@@ -1626,7 +1655,8 @@ impl OwnedWorker {
                 &["--shared-prefix-cache", if spc { "on" } else { "off" }],
             );
         }
-        if o.parked_lanes_mib > 0 {
+        if o.parked_lanes_mib > 0 || o.parked_lanes_explicit || o.shared_prefix_cache == Some(true)
+        {
             let mib = o.parked_lanes_mib.to_string();
             text(&mut words, &["--native-parked-lanes-mib", &mib]);
         }
@@ -1934,12 +1964,7 @@ impl OwnedWorker {
                 "cannot bound inherited worker descriptors",
             ))?;
         let argv = self.words();
-        // No loader/preload, Python, remote-model or runtime-selection variables.
-        let environment = [
-            b"PATH=/usr/bin:/bin:/usr/sbin:/sbin".to_vec(),
-            b"LANG=C".to_vec(),
-            b"LC_ALL=C".to_vec(),
-        ];
+        let environment = worker_environment();
         let (control, control_child) = sysfd::socket_pair()
             .map_err(|e| pair_error(e, "cannot create worker control stream"))?;
         let (status, status_child) =
@@ -3154,6 +3179,82 @@ impl OwnedWorker {
     }
 }
 
+const WORKER_PROFILE_ENV_ALLOWLIST: [&str; 3] = [
+    "TOKSPUR_ALLOW_KNOWN_PROFILE",
+    "TOKSPUR_DUMP_VERIFY_PROFILE",
+    "TOKSPUR_DUMP_PLANAR_UNION_PROFILE",
+];
+
+const PROFILE_STDERR_LINE_LIMIT: usize = 256 * 1024;
+const PROFILE_STDERR_PREFIXES: [&[u8]; 4] = [
+    b"VERIFY_PROFILE ",
+    b"DRAFT_PROFILE ",
+    b"PREFILL_PROFILE ",
+    b"PLANAR_UNION_PROFILE ",
+];
+
+fn profile_stderr_forwarding_enabled() -> bool {
+    std::env::var_os("TOKSPUR_DUMP_VERIFY_PROFILE").is_some()
+        || std::env::var_os("TOKSPUR_DUMP_PLANAR_UNION_PROFILE").is_some()
+}
+
+fn forward_profile_stderr_chunk<F>(
+    line: &mut Vec<u8>,
+    oversized: &mut bool,
+    chunk: &[u8],
+    mut emit: F,
+) where
+    F: FnMut(&[u8]),
+{
+    for &byte in chunk {
+        if byte == b'\n' {
+            if !*oversized
+                && PROFILE_STDERR_PREFIXES
+                    .iter()
+                    .any(|prefix| line.starts_with(prefix))
+            {
+                line.push(b'\n');
+                emit(line);
+            }
+            line.clear();
+            *oversized = false;
+        } else if !*oversized {
+            if line.len() < PROFILE_STDERR_LINE_LIMIT {
+                line.push(byte);
+            } else {
+                line.clear();
+                *oversized = true;
+            }
+        }
+    }
+}
+
+fn worker_environment_from<F>(lookup: F) -> Vec<Vec<u8>>
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    // No loader/preload, Python, remote-model or runtime-selection variables.
+    let mut env = vec![
+        b"PATH=/usr/bin:/bin:/usr/sbin:/sbin".to_vec(),
+        b"LANG=C".to_vec(),
+        b"LC_ALL=C".to_vec(),
+    ];
+    for name in WORKER_PROFILE_ENV_ALLOWLIST {
+        if let Some(value) = lookup(name) {
+            let mut entry = Vec::with_capacity(name.len() + 1 + value.as_bytes().len());
+            entry.extend_from_slice(name.as_bytes());
+            entry.push(b'=');
+            entry.extend_from_slice(value.as_bytes());
+            env.push(entry);
+        }
+    }
+    env
+}
+
+fn worker_environment() -> Vec<Vec<u8>> {
+    worker_environment_from(|name| std::env::var_os(name))
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
@@ -3290,5 +3391,176 @@ mod tests {
         assert_eq!(pipe.to_string(), "owned worker pipe read failed");
         assert!(pipe.source().is_some());
         assert!(!format!("{pipe:?}").contains("secret"));
+    }
+
+    #[test]
+    fn shared_prefix_and_parked_lanes_words_preserve_branch8_and_forward_opt_outs() {
+        let make_worker = |options: WorkerOptions| OwnedWorker {
+            io: Io {
+                closed: true,
+                ..Default::default()
+            },
+            options,
+            pacing: None,
+            ready_value: Json::Object(Vec::new()),
+            last_response: Json::Null,
+            needs_reset: false,
+            resync_after_pressure: false,
+            broker_epoch: 0,
+            broker_command: 0,
+            broker_lease: 0,
+            broker_position: 0,
+            #[cfg(feature = "verify8")]
+            verify_previous: Json::Null,
+            #[cfg(feature = "verify8")]
+            verify_sampling: Json::Null,
+            #[cfg(feature = "verify8")]
+            verify_seed: 0,
+            #[cfg(feature = "verify8")]
+            verify_position: 0,
+        };
+        let to_strings = |words: Vec<Vec<u8>>| {
+            words
+                .into_iter()
+                .map(|w| String::from_utf8_lossy(&w).into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        // Default / branch8 omits both flags so rust-diff argv stays unchanged.
+        #[cfg_attr(not(feature = "branch8"), allow(unused_mut))]
+        let mut default_opts = WorkerOptions::default();
+        #[cfg(feature = "branch8")]
+        {
+            default_opts.branch8 = true;
+        }
+        let default_words = to_strings(make_worker(default_opts).words());
+        assert!(!default_words.iter().any(|w| w == "--shared-prefix-cache"));
+        assert!(
+            !default_words
+                .iter()
+                .any(|w| w == "--native-parked-lanes-mib")
+        );
+
+        // shared_prefix_cache = Some(false) emits --shared-prefix-cache off; parked_lanes_explicit emits --native-parked-lanes-mib 0.
+        let spc_off = to_strings(
+            make_worker(WorkerOptions {
+                shared_prefix_cache: Some(false),
+                parked_lanes_explicit: true,
+                ..Default::default()
+            })
+            .words(),
+        );
+        assert!(
+            spc_off
+                .windows(2)
+                .any(|w| w == ["--shared-prefix-cache", "off"])
+        );
+        assert!(
+            spc_off
+                .windows(2)
+                .any(|w| w == ["--native-parked-lanes-mib", "0"])
+        );
+
+        // shared_prefix_cache = Some(true) with default 0 mib emits --native-parked-lanes-mib 0.
+        let spc_on_park_0 = to_strings(
+            make_worker(WorkerOptions {
+                shared_prefix_cache: Some(true),
+                ..Default::default()
+            })
+            .words(),
+        );
+        assert!(
+            spc_on_park_0
+                .windows(2)
+                .any(|w| w == ["--shared-prefix-cache", "on"])
+        );
+        assert!(
+            spc_on_park_0
+                .windows(2)
+                .any(|w| w == ["--native-parked-lanes-mib", "0"])
+        );
+    }
+
+    #[test]
+    fn worker_environment_forwards_only_explicit_profile_vars() {
+        use std::collections::BTreeMap;
+        use std::ffi::OsString;
+
+        let empty = worker_environment_from(|_| None);
+        assert_eq!(
+            empty,
+            vec![
+                b"PATH=/usr/bin:/bin:/usr/sbin:/sbin".to_vec(),
+                b"LANG=C".to_vec(),
+                b"LC_ALL=C".to_vec(),
+            ]
+        );
+
+        let mut env = BTreeMap::new();
+        for key in [
+            "TOKSPUR_ALLOW_KNOWN_PROFILE",
+            "TOKSPUR_DUMP_VERIFY_PROFILE",
+            "TOKSPUR_DUMP_PLANAR_UNION_PROFILE",
+            "DYLD_INSERT_LIBRARIES",
+            "HF_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "PYTHONPATH",
+            "TOKSPUR_FAKE_BIN",
+            "TOKSPUR_CLI_IMPL",
+        ] {
+            env.insert(key, OsString::from("1"));
+        }
+        let populated = worker_environment_from(|name| env.get(name).cloned());
+        assert_eq!(
+            populated,
+            vec![
+                b"PATH=/usr/bin:/bin:/usr/sbin:/sbin".to_vec(),
+                b"LANG=C".to_vec(),
+                b"LC_ALL=C".to_vec(),
+                b"TOKSPUR_ALLOW_KNOWN_PROFILE=1".to_vec(),
+                b"TOKSPUR_DUMP_VERIFY_PROFILE=1".to_vec(),
+                b"TOKSPUR_DUMP_PLANAR_UNION_PROFILE=1".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn command_invalidated_surfaces_mtp_wire_error_and_preserves_non_mtp_text() {
+        let mtp_err = WorkerError::CommandInvalidated(Some(Box::new(
+            crate::mtp_wire::MtpWireError::WorkerError("memory pressure exceeded".to_owned()),
+        )));
+        assert_eq!(
+            mtp_err.to_string(),
+            "owned command failed or became ambiguous; worker invalidated without retry: memory pressure exceeded"
+        );
+
+        let broker_err =
+            WorkerError::CommandInvalidated(Some(Box::new(WorkerError::Refused("stale epoch"))));
+        assert_eq!(
+            broker_err.to_string(),
+            "owned command failed or became ambiguous; worker invalidated without retry"
+        );
+    }
+
+    #[test]
+    fn forward_profile_stderr_chunk_forwards_only_matching_profile_lines() {
+        let mut line = Vec::new();
+        let mut oversized = false;
+        let mut out = Vec::new();
+        let input = b"noise line\nVERIFY_PROFILE sampled_ms=1.0 gpu_ms=0.5 ";
+        forward_profile_stderr_chunk(&mut line, &mut oversized, input, |l| {
+            out.extend_from_slice(l);
+        });
+        assert!(out.is_empty());
+
+        let input2 =
+            b"dispatches=10\nmore noise\nDRAFT_PROFILE sampled_ms=0.2 gpu_ms=0.1 dispatches=3\n";
+        forward_profile_stderr_chunk(&mut line, &mut oversized, input2, |l| {
+            out.extend_from_slice(l);
+        });
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "VERIFY_PROFILE sampled_ms=1.0 gpu_ms=0.5 dispatches=10\nDRAFT_PROFILE sampled_ms=0.2 gpu_ms=0.1 dispatches=3\n"
+        );
     }
 }

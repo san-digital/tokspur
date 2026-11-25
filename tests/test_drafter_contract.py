@@ -106,6 +106,15 @@ def test_valid_checkpoint_is_accepted(contract, tmp_path):
     assert report["extra_tensors"] == []
 
 
+def test_valid_block16_checkpoint_is_accepted(contract, tmp_path):
+    header, payload = valid_header(contract)
+    cfg = valid_config(contract)
+    cfg["dflash_config"]["block_size"] = 16
+    write_checkpoint(tmp_path, cfg, header, payload)
+    report = contract.check_directory(tmp_path)
+    assert report["accepted"], report["problems"]
+
+
 @pytest.mark.parametrize(
     "path, value",
     [
@@ -117,7 +126,7 @@ def test_valid_checkpoint_is_accepted(contract, tmp_path):
         (("num_hidden_layers",), 8),
         (("rms_norm_eps",), 0),
         (("rope_parameters", "rope_theta"), -1),
-        (("dflash_config", "block_size"), 16),
+        (("dflash_config", "block_size"), 32),
         (("dflash_config", "mask_token_id"), 248320),
         (("dflash_config", "target_layer_ids"), [1, 12, 23, 34, 45]),
     ],

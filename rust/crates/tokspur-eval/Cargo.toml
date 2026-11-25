@@ -1,0 +1,20 @@
+[package]
+name = "tokspur-eval"
+description = "R5 evaluation, holdout manifest, sequential futility stopping, and receipt cache tooling (development tooling, never shipped)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+tokspur-json.workspace = true
+tokspur-sys.workspace = true
+tokspur-text.workspace = true
+
+[[bin]]
+name = "tokspur-eval"
+path = "src/main.rs"
+
+[lints]
+workspace = true

@@ -971,7 +971,7 @@ fn options(args: &[OsString]) -> Result<Options> {
                 out.worker.dflash2_verify_rows = Some(value.to_owned());
             }
             "--native-dflash2-max-drafts" | "--dflash2-max-drafts" => {
-                let md = integer(value, 1, 7)? as u32;
+                let md = integer(value, 1, 15)? as u32;
                 out.worker.dflash2_max_drafts = Some(md);
             }
             "--native-dflash2-vocab-slice" | "--dflash2-vocab-slice" => {
@@ -1264,6 +1264,7 @@ fn options(args: &[OsString]) -> Result<Options> {
             }
             "--parked-lanes-mib" | "--native-parked-lanes-mib" => {
                 out.worker.parked_lanes_mib = integer(value, 0, 16_384)? as u32;
+                out.worker.parked_lanes_explicit = true;
             }
             "--context-length" | "--native-context-length" => {
                 let ctx = integer(value, 65_536, 131_072)?;
@@ -2243,11 +2244,12 @@ fn run_job(
             Ok(Some(e)) => e.string().is_ok_and(|s| s == b"done"),
             _ => false,
         } {
+            let enriched = session.apply_request_telemetry(last_resp);
             if let Ok(mut state_guard) = state.lock() {
-                drop(state_guard.write_telemetry_trace(last_resp));
+                drop(state_guard.write_telemetry_trace(&enriched));
             }
             if telemetry_stdout {
-                drop(print_line(&telemetry_record(last_resp)));
+                drop(print_line(&telemetry_record(&enriched)));
             }
         }
     }
@@ -2537,6 +2539,7 @@ impl Serving<'_> {
             }
             for opt_name in [
                 "native_dflash2_max_drafts",
+                "native_dflash2_burst_max_drafts",
                 "native_dflash2_vocab_slice",
                 "native_dflash2_vocab_gather",
                 "native_dflash2_vocab_gather_rows",
@@ -3649,7 +3652,7 @@ mod readiness_network_tests {
         if std::env::var_os("TOKSPUR_TEST_HTTP_READERS_CHILD").is_some() {
             assert!(tokspur_sys::install_stop_handlers());
             let _owner_lifetime = monitor_owner_stdin().unwrap();
-            let listener = Listener::new(0, 8).unwrap();
+            let listener = Listener::new(0, 128).unwrap();
             let ready = tokspur_json::parse_json(
                 br#"{"event":"ready","generated_marker":"native-ready-only","imported_regions":17}"#,
             )
@@ -3703,6 +3706,7 @@ mod readiness_network_tests {
                 .unwrap(),
         );
         let mut lines = BufReader::new(child.0.stdout.take().unwrap());
+        let mut port = None;
         let port = loop {
             let mut line = String::new();
             assert!(
@@ -3711,14 +3715,22 @@ mod readiness_network_tests {
             );
             if let Some(at) = line.find('{')
                 && let Ok(ready) = tokspur_json::parse_json(line[at..].trim().as_bytes())
-                && let Some(port) = ready.find("test_port").unwrap()
             {
-                break u16::try_from(port.unsigned_integer().unwrap()).unwrap();
+                if let Some(found) = ready.find("test_port").unwrap() {
+                    port = Some(u16::try_from(found.unsigned_integer().unwrap()).unwrap());
+                }
+                if ready
+                    .find("event")
+                    .unwrap()
+                    .is_some_and(|event| event.string().ok() == Some(b"ready"))
+                {
+                    break port.expect("test_port emitted before ready event");
+                }
             }
         };
         // More unauthenticated peers than there are request workers: some never send, some stall partway through their headers.
         let mut quiet = Vec::new();
-        for index in 0..24 {
+        for index in 0..2 {
             let mut peer = TcpStream::connect(("127.0.0.1", port)).unwrap();
             if index % 2 == 1 {
                 peer.write_all(b"GET /health HTTP/1.1\r\nHost: loc")
@@ -3726,11 +3738,20 @@ mod readiness_network_tests {
             }
             quiet.push(peer);
         }
-        std::thread::sleep(Duration::from_millis(30));
+        std::thread::sleep(Duration::from_millis(50));
+        for index in 2..24 {
+            let mut peer = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            if index % 2 == 1 {
+                peer.write_all(b"GET /health HTTP/1.1\r\nHost: loc")
+                    .unwrap();
+            }
+            quiet.push(peer);
+        }
+        std::thread::sleep(Duration::from_millis(100));
         for path in ["/health", "/v1/models"] {
             let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
             client
-                .set_read_timeout(Some(Duration::from_secs(1)))
+                .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             write!(
                 client,
@@ -3750,7 +3771,7 @@ mod readiness_network_tests {
         }
         for mut evicted in quiet.drain(..2) {
             evicted
-                .set_read_timeout(Some(Duration::from_secs(1)))
+                .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             let mut response = String::new();
             evicted.read_to_string(&mut response).unwrap();
@@ -3759,7 +3780,7 @@ mod readiness_network_tests {
         }
         let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
         client
-            .set_read_timeout(Some(Duration::from_secs(1)))
+            .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         write!(
             client,

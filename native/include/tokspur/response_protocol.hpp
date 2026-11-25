@@ -24,5 +24,7 @@ using ResponseDecoder = std::function<std::string(std::span<const uint32_t>)>;
 // Stateless accumulated-response adapter. The caller supplies all generated assistant IDs (not prompt IDs), the renderer's initial thinking mode, a typed tool manifest and the actual worker's termination fields. Length boundaries do not publish tool calls. Only a matching final terminal-ID/stop pair admits finish(). Callers own correlation, epochs and tool side effects. Invalid envelopes, bytes or frames throw FormatError. The CLI emits an empty-call error envelope and does not reuse parser state for the next request.
 Json parse_native_response(const Json& request, ResponseAdmission admission,
                            const ResponseDecoder& decode, size_t maximum_ids = response_maximum_ids);
+Json parse_native_response_with_controls(const Json& request, ResponseAdmission admission,
+                                         const ResponseDecoder& decode, size_t maximum_ids, std::span<const uint32_t> control_ids);
 Json native_response_error(std::string_view message);
 } // namespace tokspur

@@ -50,9 +50,9 @@ int main() {
     try {
         if (parse_dflash2_precision("q8_0") != DFlash2Precision::q8_0 || parse_dflash2_precision("bf16") != DFlash2Precision::bf16 || parse_native_speculative_depth("1") != 1 || parse_native_speculative_depth("2") != 2 || parse_native_speculative_depth("3") != 3 || parse_native_speculative_depth("7") != 7) throw FormatError("supported speculative control changed");
         if (dflash2_default_max_drafts != 7 || dflash2_width4_max_drafts != 3 || dflash2_default_vocab_slice != 32768) throw FormatError("DFlash2 speculative constants changed");
-        for (uint32_t k = 1; k <= 7; ++k) {
-            const char digit[2] = {char('0' + k), '\0'};
-            if (parse_dflash2_max_drafts(digit) != k) throw FormatError("parse_dflash2_max_drafts mismatch");
+        for (uint32_t k = 1; k <= 15; ++k) {
+            const std::string s = std::to_string(k);
+            if (parse_dflash2_max_drafts(s) != k) throw FormatError("parse_dflash2_max_drafts mismatch");
         }
         if (parse_dflash2_vocab_slice("0") != 0 || parse_dflash2_vocab_slice("full") != 0 || parse_dflash2_vocab_slice("256") != 256 || parse_dflash2_vocab_slice("32768") != 32768 || parse_dflash2_vocab_slice("65536") != 65536) throw FormatError("parse_dflash2_vocab_slice mismatch");
         unsigned refused = 0;
@@ -62,7 +62,7 @@ int main() {
         for (const auto value : {"0", "4", "8", "", "02", "03"}) {
             try { static_cast<void>(parse_native_speculative_depth(value)); } catch (const FormatError&) { ++refused; }
         }
-        for (const auto value : {"0", "8", "", "03", "-1"}) {
+        for (const auto value : {"0", "16", "", "03", "-1"}) {
             try { static_cast<void>(parse_dflash2_max_drafts(value)); } catch (const FormatError&) { ++refused; }
         }
         for (const auto value : {"", "00", "32", "224", "32769", "032768", "2097152"}) {

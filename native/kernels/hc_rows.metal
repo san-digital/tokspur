@@ -132,10 +132,10 @@ kernel void graph_hc_rows_read(device const float* normalized [[buffer(0)]], dev
         const float4 n = float4(*reinterpret_cast<device const packed_float4*>(normalized + at));
         const float4 s = float4(*reinterpret_cast<device const packed_float4*>(scores + at));
         ok = ok && isfinite(n) && isfinite(s);
-        total.x += n.x * sigmoid_value(s.x);
-        total.y += n.y * sigmoid_value(s.y);
-        total.z += n.z * sigmoid_value(s.z);
-        total.w += n.w * sigmoid_value(s.w);
+        total.x = fma(n.x, sigmoid_value(s.x), total.x);
+        total.y = fma(n.y, sigmoid_value(s.y), total.y);
+        total.z = fma(n.z, sigmoid_value(s.z), total.z);
+        total.w = fma(n.w, sigmoid_value(s.w), total.w);
     }
     const float4 out4 = total / float(shape.x);
     if (all(ok) && all(isfinite(out4))) {

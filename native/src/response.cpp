@@ -19,7 +19,7 @@ std::string_view trim(std::string_view value) {
 void require(bool condition, const char* message) { if (!condition) throw FormatError(message); }
 void name(std::string_view value, bool function) {
     require(!value.empty() && value.size() <= (function ? 64 : 1024), "response name length limit");
-    static_cast<void>(unicode_scalars(value));
+    static_cast<void>(unicode_scalar_count(value));
     for (const unsigned char c : value) {
         require(c >= 32 && c != '<' && c != '>' && c != 127, "unsafe response name");
         if (function) require((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
@@ -240,6 +240,19 @@ void ResponseParser::LiteralState::advance(char c) {
     previous = c;
 }
 
+bool ResponseParser::control_at(size_t offset) const {
+    return std::binary_search(control_offsets_.begin(), control_offsets_.end(), received_ - pending_.size() + offset);
+}
+
+void ResponseParser::mark_control() {
+    if (control_offsets_.empty() || control_offsets_.back() != received_) control_offsets_.push_back(received_);
+}
+
+ResponseStatus ResponseParser::feed_control(std::string_view bytes) {
+    if (control_tokens_ && std::ranges::find(response_control_markers, bytes) != response_control_markers.end()) mark_control();
+    return feed(bytes);
+}
+
 size_t ResponseParser::token_framed_call_end() {
     while (true) {
         if (call_in_parameter_) {
@@ -251,7 +264,8 @@ size_t ResponseParser::token_framed_call_end() {
             call_search_ = end + 13; call_in_parameter_ = false;
         } else {
             const auto parameter = pending_.find("<parameter=", call_search_);
-            const auto end = pending_.find("</tool_call>", call_search_);
+            auto end = pending_.find("</tool_call>", call_search_);
+            while (control_tokens_ && end != std::string::npos && !control_at(end)) end = pending_.find("</tool_call>", end + 1);
             if (end != std::string::npos && (parameter == std::string::npos || end < parameter)) return end;
             if (parameter == std::string::npos) {
                 call_search_ = std::max(call_search_, pending_.size() > 11 ? pending_.size() - 11 : 0);
@@ -291,7 +305,8 @@ void ResponseParser::process_token_framed(bool final) {
         size_t position = pending_.size(); std::string_view token; bool held = false;
         for (size_t i = 0; i < pending_.size(); ++i) {
             const char c = pending_[i];
-            if (state.controls(c)) {
+            const bool outside_literal = state.controls(c);
+            if (control_tokens_ ? (c == '<' && control_at(i)) : outside_literal) {
                 const std::array<std::string_view, 2> candidates = mode_ == Mode::thinking ? std::array<std::string_view, 2>{"</think>", ""} :
                     (!thought_ && !visible && !had_calls_ ? std::array<std::string_view, 2>{"<think>", "<tool_call>"} : std::array<std::string_view, 2>{"<tool_call>", ""});
                 for (const auto candidate : candidates) {
@@ -379,8 +394,11 @@ ResponseStatus ResponseParser::feed(std::string_view bytes) {
     return status_;
 }
 
-void ResponseParser::prepare_forced_thinking_close() noexcept {
-    if (mode_ == Mode::thinking) literal_ = {};
+void ResponseParser::prepare_forced_thinking_close() {
+    if (mode_ == Mode::thinking) {
+        literal_ = {};
+        if (control_tokens_) mark_control();
+    }
 }
 
 bool ResponseParser::in_thinking() const noexcept { return mode_ == Mode::thinking; }

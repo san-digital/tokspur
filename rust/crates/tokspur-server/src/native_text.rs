@@ -8,8 +8,7 @@ use std::sync::Mutex;
 
 use tokspur_gguf::{GgufError, MappedFile, ModelFiles};
 use tokspur_json::{
-    Json, JsonError, JsonLimits, Kind, UnicodeError, from_chars_f64, parse_json_limited,
-    unicode_scalars,
+    Json, JsonError, JsonLimits, Kind, UnicodeError, from_chars_f64, parse_json_limited, scalar_str,
 };
 use tokspur_sys::foundation::{Regex, RegexError, Utf16String};
 use tokspur_text::sha256::{Sha256, hex, sha256};
@@ -135,18 +134,10 @@ fn require(condition: bool, message: &'static str) -> Result<()> {
 
 /// `ns()`: literal UTF-16 units (a leading U+FEFF stays text).
 fn utf16(bytes: &[u8]) -> Result<Vec<u16>> {
-    let points = unicode_scalars(bytes).map_err(TextError::Utf8)?;
-    let mut units = Vec::with_capacity(points.len());
-    for point in points {
-        if point < 0x10000 {
-            units.push(point as u16);
-        } else {
-            let point = point - 0x10000;
-            units.push((0xd800 + (point >> 10)) as u16);
-            units.push((0xdc00 + (point & 1023)) as u16);
-        }
-    }
-    Ok(units)
+    Ok(scalar_str(bytes)
+        .map_err(TextError::Utf8)?
+        .encode_utf16()
+        .collect())
 }
 
 /// `utf8(NSString*)`: UTF-16 units to UTF-8, refusing unpaired surrogates.
@@ -175,12 +166,12 @@ fn utf8(units: &[u16]) -> Result<Vec<u8>> {
     Ok(output)
 }
 
-/// `utf8(id)` for a JSON value: a string, length-checked in UTF-16 units.
-fn string_of(value: Option<&Json>) -> Result<Vec<u8>> {
+/// A validated UTF-8 string has at most one UTF-16 unit per input byte, so the 8 MiB input limit also bounds the Foundation length.
+fn string_of(value: Option<&Json>) -> Result<&[u8]> {
     let Some(Json::String(bytes)) = value else {
         return Err(TextError::Refused("expected JSON string"));
     };
-    utf8(&utf16(bytes)?)
+    Ok(scalar_str(bytes).map_err(TextError::Utf8)?.as_bytes())
 }
 
 fn dictionary(value: Option<&Json>) -> Result<&Json> {
@@ -330,12 +321,12 @@ fn parse_model(root: &Json) -> Result<Parsed> {
         let id = integer(get(token, "id"))?;
         let content = string_of(get(token, "content"))?;
         require(
-            added.insert(id, content.clone()).is_none(),
+            added.insert(id, content).is_none(),
             "duplicate added token ID",
         )?;
         data.added.push(AddedToken {
             id,
-            content,
+            content: content.to_vec(),
             special: boolean(get(token, "special"))?,
         });
     }
@@ -347,7 +338,7 @@ fn parse_model(root: &Json) -> Result<Parsed> {
         "tokenizer vocabulary count exceeds limit",
     )?;
     data.vocabulary = vec![Vec::new(); vocabulary.len()];
-    let mut spellings: Vec<Vec<u8>> = vec![Vec::new(); vocabulary.len()];
+    let mut spellings: Vec<&[u8]> = vec![&[]; vocabulary.len()];
     let mut seen = vec![false; vocabulary.len()];
     for (spelling, value) in vocabulary {
         let id = integer(Some(value))? as usize;
@@ -356,19 +347,21 @@ fn parse_model(root: &Json) -> Result<Parsed> {
             "noncontiguous or duplicate vocabulary ID",
         )?;
         seen[id] = true;
-        let encoded = utf8(&utf16(spelling)?)?;
-        spellings[id] = encoded.clone();
+        let encoded = scalar_str(spelling).map_err(TextError::Utf8)?.as_bytes();
+        spellings[id] = encoded;
         if let Some(marker) = added.get(&(id as u32)) {
             require(*marker == encoded, "added token differs from vocabulary")?;
-            data.vocabulary[id] = encoded;
+            data.vocabulary[id] = encoded.to_vec();
         } else {
-            data.vocabulary[id] = byte_level_decode(&encoded)?;
+            data.vocabulary[id] = byte_level_decode(encoded)?;
         }
     }
     let vocabulary_fingerprint = string_fingerprint(&spellings);
-    spellings.clear();
+    drop(spellings);
     let merges = array(get(model, "merges"))?;
     require(merges.len() <= 1_000_000, "merge count exceeds limit")?;
+    let mut merge_hash = Sha256::default();
+    merge_hash.update(&(merges.len() as u64).to_le_bytes());
     data.merges.reserve(merges.len());
     for item in merges {
         let parts = array(Some(item))?;
@@ -376,18 +369,17 @@ fn parse_model(root: &Json) -> Result<Parsed> {
         let left = string_of(parts.first())?;
         let right = string_of(parts.get(1))?;
         data.merges
-            .push((byte_level_decode(&left)?, byte_level_decode(&right)?));
-        let mut joined = left;
-        joined.push(b' ');
-        joined.extend_from_slice(&right);
-        spellings.push(joined);
+            .push((byte_level_decode(left)?, byte_level_decode(right)?));
+        merge_hash.update(&((left.len() + 1 + right.len()) as u64).to_le_bytes());
+        merge_hash.update(left);
+        merge_hash.update(b" ");
+        merge_hash.update(right);
     }
-    let merge_fingerprint = string_fingerprint(&spellings);
     Ok(Parsed {
         data,
-        pattern,
+        pattern: pattern.to_vec(),
         vocabulary_fingerprint,
-        merge_fingerprint,
+        merge_fingerprint: hex(&merge_hash.finalize()),
     })
 }
 
@@ -512,8 +504,10 @@ impl NativeText {
         )?;
         let root = parse_json_limited(&bytes, JsonLimits::new(64 * 1024 * 1024, usize::MAX, 64))
             .map_err(TextError::ModelParse)?;
+        drop(bytes);
         require(root.kind() == Kind::Object, "expected JSON object")?;
         let parsed = parse_model(&root)?;
+        drop(root);
         let processor = AppleProcessor::new(&parsed.pattern)?;
         let bpe = ByteBpe::new(parsed.data)?;
         file.assert_unchanged()?;
@@ -878,6 +872,32 @@ impl tokspur_text::response_cli::ResponseTokenizer for NativeText {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_strings_keep_literal_bytes_and_refusal_order() {
+        let literal = "\u{feff}\0\u{1f600}".as_bytes();
+        let value = Json::String(literal.to_vec());
+        assert_eq!(string_of(Some(&value)).unwrap(), literal);
+        assert_eq!(utf16(literal).unwrap(), [0xfeff, 0, 0xd83d, 0xde00]);
+        assert!(matches!(
+            string_of(Some(&Json::Null)),
+            Err(TextError::Refused("expected JSON string"))
+        ));
+        for (bytes, expected) in [
+            (vec![0xc2], "invalid UTF-8 input"),
+            (vec![0xc2, 0x41], "invalid UTF-8 continuation"),
+            (vec![0xed, 0xa0, 0x80], "non-scalar or overlong UTF-8"),
+            (vec![0xff; TEXT_LIMIT + 1], "Unicode input exceeds limit"),
+        ] {
+            let value = Json::String(bytes);
+            assert!(
+                matches!(string_of(Some(&value)), Err(TextError::Utf8(UnicodeError::Decode(reason))) if reason == expected)
+            );
+            assert!(
+                matches!(utf16(value.string().unwrap()), Err(TextError::Utf8(UnicodeError::Decode(reason))) if reason == expected)
+            );
+        }
+    }
 
     #[test]
     fn split_isolates_the_pinned_pattern_pieces() {

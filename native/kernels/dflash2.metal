@@ -67,18 +67,16 @@ static inline uint nonfinite_bit(float v) {
     return (as_type<uint>(v) & 0x7f800000u) == 0x7f800000u ? 1u : 0u;
 }
 
-static inline bfloat clean_bf16(float v, thread uint& bad) {
-    const uint bits = as_type<uint>(v);
-    if ((bits & 0x7f800000u) == 0x7f800000u) {
-        bad |= 1u;
-        return as_type<bfloat>(ushort(0));
-    }
-    const ushort rounded = ushort((bits + 0x7fffu + ((bits >> 16u) & 1u)) >> 16u);
-    if ((rounded & 0x7f80u) == 0x7f80u) {
-        bad |= 1u;
-        return as_type<bfloat>(ushort(0));
-    }
-    return as_type<bfloat>(rounded);
+static inline uint nonfinite_bf16_bit(bfloat v) {
+    return (as_type<ushort>(v) & 0x7f80u) == 0x7f80u ? 1u : 0u;
+}
+
+static inline float max_nan(float a, float b) {
+    return (isnan(a) || isnan(b)) ? (a + b) : max(a, b);
+}
+
+static inline float simd_max_nan(float v) {
+    return simd_any(isnan(v)) ? NAN : simd_max(v);
 }
 
 static inline bool top_beats(float value, uint id, float other_val, uint other_id) {
@@ -163,10 +161,7 @@ kernel void dflash2_stream_mean(device const float* streams [[buffer(0)]], devic
     const float4 s2 = float4(*reinterpret_cast<device const packed_float4*>(src + 2u * a.width + col4));
     const float4 s3 = float4(*reinterpret_cast<device const packed_float4*>(src + 3u * a.width + col4));
     const float4 mean = 0.25f * ((s0 + s1) + (s2 + s3));
-    uint bad = dflash2_detail::nonfinite_bit(mean.x) | dflash2_detail::nonfinite_bit(mean.y) |
-               dflash2_detail::nonfinite_bit(mean.z) | dflash2_detail::nonfinite_bit(mean.w);
     *reinterpret_cast<device packed_float4*>(captured + ulong(row) * out_stride + ulong(a.slot_index) * a.width + col4) = mean;
-    if (bad) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
 }
 
 kernel void dflash2_context_kv_write(device const float* context_kv [[buffer(0)]],
@@ -192,7 +187,6 @@ kernel void dflash2_context_kv_write(device const float* context_kv [[buffer(0)]
     uint bad = 0u;
     const float el = tid < HeadDim ? src[tid] : 0.0f;
     const float v_el = tid < HeadDim ? src[KWidth + tid] : 0.0f;
-    bad |= dflash2_detail::nonfinite_bit(el) | dflash2_detail::nonfinite_bit(v_el);
 
     threadgroup float reductions[4];
     threadgroup bfloat normalized[HeadDim];
@@ -201,10 +195,13 @@ kernel void dflash2_context_kv_write(device const float* context_kv [[buffer(0)]
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const float mean_sq = (reductions[0] + reductions[1] + reductions[2] + reductions[3]) * (1.0f / float(HeadDim));
-    const float inv_rms = rsqrt(mean_sq + a.eps);
+    const float denom = mean_sq + a.eps;
+    const float inv_rms = isfinite(denom) ? rsqrt(denom) : NAN;
     if (tid < HeadDim) {
-        normalized[tid] = dflash2_detail::clean_bf16(el * inv_rms * k_norm[tid], bad);
-        ring_v[(ulong(head) * HeadDim + tid) * a.window + slot] = dflash2_detail::clean_bf16(v_el, bad);
+        normalized[tid] = bfloat(el * inv_rms * k_norm[tid]);
+        const bfloat vb = bfloat(v_el);
+        bad |= dflash2_detail::nonfinite_bf16_bit(vb);
+        ring_v[(ulong(head) * HeadDim + tid) * a.window + slot] = vb;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -214,8 +211,11 @@ kernel void dflash2_context_kv_write(device const float* context_kv [[buffer(0)]
         const float angle = float(position) * inv_freq[tid];
         const float c = cos(angle), s = sin(angle);
         device bfloat* key = ring_k + (ulong(head) * a.window + slot) * HeadDim;
-        key[tid] = dflash2_detail::clean_bf16(first * c - second * s, bad);
-        key[tid + HeadDim / 2u] = dflash2_detail::clean_bf16(second * c + first * s, bad);
+        const bfloat k0 = bfloat(first * c - second * s);
+        const bfloat k1 = bfloat(second * c + first * s);
+        bad |= dflash2_detail::nonfinite_bf16_bit(k0) | dflash2_detail::nonfinite_bf16_bit(k1);
+        key[tid] = k0;
+        key[tid + HeadDim / 2u] = k1;
     }
     if (bad) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
 }
@@ -242,49 +242,34 @@ kernel void dflash2_conv_f32(device const float* input [[buffer(0)]], device con
     const float4 x0 = float4(reinterpret_cast<device const packed_float4*>(input)[idx]);
     const float4 b0 = float4(*reinterpret_cast<device const packed_float4*>(base + (kind * 2u) * a.hidden + ch));
     const float d0 = dynamic[row * dyn_width + (kind * 2u) * conv_groups + cg];
-    uint bad = dflash2_detail::nonfinite_bit(d0) |
-               dflash2_detail::nonfinite_bit(x0.x) | dflash2_detail::nonfinite_bit(x0.y) |
-               dflash2_detail::nonfinite_bit(x0.z) | dflash2_detail::nonfinite_bit(x0.w) |
-               dflash2_detail::nonfinite_bit(b0.x) | dflash2_detail::nonfinite_bit(b0.y) |
-               dflash2_detail::nonfinite_bit(b0.z) | dflash2_detail::nonfinite_bit(b0.w);
     float4 val = x0 * (b0 + d0);
     if (row > 0u) {
         const float4 x1 = float4(*reinterpret_cast<device const packed_float4*>(input + ulong(row - 1u) * a.hidden + ch));
         const float4 b1 = float4(*reinterpret_cast<device const packed_float4*>(base + (kind * 2u + 1u) * a.hidden + ch));
         const float d1 = dynamic[row * dyn_width + (kind * 2u + 1u) * conv_groups + cg];
-        bad |= dflash2_detail::nonfinite_bit(d1) |
-               dflash2_detail::nonfinite_bit(x1.x) | dflash2_detail::nonfinite_bit(x1.y) |
-               dflash2_detail::nonfinite_bit(x1.z) | dflash2_detail::nonfinite_bit(x1.w) |
-               dflash2_detail::nonfinite_bit(b1.x) | dflash2_detail::nonfinite_bit(b1.y) |
-               dflash2_detail::nonfinite_bit(b1.z) | dflash2_detail::nonfinite_bit(b1.w);
         val += x1 * (b1 + d1);
     }
     if (a.finish) {
         const float4 res = float4(reinterpret_cast<device const packed_float4*>(residual)[idx]);
-        bad |= dflash2_detail::nonfinite_bit(res.x) | dflash2_detail::nonfinite_bit(res.y) |
-               dflash2_detail::nonfinite_bit(res.z) | dflash2_detail::nonfinite_bit(res.w);
         val += res;
     }
-    bad |= dflash2_detail::nonfinite_bit(val.x) | dflash2_detail::nonfinite_bit(val.y) |
-           dflash2_detail::nonfinite_bit(val.z) | dflash2_detail::nonfinite_bit(val.w);
     reinterpret_cast<device packed_float4*>(output)[idx] = val;
-    if (bad) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
 }
 
-kernel void dflash2_qkv_prepare(device const float* proposal_qkv [[buffer(0)]],
-    device const float* qk_norm_freq [[buffer(1)]], device bfloat* queries [[buffer(2)]],
-    device bfloat* query_keys [[buffer(3)]], device bfloat* query_values [[buffer(4)]],
-    constant dflash2_detail::DFlash2QkvArgs& a [[buffer(5)]], device atomic_uint* error [[buffer(7)]],
-    uint group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
-    ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
-    constexpr uint Rows = 8u, QHeads = 32u, KVHeads = 8u, HeadDim = 128u;
+template <uint Rows>
+static inline void dflash2_qkv_prepare_impl(device const float* proposal_qkv,
+    device const float* qk_norm_freq, device bfloat* queries,
+    device bfloat* query_keys, device bfloat* query_values,
+    constant dflash2_detail::DFlash2QkvArgs& a, device atomic_uint* error,
+    uint group, ushort tid, ushort lane, ushort sg,
+    threadgroup float (&reductions)[4], threadgroup bfloat (&head_buf)[128]) {
+    constexpr uint QHeads = 32u, KVHeads = 8u, HeadDim = 128u;
     constexpr uint QWidth = QHeads * HeadDim, KWidth = KVHeads * HeadDim, PackedWidth = QWidth + 2u * KWidth;
     constexpr uint QueryTasks = Rows * QHeads, TotalTasks = QueryTasks + Rows * KVHeads;
     if (a.rows != Rows || !(a.eps > 0.0f)) {
         if (!group && !tid) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
         return;
     }
-    uint bad = 0u;
     const uint elem = group * 128u + uint(tid);
     if (elem < Rows * KWidth) {
         const uint row = elem / KWidth;
@@ -292,11 +277,9 @@ kernel void dflash2_qkv_prepare(device const float* proposal_qkv [[buffer(0)]],
         const uint head = rem / HeadDim;
         const uint dim = rem % HeadDim;
         const float v = proposal_qkv[ulong(row) * PackedWidth + QWidth + KWidth + rem];
-        query_values[(head * HeadDim + dim) * Rows + row] = dflash2_detail::clean_bf16(v, bad);
+        query_values[(head * HeadDim + dim) * Rows + row] = bfloat(v);
     }
 
-    threadgroup float reductions[4];
-    threadgroup bfloat head_buf[HeadDim];
     if (group < TotalTasks) {
         const bool is_q = group < QueryTasks;
         const uint local_task = is_q ? group : (group - QueryTasks);
@@ -310,13 +293,13 @@ kernel void dflash2_qkv_prepare(device const float* proposal_qkv [[buffer(0)]],
         device bfloat* dst = (is_q ? queries : query_keys) + (head * Rows + row) * HeadDim;
 
         const float val = tid < HeadDim ? src[tid] : 0.0f;
-        bad |= dflash2_detail::nonfinite_bit(val);
         const float sq = simd_sum(val * val);
         if (!lane && sg < 4u) reductions[sg] = sq;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        const float inv_rms = rsqrt((reductions[0] + reductions[1] + reductions[2] + reductions[3]) * (1.0f / float(HeadDim)) + a.eps);
-        if (tid < HeadDim) head_buf[tid] = dflash2_detail::clean_bf16(val * inv_rms * norm_w[tid], bad);
+        const float denom = (reductions[0] + reductions[1] + reductions[2] + reductions[3]) * (1.0f / float(HeadDim)) + a.eps;
+        const float inv_rms = isfinite(denom) ? rsqrt(denom) : NAN;
+        if (tid < HeadDim) head_buf[tid] = bfloat(val * inv_rms * norm_w[tid]);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (tid < HeadDim / 2u) {
@@ -324,11 +307,32 @@ kernel void dflash2_qkv_prepare(device const float* proposal_qkv [[buffer(0)]],
             const float second = float(head_buf[tid + HeadDim / 2u]);
             const float angle = float(a.cache_len + row) * inv_freq[tid];
             const float c = cos(angle), s = sin(angle);
-            dst[tid] = dflash2_detail::clean_bf16(first * c - second * s, bad);
-            dst[tid + HeadDim / 2u] = dflash2_detail::clean_bf16(second * c + first * s, bad);
+            dst[tid] = bfloat(first * c - second * s);
+            dst[tid + HeadDim / 2u] = bfloat(second * c + first * s);
         }
     }
-    if (bad) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
+}
+
+kernel void dflash2_qkv_prepare(device const float* proposal_qkv [[buffer(0)]],
+    device const float* qk_norm_freq [[buffer(1)]], device bfloat* queries [[buffer(2)]],
+    device bfloat* query_keys [[buffer(3)]], device bfloat* query_values [[buffer(4)]],
+    constant dflash2_detail::DFlash2QkvArgs& a [[buffer(5)]], device atomic_uint* error [[buffer(7)]],
+    uint group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float reductions[4];
+    threadgroup bfloat head_buf[128];
+    dflash2_qkv_prepare_impl<8u>(proposal_qkv, qk_norm_freq, queries, query_keys, query_values, a, error, group, tid, lane, sg, reductions, head_buf);
+}
+
+kernel void dflash2_qkv_prepare_16(device const float* proposal_qkv [[buffer(0)]],
+    device const float* qk_norm_freq [[buffer(1)]], device bfloat* queries [[buffer(2)]],
+    device bfloat* query_keys [[buffer(3)]], device bfloat* query_values [[buffer(4)]],
+    constant dflash2_detail::DFlash2QkvArgs& a [[buffer(5)]], device atomic_uint* error [[buffer(7)]],
+    uint group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float reductions[4];
+    threadgroup bfloat head_buf[128];
+    dflash2_qkv_prepare_impl<16u>(proposal_qkv, qk_norm_freq, queries, query_keys, query_values, a, error, group, tid, lane, sg, reductions, head_buf);
 }
 
 kernel void dflash2_attention_split(device bfloat* queries_all [[buffer(0)]],
@@ -427,11 +431,11 @@ kernel void dflash2_attention_split(device bfloat* queries_all [[buffer(0)]],
                 const bool valid = logical_key < old_count && logical_key >= hidden_prefix;
                 const float sc = score_storage[uint(matrix_row) * N + col] * 0.08838834765f;
                 local_scores[i] = valid ? sc : -INFINITY;
-                tile_max = max(tile_max, local_scores[i]);
+                tile_max = dflash2_detail::max_nan(tile_max, local_scores[i]);
             }
-            tile_max = simd_max(tile_max);
+            tile_max = dflash2_detail::simd_max_nan(tile_max);
             const float prev_max = my_row_max[b];
-            const float next_max = max(prev_max, tile_max);
+            const float next_max = dflash2_detail::max_nan(prev_max, tile_max);
             const bool empty = (next_max == -INFINITY);
             const float scale = empty ? 1.0f : (prev_max == -INFINITY ? 0.0f : exp(prev_max - next_max));
             float tile_sum = 0.0f;
@@ -515,9 +519,9 @@ kernel void dflash2_attention_split(device bfloat* queries_all [[buffer(0)]],
         for (ushort b = 0; b < 4; ++b) {
             const ushort matrix_row = b * 8u + sg;
             const float sc = lane < CurrentN ? (current_raw_scores[uint(matrix_row) * CurrentN + lane] * 0.08838834765f) : -INFINITY;
-            const float tile_max = simd_max(sc);
+            const float tile_max = dflash2_detail::simd_max_nan(sc);
             const float prev_max = my_row_max[b];
-            const float next_max = max(prev_max, tile_max);
+            const float next_max = dflash2_detail::max_nan(prev_max, tile_max);
             const float scale = (prev_max == -INFINITY || next_max == -INFINITY) ? 0.0f : exp(prev_max - next_max);
             const float prob = (lane < CurrentN && next_max != -INFINITY) ? exp(sc - next_max) : 0.0f;
             const float tile_sum = simd_sum(prob);
@@ -583,7 +587,7 @@ kernel void dflash2_attention_reduce(device const float* partials_all [[buffer(0
     const uint dim = (uint(tid) % 8u) * Chunk;
 
     float maximum = -INFINITY;
-    for (uint s = 0u; s < Splits; ++s) maximum = max(maximum, partials[ulong(s) * Stride + M * D + m_row]);
+    for (uint s = 0u; s < Splits; ++s) maximum = dflash2_detail::max_nan(maximum, partials[ulong(s) * Stride + M * D + m_row]);
 
     float total = 0.0f;
     float4 acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
@@ -607,24 +611,294 @@ kernel void dflash2_attention_reduce(device const float* partials_all [[buffer(0
     const uint prop_row = m_row % Rows;
     const uint global_q = kv_head * 4u + local_q;
     device packed_float4* dst4 = reinterpret_cast<device packed_float4*>(output + (ulong(prop_row) * QHeads + global_q) * D + dim);
-    const float inv_total = total > 0.0f ? (1.0f / total) : 0.0f;
-    const float4 y0 = acc0 * inv_total;
-    const float4 y1 = acc1 * inv_total;
-    const float4 y2 = acc2 * inv_total;
-    const float4 y3 = acc3 * inv_total;
-    uint bad = dflash2_detail::nonfinite_bit(y0.x) | dflash2_detail::nonfinite_bit(y0.y) |
-               dflash2_detail::nonfinite_bit(y0.z) | dflash2_detail::nonfinite_bit(y0.w) |
-               dflash2_detail::nonfinite_bit(y1.x) | dflash2_detail::nonfinite_bit(y1.y) |
-               dflash2_detail::nonfinite_bit(y1.z) | dflash2_detail::nonfinite_bit(y1.w) |
-               dflash2_detail::nonfinite_bit(y2.x) | dflash2_detail::nonfinite_bit(y2.y) |
-               dflash2_detail::nonfinite_bit(y2.z) | dflash2_detail::nonfinite_bit(y2.w) |
-               dflash2_detail::nonfinite_bit(y3.x) | dflash2_detail::nonfinite_bit(y3.y) |
-               dflash2_detail::nonfinite_bit(y3.z) | dflash2_detail::nonfinite_bit(y3.w);
-    dst4[0] = y0;
-    dst4[1] = y1;
-    dst4[2] = y2;
-    dst4[3] = y3;
-    if (bad) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
+    const uint inv_ok = isfinite(total) ? 1u : 0u;
+    const float inv_total = inv_ok ? (total > 0.0f ? (1.0f / total) : 0.0f) : NAN;
+    dst4[0] = acc0 * inv_total;
+    dst4[1] = acc1 * inv_total;
+    dst4[2] = acc2 * inv_total;
+    dst4[3] = acc3 * inv_total;
+}
+
+kernel void dflash2_attention_split_16(device bfloat* queries_all [[buffer(0)]],
+    device bfloat* keys_all [[buffer(1)]], device bfloat* values_all [[buffer(2)]],
+    device bfloat* query_keys_all [[buffer(3)]], device bfloat* query_values_all [[buffer(4)]],
+    device float* partials_all [[buffer(5)]], constant dflash2_detail::DFlash2AttnArgs& a [[buffer(6)]],
+    device atomic_uint* error [[buffer(7)]], uint3 group [[threadgroup_position_in_grid]],
+    ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]]) {
+    constexpr ushort M = 32, N = 128, D = 128, TileK = 64;
+    constexpr uint Rows = 16u, Window = 2048u, Splits = 16u;
+    constexpr ulong PartialFloats = ulong(M) * D + 2ul * M;
+    if (a.window != Window || a.splits != Splits || group.y >= 2u) {
+        if (!group.x && !group.y && !group.z && !tid) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
+        return;
+    }
+    const uint kv_head = group.x, q_sub = group.y, split = group.z;
+    const uint q_pair = kv_head * 2u + q_sub;
+    device bfloat* queries = queries_all + ulong(q_pair) * M * D;
+    device bfloat* keys = keys_all + ulong(kv_head) * Window * D;
+    device bfloat* values = values_all + ulong(kv_head) * D * Window;
+    device bfloat* query_keys = query_keys_all + ulong(kv_head) * Rows * D;
+    device bfloat* query_values = query_values_all + ulong(kv_head) * D * Rows;
+    device float* partial = partials_all + (ulong(q_pair) * Splits + split) * PartialFloats;
+
+    const uint cache_length = a.cache_len;
+    const uint common_start = cache_length >= (Window - 1u) ? (cache_length - (Window - 1u)) : 0u;
+    const uint old_count = cache_length - common_start;
+    const uint physical_start = common_start % Window;
+    const uint physical_end = physical_start + old_count;
+    const uint wrapped = physical_end > Window ? (physical_end - Window + N - 1u) / N : 0u;
+    const uint tail_end = (min(physical_end, Window) + N - 1u) / N;
+    const uint resume = max(physical_start / uint(N), wrapped);
+    const uint live_tiles = wrapped + tail_end - resume;
+
+    if (split >= live_tiles && split + 1u != Splits) {
+        if (tid < M) {
+            partial[M * D + tid] = -INFINITY;
+            partial[M * D + M + tid] = 0.0f;
+        }
+        return;
+    }
+
+    // 16,384 B exact (<= 16 KiB -> 2 TGs / 512 threads per M5 Max GPU core).
+    threadgroup float score_storage[uint(M) * uint(N)];
+    float my_row_max[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
+    float my_row_sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    auto qt = tensor(queries, dextents<int, 2>{D, M}, array<int, 2>{1, D});
+    constexpr auto qk_desc = matmul2d_descriptor(M, N, TileK, false, true, false);
+    matmul2d<qk_desc, execution_simdgroups<8>> qk;
+    auto q0 = qt.slice<TileK, M>(0, 0);
+    auto pt = tensor(score_storage, dextents<int, 2>{N, M}, array<int, 2>{1, N});
+    auto p0 = pt.slice<TileK, M>(0, 0);
+    auto first_v = tensor(values, dextents<int, 2>{N, D}, array<int, 2>{1, int(Window)});
+    auto first_v0 = first_v.slice<TileK, D>(0, 0);
+    constexpr auto pv_desc = matmul2d_descriptor(M, D, TileK, false, true, false);
+    matmul2d<pv_desc, execution_simdgroups<8>> pv;
+    auto running = pv.template get_destination_cooperative_tensor<decltype(p0), decltype(first_v0), float>();
+    #pragma unroll
+    for (ushort i = 0; i < running.get_capacity(); ++i) running[i] = 0.0f;
+
+    for (uint tile = split; tile < live_tiles; tile += Splits) {
+        const uint slot = (tile < wrapped ? tile : (resume + tile - wrapped)) * uint(N);
+        auto kt = tensor(keys + ulong(slot) * D, dextents<int, 2>{D, N}, array<int, 2>{1, D});
+        auto k0 = kt.slice<TileK, N>(0, 0);
+        auto scores = qk.template get_destination_cooperative_tensor<decltype(q0), decltype(k0), float>();
+        #pragma unroll
+        for (ushort i = 0; i < scores.get_capacity(); ++i) scores[i] = 0.0f;
+        #pragma unroll
+        for (ushort chunk = 0; chunk < D / TileK; ++chunk) {
+            auto qs = qt.slice<TileK, M>(chunk * TileK, 0);
+            auto ks = kt.slice<TileK, N>(chunk * TileK, 0);
+            auto ps_acc = qk.template get_destination_cooperative_tensor<decltype(qs), decltype(ks), float>();
+            qk.run(qs, ks, ps_acc);
+            #pragma unroll
+            for (ushort i = 0; i < scores.get_capacity(); ++i) scores[i] += ps_acc[i];
+        }
+        scores.store(pt.slice<N, M>(0, 0));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float my_scale[4];
+        #pragma unroll
+        for (ushort b = 0; b < 4; ++b) {
+            const ushort matrix_row = b * 8u + sg;
+            const uint proposal_row = uint(matrix_row) % Rows;
+            const uint query_pos = cache_length + proposal_row;
+            const uint row_start = query_pos >= (Window - 1u) ? (query_pos - (Window - 1u)) : 0u;
+            const uint hidden_prefix = row_start - common_start;
+            float local_scores[4];
+            float tile_max = -INFINITY;
+            #pragma unroll
+            for (ushort i = 0; i < 4; ++i) {
+                const uint col = uint(lane) + uint(i) * 32u;
+                const uint key = slot + col;
+                const uint logical_key = key >= physical_start ? (key - physical_start) : (key + Window - physical_start);
+                const bool valid = logical_key < old_count && logical_key >= hidden_prefix;
+                const float sc = score_storage[uint(matrix_row) * N + col] * 0.08838834765f;
+                local_scores[i] = valid ? sc : -INFINITY;
+                tile_max = dflash2_detail::max_nan(tile_max, local_scores[i]);
+            }
+            tile_max = dflash2_detail::simd_max_nan(tile_max);
+            const float prev_max = my_row_max[b];
+            const float next_max = dflash2_detail::max_nan(prev_max, tile_max);
+            const bool empty = (next_max == -INFINITY);
+            const float scale = empty ? 1.0f : (prev_max == -INFINITY ? 0.0f : exp(prev_max - next_max));
+            float tile_sum = 0.0f;
+            #pragma unroll
+            for (ushort i = 0; i < 4; ++i) {
+                local_scores[i] = (empty || local_scores[i] == -INFINITY) ? 0.0f : exp(local_scores[i] - next_max);
+                tile_sum += local_scores[i];
+            }
+            tile_sum = simd_sum(tile_sum);
+            my_scale[b] = scale;
+            my_row_sum[b] = my_row_sum[b] * scale + tile_sum;
+            my_row_max[b] = next_max;
+            #pragma unroll
+            for (ushort i = 0; i < 4; ++i) {
+                score_storage[uint(matrix_row) * N + uint(lane) + uint(i) * 32u] = local_scores[i];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        auto vt = tensor(values + slot, dextents<int, 2>{N, D}, array<int, 2>{1, int(Window)});
+        auto v0 = vt.slice<TileK, D>(0, 0);
+        auto partial_out = pv.template get_destination_cooperative_tensor<decltype(p0), decltype(v0), float>();
+        #pragma unroll
+        for (ushort i = 0; i < partial_out.get_capacity(); ++i) partial_out[i] = 0.0f;
+        #pragma unroll
+        for (ushort chunk = 0; chunk < N / TileK; ++chunk) {
+            auto ps = pt.slice<TileK, M>(chunk * TileK, 0);
+            auto vs = vt.slice<TileK, D>(chunk * TileK, 0);
+            auto pv_acc = pv.template get_destination_cooperative_tensor<decltype(ps), decltype(vs), float>();
+            pv.run(ps, vs, pv_acc);
+            #pragma unroll
+            for (ushort i = 0; i < partial_out.get_capacity(); ++i) partial_out[i] += pv_acc[i];
+        }
+        if (tile == split) {
+            #pragma unroll
+            for (ushort i = 0; i < running.get_capacity(); ++i) {
+                running[i] = 0.0f + partial_out[i];
+            }
+        } else {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (!lane) {
+                #pragma unroll
+                for (ushort b = 0; b < 4; ++b) score_storage[b * 8u + sg] = my_scale[b];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            #pragma unroll
+            for (ushort i = 0; i < running.get_capacity(); ++i) {
+                const auto idx = running.get_multidimensional_index(i);
+                running[i] = running[i] * score_storage[idx[1]] + partial_out[i];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (split + 1u == Splits) {
+        constexpr ushort CurrentN = 16, CurrentValueTile = 16;
+        threadgroup float* current_raw_scores = score_storage + uint(M) * CurrentValueTile;
+        threadgroup bfloat* current_values = reinterpret_cast<threadgroup bfloat*>(score_storage + uint(M) * CurrentValueTile + uint(M) * CurrentN);
+        threadgroup float* cur_prev_scale = score_storage + (uint(M) * uint(N) - uint(M));
+        auto current_scores = tensor(current_raw_scores, dextents<int, 2>{CurrentN, M}, array<int, 2>{1, CurrentN});
+        constexpr auto cur_qk_desc = matmul2d_descriptor(M, CurrentN, TileK, false, true, false);
+        matmul2d<cur_qk_desc, execution_simdgroups<8>> cur_qk;
+        auto cur_kt = tensor(query_keys, dextents<int, 2>{D, CurrentN}, array<int, 2>{1, D});
+        auto cur_k0 = cur_kt.slice<TileK, CurrentN>(0, 0);
+        auto cur = cur_qk.template get_destination_cooperative_tensor<decltype(q0), decltype(cur_k0), float>();
+        #pragma unroll
+        for (ushort i = 0; i < cur.get_capacity(); ++i) cur[i] = 0.0f;
+        #pragma unroll
+        for (ushort chunk = 0; chunk < D / TileK; ++chunk) {
+            auto qs = qt.slice<TileK, M>(chunk * TileK, 0);
+            auto ks = cur_kt.slice<TileK, CurrentN>(chunk * TileK, 0);
+            auto ps_acc = cur_qk.template get_destination_cooperative_tensor<decltype(qs), decltype(ks), float>();
+            cur_qk.run(qs, ks, ps_acc);
+            #pragma unroll
+            for (ushort i = 0; i < cur.get_capacity(); ++i) cur[i] += ps_acc[i];
+        }
+        cur.store(current_scores.slice<CurrentN, M>(0, 0));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma unroll
+        for (ushort b = 0; b < 4; ++b) {
+            const ushort matrix_row = b * 8u + sg;
+            const float sc = lane < CurrentN ? (current_raw_scores[uint(matrix_row) * CurrentN + lane] * 0.08838834765f) : -INFINITY;
+            const float tile_max = dflash2_detail::simd_max_nan(sc);
+            const float prev_max = my_row_max[b];
+            const float next_max = dflash2_detail::max_nan(prev_max, tile_max);
+            const float scale = (prev_max == -INFINITY || next_max == -INFINITY) ? 0.0f : exp(prev_max - next_max);
+            const float prob = (lane < CurrentN && next_max != -INFINITY) ? exp(sc - next_max) : 0.0f;
+            const float tile_sum = simd_sum(prob);
+            if (!lane) {
+                cur_prev_scale[matrix_row] = scale;
+            }
+            my_row_sum[b] = my_row_sum[b] * scale + tile_sum;
+            my_row_max[b] = next_max;
+            if (lane < CurrentValueTile) {
+                score_storage[uint(matrix_row) * CurrentValueTile + lane] = prob;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint idx = tid; idx < uint(D) * CurrentValueTile; idx += 256u) {
+            current_values[idx] = query_values[idx];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        auto cur_probs = tensor(score_storage, dextents<int, 2>{CurrentValueTile, M}, array<int, 2>{1, CurrentValueTile});
+        auto cur_p0 = cur_probs.slice<CurrentValueTile, M>(0, 0);
+        auto cur_vt = tensor(current_values, dextents<int, 2>{CurrentValueTile, D}, array<int, 2>{1, int(CurrentValueTile)});
+        auto cur_v0 = cur_vt.slice<CurrentValueTile, D>(0, 0);
+        constexpr auto cur_pv_desc = matmul2d_descriptor(M, D, CurrentValueTile, false, true, false);
+        matmul2d<cur_pv_desc, execution_simdgroups<8>> cur_pv;
+        auto cur_out = cur_pv.template get_destination_cooperative_tensor<decltype(cur_p0), decltype(cur_v0), float>();
+        cur_pv.run(cur_p0, cur_v0, cur_out);
+        #pragma unroll
+        for (ushort i = 0; i < running.get_capacity(); ++i) {
+            const auto idx = running.get_multidimensional_index(i);
+            running[i] = running[i] * cur_prev_scale[idx[1]] + cur_out[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    auto acc_tensor = tensor(partial, dextents<int, 2>{D, M}, array<int, 2>{1, D});
+    running.store(acc_tensor.slice<D, M>(0, 0));
+    if (!lane) {
+        #pragma unroll
+        for (ushort b = 0; b < 4; ++b) {
+            const uint matrix_row = uint(b) * 8u + uint(sg);
+            partial[M * D + matrix_row] = my_row_max[b];
+            partial[M * D + M + matrix_row] = my_row_sum[b];
+        }
+    }
+}
+
+kernel void dflash2_attention_reduce_16(device const float* partials_all [[buffer(0)]],
+    device float* output [[buffer(1)]], constant dflash2_detail::DFlash2AttnArgs& a [[buffer(2)]],
+    device atomic_uint* error [[buffer(7)]], uint group [[threadgroup_position_in_grid]],
+    ushort tid [[thread_index_in_threadgroup]]) {
+    constexpr uint M = 32u, D = 128u, Splits = 16u, Rows = 16u, QHeads = 32u, Chunk = 16u;
+    constexpr ulong Stride = ulong(M) * D + 2ul * M;
+    if (a.splits != Splits) {
+        if (!group && !tid) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
+        return;
+    }
+    const uint q_pair = group;
+    device const float* partials = partials_all + ulong(q_pair) * Splits * Stride;
+    const uint m_row = uint(tid) / 8u;
+    const uint dim = (uint(tid) % 8u) * Chunk;
+
+    float maximum = -INFINITY;
+    for (uint s = 0u; s < Splits; ++s) maximum = dflash2_detail::max_nan(maximum, partials[ulong(s) * Stride + M * D + m_row]);
+
+    float total = 0.0f;
+    float4 acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+
+    if (maximum != -INFINITY) {
+        for (uint s = 0u; s < Splits; ++s) {
+            device const float* p = partials + ulong(s) * Stride;
+            const float split_max = p[M * D + m_row];
+            if (split_max == -INFINITY) continue;
+            const float scale = exp(split_max - maximum);
+            total += scale * p[M * D + M + m_row];
+            device const packed_float4* pv4 = reinterpret_cast<device const packed_float4*>(p + m_row * D + dim);
+            acc0 += scale * float4(pv4[0]);
+            acc1 += scale * float4(pv4[1]);
+            acc2 += scale * float4(pv4[2]);
+            acc3 += scale * float4(pv4[3]);
+        }
+    }
+
+    const uint local_q = m_row / Rows;
+    const uint prop_row = m_row % Rows;
+    const uint global_q = q_pair * 2u + local_q;
+    device packed_float4* dst4 = reinterpret_cast<device packed_float4*>(output + (ulong(prop_row) * QHeads + global_q) * D + dim);
+    const float inv_total = isfinite(total) ? (total > 0.0f ? (1.0f / total) : 0.0f) : NAN;
+    dst4[0] = acc0 * inv_total;
+    dst4[1] = acc1 * inv_total;
+    dst4[2] = acc2 * inv_total;
+    dst4[3] = acc3 * inv_total;
 }
 
 kernel void dflash2_top16_sharded(device const float* logits [[buffer(0)]],
@@ -633,7 +907,7 @@ kernel void dflash2_top16_sharded(device const float* logits [[buffer(0)]],
     uint group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
     constexpr uint Shards = 8u, K = 16u, VectorTokens = 4u;
-    if (!a.positions || a.positions > 7u || !a.vocabulary) {
+    if (!a.positions || a.positions > 15u || !a.vocabulary) {
         if (!group && !tid) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
         return;
     }
@@ -746,7 +1020,7 @@ kernel void dflash2_top16_sharded(device const float* logits [[buffer(0)]],
 kernel void dflash2_remap_top16(device uint* partial_ids [[buffer(0)]], device const uint* row_token_ids [[buffer(1)]],
     constant dflash2_detail::DFlash2SelectArgs& a [[buffer(2)]], device atomic_uint* error [[buffer(7)]],
     uint index [[thread_position_in_grid]]) {
-    if (!a.positions || a.positions > 7u || !a.vocabulary || a.reserved < a.vocabulary) {
+    if (!a.positions || a.positions > 15u || !a.vocabulary || a.reserved < a.vocabulary) {
         if (!index) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
         return;
     }
@@ -761,24 +1035,25 @@ kernel void dflash2_remap_top16(device uint* partial_ids [[buffer(0)]], device c
     partial_ids[index] = token;
 }
 
-// Writes packed selector_out layout: uint candidates[7*16], float unary[7*16], float edges[7*16*16].
+// Writes packed selector_out layout: uint candidates[max_pos*16], float unary[max_pos*16], float edges[max_pos*16*16].
 kernel void dflash2_select_edges(device const uint* partial_ids [[buffer(0)]],
     device const float* partial_values [[buffer(1)]], device uchar* selector_out [[buffer(2)]],
     device const float* selector_hidden [[buffer(3)]], device const bfloat* predecessor_codebook [[buffer(4)]],
     device const bfloat* successor_codebook [[buffer(5)]], constant dflash2_detail::DFlash2SelectArgs& a [[buffer(6)]],
     device atomic_uint* error [[buffer(7)]], uint row [[threadgroup_position_in_grid]],
     ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
-    constexpr uint MaxPos = 7u, Candidates = 16u, Rank = 256u, TaskCandidates = 8u, Dims = Rank / 32u;
+    constexpr uint Candidates = 16u, Rank = 256u, TaskCandidates = 8u, Dims = Rank / 32u;
+    const uint max_pos = (a.positions <= 7u) ? 7u : 15u;
     const uint cb_vocab = a.reserved ? a.reserved : a.vocabulary;
-    if (!a.positions || a.positions > MaxPos || !a.vocabulary || cb_vocab < a.vocabulary || a.anchor >= cb_vocab) {
+    if (!a.positions || a.positions > 15u || !a.vocabulary || cb_vocab < a.vocabulary || a.anchor >= cb_vocab) {
         if (!row && !sg && !lane) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
         return;
     }
     if (row >= a.positions) return;
 
     device uint* candidates = reinterpret_cast<device uint*>(selector_out);
-    device float* unary = reinterpret_cast<device float*>(selector_out + MaxPos * Candidates * sizeof(uint));
-    device float* tables = reinterpret_cast<device float*>(selector_out + MaxPos * Candidates * (sizeof(uint) + sizeof(float)));
+    device float* unary = reinterpret_cast<device float*>(selector_out + max_pos * Candidates * sizeof(uint));
+    device float* tables = reinterpret_cast<device float*>(selector_out + max_pos * Candidates * (sizeof(uint) + sizeof(float)));
 
     threadgroup uint successors[Candidates];
     threadgroup uint predecessors[Candidates];
@@ -801,7 +1076,6 @@ kernel void dflash2_select_edges(device const uint* partial_ids [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    uint bad = 0u;
     const uint tasks = (row > 0u ? Candidates : 1u) * (Candidates / TaskCandidates);
     device float* table = tables + ulong(row) * Candidates * Candidates;
     device const float* row_hidden = selector_hidden + ulong(row) * Rank;
@@ -816,7 +1090,6 @@ kernel void dflash2_select_edges(device const uint* partial_ids [[buffer(0)]],
             const uint dim = uint(lane) + i * 32u;
             const float h = row_hidden[dim];
             const float p = float(predecessor_codebook[ulong(safe_pred) * Rank + dim]);
-            bad |= dflash2_detail::nonfinite_bit(h) | dflash2_detail::nonfinite_bit(p);
             ctx[i] = p * h;
         }
         #pragma unroll
@@ -824,9 +1097,7 @@ kernel void dflash2_select_edges(device const uint* partial_ids [[buffer(0)]],
             const uint safe_cand = min(successors[first_cand + j], cb_vocab - 1u);
             #pragma unroll
             for (uint i = 0u; i < Dims; ++i) {
-                const float s = float(successor_codebook[ulong(safe_cand) * Rank + uint(lane) + i * 32u]);
-                bad |= dflash2_detail::nonfinite_bit(s);
-                succ[j][i] = s;
+                succ[j][i] = float(successor_codebook[ulong(safe_cand) * Rank + uint(lane) + i * 32u]);
             }
         }
         #pragma unroll
@@ -836,12 +1107,10 @@ kernel void dflash2_select_edges(device const uint* partial_ids [[buffer(0)]],
             for (uint i = 0u; i < Dims; ++i) sc += ctx[i] * succ[j][i];
             sc = simd_sum(sc);
             if (!lane) {
-                bad |= dflash2_detail::nonfinite_bit(sc);
                 table[pred_idx * Candidates + first_cand + j] = sc;
             }
         }
     }
-    if (bad) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
 }
 
 namespace dflash2_dense_detail {
@@ -850,44 +1119,17 @@ static inline float stored_half_q8(device const uchar* p) {
     return float(as_type<half>(ushort(uint(p[0]) | (uint(p[1]) << 8u))));
 }
 
-static inline void write_dense_epilogue(float tot, device float* out, uint row, uint swiglu, thread uint& bad) {
-    if (dflash2_detail::nonfinite_bit(tot)) {
-        bad |= 1u;
-        out[row] = NAN;
-    } else if (swiglu) {
+static inline void write_dense_epilogue(float tot, device float* out, uint row, uint swiglu) {
+    if (swiglu) {
         const float g0 = out[row];
-        if (dflash2_detail::nonfinite_bit(g0)) {
-            bad |= 1u;
-            out[row] = NAN;
-        } else {
-            const float act = g0 * dflash2_detail::sigmoid_f32(g0);
-            const float prod = act * tot;
-            if (dflash2_detail::nonfinite_bit(act) || dflash2_detail::nonfinite_bit(prod)) {
-                bad |= 1u;
-                out[row] = NAN;
-            } else {
-                out[row] = prod;
-            }
-        }
+        out[row] = (g0 * dflash2_detail::sigmoid_f32(g0)) * tot;
     } else {
         out[row] = tot;
     }
 }
 
-static inline void write_swiglu_pair_epilogue(float g0, float u0, device float* out, uint row, thread uint& bad) {
-    if (dflash2_detail::nonfinite_bit(g0) || dflash2_detail::nonfinite_bit(u0)) {
-        bad |= 1u;
-        out[row] = NAN;
-    } else {
-        const float act = g0 * dflash2_detail::sigmoid_f32(g0);
-        const float prod = act * u0;
-        if (dflash2_detail::nonfinite_bit(act) || dflash2_detail::nonfinite_bit(prod)) {
-            bad |= 1u;
-            out[row] = NAN;
-        } else {
-            out[row] = prod;
-        }
-    }
+static inline void write_swiglu_pair_epilogue(float g0, float u0, device float* out, uint row) {
+    out[row] = (g0 * dflash2_detail::sigmoid_f32(g0)) * u0;
 }
 
 template <uint RowsPerSG>
@@ -912,15 +1154,12 @@ static inline void dense_bf16_staged(device const bfloat* matrix, device const f
         #pragma unroll
         for (uint t = 0u; t < 8u; ++t) sums[r][t] = 0.0f;
     }
-    uint bad = 0u;
 
     for (uint col0 = 0u; col0 < a.columns; col0 += 256u) {
         const uint cnt = min(256u, a.columns - col0);
         for (uint t = 0u; t < nt; ++t) {
             if (tid < cnt) {
-                float xv = input[ulong(t0 + t) * in_stride + col0 + tid];
-                if (dflash2_detail::nonfinite_bit(xv)) { bad |= 1u; xv = 0.0f; }
-                sx[t][tid] = xv;
+                sx[t][tid] = input[ulong(t0 + t) * in_stride + col0 + tid];
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -931,8 +1170,7 @@ static inline void dense_bf16_staged(device const bfloat* matrix, device const f
                 #pragma unroll
                 for (uint r = 0u; r < RowsPerSG; ++r) {
                     if (row0 + r < a.rows) {
-                        float w = float(matrix[ulong(row0 + r) * a.columns + col]);
-                        if (dflash2_detail::nonfinite_bit(w)) { bad |= 1u; w = 0.0f; }
+                        const float w = float(matrix[ulong(row0 + r) * a.columns + col]);
                         for (uint t = 0u; t < nt; ++t) sums[r][t] += w * sx[t][k];
                     }
                 }
@@ -947,18 +1185,16 @@ static inline void dense_bf16_staged(device const bfloat* matrix, device const f
             if (row0 + r < a.rows) {
                 for (uint t = 0u; t < nt; ++t) {
                     const float tot = simd_sum(sums[r][t]);
-                    if (!lane) write_dense_epilogue(tot, output + ulong(t0 + t) * out_stride, row0 + r, a.swiglu, bad);
+                    if (!lane) write_dense_epilogue(tot, output + ulong(t0 + t) * out_stride, row0 + r, a.swiglu);
                 }
             }
         }
     }
-    bad = simd_or(bad);
-    if (!lane && bad) atomic_fetch_or_explicit(error, bad, memory_order_relaxed);
 }
 
 template <uint T, uint RowsPerSG>
 static inline void dense_q8_staged(device const uchar* weights, device const float* input, device float* output,
-    constant dflash2_detail::DFlash2DenseBf16Args& a, device atomic_uint* error, uint group_x,
+    constant dflash2_detail::DFlash2DenseBf16Args& a, uint group_x,
     ushort tid, ushort sg, ushort lane, threadgroup float (&sx)[8][256]) {
     const uint row0 = (group_x * 8u + uint(sg)) * RowsPerSG;
     const ulong in_stride = a.input_stride_bytes / sizeof(float);
@@ -969,7 +1205,6 @@ static inline void dense_q8_staged(device const uchar* weights, device const flo
         #pragma unroll
         for (uint t = 0u; t < T; ++t) sums[r][t] = 0.0f;
     }
-    uint bad = 0u;
     const uint blocks = a.columns / 32u;
     const uint full = blocks / 16u;
 
@@ -979,9 +1214,7 @@ static inline void dense_q8_staged(device const uchar* weights, device const flo
         if (uint(tid) < elems) {
             #pragma unroll
             for (uint t = 0u; t < T; ++t) {
-                float xv = input[ulong(t) * in_stride + ulong(b0) * 32ul + uint(tid)];
-                if (dflash2_detail::nonfinite_bit(xv)) { bad |= 1u; xv = 0.0f; }
-                sx[t][tid] = xv;
+                sx[t][tid] = input[ulong(t) * in_stride + ulong(b0) * 32ul + uint(tid)];
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -999,8 +1232,7 @@ static inline void dense_q8_staged(device const uchar* weights, device const flo
                     for (uint r = 0u; r < RowsPerSG; ++r) {
                         if (r < active_rows) {
                             device const uchar* enc = weights + ulong(row0 + r) * a.row_bytes + ulong(b) * 34ul;
-                            float sc = stored_half_q8(enc);
-                            if (dflash2_detail::nonfinite_bit(sc)) { bad |= 1u; sc = 0.0f; }
+                            const float sc = stored_half_q8(enc);
                             const float w = sc * float(as_type<char>(enc[2u + lane]));
                             #pragma unroll
                             for (uint t = 0u; t < T; ++t) sums[r][t] += w * xv[t];
@@ -1033,8 +1265,7 @@ static inline void dense_q8_staged(device const uchar* weights, device const flo
                         #pragma unroll
                         for (uint r = 0u; r < RowsPerSG; ++r) {
                             if (r < active_rows) {
-                                float sc = float(sc4_r[r][k]);
-                                if (dflash2_detail::nonfinite_bit(sc)) { bad |= 1u; sc = 0.0f; }
+                                const float sc = float(sc4_r[r][k]);
                                 const float w = sc * float(as_type<char>(uchar((word_r[r] >> (8u * k)) & 255u)));
                                 #pragma unroll
                                 for (uint t = 0u; t < T; ++t) sums[r][t] += w * xv[t];
@@ -1052,8 +1283,7 @@ static inline void dense_q8_staged(device const uchar* weights, device const flo
                         device const half* scales = reinterpret_cast<device const half*>(data);
                         device const uchar* tail = data + ulong(blocks) * 2ul + ulong(full) * 512ul + ulong(lane) * tail_blocks + tail_off;
                         for (uint k = 0u; k < cnt; ++k) {
-                            float sc = float(scales[b0 + k]);
-                            if (dflash2_detail::nonfinite_bit(sc)) { bad |= 1u; sc = 0.0f; }
+                            const float sc = float(scales[b0 + k]);
                             const float w = sc * float(as_type<char>(tail[k]));
                             const uint col_local = k * 32u + uint(lane);
                             #pragma unroll
@@ -1073,19 +1303,17 @@ static inline void dense_q8_staged(device const uchar* weights, device const flo
                 #pragma unroll
                 for (uint t = 0u; t < T; ++t) {
                     const float tot = simd_sum(sums[r][t]);
-                    if (!lane) write_dense_epilogue(tot, output + ulong(t) * out_stride, row0 + r, a.swiglu, bad);
+                    if (!lane) write_dense_epilogue(tot, output + ulong(t) * out_stride, row0 + r, a.swiglu);
                 }
             }
         }
     }
-    bad = simd_or(bad);
-    if (!lane && bad) atomic_fetch_or_explicit(error, bad, memory_order_relaxed);
 }
 
 template <uint T>
 static inline void gate_up_swiglu_q8_staged(device const uchar* gate_w, device const uchar* up_w,
     device const float* input, device float* output, constant dflash2_detail::DFlash2DenseBf16Args& a,
-    device atomic_uint* error, uint group_x, ushort tid, ushort sg, ushort lane, threadgroup float (&sx)[8][512]) {
+    uint group_x, ushort tid, ushort sg, ushort lane, threadgroup float (&sx)[8][512]) {
     constexpr uint RowsPerSG = 2u;
     const uint row0 = (group_x * 8u + uint(sg)) * RowsPerSG;
     const ulong in_stride = a.input_stride_bytes / sizeof(float);
@@ -1100,7 +1328,6 @@ static inline void gate_up_swiglu_q8_staged(device const uchar* gate_w, device c
             u_sums[r][t] = 0.0f;
         }
     }
-    uint bad = 0u;
     const uint blocks = a.columns / 32u;
     const uint full = blocks / 16u;
 
@@ -1111,14 +1338,10 @@ static inline void gate_up_swiglu_q8_staged(device const uchar* gate_w, device c
         for (uint t = 0u; t < T; ++t) {
             device const float* x_t = input + ulong(t) * in_stride + ulong(b0) * 32ul;
             if (uint(tid) < elems) {
-                float xv = x_t[tid];
-                if (dflash2_detail::nonfinite_bit(xv)) { bad |= 1u; xv = 0.0f; }
-                sx[t][tid] = xv;
+                sx[t][tid] = x_t[tid];
             }
             if (uint(tid) + 256u < elems) {
-                float xv = x_t[uint(tid) + 256u];
-                if (dflash2_detail::nonfinite_bit(xv)) { bad |= 1u; xv = 0.0f; }
-                sx[t][uint(tid) + 256u] = xv;
+                sx[t][uint(tid) + 256u] = x_t[uint(tid) + 256u];
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1137,9 +1360,7 @@ static inline void gate_up_swiglu_q8_staged(device const uchar* gate_w, device c
                         if (r < active_rows) {
                             device const uchar* g_enc = gate_w + ulong(row0 + r) * a.row_bytes + ulong(b) * 34ul;
                             device const uchar* u_enc = up_w + ulong(row0 + r) * a.row_bytes + ulong(b) * 34ul;
-                            float g_sc = stored_half_q8(g_enc), u_sc = stored_half_q8(u_enc);
-                            if (dflash2_detail::nonfinite_bit(g_sc)) { bad |= 1u; g_sc = 0.0f; }
-                            if (dflash2_detail::nonfinite_bit(u_sc)) { bad |= 1u; u_sc = 0.0f; }
+                            const float g_sc = stored_half_q8(g_enc), u_sc = stored_half_q8(u_enc);
                             const float gw = g_sc * float(as_type<char>(g_enc[2u + lane]));
                             const float uw = u_sc * float(as_type<char>(u_enc[2u + lane]));
                             #pragma unroll
@@ -1184,9 +1405,7 @@ static inline void gate_up_swiglu_q8_staged(device const uchar* gate_w, device c
                         #pragma unroll
                         for (uint r = 0u; r < RowsPerSG; ++r) {
                             if (r < active_rows) {
-                                float g_sc = float(g_sc4[r][k]), u_sc = float(u_sc4[r][k]);
-                                if (dflash2_detail::nonfinite_bit(g_sc)) { bad |= 1u; g_sc = 0.0f; }
-                                if (dflash2_detail::nonfinite_bit(u_sc)) { bad |= 1u; u_sc = 0.0f; }
+                                const float g_sc = float(g_sc4[r][k]), u_sc = float(u_sc4[r][k]);
                                 const float gw = g_sc * float(as_type<char>(uchar((g_words[r][part] >> (8u * k)) & 255u)));
                                 const float uw = u_sc * float(as_type<char>(uchar((u_words[r][part] >> (8u * k)) & 255u)));
                                 #pragma unroll
@@ -1212,9 +1431,7 @@ static inline void gate_up_swiglu_q8_staged(device const uchar* gate_w, device c
                             device const uchar* u_data = up_w + ulong(row0 + r) * a.row_bytes;
                             device const half* g_scales = reinterpret_cast<device const half*>(g_data);
                             device const half* u_scales = reinterpret_cast<device const half*>(u_data);
-                            float g_sc = float(g_scales[b0 + k]), u_sc = float(u_scales[b0 + k]);
-                            if (dflash2_detail::nonfinite_bit(g_sc)) { bad |= 1u; g_sc = 0.0f; }
-                            if (dflash2_detail::nonfinite_bit(u_sc)) { bad |= 1u; u_sc = 0.0f; }
+                            const float g_sc = float(g_scales[b0 + k]), u_sc = float(u_scales[b0 + k]);
                             const float gw = g_sc * float(as_type<char>((g_data + t_off)[k]));
                             const float uw = u_sc * float(as_type<char>((u_data + t_off)[k]));
                             #pragma unroll
@@ -1238,13 +1455,11 @@ static inline void gate_up_swiglu_q8_staged(device const uchar* gate_w, device c
                 for (uint t = 0u; t < T; ++t) {
                     const float g0 = simd_sum(g_sums[r][t]);
                     const float u0 = simd_sum(u_sums[r][t]);
-                    if (!lane) write_swiglu_pair_epilogue(g0, u0, output + ulong(t) * out_stride, row0 + r, bad);
+                    if (!lane) write_swiglu_pair_epilogue(g0, u0, output + ulong(t) * out_stride, row0 + r);
                 }
             }
         }
     }
-    bad = simd_or(bad);
-    if (!lane && bad) atomic_fetch_or_explicit(error, bad, memory_order_relaxed);
 }
 
 } // namespace dflash2_dense_detail
@@ -1289,16 +1504,20 @@ kernel void dflash2_gate_up_swiglu_bf16_m8(
     ushort tid [[thread_index_in_threadgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]]) {
-    if (!a.columns || (a.columns % 32u) != 0u || !a.rows || !a.tokens || a.tokens > 8u ||
+    if (!a.columns || (a.columns % 32u) != 0u || !a.rows || !a.tokens || a.tokens > 16u ||
         a.row_bytes != a.columns * 2u || (a.input_stride_bytes % 4ul) != 0ul || (a.output_stride_bytes % 4ul) != 0ul) {
         if (!group.x && !group.y && !tid) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
         return;
     }
+    const uint t0 = group.y * 8u;
+    if (t0 >= a.tokens) return;
     constexpr uint RowsPerSG = 2u;
-    const uint nt = a.tokens;
+    const uint nt = min(8u, a.tokens - t0);
     const uint row0 = (group.x * 8u + uint(sg)) * RowsPerSG;
     const ulong in_stride = a.input_stride_bytes / sizeof(float);
     const ulong out_stride = a.output_stride_bytes / sizeof(float);
+    input += ulong(t0) * in_stride;
+    output += ulong(t0) * out_stride;
     threadgroup float sx[8][256];
     float g_sums[RowsPerSG][8];
     float u_sums[RowsPerSG][8];
@@ -1307,14 +1526,11 @@ kernel void dflash2_gate_up_swiglu_bf16_m8(
         #pragma unroll
         for (uint t = 0u; t < 8u; ++t) { g_sums[r][t] = 0.0f; u_sums[r][t] = 0.0f; }
     }
-    uint bad = 0u;
     for (uint col0 = 0u; col0 < a.columns; col0 += 256u) {
         const uint cnt = min(256u, a.columns - col0);
         for (uint t = 0u; t < nt; ++t) {
             if (tid < cnt) {
-                float xv = input[ulong(t) * in_stride + col0 + tid];
-                if (dflash2_detail::nonfinite_bit(xv)) { bad |= 1u; xv = 0.0f; }
-                sx[t][tid] = xv;
+                sx[t][tid] = input[ulong(t) * in_stride + col0 + tid];
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1324,10 +1540,8 @@ kernel void dflash2_gate_up_swiglu_bf16_m8(
                 #pragma unroll
                 for (uint r = 0u; r < RowsPerSG; ++r) {
                     if (row0 + r < a.rows) {
-                        float gw = float(gate_matrix[ulong(row0 + r) * a.columns + col]);
-                        float uw = float(up_matrix[ulong(row0 + r) * a.columns + col]);
-                        if (dflash2_detail::nonfinite_bit(gw)) { bad |= 1u; gw = 0.0f; }
-                        if (dflash2_detail::nonfinite_bit(uw)) { bad |= 1u; uw = 0.0f; }
+                        const float gw = float(gate_matrix[ulong(row0 + r) * a.columns + col]);
+                        const float uw = float(up_matrix[ulong(row0 + r) * a.columns + col]);
                         for (uint t = 0u; t < nt; ++t) {
                             const float xv = sx[t][k];
                             g_sums[r][t] += gw * xv;
@@ -1346,13 +1560,11 @@ kernel void dflash2_gate_up_swiglu_bf16_m8(
                 for (uint t = 0u; t < nt; ++t) {
                     const float g0 = simd_sum(g_sums[r][t]);
                     const float u0 = simd_sum(u_sums[r][t]);
-                    if (!lane) dflash2_dense_detail::write_swiglu_pair_epilogue(g0, u0, output + ulong(t) * out_stride, row0 + r, bad);
+                    if (!lane) dflash2_dense_detail::write_swiglu_pair_epilogue(g0, u0, output + ulong(t) * out_stride, row0 + r);
                 }
             }
         }
     }
-    bad = simd_or(bad);
-    if (!lane && bad) atomic_fetch_or_explicit(error, bad, memory_order_relaxed);
 }
 
 kernel void dflash2_dense_q8_m8(
@@ -1366,21 +1578,26 @@ kernel void dflash2_dense_q8_m8(
     ushort sg [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]]) {
     if (dflash2_q8_encoding != 8u || dflash2_q8_layout > 1u || !a.columns || (a.columns % 32u) != 0u ||
-        !a.rows || !a.tokens || a.tokens > 8u || a.row_bytes != (a.columns / 32u) * 34u ||
+        !a.rows || !a.tokens || a.tokens > 16u || a.row_bytes != (a.columns / 32u) * 34u ||
         (a.input_stride_bytes % 4ul) != 0ul || (a.output_stride_bytes % 4ul) != 0ul) {
         if (!group.x && !group.y && !tid) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
         return;
     }
+    const uint t0 = group.y * 8u;
+    if (t0 >= a.tokens) return;
+    const uint nt = min(8u, a.tokens - t0);
+    input += ulong(t0) * (a.input_stride_bytes / sizeof(float));
+    output += ulong(t0) * (a.output_stride_bytes / sizeof(float));
     threadgroup float sx[8][256];
-    switch (a.tokens) {
-        case 1u: dflash2_dense_detail::dense_q8_staged<1u, 1u>(weights, input, output, a, error, group.x, tid, sg, lane, sx); break;
-        case 2u: dflash2_dense_detail::dense_q8_staged<2u, 1u>(weights, input, output, a, error, group.x, tid, sg, lane, sx); break;
-        case 3u: dflash2_dense_detail::dense_q8_staged<3u, 1u>(weights, input, output, a, error, group.x, tid, sg, lane, sx); break;
-        case 4u: dflash2_dense_detail::dense_q8_staged<4u, 1u>(weights, input, output, a, error, group.x, tid, sg, lane, sx); break;
-        case 5u: dflash2_dense_detail::dense_q8_staged<5u, 1u>(weights, input, output, a, error, group.x, tid, sg, lane, sx); break;
-        case 6u: dflash2_dense_detail::dense_q8_staged<6u, 1u>(weights, input, output, a, error, group.x, tid, sg, lane, sx); break;
-        case 7u: dflash2_dense_detail::dense_q8_staged<7u, 1u>(weights, input, output, a, error, group.x, tid, sg, lane, sx); break;
-        default: dflash2_dense_detail::dense_q8_staged<8u, 1u>(weights, input, output, a, error, group.x, tid, sg, lane, sx); break;
+    switch (nt) {
+        case 1u: dflash2_dense_detail::dense_q8_staged<1u, 1u>(weights, input, output, a, group.x, tid, sg, lane, sx); break;
+        case 2u: dflash2_dense_detail::dense_q8_staged<2u, 1u>(weights, input, output, a, group.x, tid, sg, lane, sx); break;
+        case 3u: dflash2_dense_detail::dense_q8_staged<3u, 1u>(weights, input, output, a, group.x, tid, sg, lane, sx); break;
+        case 4u: dflash2_dense_detail::dense_q8_staged<4u, 1u>(weights, input, output, a, group.x, tid, sg, lane, sx); break;
+        case 5u: dflash2_dense_detail::dense_q8_staged<5u, 1u>(weights, input, output, a, group.x, tid, sg, lane, sx); break;
+        case 6u: dflash2_dense_detail::dense_q8_staged<6u, 1u>(weights, input, output, a, group.x, tid, sg, lane, sx); break;
+        case 7u: dflash2_dense_detail::dense_q8_staged<7u, 1u>(weights, input, output, a, group.x, tid, sg, lane, sx); break;
+        default: dflash2_dense_detail::dense_q8_staged<8u, 1u>(weights, input, output, a, group.x, tid, sg, lane, sx); break;
     }
 }
 
@@ -1395,21 +1612,26 @@ kernel void dflash2_dense_q8_r4_m8(
     ushort sg [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]]) {
     if (dflash2_q8_encoding != 8u || dflash2_q8_layout > 1u || !a.columns || (a.columns % 32u) != 0u ||
-        !a.rows || !a.tokens || a.tokens > 8u || a.row_bytes != (a.columns / 32u) * 34u ||
+        !a.rows || !a.tokens || a.tokens > 16u || a.row_bytes != (a.columns / 32u) * 34u ||
         (a.input_stride_bytes % 4ul) != 0ul || (a.output_stride_bytes % 4ul) != 0ul) {
         if (!group.x && !group.y && !tid) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
         return;
     }
+    const uint t0 = group.y * 8u;
+    if (t0 >= a.tokens) return;
+    const uint nt = min(8u, a.tokens - t0);
+    input += ulong(t0) * (a.input_stride_bytes / sizeof(float));
+    output += ulong(t0) * (a.output_stride_bytes / sizeof(float));
     threadgroup float sx[8][256];
-    switch (a.tokens) {
-        case 1u: dflash2_dense_detail::dense_q8_staged<1u, 4u>(weights, input, output, a, error, group.x, tid, sg, lane, sx); break;
-        case 2u: dflash2_dense_detail::dense_q8_staged<2u, 4u>(weights, input, output, a, error, group.x, tid, sg, lane, sx); break;
-        case 3u: dflash2_dense_detail::dense_q8_staged<3u, 4u>(weights, input, output, a, error, group.x, tid, sg, lane, sx); break;
-        case 4u: dflash2_dense_detail::dense_q8_staged<4u, 4u>(weights, input, output, a, error, group.x, tid, sg, lane, sx); break;
-        case 5u: dflash2_dense_detail::dense_q8_staged<5u, 4u>(weights, input, output, a, error, group.x, tid, sg, lane, sx); break;
-        case 6u: dflash2_dense_detail::dense_q8_staged<6u, 4u>(weights, input, output, a, error, group.x, tid, sg, lane, sx); break;
-        case 7u: dflash2_dense_detail::dense_q8_staged<7u, 4u>(weights, input, output, a, error, group.x, tid, sg, lane, sx); break;
-        default: dflash2_dense_detail::dense_q8_staged<8u, 4u>(weights, input, output, a, error, group.x, tid, sg, lane, sx); break;
+    switch (nt) {
+        case 1u: dflash2_dense_detail::dense_q8_staged<1u, 4u>(weights, input, output, a, group.x, tid, sg, lane, sx); break;
+        case 2u: dflash2_dense_detail::dense_q8_staged<2u, 4u>(weights, input, output, a, group.x, tid, sg, lane, sx); break;
+        case 3u: dflash2_dense_detail::dense_q8_staged<3u, 4u>(weights, input, output, a, group.x, tid, sg, lane, sx); break;
+        case 4u: dflash2_dense_detail::dense_q8_staged<4u, 4u>(weights, input, output, a, group.x, tid, sg, lane, sx); break;
+        case 5u: dflash2_dense_detail::dense_q8_staged<5u, 4u>(weights, input, output, a, group.x, tid, sg, lane, sx); break;
+        case 6u: dflash2_dense_detail::dense_q8_staged<6u, 4u>(weights, input, output, a, group.x, tid, sg, lane, sx); break;
+        case 7u: dflash2_dense_detail::dense_q8_staged<7u, 4u>(weights, input, output, a, group.x, tid, sg, lane, sx); break;
+        default: dflash2_dense_detail::dense_q8_staged<8u, 4u>(weights, input, output, a, group.x, tid, sg, lane, sx); break;
     }
 }
 
@@ -1425,21 +1647,26 @@ kernel void dflash2_gate_up_swiglu_q8_m8(
     ushort sg [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]]) {
     if (dflash2_q8_encoding != 8u || dflash2_q8_layout > 1u || !a.columns || (a.columns % 32u) != 0u ||
-        !a.rows || !a.tokens || a.tokens > 8u || a.row_bytes != (a.columns / 32u) * 34u ||
+        !a.rows || !a.tokens || a.tokens > 16u || a.row_bytes != (a.columns / 32u) * 34u ||
         (a.input_stride_bytes % 4ul) != 0ul || (a.output_stride_bytes % 4ul) != 0ul) {
         if (!group.x && !group.y && !tid) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
         return;
     }
+    const uint t0 = group.y * 8u;
+    if (t0 >= a.tokens) return;
+    const uint nt = min(8u, a.tokens - t0);
+    input += ulong(t0) * (a.input_stride_bytes / sizeof(float));
+    output += ulong(t0) * (a.output_stride_bytes / sizeof(float));
     threadgroup float sx[8][512];
-    switch (a.tokens) {
-        case 1u: dflash2_dense_detail::gate_up_swiglu_q8_staged<1u>(gate_w, up_w, input, output, a, error, group.x, tid, sg, lane, sx); break;
-        case 2u: dflash2_dense_detail::gate_up_swiglu_q8_staged<2u>(gate_w, up_w, input, output, a, error, group.x, tid, sg, lane, sx); break;
-        case 3u: dflash2_dense_detail::gate_up_swiglu_q8_staged<3u>(gate_w, up_w, input, output, a, error, group.x, tid, sg, lane, sx); break;
-        case 4u: dflash2_dense_detail::gate_up_swiglu_q8_staged<4u>(gate_w, up_w, input, output, a, error, group.x, tid, sg, lane, sx); break;
-        case 5u: dflash2_dense_detail::gate_up_swiglu_q8_staged<5u>(gate_w, up_w, input, output, a, error, group.x, tid, sg, lane, sx); break;
-        case 6u: dflash2_dense_detail::gate_up_swiglu_q8_staged<6u>(gate_w, up_w, input, output, a, error, group.x, tid, sg, lane, sx); break;
-        case 7u: dflash2_dense_detail::gate_up_swiglu_q8_staged<7u>(gate_w, up_w, input, output, a, error, group.x, tid, sg, lane, sx); break;
-        default: dflash2_dense_detail::gate_up_swiglu_q8_staged<8u>(gate_w, up_w, input, output, a, error, group.x, tid, sg, lane, sx); break;
+    switch (nt) {
+        case 1u: dflash2_dense_detail::gate_up_swiglu_q8_staged<1u>(gate_w, up_w, input, output, a, group.x, tid, sg, lane, sx); break;
+        case 2u: dflash2_dense_detail::gate_up_swiglu_q8_staged<2u>(gate_w, up_w, input, output, a, group.x, tid, sg, lane, sx); break;
+        case 3u: dflash2_dense_detail::gate_up_swiglu_q8_staged<3u>(gate_w, up_w, input, output, a, group.x, tid, sg, lane, sx); break;
+        case 4u: dflash2_dense_detail::gate_up_swiglu_q8_staged<4u>(gate_w, up_w, input, output, a, group.x, tid, sg, lane, sx); break;
+        case 5u: dflash2_dense_detail::gate_up_swiglu_q8_staged<5u>(gate_w, up_w, input, output, a, group.x, tid, sg, lane, sx); break;
+        case 6u: dflash2_dense_detail::gate_up_swiglu_q8_staged<6u>(gate_w, up_w, input, output, a, group.x, tid, sg, lane, sx); break;
+        case 7u: dflash2_dense_detail::gate_up_swiglu_q8_staged<7u>(gate_w, up_w, input, output, a, group.x, tid, sg, lane, sx); break;
+        default: dflash2_dense_detail::gate_up_swiglu_q8_staged<8u>(gate_w, up_w, input, output, a, group.x, tid, sg, lane, sx); break;
     }
 }
 
@@ -1457,7 +1684,7 @@ kernel void dflash2_conv_finish_rms_f32(
     ushort tid [[thread_index_in_threadgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]]) {
-    if (a.hidden != 2560u || !a.rows || a.rows > 8u || a.group_size != 16u || !(a.eps > 0.0f)) {
+    if (a.hidden != 2560u || !a.rows || a.rows > 16u || a.group_size != 16u || !(a.eps > 0.0f)) {
         if (!row && !tid) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
         return;
     }
@@ -1465,9 +1692,6 @@ kernel void dflash2_conv_finish_rms_f32(
     constexpr uint Hidden = 2560u, GroupSize = 16u, ConvGroups = Hidden / GroupSize, DynWidth = 4u * ConvGroups;
     alignas(16) threadgroup float row_buf[Hidden];
     threadgroup float s_inv;
-    threadgroup uint s_bad;
-    if (!tid) s_bad = 0u;
-    uint bad = 0u;
     const ulong row_off = ulong(row) * Hidden;
     device const packed_float4* in4_cur = reinterpret_cast<device const packed_float4*>(input + row_off);
     device const packed_float4* in4_prev = row > 0u ? reinterpret_cast<device const packed_float4*>(input + ulong(row - 1u) * Hidden) : nullptr;
@@ -1485,29 +1709,15 @@ kernel void dflash2_conv_finish_rms_f32(
         const float4 x0 = float4(in4_cur[q]);
         const float4 b0 = float4(base4_0[q]);
         const float d0 = dynamic[row * DynWidth + 2u * ConvGroups + cg];
-        bad |= dflash2_detail::nonfinite_bit(d0) |
-               dflash2_detail::nonfinite_bit(x0.x) | dflash2_detail::nonfinite_bit(x0.y) |
-               dflash2_detail::nonfinite_bit(x0.z) | dflash2_detail::nonfinite_bit(x0.w) |
-               dflash2_detail::nonfinite_bit(b0.x) | dflash2_detail::nonfinite_bit(b0.y) |
-               dflash2_detail::nonfinite_bit(b0.z) | dflash2_detail::nonfinite_bit(b0.w);
         float4 val = x0 * (b0 + d0);
         if (row > 0u) {
             const float4 x1 = float4(in4_prev[q]);
             const float4 b1 = float4(base4_1[q]);
             const float d1 = dynamic[row * DynWidth + 3u * ConvGroups + cg];
-            bad |= dflash2_detail::nonfinite_bit(d1) |
-                   dflash2_detail::nonfinite_bit(x1.x) | dflash2_detail::nonfinite_bit(x1.y) |
-                   dflash2_detail::nonfinite_bit(x1.z) | dflash2_detail::nonfinite_bit(x1.w) |
-                   dflash2_detail::nonfinite_bit(b1.x) | dflash2_detail::nonfinite_bit(b1.y) |
-                   dflash2_detail::nonfinite_bit(b1.z) | dflash2_detail::nonfinite_bit(b1.w);
             val += x1 * (b1 + d1);
         }
         const float4 res = float4(res4[q]);
-        bad |= dflash2_detail::nonfinite_bit(res.x) | dflash2_detail::nonfinite_bit(res.y) |
-               dflash2_detail::nonfinite_bit(res.z) | dflash2_detail::nonfinite_bit(res.w);
         val += res;
-        bad |= dflash2_detail::nonfinite_bit(val.x) | dflash2_detail::nonfinite_bit(val.y) |
-               dflash2_detail::nonfinite_bit(val.z) | dflash2_detail::nonfinite_bit(val.w);
         rout4[q] = val;
         rbuf4[q] = val;
         rv[step] = val;
@@ -1521,16 +1731,12 @@ kernel void dflash2_conv_finish_rms_f32(
         }
         sum = simd_sum(sum);
         const float denom = sum / float(Hidden) + a.eps;
-        if (!isfinite(sum) || !isfinite(denom)) {
-            if (!lane) { s_bad = 1u; s_inv = 0.0f; }
-        } else if (!lane) {
-            s_inv = rsqrt(denom);
+        if (!lane) {
+            s_inv = isfinite(denom) ? rsqrt(denom) : NAN;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (s_bad) {
-        bad |= 1u;
-    } else {
+    {
         const float inv = s_inv;
         device const packed_float4* gains4 = reinterpret_cast<device const packed_float4*>(gains);
         device packed_float4* nout4 = reinterpret_cast<device packed_float4*>(norm_out + row_off);
@@ -1538,13 +1744,7 @@ kernel void dflash2_conv_finish_rms_f32(
         for (uint step = 0u; step < 5u; ++step) {
             const uint q = step * 128u + uint(tid);
             const float4 g = float4(gains4[q]);
-            bad |= dflash2_detail::nonfinite_bit(g.x) | dflash2_detail::nonfinite_bit(g.y) |
-                   dflash2_detail::nonfinite_bit(g.z) | dflash2_detail::nonfinite_bit(g.w);
-            const float4 out_v = (rv[step] * inv) * g;
-            bad |= dflash2_detail::nonfinite_bit(out_v.x) | dflash2_detail::nonfinite_bit(out_v.y) |
-                   dflash2_detail::nonfinite_bit(out_v.z) | dflash2_detail::nonfinite_bit(out_v.w);
-            nout4[q] = out_v;
+            nout4[q] = (rv[step] * inv) * g;
         }
     }
-    if (bad) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
 }

@@ -62,6 +62,70 @@ struct PlanarExpertSpec {
 
 [[nodiscard]] PlanarExpertSpec make_expert_spec(uint32_t source_type, uint32_t columns, uint32_t rows);
 
+// Zero-dependency compile-time / runtime shape & tiling invariant discharge for Metal planar v3 kernels.
+// Proves that decode16_planar_v3, decode32_planar_v3, and stage64_planar_gu_v3 block indices never exceed blocks_per_row.
+[[nodiscard]] constexpr bool discharge_planar_tiling_invariants(
+    uint32_t source_type, uint32_t columns, uint32_t rows, uint32_t experts) noexcept {
+    if (experts < 1u || experts > 512u || rows < 4u || rows > 65536u || (rows % 4u) != 0u) return false;
+    if (columns < 32u || columns > 65536u) return false;
+    const uint32_t block_cols = (source_type == 12u || source_type == 13u) ? 256u
+                              : ((source_type == 7u || source_type == 8u) ? 32u : 0u);
+    if (block_cols == 0u || (columns % block_cols) != 0u) return false;
+    const uint32_t blocks_per_row = columns / block_cols;
+    const uint32_t steps = columns / 32u;
+    if (blocks_per_row == 0u || steps == 0u) return false;
+    if (source_type == 8u && ((uint64_t(rows) * blocks_per_row) % 8ull) != 0ull) return false;
+    // decode16_planar_v3: ci in [0, 2*steps - 1]
+    const uint32_t max_ci = 2u * steps - 1u;
+    const uint32_t max_blk16 = (source_type == 12u || source_type == 13u) ? (max_ci >> 4u) : (max_ci >> 1u);
+    if (max_blk16 >= blocks_per_row) return false;
+    // decode32_planar_v3: group32 in [0, steps - 1]
+    const uint32_t max_g32 = steps - 1u;
+    const uint32_t max_blk32 = (source_type == 12u || source_type == 13u) ? (max_g32 >> 3u) : max_g32;
+    if (max_blk32 >= blocks_per_row) return false;
+    // stage64_planar_gu_v3 (Q4_K / Q5_K): window64 in [0, columns/64 - 1]
+    if (source_type == 12u || source_type == 13u) {
+        if ((columns % 64u) != 0u) return false;
+        const uint32_t max_sb64 = (columns / 64u - 1u) >> 2u;
+        if (max_sb64 >= blocks_per_row) return false;
+    }
+    return true;
+}
+
+static_assert(discharge_planar_tiling_invariants(12u, 256u, 4u, 2u));
+static_assert(discharge_planar_tiling_invariants(13u, 2560u, 640u, 512u));
+static_assert(discharge_planar_tiling_invariants(12u, 65536u, 65536u, 512u));
+static_assert(discharge_planar_tiling_invariants(7u, 96u, 512u, 1u));
+static_assert(discharge_planar_tiling_invariants(8u, 640u, 2560u, 512u));
+static_assert(!discharge_planar_tiling_invariants(12u, 128u, 64u, 2u));
+static_assert(!discharge_planar_tiling_invariants(12u, 256u, 6u, 2u));
+static_assert(!discharge_planar_tiling_invariants(8u, 32u, 4u, 1u));
+static_assert(!discharge_planar_tiling_invariants(7u, 64u, 4u, 513u));
+
+// Statically certify finite dm (d, dmin), 6-bit sm <= 63, and FP16-staging safety (|wf| < 65520.0f).
+void certify_expert_planar_v3(const PlanarExpertSpec& spec, std::span<const std::byte> planar_expert);
+void certify_planar_matrix_bytes(const PlanarExpertSpec& spec, uint32_t experts, std::span<const std::byte> matrix_bytes);
+struct CertifiedPlanarTensor {
+    uint64_t pack_data_offset = 0;
+    uint64_t bytes = 0;
+    uint32_t source_type = 0;
+    uint32_t kind = 0;
+    uint32_t columns = 0;
+    uint32_t rows = 0;
+    uint32_t experts = 0;
+    bool operator==(const CertifiedPlanarTensor&) const = default;
+};
+enum class CertifiedTensorLookup : uint8_t {
+    not_certified_model = 0,
+    exact_match = 1,
+    not_found = 2,
+    mismatched_overlap = 3,
+};
+[[nodiscard]] bool is_certified_pack_model(const std::shared_ptr<const ModelFiles>& model) noexcept;
+[[nodiscard]] CertifiedTensorLookup lookup_certified_planar_tensor(
+    const std::shared_ptr<const ModelFiles>& model,
+    const CertifiedPlanarTensor& query) noexcept;
+
 // Bijective 12-byte GGUF Q4_K/Q5_K scales[12] <-> 16-byte {uint8 sc[8], uint8 mn[8]} in [0, 63].
 void pack_sm16(std::span<const std::byte, 12> g_scales, std::span<std::byte, 16> out_sm) noexcept;
 void unpack_sm16(std::span<const std::byte, 16> in_sm, std::span<std::byte, 12> out_scales);

@@ -7,6 +7,7 @@
 #include "tokspur/metal.hpp"
 #include "tokspur/numeric.hpp"
 #include "tokspur/planar_pack_v3.hpp"
+#include "tokspur/sampling.hpp"
 
 #include <algorithm>
 #include <array>
@@ -430,6 +431,46 @@ PlanarKind down_kind_for(uint32_t dn_type) {
     return dn_type == 7u ? PlanarKind::q51_planar_v3 : PlanarKind::q8_planar_v3;
 }
 
+void test_partial_union_gate_group(const char* metallib) {
+    constexpr uint32_t channels = 256, hidden = 12, experts = 2, tokens = 3, stride = 20;
+    constexpr float sentinel = -77.0f;
+    const auto raw = grouped_fixture::weights({8u, channels, hidden, 1u, 1u, 1u, true});
+    const auto spec = make_expert_spec(8, channels, hidden);
+    Bytes pair(2 * spec.planar_expert_bytes);
+    auto packed = std::span(pair).first(spec.planar_expert_bytes);
+    pack_expert_planar_v3(spec, raw, packed);
+    std::copy(packed.begin(), packed.end(), pair.begin() + spec.planar_expert_bytes);
+    std::vector<float> reference(channels * hidden);
+    dequantize(8, raw, reference);
+
+    MetalGraph g(metallib, 64ull << 20);
+    Arena a{g, {}};
+    const auto lo = a.upload(pair), hi = a.upload(pair);
+    const auto [lo_kind, hi_kind] = coloc_kinds_for(8);
+    g.register_planar_matrix(lo, {8, uint32_t(lo_kind), channels, hidden, experts});
+    g.register_planar_matrix(hi, {8, uint32_t(hi_kind), channels, hidden, experts});
+    g.prepare_planar_moe_v3(8, 8, false);
+    const std::array<uint32_t, tokens> ids{0, 0, 1};
+    const auto routes = a.upload(std::as_bytes(std::span(ids)));
+    std::vector<float> x(tokens * channels), y(tokens * stride, sentinel);
+    for (uint32_t i = 0; i < x.size(); ++i) x[i] = float(int(i % 199) - 99) / 128.0f;
+    const auto input = a.floats(x), output = a.upload(std::as_bytes(std::span(y)), false);
+    g.begin();
+    g.planar_moe_gate_up_swiglu_m8(lo, hi, routes, {input, tokens, channels, channels * 4}, {output, tokens, hidden, stride * 4}, experts, 1);
+    static_cast<void>(g.submit());
+    g.read(output, std::as_writable_bytes(std::span(y)));
+    for (uint32_t t = 0; t < tokens; ++t) {
+        for (uint32_t r = 0; r < hidden; ++r) {
+            double dot = 0.0;
+            for (uint32_t c = 0; c < channels; ++c) dot += double(reference[r * channels + c]) * x[t * channels + c];
+            const float expected = silu_f32(float(dot)) * float(dot);
+            need(std::abs(y[t * stride + r] - expected) <= 1e-5f * (1.f + std::abs(expected)), "partial gate group result differs");
+        }
+        for (uint32_t r = hidden; r < stride; ++r)
+            need(y[t * stride + r] == sentinel, "inactive gate group overwrote stride padding");
+    }
+}
+
 void test_gpu_isolation_and_numerical_parity(const char* metallib, std::vector<float>* captured = nullptr,
     std::vector<uint64_t>* resources = nullptr) {
     struct Combo {
@@ -482,8 +523,9 @@ void test_gpu_isolation_and_numerical_parity(const char* metallib, std::vector<f
 
         g.prepare_planar_moe_v3(combo.gu_type, combo.dn_type, true, 600u, experts, selected, channels, hidden);
 
-        // Every supported width, including duplicate/shared routes and singletons.
-        for (const uint32_t m : {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u}) {
+        // Every supported width, including duplicate/shared routes, singletons, and M=16 burst width.
+        for (const uint32_t m : {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 12u, 16u}) {
+            if (m > 8u && (captured || resources)) continue;
             std::vector<float> x(uint64_t(m) * channels);
             uint32_t rng = 9001u + m * 31u + combo.gu_type;
             for (auto& val : x) {
@@ -703,7 +745,8 @@ void test_sticky_finite_contract(const char* metallib, uint32_t gu_type = 12u, u
     const auto dn_spec = make_expert_spec(dn_type, hidden, channels);
 
     const auto run_case = [&](const Bytes& lo_b, const Bytes& hi_b, const Bytes& dn_b,
-                              const std::vector<float>& x, const std::vector<uint32_t>& ids, bool use_nax) {
+                              const std::vector<float>& x, const std::vector<uint32_t>& ids, bool use_nax,
+                              std::vector<float>* out_y = nullptr, GpuLogitTopKRow* out_topk = nullptr) {
         MetalGraph g(metallib, 256ull << 20);
         Arena a{g, {}};
         const auto v_lo = a.upload(lo_b);
@@ -715,10 +758,16 @@ void test_sticky_finite_contract(const char* metallib, uint32_t gu_type = 12u, u
         g.register_planar_matrix(v_dn, {dn_type, uint32_t(down_kind_for(dn_type)), hidden, channels, experts});
         const uint32_t n = uint32_t(x.size() / channels);
         g.prepare_planar_moe_v3(gu_type, dn_type, use_nax, std::max(32u, n), experts, selected, channels, hidden);
+        if (out_topk) g.prepare_logit_topk();
 
         const auto vx = a.floats(x);
         const auto vix = a.upload(std::as_bytes(std::span(ids)));
         const auto vy = a.zeros(uint64_t(n * selected) * channels * 4u);
+        GpuView vscratch{}, vtopk{};
+        if (out_topk) {
+            vscratch = a.zeros(MetalGraph::logit_topk_scratch_bytes(n * selected, channels));
+            vtopk = a.zeros(MetalGraph::logit_topk_output_bytes(n * selected));
+        }
         if (use_nax) {
             const uint32_t max_tasks = (n * selected) / 32u + experts;
             const auto vmap = a.zeros(uint64_t(experts) * n * 4u);
@@ -730,6 +779,9 @@ void test_sticky_finite_contract(const char* metallib, uint32_t gu_type = 12u, u
                 {vx, n, channels, uint64_t(channels) * 4u},
                 {vy, n * selected, channels, uint64_t(channels) * 4u},
                 vmap, vcnt, vtsk, experts, selected);
+            if (out_topk) {
+                g.logit_topk({vy, n * selected, channels, uint64_t(channels) * 4u}, vscratch, vtopk);
+            }
             static_cast<void>(g.submit());
         } else {
             const auto vh = a.zeros(uint64_t(n * selected) * hidden * 4u);
@@ -740,7 +792,25 @@ void test_sticky_finite_contract(const char* metallib, uint32_t gu_type = 12u, u
                 {vh, n * selected, hidden, uint64_t(hidden) * 4u},
                 {vy, n * selected, channels, uint64_t(channels) * 4u},
                 experts, selected);
+            if (out_topk) {
+                g.logit_topk({vy, n * selected, channels, uint64_t(channels) * 4u}, vscratch, vtopk);
+            }
             static_cast<void>(g.submit());
+        }
+        if (out_y) {
+            out_y->resize(uint64_t(n * selected) * channels);
+            g.read(vy, std::as_writable_bytes(std::span(*out_y)));
+        }
+        if (out_topk) {
+            std::vector<GpuLogitTopKRow> rows_out(n * selected);
+            g.read(vtopk, std::as_writable_bytes(std::span(rows_out)));
+            *out_topk = rows_out[0];
+            for (const auto& r : rows_out) {
+                if (r.first_nonfinite_col != 0xffffffffu) {
+                    *out_topk = r;
+                    break;
+                }
+            }
         }
     };
 
@@ -751,35 +821,55 @@ void test_sticky_finite_contract(const char* metallib, uint32_t gu_type = 12u, u
         clean_ids[row * selected + 1u] = 3u;
     }
 
+    const auto require_host_finite = [&](std::span<const float> vals, const char* why) {
+        for (const float v : vals) {
+            if (!std::isfinite(v)) throw FormatError(std::string(why) + " (nonfinite)");
+        }
+    };
+
     for (const bool use_nax : {false, true}) {
         if (nax_only && !use_nax) continue;
-        // Control pass succeeds.
-        run_case(base_fx.pair_lo, base_fx.pair_hi, base_fx.down, clean_x, clean_ids, use_nax);
+        // Control pass succeeds cleanly and produces finite outputs.
+        {
+            std::vector<float> y_out;
+            GpuLogitTopKRow topk_row{};
+            run_case(base_fx.pair_lo, base_fx.pair_hi, base_fx.down, clean_x, clean_ids, use_nax, &y_out, &topk_row);
+            require_host_finite(y_out, "planar MoE clean control output");
+            need(topk_row.first_nonfinite_col == 0xffffffffu, "clean planar MoE control must have no nonfinite columns");
+        }
 
-        // 1. Non-finite NaN / Inf in input activation.
+        // 1. Non-finite NaN / Inf in input activation: propagates unmasked and is caught at the end-of-batch / topk boundary.
         for (const float bad_v : {std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity()}) {
             auto bad_x = clean_x;
             bad_x[17u] = bad_v;
-            refuses([&] { run_case(base_fx.pair_lo, base_fx.pair_hi, base_fx.down, bad_x, clean_ids, use_nax); },
-                    "planar MoE must refuse non-finite input", "nonfinite");
+            std::vector<float> y_out;
+            GpuLogitTopKRow topk_row{};
+            run_case(base_fx.pair_lo, base_fx.pair_hi, base_fx.down, bad_x, clean_ids, use_nax, &y_out, &topk_row);
+            need(std::any_of(y_out.begin(), y_out.end(), [](float v) { return !std::isfinite(v); }),
+                 "planar MoE must propagate non-finite activation without masking to zero");
+            need(topk_row.first_nonfinite_col != 0xffffffffu,
+                 "logit_topk must observe nonfinite output column from nonfinite activation");
+            refuses([&] { require_host_finite(y_out, "planar MoE nonfinite activation output"); },
+                    "host finiteness check must refuse non-finite output", "nonfinite");
+            refuses([&] { static_cast<void>(sampling_distribution_from_topk(topk_row, SamplingPolicy{0.0, 16u, 1.0, 0.0})); },
+                    "sampling_distribution_from_topk must refuse non-finite output", "nonfinite");
         }
 
-        // 2. Stored FP16 NaN (0x7e00) in gate super-scale: even though tile loader substitutes 0.0f so output stays 0, sticky error MUST fire!
+        // 2. Stored FP16 NaN (0x7e00) / Inf (0x7c00) in gate/up super-scale and FP16-stage overflow weights:
+        //    refused statically at register_planar_matrix().
         {
             auto bad_lo = base_fx.pair_lo;
             const uint16_t nan_h = 0x7e00u;
             std::memcpy(bad_lo.data() + gu_spec.dm_offset, &nan_h, 2);
             refuses([&] { run_case(bad_lo, base_fx.pair_hi, base_fx.down, clean_x, clean_ids, use_nax); },
-                    "planar MoE must refuse non-finite stored gate scale despite zero substitution", "nonfinite");
+                    "planar MoE must refuse non-finite stored gate scale at registration", "nonfinite");
         }
-
-        // The up scale and finite weights that overflow the FP16 stage must reach the same sticky guard in each staged tile size.
         {
             auto bad_lo = base_fx.pair_lo;
             const uint16_t inf_h = 0x7c00u;
             std::memcpy(bad_lo.data() + gu_spec.planar_expert_bytes + gu_spec.dm_offset, &inf_h, 2);
             refuses([&] { run_case(bad_lo, base_fx.pair_hi, base_fx.down, clean_x, clean_ids, use_nax); },
-                    "planar MoE must refuse non-finite stored up scale", "nonfinite");
+                    "planar MoE must refuse non-finite stored up scale at registration", "nonfinite");
         }
         if (use_nax && rows >= 3u) {
             auto bad_lo = base_fx.pair_lo;
@@ -788,16 +878,16 @@ void test_sticky_finite_contract(const char* metallib, uint32_t gu_type = 12u, u
             if (gu_type == 12u || gu_type == 13u) bad_lo[size_t(gu_spec.sm_offset)] = std::byte{63};
             std::fill_n(bad_lo.begin() + std::ptrdiff_t(gu_spec.qs_offset), gu_type == 8u ? 32u : 128u, std::byte{0x7f});
             refuses([&] { run_case(bad_lo, base_fx.pair_hi, base_fx.down, clean_x, clean_ids, use_nax); },
-                    "planar MoE must refuse finite stored weights overflowing its FP16 stage", "nonfinite");
+                    "planar MoE must refuse finite stored weights overflowing its FP16 stage at registration", "nonfinite");
         }
 
-        // 3. Stored FP16 Inf (0x7c00) in down Q5_1 scale: verifies intermediate/stored check in down kernel.
+        // 3. Stored FP16 Inf (0x7c00) / FP16-stage overflow in down weights: refused statically at registration.
         {
             auto bad_dn = base_fx.down;
             const uint16_t inf_h = 0x7c00u;
             std::memcpy(bad_dn.data() + dn_spec.dm_offset, &inf_h, 2);
             refuses([&] { run_case(base_fx.pair_lo, base_fx.pair_hi, bad_dn, clean_x, clean_ids, use_nax); },
-                    "planar MoE must refuse non-finite stored down scale", "nonfinite");
+                    "planar MoE must refuse non-finite stored down scale at registration", "nonfinite");
         }
         if (use_nax && rows >= 3u) {
             auto bad_dn = base_fx.down;
@@ -805,17 +895,25 @@ void test_sticky_finite_contract(const char* metallib, uint32_t gu_type = 12u, u
             std::memcpy(bad_dn.data() + dn_spec.dm_offset, &large_h, 2);
             std::fill_n(bad_dn.begin() + std::ptrdiff_t(dn_spec.qs_offset), dn_type == 8u ? 32u : 16u, std::byte{0x7f});
             refuses([&] { run_case(base_fx.pair_lo, base_fx.pair_hi, bad_dn, clean_x, clean_ids, use_nax); },
-                    "planar MoE must refuse finite down weights overflowing its FP16 stage", "nonfinite");
+                    "planar MoE must refuse finite down weights overflowing its FP16 stage at registration", "nonfinite");
         }
 
-        // 4. Intermediate SwiGLU overflow (finite large inputs whose gate*up product overflows FP32 / BF16 conversion).
+        // 4. Intermediate SwiGLU overflow (finite large inputs whose gate*up product overflows FP32 / BF16 conversion):
+        //    must not be masked to 0 and must be caught at the end-of-batch / topk boundary.
         {
             std::vector<float> huge_x(rows * channels, 3.0e38f);
-            refuses([&] { run_case(base_fx.pair_lo, base_fx.pair_hi, base_fx.down, huge_x, clean_ids, use_nax); },
-                    "planar MoE must refuse intermediate/narrow-conversion overflow", "nonfinite");
+            std::vector<float> y_out;
+            GpuLogitTopKRow topk_row{};
+            run_case(base_fx.pair_lo, base_fx.pair_hi, base_fx.down, huge_x, clean_ids, use_nax, &y_out, &topk_row);
+            need(std::any_of(y_out.begin(), y_out.end(), [](float v) { return !std::isfinite(v); }),
+                 "planar MoE must propagate intermediate/narrow-conversion overflow without zero substitution");
+            need(topk_row.first_nonfinite_col != 0xffffffffu,
+                 "logit_topk must observe nonfinite output from intermediate SwiGLU overflow");
+            refuses([&] { require_host_finite(y_out, "planar MoE huge_x overflow output"); },
+                    "host finiteness check must refuse intermediate/narrow-conversion overflow", "nonfinite");
         }
 
-        // 5. Out-of-range expert route index (>= experts).
+        // 5. Out-of-range expert route index (>= experts): refused at dispatch boundary via discharge_routes().
         {
             auto bad_ids = clean_ids;
             bad_ids.back() = experts;
@@ -824,9 +922,261 @@ void test_sticky_finite_contract(const char* metallib, uint32_t gu_type = 12u, u
         }
 
         // Clean control pass still succeeds afterwards.
-        run_case(base_fx.pair_lo, base_fx.pair_hi, base_fx.down, clean_x, clean_ids, use_nax);
+        {
+            std::vector<float> y_out;
+            run_case(base_fx.pair_lo, base_fx.pair_hi, base_fx.down, clean_x, clean_ids, use_nax, &y_out, nullptr);
+            require_host_finite(y_out, "planar MoE post-refusal clean control output");
+        }
     }
     std::cout << "PASS planar_v3 sticky finite-value contract (input, stored scale, narrow conversion, intermediate SwiGLU, route bounds)\n";
+}
+
+void test_route_discharge_and_shape_certification(const char* metallib) {
+    const uint32_t channels = 256u, hidden = 64u, experts = 4u, selected = 2u, rows = 4u;
+    const auto base_fx = build_coloc_fixture(12u, 7u, channels, hidden, experts);
+    const auto gu_spec = make_expert_spec(12u, channels, hidden);
+    const auto [gate_kind, up_kind] = coloc_kinds_for(12u);
+
+    // 1. Out-of-range 6-bit scale (sm > 63) refused on raw-uploaded Q4_K at register_planar_matrix().
+    {
+        auto bad_lo = base_fx.pair_lo;
+        bad_lo[size_t(gu_spec.sm_offset)] = std::byte{64u};
+        MetalGraph g(metallib, 64ull << 20);
+        const auto v_lo = g.upload(bad_lo, "bad_sm_lo");
+        refuses([&] {
+            g.register_planar_matrix(v_lo, {12u, uint32_t(gate_kind), channels, hidden, experts});
+        }, "register_planar_matrix must refuse sm > 63", "nonfinite");
+    }
+
+    // 2. MetalGraph::route() and prefill_route_batch() discharge GPU-resident route buffers without readback,
+    //    and span writes / non-router GPU outputs invalidate verified route spans.
+    {
+        MetalGraph g(metallib, 128ull << 20);
+        Arena a{g, {}};
+        const auto v_lo = a.upload(base_fx.pair_lo);
+        const auto v_hi = a.upload(base_fx.pair_hi);
+        const auto v_dn = a.upload(base_fx.down);
+        g.register_planar_matrix(v_lo, {12u, uint32_t(gate_kind), channels, hidden, experts});
+        g.register_planar_matrix(v_hi, {12u, uint32_t(up_kind), channels, hidden, experts});
+        g.register_planar_matrix(v_dn, {7u, uint32_t(down_kind_for(7u)), hidden, channels, experts});
+        g.prepare_planar_moe_v3(12u, 7u, true, 32u, experts, selected, channels, hidden);
+        g.prepare_planar_moe_v3(12u, 7u, false, 32u, experts, selected, channels, hidden);
+        g.prepare_prefill_top10_mixture();
+
+        std::vector<float> logits_h(size_t(rows) * experts, 0.0f);
+        for (uint32_t r = 0; r < rows; ++r) logits_h[r * experts + (r % experts)] = 5.0f;
+        const auto v_logits = a.floats(logits_h);
+        // Poison route buffer with out-of-range indices initially; router GPU write discharges it without host readback.
+        std::vector<uint32_t> bad_init(size_t(rows) * selected, experts + 7u);
+        const auto v_ids = a.zeros(bad_init.size() * sizeof(uint32_t));
+        g.write(v_ids, std::as_bytes(std::span(bad_init)));
+        const auto v_w = a.zeros(uint64_t(rows * selected) * 4u);
+        const auto vx = a.floats(std::vector<float>(rows * channels, 0.25f));
+        const auto vh = a.zeros(uint64_t(rows * selected) * hidden * 4u);
+        const auto vy = a.zeros(uint64_t(rows * selected) * channels * 4u);
+
+        const auto subview = [](GpuView v, uint64_t off, uint64_t bytes) {
+            v.offset += off;
+            v.bytes = bytes;
+            return v;
+        };
+        g.begin();
+        for (uint32_t r = 0; r < rows; ++r) {
+            g.route(subview(v_logits, uint64_t(r) * experts * 4u, uint64_t(experts) * 4u),
+                    subview(v_ids, uint64_t(r) * selected * 4u, uint64_t(selected) * 4u),
+                    subview(v_w, uint64_t(r) * selected * 4u, uint64_t(selected) * 4u),
+                    selected, RouterMode::softmax, true);
+        }
+        g.planar_moe_routed_m8(
+            v_lo, v_hi, v_dn, v_ids,
+            {vx, rows, channels, uint64_t(channels) * 4u},
+            {vh, rows * selected, hidden, uint64_t(hidden) * 4u},
+            {vy, rows * selected, channels, uint64_t(channels) * 4u},
+            experts, selected);
+        static_cast<void>(g.submit());
+
+        // prefill_route_batch() + NAX grouped MoE in same batch also discharges cleanly.
+        const uint32_t max_tasks = (rows * selected) / 32u + experts;
+        const auto vmap = a.zeros(uint64_t(experts) * rows * 4u);
+        const auto vcnt = a.zeros(uint64_t(experts) * 4u);
+        const auto vtsk = a.zeros(uint64_t(2u + max_tasks * 2u) * 4u);
+        g.begin();
+        g.prefill_route_batch(v_logits, v_ids, v_w, experts, selected, rows, RouterMode::softmax, true);
+        g.planar_nax_grouped_moe(
+            v_lo, v_hi, v_dn, v_ids,
+            {vx, rows, channels, uint64_t(channels) * 4u},
+            {vy, rows * selected, channels, uint64_t(channels) * 4u},
+            vmap, vcnt, vtsk, experts, selected);
+        static_cast<void>(g.submit());
+
+        // Host write() invalidates verified span so an out-of-range id is caught again.
+        std::vector<uint32_t> bad_tail(size_t(rows) * selected, 0u);
+        bad_tail.back() = experts;
+        g.write(v_ids, std::as_bytes(std::span(bad_tail)));
+        g.begin();
+        refuses([&] {
+            g.planar_moe_routed_m8(
+                v_lo, v_hi, v_dn, v_ids,
+                {vx, rows, channels, uint64_t(channels) * 4u},
+                {vh, rows * selected, hidden, uint64_t(hidden) * 4u},
+                {vy, rows * selected, channels, uint64_t(channels) * 4u},
+                experts, selected);
+        }, "host write must invalidate verified route span", "nonfinite");
+        g.abort();
+
+        // Non-router GPU write into route buffer invalidates verified span and forces refusal.
+        const auto v_src_gpu = a.floats(std::vector<float>(rows * selected, 0.0f));
+        g.begin();
+        g.prefill_route_batch(v_logits, v_ids, v_w, experts, selected, rows, RouterMode::softmax, true);
+        g.activate(v_src_gpu, v_ids, Activation::identity);
+        refuses([&] {
+            g.planar_moe_routed_m8(
+                v_lo, v_hi, v_dn, v_ids,
+                {vx, rows, channels, uint64_t(channels) * 4u},
+                {vh, rows * selected, hidden, uint64_t(hidden) * 4u},
+                {vy, rows * selected, channels, uint64_t(channels) * 4u},
+                experts, selected);
+        }, "non-router GPU overwrite must invalidate verified route span", "nonfinite");
+        g.abort();
+
+        // 3. Regression Test 1 (Attack A): route(experts=8) -> planar_moe(experts=4) in same batch
+        //    must be rejected synchronously by discharge_routes() instead of falling back to CPU zeros.
+        {
+            const uint32_t wide_experts = 8u;
+            std::vector<float> logits8_h(size_t(rows) * wide_experts, 0.0f);
+            for (uint32_t r = 0; r < rows; ++r) logits8_h[r * wide_experts + (wide_experts - 1u)] = 5.0f;
+            const auto v_logits8 = a.floats(logits8_h);
+            const auto v_ids1 = a.zeros(uint64_t(rows) * selected * sizeof(uint32_t));
+            const auto v_w1 = a.zeros(uint64_t(rows) * selected * sizeof(float));
+
+            g.begin();
+            g.route(subview(v_logits8, 0, uint64_t(wide_experts) * 4u),
+                    subview(v_ids1, 0, uint64_t(selected) * 4u),
+                    subview(v_w1, 0, uint64_t(selected) * 4u),
+                    selected, RouterMode::softmax, true);
+            refuses([&] {
+                g.planar_moe_gate_up_swiglu_m8(
+                    v_lo, v_hi, v_ids1,
+                    {vx, rows, channels, uint64_t(channels) * 4u},
+                    {vh, rows * selected, hidden, uint64_t(hidden) * 4u},
+                    experts, selected);
+            }, "same-batch route(experts=8) -> planar_moe_gate_up_swiglu_m8(experts=4) must refuse synchronously", "nonfinite");
+            refuses([&] {
+                g.planar_moe_routed_m8(
+                    v_lo, v_hi, v_dn, v_ids1,
+                    {vx, rows, channels, uint64_t(channels) * 4u},
+                    {vh, rows * selected, hidden, uint64_t(hidden) * 4u},
+                    {vy, rows * selected, channels, uint64_t(channels) * 4u},
+                    experts, selected);
+            }, "same-batch route(experts=8) -> planar_moe_routed_m8(experts=4) must refuse synchronously", "nonfinite");
+            g.abort();
+
+            // Mixed partial overlap: row 0 covered by route(experts=4), row 1 covered by route(experts=8).
+            g.begin();
+            g.route(subview(v_logits, 0, uint64_t(experts) * 4u),
+                    subview(v_ids1, 0, uint64_t(selected) * 4u),
+                    subview(v_w1, 0, uint64_t(selected) * 4u),
+                    selected, RouterMode::softmax, true);
+            g.route(subview(v_logits8, uint64_t(wide_experts) * 4u, uint64_t(wide_experts) * 4u),
+                    subview(v_ids1, uint64_t(selected) * 4u, uint64_t(selected) * 4u),
+                    subview(v_w1, uint64_t(selected) * 4u, uint64_t(selected) * 4u),
+                    selected, RouterMode::softmax, true);
+            refuses([&] {
+                g.planar_moe_gate_up_swiglu_m8(
+                    v_lo, v_hi, v_ids1,
+                    {vx, rows, channels, uint64_t(channels) * 4u},
+                    {vh, rows * selected, hidden, uint64_t(hidden) * 4u},
+                    experts, selected);
+            }, "mixed partial overlap with s.experts > experts must refuse synchronously", "nonfinite");
+            g.abort();
+
+            // Mixed partial overlap: row 0 covered by route(experts=4) over poisoned host bytes,
+            // remaining rows host-validated cleanly -> succeeds; poisoned host tail -> refuses.
+            g.write(v_ids1, std::as_bytes(std::span(bad_init)));
+            std::vector<uint32_t> clean_tail(size_t(rows - 1u) * selected, 0u);
+            g.write_bytes(v_ids1, uint64_t(selected) * 4u, std::as_bytes(std::span(clean_tail)));
+            g.begin();
+            g.route(subview(v_logits, 0, uint64_t(experts) * 4u),
+                    subview(v_ids1, 0, uint64_t(selected) * 4u),
+                    subview(v_w1, 0, uint64_t(selected) * 4u),
+                    selected, RouterMode::softmax, true);
+            g.planar_moe_gate_up_swiglu_m8(
+                v_lo, v_hi, v_ids1,
+                {vx, rows, channels, uint64_t(channels) * 4u},
+                {vh, rows * selected, hidden, uint64_t(hidden) * 4u},
+                experts, selected);
+            static_cast<void>(g.submit());
+
+            g.write(v_ids1, std::as_bytes(std::span(bad_init)));
+            g.begin();
+            g.route(subview(v_logits, 0, uint64_t(experts) * 4u),
+                    subview(v_ids1, 0, uint64_t(selected) * 4u),
+                    subview(v_w1, 0, uint64_t(selected) * 4u),
+                    selected, RouterMode::softmax, true);
+            refuses([&] {
+                g.planar_moe_gate_up_swiglu_m8(
+                    v_lo, v_hi, v_ids1,
+                    {vx, rows, channels, uint64_t(channels) * 4u},
+                    {vh, rows * selected, hidden, uint64_t(hidden) * 4u},
+                    experts, selected);
+            }, "partial route span with unverified poisoned host tail must refuse", "nonfinite");
+            g.abort();
+        }
+    }
+
+    // 4. Regression Test 2: ModelFiles coarse-skip bypass.
+    //    Certified Pack v3 ModelFiles must NOT skip certification for plain F32 tensors or wrong-shape planar tensors.
+    {
+        TempDir dir;
+        const auto src_path = dir.path / "source.gguf";
+        const auto pack_path = dir.path / "tokspur-pack-v3-cert-slice.asa.gguf";
+
+        // Plain F32 tensor of 68 floats (272 bytes == Q8_0 [64, 4, 1] planar_expert_bytes)
+        // containing 0x7c000000 words (upper 16 bits = 0x7c00 FP16 Inf).
+        std::vector<uint32_t> plain_words(68u, 0x7c000000u);
+        Bytes plain_bytes(plain_words.size() * 4u);
+        std::memcpy(plain_bytes.data(), plain_words.data(), plain_bytes.size());
+
+        // Valid Q5_1 [32, 4, 2] tensor (192 bytes == Q5_1 [64, 4, 1] planar_expert_bytes).
+        const auto q51_32x4x2 = grouped_fixture::weights({7u, 32u, 4u, 2u, 1u, 1u, true});
+
+        const std::vector<SyntheticTensorSpec> src_specs{
+            {"blk.0.attn_norm.weight", 0u, {68u}, plain_bytes},
+            {"blk.0.ffn_down_exps.weight", 7u, {32u, 4u, 2u}, q51_32x4x2},
+        };
+        write_gguf_shard(src_path, "qwen35moe", src_specs);
+
+        const std::vector<std::filesystem::path> src_paths{src_path};
+        const auto source = std::make_shared<const ModelFiles>(src_paths);
+        static_cast<void>(build_derived_pack_v3(source, nullptr, pack_path, 2u, 1024ull * 1024ull));
+        const auto adopted = adopt_derived_pack_v3(source, nullptr, pack_path, 2u, derived_pack::default_chunk_bytes, 1u,
+                                                   derived_pack::TrustMode::full, false);
+        need(is_certified_pack_model(adopted.model), "adopted pack v3 model must be marked certified");
+
+        MetalGraph g(metallib, 64ull << 20);
+        const std::array<TensorSlice, 2> slices{{
+            {"blk.0.attn_norm.weight", 0u, 0u},
+            {"blk.0.ffn_down_exps.weight", 0u, 0u},
+        }};
+        const auto imported = g.import_weights(adopted.model, slices);
+        const auto v_plain = imported.tensors[0];
+        const auto v_q51 = imported.tensors[1];
+
+        // Plain F32 tensor with 0x7c000000 bytes must NOT skip certification when registered as Q8_0 [64, 4, 1].
+        refuses([&] {
+            g.register_planar_matrix(v_plain, {8u, uint32_t(PlanarKind::q8_planar_v3), 64u, 4u, 1u});
+        }, "register_planar_matrix must certify and refuse plain F32 tensor containing 0x7c00 bytes", "nonfinite");
+
+        // Q5_1 [32, 4, 2] tensor registered with swapped shape [64, 4, 1] must be refused.
+        refuses([&] {
+            g.register_planar_matrix(v_q51, {7u, uint32_t(PlanarKind::q51_planar_v3), 64u, 4u, 1u});
+        }, "register_planar_matrix must refuse certified planar tensor with swapped shape [64, 4, 1]");
+
+        // Exact matching shape [32, 4, 2] succeeds cleanly.
+        g.register_planar_matrix(v_q51, {7u, uint32_t(PlanarKind::q51_planar_v3), 32u, 4u, 2u});
+        need(g.planar_matrix_count() == 1u, "matching certified planar tensor registration failed");
+    }
+    std::cout << "PASS planar_v3 shape certification and span-based route discharge\n";
 }
 
 float represented_bf16(float value) {
@@ -1025,7 +1375,7 @@ void test_union_tiles(const char* candidate, const char* control) {
             if (leg == 0) expected_bytes = g.memory().live_bytes;
             need(g.memory().live_bytes == expected_bytes, "narrow union changed prepared Metal bytes");
             std::vector<float> captured;
-            for (const uint32_t rows : {2u, 4u, 5u, 8u}) for (uint32_t pattern = 0; pattern < 3; ++pattern) {
+            for (const uint32_t rows : {2u, 3u, 4u, 5u, 8u}) for (uint32_t pattern = 0; pattern < 3; ++pattern) {
                 const uint32_t input_stride = channels + 4, hidden_stride = hidden + 4, output_stride = channels + 4;
                 std::vector<float> x(uint64_t(rows) * input_stride, sentinel);
                 std::vector<uint32_t> ids(rows * selected);
@@ -1140,8 +1490,10 @@ int main(int argc, char** argv) {
     test_sm16_bijection_and_range_refusal();
     test_cpu_pack_unpack_and_exact_operands();
     test_pack_v3_builder_adoption_and_tamper();
+    test_partial_union_gate_group(argv[1]);
     test_gpu_isolation_and_numerical_parity(argv[1]);
     test_sticky_finite_contract(argv[1]);
+    test_route_discharge_and_shape_certification(argv[1]);
     static_cast<void>(test_nax_staging(argv[1]));
     std::cout << "PASS test-planar_pack_v3 (" << total_checks << " checks)\n";
     return 0;

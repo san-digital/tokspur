@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -46,6 +47,7 @@ public:
     [[nodiscard]] std::string decode_text(std::span<const uint32_t> ids, bool skip_special = false) const;
     [[nodiscard]] size_t vocabulary_size() const { return vocabulary_.size(); }
     [[nodiscard]] size_t merge_count() const { return merges_.size(); }
+    [[nodiscard]] std::optional<uint32_t> added_token(std::string_view content) const;
     [[nodiscard]] std::vector<uint32_t> nonordinary_token_ids() const;
 
 private:

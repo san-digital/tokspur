@@ -554,9 +554,9 @@ def serve(
     ple_overlap: bool = True,
     shared_prefix_cache: bool | None = None,
     parked_lanes_mib: int | None = None,
-    mtp_lookup: str = "off",
+    mtp_lookup: str | None = None,
     mtp_lookup_match: int | None = None,
-    dflash2_lookup: str = "off",
+    dflash2_lookup: str | None = None,
     dflash2_lookup_match: int | None = None,
     tool_enum_validation: str | None = None,
     tool_arg_validation: str | None = None,
@@ -667,6 +667,8 @@ def serve(
                 native_dflash2_verify_rows = "auto"
         if output_packet == 64 and first_output_packet is None:
             first_output_packet = 8
+    if drafter == "dflash2" and native_dflash2_defer_context is None:
+        native_dflash2_defer_context = "on"
     if tool_enum_validation is None:
         tool_enum_validation = "executor" if speed_preset else "strict"
     if tool_arg_validation is None:
@@ -700,9 +702,9 @@ def serve(
     if dflash2_max_drafts is not None:
         if drafter != "dflash2":
             raise ValueError("--dflash2-max-drafts requires --drafter dflash2")
-        if dflash2_max_drafts not in range(1, 8):
+        if dflash2_max_drafts not in range(1, 16):
             raise ValueError(
-                f"Unsupported dflash2_max_drafts: {dflash2_max_drafts} (expected 1..7)"
+                f"Unsupported dflash2_max_drafts: {dflash2_max_drafts} (expected 1..15)"
             )
     if dflash2_vocab_slice is not None:
         if drafter != "dflash2":
@@ -780,13 +782,13 @@ def serve(
         raise ValueError(f"Unsupported q8_gemv_rg4 mode: {q8_gemv_rg4}")
     if q8_three_msg not in ("off", "on", "wide"):
         raise ValueError(f"Unsupported q8_three_msg mode: {q8_three_msg}")
-    if mtp_lookup not in ("off", "bypass", "hybrid"):
+    if mtp_lookup not in (None, "off", "bypass", "hybrid"):
         raise ValueError(f"Unsupported mtp_lookup mode: {mtp_lookup}")
     if mtp_lookup_match is not None and not (2 <= mtp_lookup_match <= 16):
         raise ValueError(
             f"Unsupported mtp_lookup_match: {mtp_lookup_match} (expected 2..16)"
         )
-    if dflash2_lookup not in ("off", "bypass", "hybrid"):
+    if dflash2_lookup not in (None, "off", "bypass", "hybrid"):
         raise ValueError(f"Unsupported dflash2_lookup mode: {dflash2_lookup}")
     if dflash2_lookup_match is not None and not (2 <= dflash2_lookup_match <= 16):
         raise ValueError(
@@ -810,14 +812,22 @@ def serve(
             raise ValueError(
                 "--no-mtp-draft-slice and --native-mtp-draft-slice do not apply to --drafter dflash2; use --dflash2-vocab-slice 0 for the full draft vocabulary"
             )
-        if mtp_lookup != "off" or mtp_lookup_match is not None:
+        if mtp_lookup not in (None, "off") or mtp_lookup_match is not None:
             raise ValueError("--mtp-lookup is incompatible with --drafter dflash2")
     elif dflash2_dir is not None:
         raise ValueError("--dflash2-dir requires --drafter dflash2")
     elif dflash2_precision is not None:
         raise ValueError("--dflash2-precision requires --drafter dflash2")
-    elif dflash2_lookup != "off" or dflash2_lookup_match is not None:
+    elif dflash2_lookup not in (None, "off") or dflash2_lookup_match is not None:
         raise ValueError("--dflash2-lookup requires --drafter dflash2")
+    effective_mtp_lookup = (
+        ("hybrid" if drafter == "mtp" else "off") if mtp_lookup is None else mtp_lookup
+    )
+    effective_dflash2_lookup = (
+        ("hybrid" if drafter == "dflash2" else "off")
+        if dflash2_lookup is None
+        else dflash2_lookup
+    )
 
     if checkpoint_cap_gib is not None:
         effective_checkpoint_cap_gib = float(checkpoint_cap_gib)
@@ -855,27 +865,16 @@ def serve(
                     f"{flag} has no effect unless --checkpoint-cap-gib is greater than 0"
                 )
     effective_shared_prefix = (
-        (drafter == "mtp") if shared_prefix_cache is None else bool(shared_prefix_cache)
+        True if shared_prefix_cache is None else bool(shared_prefix_cache)
     )
     if parked_lanes_mib is None:
-        effective_parked_lanes_mib = (
-            4096
-            if (
-                speed_preset
-                and drafter == "mtp"
-                and effective_shared_prefix
-                and effective_checkpoint_cap_gib <= 0.0
-            )
-            else 0
-        )
+        effective_parked_lanes_mib = 4096 if effective_shared_prefix else 0
     else:
         effective_parked_lanes_mib = int(parked_lanes_mib)
     if not (0 <= effective_parked_lanes_mib <= 16384):
         raise ValueError("--parked-lanes-mib must be between 0 and 16384")
     if effective_parked_lanes_mib > 0 and not effective_shared_prefix:
         raise ValueError("--parked-lanes-mib requires the shared prefix cache")
-    if effective_parked_lanes_mib > 0 and effective_checkpoint_cap_gib > 0.0:
-        raise ValueError("--parked-lanes-mib is incompatible with SSD checkpoints")
 
     state = private_dir(ROOT / ".tokspur/state")
     with state_lock():
@@ -1343,21 +1342,29 @@ def serve(
             *(["--native-qsa-prefill-fused", "on"] if qsa_prefill_fused else []),
             *(["--native-hc-consumer-fused", "on"] if hc_consumer_fused else []),
             *(["--native-ple-overlap", "on"] if ple_overlap else []),
-            *(["--shared-prefix-cache", "on"] if effective_shared_prefix else []),
+            "--shared-prefix-cache",
+            "on" if effective_shared_prefix else "off",
+            "--native-parked-lanes-mib",
+            str(effective_parked_lanes_mib),
             *(
-                ["--native-parked-lanes-mib", str(effective_parked_lanes_mib)]
-                if effective_parked_lanes_mib > 0
+                ["--native-mtp-lookup", effective_mtp_lookup]
+                if (
+                    effective_mtp_lookup != "off"
+                    or (drafter == "mtp" and mtp_lookup == "off")
+                )
                 else []
             ),
-            *(["--native-mtp-lookup", mtp_lookup] if mtp_lookup != "off" else []),
             *(
                 ["--native-mtp-lookup-match", str(mtp_lookup_match)]
                 if mtp_lookup_match is not None
                 else []
             ),
             *(
-                ["--native-dflash2-lookup", dflash2_lookup]
-                if dflash2_lookup != "off"
+                ["--native-dflash2-lookup", effective_dflash2_lookup]
+                if (
+                    effective_dflash2_lookup != "off"
+                    or (drafter == "dflash2" and dflash2_lookup == "off")
+                )
                 else []
             ),
             *(
@@ -1739,9 +1746,9 @@ def main() -> None:
         "--native-dflash2-max-drafts",
         dest="dflash2_max_drafts",
         type=int,
-        choices=range(1, 8),
+        choices=range(1, 16),
         default=None,
-        help="Opt-in DFlash2 maximum drafted proposals per round (1..7)",
+        help="Opt-in DFlash2 maximum drafted proposals per round (1..15)",
     )
     s.add_argument(
         "--dflash2-vocab-slice",
@@ -1814,7 +1821,7 @@ def main() -> None:
         "--native-dflash2-defer-context",
         choices=["off", "on"],
         default=None,
-        help="Opt-in native deferred DFlash2 context (default: off)",
+        help="Deferred DFlash2 context mode (default: on for dflash2)",
     )
     s.add_argument(
         "--native-dflash2-verify-rows",
@@ -1886,19 +1893,19 @@ def main() -> None:
         "--shared-prefix-cache",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Host-RAM shared system-prefix cache (default: on for mtp)",
+        help="Host-RAM shared system-prefix cache (default: on)",
     )
     s.add_argument(
         "--parked-lanes-mib",
         type=int,
         default=None,
-        help="Host RAM for conversations parked on a switch (0..16384, default: 0, 4096 with the MTP speed preset and shared prefix cache)",
+        help="Host RAM for conversations parked on a switch (0..16384, default: 4096 when shared prefix cache is enabled)",
     )
     s.add_argument(
         "--mtp-lookup",
         choices=["off", "bypass", "hybrid"],
-        default="off",
-        help="Opt-in MTP prompt-lookup mode (default: off)",
+        default=None,
+        help="MTP prompt-lookup mode (default: hybrid for mtp)",
     )
     s.add_argument(
         "--mtp-lookup-match",
@@ -1911,8 +1918,8 @@ def main() -> None:
     s.add_argument(
         "--dflash2-lookup",
         choices=["off", "bypass", "hybrid"],
-        default="off",
-        help="Opt-in DFlash2 prompt-lookup mode (default: off)",
+        default=None,
+        help="DFlash2 prompt-lookup mode (default: hybrid for dflash2)",
     )
     s.add_argument(
         "--dflash2-lookup-match",

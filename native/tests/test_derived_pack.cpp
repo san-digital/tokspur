@@ -1193,13 +1193,14 @@ void test_v3_publication(const std::filesystem::path& dir, std::shared_ptr<const
     const DirFd pack_dir(dir);
     const auto& manifest = built.verified.manifest_sha256;
     const auto sealed = [&](SealScope needed = scope_both) {
-        return read_local_seal(pack_dir.fd, "block.asa.gguf", manifest, identity_at(output), needed);
+        return read_local_seal(pack_dir.fd, "block.asa.gguf", manifest, identity_at(output), needed,
+                               SealCertification::dm_fp16_v1);
     };
     require(built.verified.local_seal == LocalSealUse::not_consulted && built.verified.pack_identity == identity_at(output) &&
             built.verified.compared == scope_both &&
-            read_text(seal) == encode_local_seal({manifest, identity_at(output), scope_both}) && sealed().vouches &&
-            sealed(scope_target).vouches && sealed(scope_mtp).vouches && sealed(scope_none).vouches,
-            "published v3 seal records the verified pack file and both sources");
+            read_text(seal) == encode_local_seal({manifest, identity_at(output), scope_both, SealCertification::dm_fp16_v1}) &&
+            sealed().vouches && sealed(scope_target).vouches && sealed(scope_mtp).vouches && sealed(scope_none).vouches,
+            "published v3 seal records the verified pack file, both sources, and dm-fp16-v1 certification");
     struct stat pack_st{}, seal_st{};
     require(::stat(output.c_str(), &pack_st) == 0 && ::stat(seal.c_str(), &seal_st) == 0 &&
             (pack_st.st_mode & 0777) == 0444 && (seal_st.st_mode & 0777) == 0444, "v3 pack and seal immutable");
@@ -1212,33 +1213,36 @@ void test_v3_publication(const std::filesystem::path& dir, std::shared_ptr<const
     require(repaired.existed && repaired.verified.manifest_sha256 == built.verified.manifest_sha256 &&
             ::stat(output.c_str(), &same) == 0 && same.st_ino == pack_st.st_ino, "missing v3 seal repaired in place");
 
-    // A sound seal for this manifest that is not current is replaced, after the full verification.
-    for (const auto& stale : {manifest + "\n", manifest, encode_local_seal({manifest, {}, scope_both}),
+    // A sound seal for this manifest that is not current (including uncertified seal-v2) is replaced after full verification.
+    for (const auto& stale : {manifest + "\n", manifest,
+                              encode_local_seal({manifest, {}, scope_both, SealCertification::dm_fp16_v1}),
+                              encode_local_seal({manifest, identity_at(output), scope_both, SealCertification::none}),
                               // The right file, compared with fewer sources than the publisher just compared.
-                              encode_local_seal({manifest, identity_at(output), scope_target}),
-                              encode_local_seal({manifest, identity_at(output), scope_mtp}),
-                              encode_local_seal({manifest, identity_at(output), scope_none})}) {
+                              encode_local_seal({manifest, identity_at(output), scope_target, SealCertification::dm_fp16_v1}),
+                              encode_local_seal({manifest, identity_at(output), scope_mtp, SealCertification::dm_fp16_v1}),
+                              encode_local_seal({manifest, identity_at(output), scope_none, SealCertification::dm_fp16_v1})}) {
         put_text(seal, stale);
         require(::stat(seal.c_str(), &seal_st) == 0 && !sealed().vouches && sealed().names_manifest, "stale seal for this manifest");
         const auto resealed = publish();
         require(resealed.existed && sealed().vouches && ::stat(seal.c_str(), &same) == 0 && same.st_ino != seal_st.st_ino &&
                 (same.st_mode & 0777) == 0444 && count_entries(dir) == 2 && resealed.verified.compared == scope_both &&
-                read_text(seal) == encode_local_seal({manifest, identity_at(output), scope_both}),
-                "stale seal for this manifest is replaced by a current one for both sources");
+                read_text(seal) == encode_local_seal({manifest, identity_at(output), scope_both, SealCertification::dm_fp16_v1}),
+                "stale or uncertified v2 seal for this manifest is upgraded to certified v3 seal");
     }
     // Anything else at the seal name is refused and left exactly as it was.
     const std::string other_manifest(64, '0');
-    for (const auto& foreign : {encode_local_seal({other_manifest, identity_at(output), scope_both}), std::string("garbage\n")}) {
+    for (const auto& foreign : {encode_local_seal({other_manifest, identity_at(output), scope_both, SealCertification::dm_fp16_v1}),
+                                std::string("garbage\n")}) {
         put_text(seal, foreign);
         require(::stat(seal.c_str(), &seal_st) == 0, "stat foreign seal");
         refuses([&] { static_cast<void>(publish()); }, "seal for another manifest refused");
         require(::stat(seal.c_str(), &same) == 0 && same.st_ino == seal_st.st_ino && read_text(seal) == foreign,
                 "seal for another manifest never replaced");
     }
-    put_text(seal, encode_local_seal({manifest, identity_at(output), scope_both}), 0644);
-    require(::stat(seal.c_str(), &seal_st) == 0, "stat writable seal");
+    put_text(seal, encode_local_seal({manifest, identity_at(output), scope_both, SealCertification::dm_fp16_v1}), 0644);
+    require(::stat(seal.c_str(), &seal_st) == 0 && (seal_st.st_mode & S_IWUSR), "fixture seal must be owner-writable");
     refuses([&] { static_cast<void>(publish()); }, "writable v3 seal refused");
-    require(::stat(seal.c_str(), &same) == 0 && same.st_ino == seal_st.st_ino && (same.st_mode & 0777) == 0644,
+    require(::stat(seal.c_str(), &same) == 0 && same.st_ino == seal_st.st_ino && same.st_mode == seal_st.st_mode,
             "writable seal never replaced");
 
     require(std::filesystem::remove(seal), "remove valid seal for mismatch test");
@@ -1266,6 +1270,115 @@ void test_v3_publication(const std::filesystem::path& dir, std::shared_ptr<const
     refuses([&] { static_cast<void>(publish()); }, "tampered v3 payload cannot be resealed");
     require(!std::filesystem::exists(seal) && ::stat(output.c_str(), &same) == 0 &&
             same.st_ino == pack_st.st_ino, "corrupt pack preserved and no new seal issued");
+}
+
+void test_v3_static_dm_and_fp16_certification(const std::filesystem::path& dir) {
+    using namespace tokspur::planar_v3;
+    std::filesystem::create_directory(dir);
+
+    // 1. Direct pack_expert_planar_v3 & certify_expert_planar_v3 reject NaN/Inf dm and FP16-staging overflows.
+    for (const uint32_t st : {12u, 13u, 7u, 8u}) {
+        const uint32_t cols = (st == 12u || st == 13u) ? 256u : 32u;
+        const uint32_t rows = (st == 8u) ? 8u : 4u;
+        const auto spec = make_expert_spec(st, cols, rows);
+        const Bytes ok_gguf(spec.source_expert_bytes, std::byte{0});
+        Bytes ok_planar(spec.planar_expert_bytes, std::byte{0});
+        pack_expert_planar_v3(spec, ok_gguf, ok_planar);
+        certify_expert_planar_v3(spec, ok_planar);
+
+        for (const uint16_t bad_dm : {uint16_t(0x7e00u), uint16_t(0x7c00u), uint16_t(0xfc00u)}) {
+            Bytes bad_gguf = ok_gguf;
+            std::memcpy(bad_gguf.data(), &bad_dm, 2);
+            Bytes scratch(spec.planar_expert_bytes, std::byte{0});
+            refuses([&] { pack_expert_planar_v3(spec, bad_gguf, scratch); },
+                    "pack_expert_planar_v3 must reject nonfinite dm");
+            Bytes bad_planar = ok_planar;
+            std::memcpy(bad_planar.data() + spec.dm_offset, &bad_dm, 2);
+            refuses([&] { certify_expert_planar_v3(spec, bad_planar); },
+                    "certify_expert_planar_v3 must reject nonfinite dm");
+        }
+
+        // Large finite scale 65504 (0x7bff) with q=0 is safe; with large q it overflows FP16 staging!
+        const uint16_t large_h = 0x7bffu;
+        Bytes zero_q_planar = ok_planar;
+        std::memcpy(zero_q_planar.data() + spec.dm_offset, &large_h, 2);
+        certify_expert_planar_v3(spec, zero_q_planar);
+
+        Bytes overflow_planar = zero_q_planar;
+        if (st == 12u || st == 13u) {
+            overflow_planar[size_t(spec.sm_offset)] = std::byte{63};
+            std::fill_n(overflow_planar.begin() + std::ptrdiff_t(spec.qs_offset), 128u, std::byte{0x7f});
+        } else if (st == 7u) {
+            std::fill_n(overflow_planar.begin() + std::ptrdiff_t(spec.qs_offset), 16u, std::byte{0x7f});
+        } else {
+            std::fill_n(overflow_planar.begin() + std::ptrdiff_t(spec.qs_offset), 32u, std::byte{0x7f});
+        }
+        refuses([&] { certify_expert_planar_v3(spec, overflow_planar); },
+                "certify_expert_planar_v3 must reject FP16 staging overflow");
+
+        if (st == 12u || st == 13u) {
+            Bytes bad_sm = ok_planar;
+            bad_sm[size_t(spec.sm_offset)] = std::byte{64};
+            refuses([&] { certify_expert_planar_v3(spec, bad_sm); },
+                    "certify_expert_planar_v3 must reject sm > 63");
+        }
+    }
+
+    // 2. build_derived_pack_v3 refuses GGUF source containing FP16-staging overflow.
+    {
+        Bytes bad_q51 = make_valid_q51_rows(640, 8, 9);
+        const uint16_t large_h = 0x7bffu;
+        std::memcpy(bad_q51.data(), &large_h, 2);
+        std::fill_n(bad_q51.begin() + 8, 16, std::byte{0x7f});
+        const std::vector<SyntheticTensorSpec> bad_tensors{
+            {"blk.0.ffn_down_exps.weight", 7, {640, 4, 2}, std::move(bad_q51)},
+        };
+        const auto bad_src_path = dir / "bad-fp16-src.gguf";
+        const auto bad_mtp_path = dir / "bad-fp16-mtp.gguf";
+        write_gguf_shard(bad_src_path, "qwen35moe", bad_tensors);
+        write_gguf_shard(bad_mtp_path, "qwen35moe", {{"blk.48.attn_q.weight", 8, {256, 8}, make_valid_q8_rows(256, 8, 1)}});
+        const auto bad_src = std::make_shared<const ModelFiles>(std::vector<std::filesystem::path>{bad_src_path});
+        const auto bad_mtp = std::make_shared<const ModelFiles>(std::vector<std::filesystem::path>{bad_mtp_path});
+        refuses([&] {
+            static_cast<void>(build_derived_pack_v3(bad_src, bad_mtp, dir / "bad-fp16-out.asa.gguf", 2, 0, 32768));
+        }, "build_derived_pack_v3 must reject FP16-staging overflow in source");
+    }
+
+    // 3. adopt_derived_pack_v3 certifies pack_only tensors (when mtp_sidecar == nullptr) & rejects corrupt blk.48.* dm.
+    {
+        const auto ok_src_path = dir / "src-ok.gguf";
+        const auto ok_mtp_path = dir / "mtp-ok.gguf";
+        const auto pk_path = dir / "pack-ok.asa.gguf";
+        const std::vector<SyntheticTensorSpec> src_t{
+            {"blk.0.ffn_down_exps.weight", 7, {640, 4, 2}, make_valid_q51_rows(640, 4 * 2, 3)},
+        };
+        const std::vector<SyntheticTensorSpec> mtp_t{
+            {"blk.48.ffn_down_exps.weight", 7, {640, 4, 2}, make_valid_q51_rows(640, 4 * 2, 4)},
+        };
+        write_gguf_shard(ok_src_path, "qwen35moe", src_t);
+        write_gguf_shard(ok_mtp_path, "qwen35moe", mtp_t);
+        const auto src_m = std::make_shared<const ModelFiles>(std::vector<std::filesystem::path>{ok_src_path});
+        const auto mtp_m = std::make_shared<const ModelFiles>(std::vector<std::filesystem::path>{ok_mtp_path});
+        const auto plan = build_derived_pack_v3(src_m, mtp_m, pk_path, 2, 0, 32768);
+        const auto adopted_pack_only = adopt_pack_v3_with_plan(plan, src_m, nullptr, pk_path, 2, 32768, 1,
+                                                               TrustMode::full, false);
+        require(is_certified_pack_model(adopted_pack_only.model),
+                "adopted Pack v3 model must be registered as certified");
+    }
+
+    // 4. Legacy tokspur-local-seal-v2 cannot vouch for Pack v3.
+    {
+        const std::string manifest(64, 'a');
+        const PackFileIdentity id{111, 222, 1000, 0, 1000, 0, 1000, 0};
+        const auto v2_seal = encode_local_seal({manifest, id, scope_both, SealCertification::none});
+        const auto v3_seal = encode_local_seal({manifest, id, scope_both, SealCertification::dm_fp16_v1});
+        require(local_seal_vouches(v2_seal, manifest, id, scope_both, SealCertification::none),
+                "v2 seal vouches when no extra certification required (Pack v2)");
+        require(!local_seal_vouches(v2_seal, manifest, id, scope_both, SealCertification::dm_fp16_v1),
+                "uncertified v2 seal must NOT vouch for Pack v3 dm_fp16_v1");
+        require(local_seal_vouches(v3_seal, manifest, id, scope_both, SealCertification::dm_fp16_v1),
+                "certified v3 seal vouches for Pack v3 dm_fp16_v1");
+    }
 }
 
 } // namespace
@@ -1312,6 +1425,7 @@ int main(int argc, char** argv) {
         test_local_seal_files(root.path / "seal-files");
         test_local_seal_adoption(root.path / "seal-adoption");
         test_v3_publication(root.path / "v3", source, mtp);
+        test_v3_static_dm_and_fp16_certification(root.path / "v3-cert");
         test_v3_authentication_sources(root.path / "v3-auth");
 
         // 1. Planning checks

@@ -1,4 +1,5 @@
 #include "tokspur/graph.hpp"
+#include "tokspur/mtp_anchor_state.hpp"
 #include "tokspur/sampled_path.hpp"
 #include "tokspur/sampling.hpp"
 
@@ -121,6 +122,14 @@ void test_gpu_and_cpu_parity(MetalGraph& graph) {
             logits[vocab - 1u] = +0.0f;
             for (uint32_t c = 0; c < vocab - 2u; ++c) {
                 if (c != 3u && c != 19u && c != 31u) logits[c] = -100.0f - float(c % 11u);
+            }
+        }
+        if (vocab > gpu_logit_topk_tile_span) {
+            auto tied = std::span(logits).subspan(vocab, vocab);
+            std::fill(tied.begin(), tied.end(), -1.0f);
+            for (uint32_t rank = 0; rank < gpu_logit_topk_capacity; ++rank) {
+                const size_t col = size_t(rank) * (vocab - 1) / (gpu_logit_topk_capacity - 1);
+                tied[col] = rank % 2 ? +0.0f : -0.0f;
             }
         }
 
@@ -251,6 +260,17 @@ void test_refusal_parity(MetalGraph& graph) {
         static_cast<void>(decide_sampled_path_topk(ident, std::span(&prop, 1), ident, target_topk, pol, 16u, {}, rng_clean, 0ull));
     }, "subnormal sampling logit");
 
+    std::fill_n(logits.begin(), vocab, -std::numeric_limits<float>::infinity());
+    graph.write(logits_gpu, std::as_bytes(std::span(logits)));
+    run_gpu_logit_topk(graph, GpuRowsF32{logits_gpu, rows, vocab, uint64_t(vocab) * sizeof(float)},
+                       scratch_gpu, out_gpu, gpu_rows);
+    const auto& empty = gpu_rows.front();
+    check(empty.count == 0 && empty.first_nonfinite_col == 0 && empty.first_subnormal_col == 0xffffffffu,
+          "all-nonfinite row reported a winning token or the wrong fault");
+    for (uint32_t rank = 0; rank < gpu_logit_topk_capacity; ++rank) {
+        check(empty.ids[rank] == 0 && float_bits(empty.logits[rank]) == 0xff800000u, "empty top-k slot changed");
+    }
+
     graph.release(out_gpu);
     graph.release(scratch_gpu);
     graph.release(logits_gpu);
@@ -376,6 +396,33 @@ void test_decide_sampled_path_parity_and_bench(MetalGraph& graph) {
     graph.release(logits_gpu);
 }
 
+void test_anchor_entropy_topk_parity(MetalGraph& graph) {
+    constexpr uint32_t vocab = 4096u;
+    std::vector<float> logits(vocab, -8.0f);
+    logits[11] = 8.0f;
+    logits[22] = 6.5f;
+    logits[33] = 5.0f;
+
+    const auto logits_gpu = graph.upload(std::as_bytes(std::span(logits)), "test_logit_topk.ent_logits", false);
+    const auto scratch_gpu = graph.zeros(MetalGraph::logit_topk_scratch_bytes(1, vocab), "test_logit_topk.ent_scratch");
+    const auto out_gpu = graph.zeros(MetalGraph::logit_topk_output_bytes(1), "test_logit_topk.ent_out");
+    std::vector<GpuLogitTopKRow> gpu_rows(1);
+    run_gpu_logit_topk(graph, GpuRowsF32{logits_gpu, 1, vocab, uint64_t(vocab) * sizeof(float)},
+                       scratch_gpu, out_gpu, gpu_rows);
+
+    const SamplingPolicy pol{0.8, 32u, 0.95, 0.0};
+    const auto m_topk = compute_anchor_entropy_metrics(gpu_rows[0], pol);
+    const auto m_span = compute_anchor_entropy_metrics(logits, pol);
+    check(m_topk.valid && m_span.valid, "entropy metrics invalid on finite logits");
+    check(std::abs(m_topk.top1_prob - m_span.top1_prob) < 1e-4, "top1_prob mismatch between topk and dense span");
+    check(std::abs(m_topk.top2_logit_margin - m_span.top2_logit_margin) < 1e-4, "top2_logit_margin mismatch between topk and dense span");
+    check(std::abs(m_topk.entropy_nats - m_span.entropy_nats) < 1e-2, "entropy_nats mismatch between topk and dense span");
+
+    graph.release(out_gpu);
+    graph.release(scratch_gpu);
+    graph.release(logits_gpu);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -387,6 +434,7 @@ int main(int argc, char** argv) {
         test_gpu_and_cpu_parity(graph);
         test_refusal_parity(graph);
         test_decide_sampled_path_parity_and_bench(graph);
+        test_anchor_entropy_topk_parity(graph);
         check(graph.memory().live_bytes == initial_bytes, "test_logit_topk leaked GPU buffers");
         return 0;
     } catch (const std::exception& error) {
