@@ -19,6 +19,17 @@ if (dflash2 && mtp_depth == 7) {
     const auto anchor = pending ? pending->id : sample(sampling_distribution(current.logits, sampler.options().policy), random);
     const auto anchor_score = pending ? pending->source_logit : current.logits[anchor];
     const bool anchor_stop = std::find(job.stops.begin(), job.stops.end(), anchor) != job.stops.end();
+    const auto* carried_metrics = pending ? mtp_anchor.peek_metrics(base) : nullptr;
+    const AnchorEntropyMetrics anchor_metrics = carried_metrics
+        ? *carried_metrics
+        : ((!pending && !current.logits.empty())
+            ? compute_anchor_entropy_metrics(current.logits, sampler.options().policy)
+            : AnchorEntropyMetrics{});
+    const uint32_t burst_cap_k = measured_controller ? std::min(7u, dflash2->max_drafts()) : dflash2->effective_max_drafts();
+    const uint32_t max_overflow_cap = dflash2_verify16 ? 15u : 7u;
+    const AnchorWidthGate width_gate = decide_anchor_width_gate(
+        anchor_metrics, mtp_depth, mtp_lookup_mode != MtpLookupMode::off,
+        (dflash2_verify16 && burst_cap_k > 7u) ? 16u : 8u);
     MeasuredRoundObserver measured_observer(
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
         carrier_mode == CarrierDiagnosticMode::off ? measured_controller.get() : nullptr,
@@ -34,6 +45,7 @@ if (dflash2 && mtp_depth == 7) {
     const bool is_ordinary_step = compute_remaining < 2 || max_context_steps < 2 || anchor_stop || measured_action == 1;
 
     if (is_ordinary_step) {
+        dflash2->reset_burst_streak();
         advance(anchor);
         sampler.publish(std::move(random));
         if (pending) ++mtp_carried_anchors;
@@ -48,7 +60,7 @@ if (dflash2 && mtp_depth == 7) {
             {"entropy_words", Json::integer(sampler.random().words_consumed())}, {"gpu_profile", Json()}})).dump() << std::endl; }
         if (is_v2) {
             mtp_generation.commit_round(1, std::span(&anchor, 1), std::span(&anchor_score, 1),
-                                       base, stack.position(), 1, anchor_stop, 7);
+                                       base, stack.position(), 1, anchor_stop, max_overflow_cap);
         }
         if (anchor_stop) {
             stop_id = anchor;
@@ -59,7 +71,11 @@ if (dflash2 && mtp_depth == 7) {
         continue;
     }
 
-    const uint32_t max_k = std::min({7u, dflash2->max_drafts(), compute_remaining - 1u, max_context_steps - 1u});
+    const uint32_t gated_cap_k = (width_gate.max_dflash2_verify_rows <= 8u || !dflash2_verify16)
+        ? std::min(7u, burst_cap_k)
+        : std::min(15u, burst_cap_k);
+    const uint32_t max_k = std::min({gated_cap_k, compute_remaining - 1u, max_context_steps - 1u});
+    const uint32_t lookup_max_k = std::min(7u, max_k);
     dequantize(token_table.type, files.tensor_bytes(token_table.name).subspan(uint64_t(anchor) * row_bytes, row_bytes),
         std::span(mtp_candidate_rows).first(2560));
 
@@ -68,10 +84,10 @@ if (dflash2 && mtp_depth == 7) {
     if (mtp_lookup && mtp_lookup_valid) {
         require(mtp_lookup->committed_length() == base, "DFlash2 lookup prefix differs from target frontier");
         mtp_lookup->append(mtp_lookup->epoch(), base, std::span(&anchor, 1));
-        if (mtp_lookup_mode != MtpLookupMode::off && max_k >= 1) {
+        if (max_k <= 7u && width_gate.allow_lookup && width_gate.max_lookup_width >= 1 && lookup_max_k >= 1) {
             const auto prop = mtp_lookup->propose(mtp_lookup->epoch(), base + 1);
             if (prop.outcome == LookupOutcome::proposed && prop.count >= 1) {
-                const uint32_t limit = std::min(prop.count, max_k);
+                const uint32_t limit = std::min({prop.count, lookup_max_k, width_gate.max_lookup_width});
                 uint32_t usable = 0;
                 for (uint32_t t = 0; t < limit; ++t) {
                     lookup_proposed[t] = prop.tokens[t];
@@ -80,7 +96,7 @@ if (dflash2 && mtp_depth == 7) {
                         break;
                     }
                 }
-                if (mtp_lookup_mode == MtpLookupMode::hybrid || usable >= 2 || (usable == 1 && max_k == 1)) {
+                if (mtp_lookup_mode == MtpLookupMode::hybrid || usable >= 2 || (usable == 1 && lookup_max_k == 1)) {
                     lookup_bypass_k = usable;
                 }
             }
@@ -124,9 +140,12 @@ if (dflash2 && mtp_depth == 7) {
         }
         const auto head_started = Clock::now();
         measured_observer.drafted_rows = max_k + 1;
-        draft = dflash2->draft_block8(max_k, base, anchor, std::span(mtp_candidate_rows).first(2560),
-            sampler.options().policy, random, dflash2->adaptive_budget());
-        if (measured_controller) measured_observer.probabilities = dflash_measured_probabilities(*dflash2, draft.confidences);
+        draft = dflash2->draft_block(max_k, base, anchor, std::span(mtp_candidate_rows).first(2560),
+            sampler.options().policy, random, dflash2->adaptive_budget(), width_gate.max_dflash2_verify_rows);
+        if (measured_controller) {
+            measured_observer.probabilities = dflash_measured_probabilities(
+                *dflash2, std::span<const float, 7>(draft.confidences.data(), 7));
+        }
         draft_wall = milliseconds(head_started);
         draft_gpu = draft.batch.gpu_ms;
         if (ple_async) {
@@ -155,7 +174,7 @@ if (dflash2 && mtp_depth == 7) {
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
         if (carrier_mode == CarrierDiagnosticMode::off) {
 #endif
-        dflash2->observe_verify_round(draft.confidences, 1u, 0u, measured_controller ? 0 : controller_observed_decode_ms(round_wall), true);
+        dflash2->observe_verify_round_any(draft.confidences, 1u, 0u, measured_controller ? 0 : controller_observed_decode_ms(round_wall), true);
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
         }
 #endif
@@ -167,12 +186,12 @@ if (dflash2 && mtp_depth == 7) {
             {"entropy_words", Json::integer(sampler.random().words_consumed())}, {"gpu_profile", Json()}})).dump() << std::endl; }
         if (is_v2) {
             mtp_generation.commit_round(1, std::span(&anchor, 1), std::span(&anchor_score, 1),
-                                       base, stack.position(), 1, false, 7);
+                                       base, stack.position(), 1, false, max_overflow_cap);
         }
         continue;
     }
 
-    std::array<uint32_t, 8> candidates{};
+    std::array<uint32_t, 16> candidates{};
     candidates[0] = anchor;
     for (uint32_t t = 0; t < k; ++t) candidates[1 + t] = draft.proposals[t].selected;
     const auto cand_span = std::span<const uint32_t>(candidates).first(1 + k);
@@ -190,24 +209,40 @@ if (dflash2 && mtp_depth == 7) {
         }
         static_cast<void>(ple_guard.finish());
     } else {
-        const auto staged = stack.sampled_verification8_lookups(cand_span);
-        std::array<uint64_t, 128> batch_ple_rows{};
-        for (uint32_t t = 0; t <= k; ++t) {
-            if (t) {
-                dequantize(token_table.type, files.tensor_bytes(token_table.name).subspan(uint64_t(candidates[t]) * row_bytes, row_bytes),
-                    std::span(mtp_candidate_rows).subspan(uint64_t(t) * 2560, 2560));
+        std::array<uint64_t, 256> batch_ple_rows{};
+        if (dflash2_verify16) {
+            const auto staged = stack.sampled_verification16_lookups(cand_span);
+            for (uint32_t t = 0; t <= k; ++t) {
+                if (t) {
+                    dequantize(token_table.type, files.tensor_bytes(token_table.name).subspan(uint64_t(candidates[t]) * row_bytes, row_bytes),
+                        std::span(mtp_candidate_rows).subspan(uint64_t(t) * 2560, 2560));
+                }
+                std::copy(staged[t].rows.begin(), staged[t].rows.end(), batch_ple_rows.begin() + ptrdiff_t(t * 16));
             }
-            std::copy(staged[t].rows.begin(), staged[t].rows.end(), batch_ple_rows.begin() + ptrdiff_t(t * 16));
+        } else {
+            const auto staged = stack.sampled_verification8_lookups(cand_span);
+            for (uint32_t t = 0; t <= k; ++t) {
+                if (t) {
+                    dequantize(token_table.type, files.tensor_bytes(token_table.name).subspan(uint64_t(candidates[t]) * row_bytes, row_bytes),
+                        std::span(mtp_candidate_rows).subspan(uint64_t(t) * 2560, 2560));
+                }
+                std::copy(staged[t].rows.begin(), staged[t].rows.end(), batch_ple_rows.begin() + ptrdiff_t(t * 16));
+            }
         }
         cache.gather(std::span<const uint64_t>(batch_ple_rows).first(size_t(1 + k) * 16),
                      std::span(mtp_candidate_memory).first(uint64_t(1 + k) * 2560));
     }
 
     TargetDFlash2Selection selector{base, anchor, draft, sampler.options().policy, job.stops, {}, {}, shape.attention.capacity};
-    const auto verified = stack.verify_sampled8(cand_span,
-        std::span(mtp_candidate_rows).first(uint64_t(1 + k) * 2560),
-        std::span(mtp_candidate_memory).first(uint64_t(1 + k) * 2560),
-        base, {TargetDFlash2Selection::choose, &selector, current_allow_topk()});
+    const auto verified = dflash2_verify16
+        ? stack.verify_sampled16(cand_span,
+            std::span(mtp_candidate_rows).first(uint64_t(1 + k) * 2560),
+            std::span(mtp_candidate_memory).first(uint64_t(1 + k) * 2560),
+            base, {TargetDFlash2Selection::choose, &selector, current_allow_topk()})
+        : stack.verify_sampled8(cand_span,
+            std::span(mtp_candidate_rows).first(uint64_t(1 + k) * 2560),
+            std::span(mtp_candidate_memory).first(uint64_t(1 + k) * 2560),
+            base, {TargetDFlash2Selection::choose, &selector, current_allow_topk()});
     require(selector.decision && selector.publication &&
         verified.committed == 1 + selector.decision->accepted &&
         selector.publication->prefix == stack.position(), "DFlash2 target/decision publication differs");
@@ -257,11 +292,24 @@ if (dflash2 && mtp_depth == 7) {
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
         if (carrier_mode == CarrierDiagnosticMode::off) {
 #endif
-        dflash2->observe_verify_round(draft.confidences, 1u + k, decision.accepted, measured_controller ? 0 : controller_observed_decode_ms(round_wall), !decision.stopped);
+        dflash2->observe_verify_round_any(draft.confidences, 1u + k, decision.accepted, measured_controller ? 0 : controller_observed_decode_ms(round_wall), !decision.stopped);
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
         }
 #endif
+    } else {
+        dflash2->note_lookup_round(k, decision.accepted, decision.stopped);
     }
+#ifdef TOKSPUR_PRIVATE_DFLASH2_PHASE_TIMING
+    auto& totals = dflash2_phase_totals[1u + k];
+    ++totals.rounds;
+    totals.accepted += decision.accepted;
+    totals.round_wall_ms += round_wall;
+    totals.draft_wall_ms += draft_wall;
+    totals.verification_wall_ms += verified.verification.wall_ms;
+    totals.verification_gpu_ms += verified.verification.gpu_ms;
+    totals.recovery_wall_ms += verified.recovery.wall_ms;
+    totals.recovery_gpu_ms += verified.recovery.gpu_ms;
+#endif
     batch_wall += round_wall;
     batch_gpu += verified.verification.gpu_ms + verified.recovery.gpu_ms + draft_gpu + mtp_prime_gpu_ms - prime_before;
     Json::Object round_obj{{"event", Json("mtp_round")}, {"base", Json::integer(base)},
@@ -288,8 +336,8 @@ if (dflash2 && mtp_depth == 7) {
     round_obj.emplace_back("timings_qualified", Json(false));
     std::cout << decorate(Json(std::move(round_obj))).dump() << '\n';
 
-    std::array<uint32_t, 8> round_ids{};
-    std::array<float, 8> round_scores{};
+    std::array<uint32_t, 16> round_ids{};
+    std::array<float, 16> round_scores{};
     for (uint32_t t = 0; t < count; ++t) {
         round_ids[t] = t ? decision.tokens[t - 1].id : anchor;
         round_scores[t] = t ? decision.tokens[t - 1].source_logit : anchor_score;
@@ -300,7 +348,7 @@ if (dflash2 && mtp_depth == 7) {
         mtp_generation.commit_round(count, std::span(round_ids).first(count),
                                    std::span(round_scores).first(count),
                                    base, stack.position(), emitted_now,
-                                   selector.publication->stopped, 7);
+                                   selector.publication->stopped, max_overflow_cap);
     }
     for (uint32_t t = 0; t < emitted_now; ++t) {
         TOKSPUR_CARRIER_PHASE(publication);

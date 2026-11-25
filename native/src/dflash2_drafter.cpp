@@ -281,12 +281,19 @@ SampledSparseLaw build_selector_law(uint32_t vocab_size, std::span<const uint32_
 
 DFlash2SelectorProposals dflash2_selector_proposals(std::span<const std::byte> selector_out, uint32_t count,
     uint32_t vocabulary, uint32_t base_position, uint32_t anchor_id, const SamplingPolicy& policy, const SamplingRng& after_anchor) {
-    require(count >= 1u && count <= 7u && anchor_id < vocabulary &&
-        selector_out.size() == 7ull * 16ull * (sizeof(uint32_t) + sizeof(float)) + 7ull * 256ull * sizeof(float),
+    const uint64_t max_pos = count <= 7u ? 7ull : 15ull;
+    require(count >= 1u && count <= 15u && anchor_id < vocabulary &&
+        selector_out.size() == max_pos * 16ull * (sizeof(uint32_t) + sizeof(float)) + max_pos * 256ull * sizeof(float),
         "DFlash2 selector result geometry mismatch");
     const auto* candidates = reinterpret_cast<const uint32_t*>(selector_out.data());
-    const auto* unary = reinterpret_cast<const float*>(selector_out.data() + 7ull * 16ull * sizeof(uint32_t));
-    const auto* tables = reinterpret_cast<const float*>(selector_out.data() + 7ull * 16ull * (sizeof(uint32_t) + sizeof(float)));
+    const auto* unary = reinterpret_cast<const float*>(selector_out.data() + max_pos * 16ull * sizeof(uint32_t));
+    const auto* tables = reinterpret_cast<const float*>(selector_out.data() + max_pos * 16ull * (sizeof(uint32_t) + sizeof(float)));
+    for (uint32_t i = 0; i < count * 16u; ++i) {
+        require(finite_bits(unary[i]), "nonfinite DFlash2 selector unary score");
+    }
+    for (uint32_t i = 0; i < count * 16u * 16u; ++i) {
+        require(finite_bits(tables[i]), "nonfinite DFlash2 selector edge score");
+    }
 
     DFlash2SelectorProposals out{};
     SamplingRng trial_rng = after_anchor;
@@ -332,14 +339,17 @@ DFlash2SelectorProposals dflash2_selector_proposals(std::span<const std::byte> s
     return out;
 }
 
-void DFlash2ContextStage::prepare(GpuView storage, uint32_t width) {
-    require(!storage_.owner && storage.owner && width && width <= 16u * 2560u && storage.bytes == uint64_t(8) * width * sizeof(float), "DFlash2 pending context storage bound");
+void DFlash2ContextStage::prepare(GpuView storage, uint32_t width, uint32_t max_rows) {
+    require(!storage_.owner && storage.owner && width && width <= 16u * 2560u &&
+        (max_rows == 8u || max_rows == 16u) && storage.bytes == uint64_t(max_rows) * width * sizeof(float),
+        "DFlash2 pending context storage bound");
     storage_ = storage;
     width_ = width;
+    max_rows_ = max_rows;
 }
 
 void DFlash2ContextStage::stage(MetalGraph& gpu, GpuView source, uint32_t rows, uint32_t start) {
-    require(storage_.owner && !rows_ && rows && rows <= 8 && start <= UINT32_MAX - rows, "DFlash2 pending context stage bound or undrained rows");
+    require(storage_.owner && !rows_ && rows && rows <= max_rows_ && start <= UINT32_MAX - rows, "DFlash2 pending context stage bound or undrained rows");
     const auto bytes = uint64_t(rows) * width_ * sizeof(float);
     const auto input = gpu.slice(source, 0, bytes);
     const auto values = std::span(gpu.host_floats(input), uint64_t(rows) * width_);
@@ -389,12 +399,14 @@ DFlash2Drafter::DFlash2Drafter(MetalGraph& gpu, const std::filesystem::path& dir
         rope_theta_ = float(json_double(json_at(json_at(cfg, "rope_parameters"), "rope_theta")));
 
         const auto& df = json_at(cfg, "dflash_config");
-        require(json_at(df, "block_size").unsigned_integer() == 8 &&
+        const uint64_t block_size_cfg = json_at(df, "block_size").unsigned_integer();
+        require((block_size_cfg == 8 || block_size_cfg == 16) &&
             json_at(df, "conv_group_size").unsigned_integer() == 16 &&
             json_at(df, "conv_kernel_size").unsigned_integer() == 2 &&
             json_at(df, "selector_rank").unsigned_integer() == 256 &&
             json_at(df, "selector_top_k").unsigned_integer() == 16,
             "DFlash2 block/conv/selector config mismatch");
+        checkpoint_block_size_ = uint32_t(block_size_cfg);
         mask_token_id_ = uint32_t(json_at(df, "mask_token_id").unsigned_integer());
         selector_rank_ = 256;
         selector_top_k_ = 16;
@@ -421,14 +433,15 @@ DFlash2Drafter::DFlash2Drafter(MetalGraph& gpu, const std::filesystem::path& dir
         active_output_vocab_ = vocab_size_;
         max_drafts_ = dflash2_default_max_drafts;
 
+        const uint32_t max_pos_cap = checkpoint_block_size_ - 1u;
         mask_embedding_.resize(hidden_size_);
         embed_token(mask_token_id_, mask_embedding_);
         for (float v : mask_embedding_) require(finite_bits(v), "nonfinite DFlash2 mask token embedding");
-        host_input_8_.resize(8ull * hidden_size_);
-        for (uint32_t r = 1; r < 8u; ++r) {
+        host_input_8_.resize(uint64_t(checkpoint_block_size_) * hidden_size_);
+        for (uint32_t r = 1; r < checkpoint_block_size_; ++r) {
             std::copy(mask_embedding_.begin(), mask_embedding_.end(), host_input_8_.begin() + ptrdiff_t(r * hidden_size_));
         }
-        host_selector_out_.resize(7ull * 16ull * 8ull + 7ull * 256ull * 4ull);
+        host_selector_out_.resize(uint64_t(max_pos_cap) * 16ull * 8ull + uint64_t(max_pos_cap) * 256ull * 4ull);
 
         SafetensorMmap st_file(directory / "model.safetensors");
         state_identity_sha256_ = dflash2_checkpoint_identity(bind_checkpoint_identity, checkpoint_sha256_,
@@ -530,6 +543,10 @@ DFlash2Drafter::DFlash2Drafter(MetalGraph& gpu, const std::filesystem::path& dir
         const uint64_t cb_elems = uint64_t(vocab_size_) * selector_rank_;
         const auto* pred_cb = require_bf16("candidate_selector.predecessor_codebook", {vocab_size_, selector_rank_});
         const auto* succ_cb = require_bf16("candidate_selector.successor_codebook", {vocab_size_, selector_rank_});
+        for (uint64_t i = 0; i < cb_elems; ++i) {
+            require(std::isfinite(bf16_to_f32(pred_cb[i])), "nonfinite BF16 codebook weight in DFlash2 checkpoint");
+            require(std::isfinite(bf16_to_f32(succ_cb[i])), "nonfinite BF16 codebook weight in DFlash2 checkpoint");
+        }
         predecessor_codebook_ = track_weight(gpu_.upload(std::as_bytes(std::span(pred_cb, size_t(cb_elems))), "dflash2.pred_cb", /*immutable=*/true));
         successor_codebook_ = track_weight(gpu_.upload(std::as_bytes(std::span(succ_cb, size_t(cb_elems))), "dflash2.succ_cb", /*immutable=*/true));
 
@@ -563,8 +580,14 @@ DFlash2Drafter::DFlash2Drafter(MetalGraph& gpu, const std::filesystem::path& dir
                 const auto* qn = require_bf16(pfx + "self_attn.q_norm.weight", {head_dim_});
                 const auto* kn = require_bf16(pfx + "self_attn.k_norm.weight", {head_dim_});
                 std::array<float, 320> qk_freq{};
-                for (uint32_t i = 0; i < 128u; ++i) qk_freq[i] = bf16_to_f32(qn[i]);
-                for (uint32_t i = 0; i < 128u; ++i) qk_freq[128u + i] = bf16_to_f32(kn[i]);
+                for (uint32_t i = 0; i < 128u; ++i) {
+                    qk_freq[i] = bf16_to_f32(qn[i]);
+                    require(std::isfinite(qk_freq[i]), "nonfinite BF16 qk_norm parameter in DFlash2 checkpoint");
+                }
+                for (uint32_t i = 0; i < 128u; ++i) {
+                    qk_freq[128u + i] = bf16_to_f32(kn[i]);
+                    require(std::isfinite(qk_freq[128u + i]), "nonfinite BF16 qk_norm parameter in DFlash2 checkpoint");
+                }
                 for (uint32_t i = 0; i < 64u; ++i) qk_freq[256u + i] = inv_freq[i];
                 layer.qk_norm_freq = track_weight(gpu_.upload(std::as_bytes(std::span(qk_freq)), "dflash2.qk_norm_freq", /*immutable=*/true));
             }
@@ -581,31 +604,33 @@ DFlash2Drafter::DFlash2Drafter(MetalGraph& gpu, const std::filesystem::path& dir
             layer.ring_v = track_workspace(gpu_.zeros(ring_bytes, "dflash2.ring_v"));
         }
 
-        priming_cap_ = std::min<uint32_t>(2048u, std::max<uint32_t>(8u, known_token_capacity ? known_token_capacity : 512u));
+        const uint64_t blk_rows = uint64_t(checkpoint_block_size_);
+        const uint64_t pos_rows = uint64_t(max_pos_cap);
+        priming_cap_ = std::min<uint32_t>(2048u, std::max<uint32_t>(checkpoint_block_size_, known_token_capacity ? known_token_capacity : 512u));
         prime_projected_ = track_priming(gpu_.zeros(uint64_t(priming_cap_) * hidden_size_ * sizeof(float), "dflash2.prime_proj"));
         prime_hidden_ = track_priming(gpu_.zeros(uint64_t(priming_cap_) * hidden_size_ * sizeof(float), "dflash2.prime_hidden"));
         prime_kv_ = track_priming(gpu_.zeros(uint64_t(priming_cap_) * 2048ull * sizeof(float), "dflash2.prime_kv"));
-        if (defer_context_) pending_context_.prepare(track_workspace(gpu_.zeros(8ull * target_concat * sizeof(float), "dflash2.pending_context")), target_concat);
+        if (defer_context_) pending_context_.prepare(track_workspace(gpu_.zeros(blk_rows * target_concat * sizeof(float), "dflash2.pending_context")), target_concat, checkpoint_block_size_);
 
-        draft_hidden_[0] = track_workspace(gpu_.zeros(8ull * hidden_size_ * sizeof(float), "dflash2.hidden0"));
-        draft_hidden_[1] = track_workspace(gpu_.zeros(8ull * hidden_size_ * sizeof(float), "dflash2.hidden1"));
-        draft_norm_ = track_workspace(gpu_.zeros(8ull * hidden_size_ * sizeof(float), "dflash2.norm_rows"));
-        draft_dynamic_ = track_workspace(gpu_.zeros(8ull * 640ull * sizeof(float), "dflash2.dynamic"));
-        draft_conv_ = track_workspace(gpu_.zeros(8ull * hidden_size_ * sizeof(float), "dflash2.conv"));
-        draft_qkv_ = track_workspace(gpu_.zeros(8ull * 6144ull * sizeof(float), "dflash2.qkv"));
-        draft_queries_ = track_workspace(gpu_.zeros(32ull * 8ull * 128ull * sizeof(uint16_t), "dflash2.queries"));
-        draft_query_keys_ = track_workspace(gpu_.zeros(8ull * 8ull * 128ull * sizeof(uint16_t), "dflash2.qkeys"));
-        draft_query_values_ = track_workspace(gpu_.zeros(8ull * 128ull * 8ull * sizeof(uint16_t), "dflash2.qvals"));
-        draft_partials_ = track_workspace(gpu_.zeros(8ull * 16ull * (32ull * 128ull + 64ull) * sizeof(float), "dflash2.partials"));
-        draft_attn_out_ = track_workspace(gpu_.zeros(8ull * 4096ull * sizeof(float), "dflash2.attn_out"));
-        draft_proj_ = track_workspace(gpu_.zeros(8ull * hidden_size_ * sizeof(float), "dflash2.proj"));
-        draft_residual_ = track_workspace(gpu_.zeros(8ull * hidden_size_ * sizeof(float), "dflash2.residual"));
-        draft_inter_ = track_workspace(gpu_.zeros(8ull * intermediate_size_ * sizeof(float), "dflash2.inter"));
-        draft_final_ = track_workspace(gpu_.zeros(8ull * hidden_size_ * sizeof(float), "dflash2.final"));
-        draft_logits_7_ = track_workspace(gpu_.zeros(7ull * vocab_size_ * sizeof(float), "dflash2.logits7"));
-        draft_selector_hidden_7_ = track_workspace(gpu_.zeros(7ull * selector_rank_ * sizeof(float), "dflash2.sel_hidden7"));
-        draft_top_ids_ = track_workspace(gpu_.zeros(7ull * 8ull * 16ull * sizeof(uint32_t), "dflash2.top_ids"));
-        draft_top_vals_ = track_workspace(gpu_.zeros(7ull * 8ull * 16ull * sizeof(float), "dflash2.top_vals"));
+        draft_hidden_[0] = track_workspace(gpu_.zeros(blk_rows * hidden_size_ * sizeof(float), "dflash2.hidden0"));
+        draft_hidden_[1] = track_workspace(gpu_.zeros(blk_rows * hidden_size_ * sizeof(float), "dflash2.hidden1"));
+        draft_norm_ = track_workspace(gpu_.zeros(blk_rows * hidden_size_ * sizeof(float), "dflash2.norm_rows"));
+        draft_dynamic_ = track_workspace(gpu_.zeros(blk_rows * 640ull * sizeof(float), "dflash2.dynamic"));
+        draft_conv_ = track_workspace(gpu_.zeros(blk_rows * hidden_size_ * sizeof(float), "dflash2.conv"));
+        draft_qkv_ = track_workspace(gpu_.zeros(blk_rows * 6144ull * sizeof(float), "dflash2.qkv"));
+        draft_queries_ = track_workspace(gpu_.zeros(32ull * blk_rows * 128ull * sizeof(uint16_t), "dflash2.queries"));
+        draft_query_keys_ = track_workspace(gpu_.zeros(8ull * blk_rows * 128ull * sizeof(uint16_t), "dflash2.qkeys"));
+        draft_query_values_ = track_workspace(gpu_.zeros(8ull * 128ull * blk_rows * sizeof(uint16_t), "dflash2.qvals"));
+        draft_partials_ = track_workspace(gpu_.zeros(blk_rows * 16ull * (32ull * 128ull + 64ull) * sizeof(float), "dflash2.partials"));
+        draft_attn_out_ = track_workspace(gpu_.zeros(blk_rows * 4096ull * sizeof(float), "dflash2.attn_out"));
+        draft_proj_ = track_workspace(gpu_.zeros(blk_rows * hidden_size_ * sizeof(float), "dflash2.proj"));
+        draft_residual_ = track_workspace(gpu_.zeros(blk_rows * hidden_size_ * sizeof(float), "dflash2.residual"));
+        draft_inter_ = track_workspace(gpu_.zeros(blk_rows * intermediate_size_ * sizeof(float), "dflash2.inter"));
+        draft_final_ = track_workspace(gpu_.zeros(blk_rows * hidden_size_ * sizeof(float), "dflash2.final"));
+        draft_logits_7_ = track_workspace(gpu_.zeros(pos_rows * vocab_size_ * sizeof(float), "dflash2.logits7"));
+        draft_selector_hidden_7_ = track_workspace(gpu_.zeros(pos_rows * selector_rank_ * sizeof(float), "dflash2.sel_hidden7"));
+        draft_top_ids_ = track_workspace(gpu_.zeros(pos_rows * 8ull * 16ull * sizeof(uint32_t), "dflash2.top_ids"));
+        draft_top_vals_ = track_workspace(gpu_.zeros(pos_rows * 8ull * 16ull * sizeof(float), "dflash2.top_vals"));
         draft_selector_out_ = track_workspace(gpu_.zeros(host_selector_out_.size(), "dflash2.selector_out"));
     } catch (...) {
         for (auto it = owned_views_.rbegin(); it != owned_views_.rend(); ++it) {
@@ -624,6 +649,8 @@ DFlash2Drafter::~DFlash2Drafter() {
 void DFlash2Drafter::reset() noexcept {
     context_len_ = 0;
     pending_context_.clear();
+    verify_budget_.reset();
+    consecutive_full_accepts_ = 0;
 }
 
 uint64_t DFlash2Drafter::ssd_cache_bytes(uint32_t rows) const {
@@ -660,6 +687,7 @@ bool DFlash2Drafter::write_ssd_cache_span(uint32_t first, uint32_t rows, uint64_
     if (!offset) {
         context_len_ = first + rows;
         pending_context_.clear();
+        consecutive_full_accepts_ = 0;
     }
     return layout.visit(offset, source.size(), [&](uint32_t layer, bool value, uint64_t physical, uint64_t request, uint64_t bytes) {
         gpu_.write_bytes(value ? layers_[layer].ring_v : layers_[layer].ring_k, physical, source.subspan(size_t(request), size_t(bytes)));
@@ -671,11 +699,39 @@ void DFlash2Drafter::truncate(uint32_t position) {
     require(position <= context_len_, "cannot extend DFlash2 context via truncate");
     context_len_ = position;
     pending_context_.truncate(position);
+    consecutive_full_accepts_ = 0;
 }
 
 void DFlash2Drafter::set_max_drafts(uint32_t max_drafts) {
-    require(max_drafts >= 1u && max_drafts <= 7u, "DFlash2 max_drafts must be in 1..7");
+    require(max_drafts >= 1u && max_drafts <= checkpoint_block_size_ - 1u,
+        "DFlash2 max_drafts exceeds checkpoint block capacity");
     max_drafts_ = max_drafts;
+}
+
+uint32_t DFlash2Drafter::burst_max_drafts() const noexcept {
+    if (checkpoint_block_size_ < 16u) return std::min(max_drafts_, 7u);
+    if (max_drafts_ > 7u) return std::min(max_drafts_, 15u);
+    if (!measured_budget_ && adaptive_budget_ && max_drafts_ == 7u && gpu_.verify_nax_m8()) return 15u;
+    return max_drafts_;
+}
+
+uint32_t DFlash2Drafter::effective_max_drafts() const noexcept {
+    if (checkpoint_block_size_ < 16u) return std::min(max_drafts_, 7u);
+    if (max_drafts_ > 7u) return std::min(max_drafts_, 15u);
+    if (!measured_budget_ && adaptive_budget_ && max_drafts_ == 7u && gpu_.verify_nax_m8() && consecutive_full_accepts_ >= 1u) {
+        return 15u;
+    }
+    return max_drafts_;
+}
+
+void DFlash2Drafter::note_lookup_round(uint32_t proposed, uint32_t accepted, bool stopped) noexcept {
+    if (stopped || proposed == 0u) {
+        consecutive_full_accepts_ = 0u;
+    } else if (accepted == proposed && proposed >= 7u) {
+        consecutive_full_accepts_ = std::min<uint32_t>(consecutive_full_accepts_ + 1u, 8u);
+    } else if (accepted < proposed && accepted < 7u) {
+        consecutive_full_accepts_ = 0u;
+    }
 }
 
 void DFlash2Drafter::release_draft_vocab_gather() {
@@ -755,7 +811,7 @@ void DFlash2Drafter::encode_context_commit_chunk(GpuView captured_target_hidden,
 
 void DFlash2Drafter::stage_context_commit(GpuView captured_target_hidden, uint32_t rows, uint32_t start_position) {
     require(defer_context_, "DFlash2 deferred context is not enabled");
-    require(rows > 0 && rows <= 8u, "DFlash2 stage_context_commit requires 1..8 rows");
+    require(rows > 0 && rows <= checkpoint_block_size_, "DFlash2 stage_context_commit row count exceeds block capacity");
     require(start_position == context_len_, "DFlash2 context continuity mismatch in stage_context_commit");
     const uint32_t target_concat = uint32_t(target_layer_ids_.size()) * hidden_size_;
     const uint64_t row_bytes = uint64_t(target_concat) * sizeof(float);
@@ -822,7 +878,7 @@ BatchResult DFlash2Drafter::commit_context(GpuView captured_target_hidden, uint3
         gpu_.set_dflash2_scope(true);
         BatchResult part{};
         try {
-            if (precision_ == DFlash2Precision::bf16 || chunk <= 8u) {
+            if (precision_ == DFlash2Precision::bf16 || chunk <= 16u) {
                 dense_proj(fc_proj_, in_rows, proj_rows, false);
                 gpu_.rms_rows(proj_rows, hidden_norm_, hid_rows, hidden_size_, rms_eps_, true);
                 for (uint32_t l = 0; l < num_layers_; ++l) {
@@ -859,29 +915,45 @@ BatchResult DFlash2Drafter::commit_context(GpuView captured_target_hidden, uint3
 
 DFlash2DraftResult DFlash2Drafter::draft_block8(uint32_t k, uint32_t base_position, uint32_t anchor_id,
                                                 std::span<const float> anchor_row, SamplingPolicy policy,
-                                                const SamplingRng& after_anchor, bool adaptive_budget) {
-    require(base_position == context_len_, "DFlash2 context frontier differs from target base position");
+                                                const SamplingRng& after_anchor, bool adaptive_budget,
+                                                uint32_t max_verify_rows) {
     require(k >= 1u && k <= 7u, "DFlash2 draft_block8 proposal count must be in 1..7");
-    k = std::min(k, max_drafts_);
+    k = std::min(k, std::min(max_drafts_, 7u));
+    return draft_block(k, base_position, anchor_id, anchor_row, policy, after_anchor, adaptive_budget, std::min(max_verify_rows, 8u));
+}
+
+DFlash2DraftResult DFlash2Drafter::draft_block(uint32_t k, uint32_t base_position, uint32_t anchor_id,
+                                               std::span<const float> anchor_row, SamplingPolicy policy,
+                                               const SamplingRng& after_anchor, bool adaptive_budget,
+                                               uint32_t max_verify_rows) {
+    require(base_position == context_len_, "DFlash2 context frontier differs from target base position");
+    require(k >= 1u && k <= checkpoint_block_size_ - 1u, "DFlash2 draft_block proposal count out of bounds");
+    k = std::min(k, burst_max_drafts());
     require(anchor_id < vocab_size_ && anchor_row.size() == hidden_size_, "DFlash2 anchor token or embedding mismatch");
     for (float v : anchor_row) require(finite_bits(v), "nonfinite DFlash2 anchor embedding");
 
-    std::copy(anchor_row.begin(), anchor_row.end(), host_input_8_.begin());
-    gpu_.write(draft_hidden_[0], std::as_bytes(std::span(host_input_8_)));
-
+    const uint32_t block_rows = k <= 7u ? 8u : 16u;
+    const uint64_t max_pos = k <= 7u ? 7ull : 15ull;
+    const uint64_t sel_bytes = max_pos * (16ull * 8ull + 256ull * 4ull);
     const uint64_t hid_stride = uint64_t(hidden_size_) * sizeof(float);
-    const GpuRowsF32 norm_rows{draft_norm_, 8u, hidden_size_, hid_stride};
-    const GpuRowsF32 dyn_rows{draft_dynamic_, 8u, 640u, 640ull * sizeof(float)};
-    const GpuRowsF32 conv_rows{draft_conv_, 8u, hidden_size_, hid_stride};
-    const GpuRowsF32 qkv_rows{draft_qkv_, 8u, 6144u, 6144ull * sizeof(float)};
-    const GpuRowsF32 attn_rows{draft_attn_out_, 8u, 4096u, 4096ull * sizeof(float)};
-    const GpuRowsF32 proj_rows{draft_proj_, 8u, hidden_size_, hid_stride};
-    const GpuRowsF32 inter_rows{draft_inter_, 8u, intermediate_size_, uint64_t(intermediate_size_) * sizeof(float)};
+
+    std::copy(anchor_row.begin(), anchor_row.end(), host_input_8_.begin());
+    gpu_.write(gpu_.slice(draft_hidden_[0], 0, uint64_t(block_rows) * hid_stride),
+               std::as_bytes(std::span(host_input_8_).first(uint64_t(block_rows) * hidden_size_)));
+
+    const GpuRowsF32 norm_rows{draft_norm_, block_rows, hidden_size_, hid_stride};
+    const GpuRowsF32 dyn_rows{draft_dynamic_, block_rows, 640u, 640ull * sizeof(float)};
+    const GpuRowsF32 conv_rows{draft_conv_, block_rows, hidden_size_, hid_stride};
+    const GpuRowsF32 qkv_rows{draft_qkv_, block_rows, 6144u, 6144ull * sizeof(float)};
+    const GpuRowsF32 attn_rows{draft_attn_out_, block_rows, 4096u, 4096ull * sizeof(float)};
+    const GpuRowsF32 proj_rows{draft_proj_, block_rows, hidden_size_, hid_stride};
+    const GpuRowsF32 inter_rows{draft_inter_, block_rows, intermediate_size_, uint64_t(intermediate_size_) * sizeof(float)};
 
     const uint32_t out_vocab = active_output_vocab_;
     const auto final_slice_k = gpu_.slice(draft_final_, hid_stride, uint64_t(k) * hid_stride);
     const auto logits_slice_k = gpu_.slice(draft_logits_7_, 0, uint64_t(k) * out_vocab * sizeof(float));
     const auto sel_hid_slice_k = gpu_.slice(draft_selector_hidden_7_, 0, uint64_t(k) * selector_rank_ * sizeof(float));
+    const auto sel_out_slice = gpu_.slice(draft_selector_out_, 0, sel_bytes);
     const GpuRowsF32 final_rows_k{final_slice_k, k, hidden_size_, hid_stride};
     const GpuRowsF32 logits_rows_k{logits_slice_k, k, out_vocab, uint64_t(out_vocab) * sizeof(float)};
     const GpuRowsF32 sel_hid_rows_k{sel_hid_slice_k, k, selector_rank_, uint64_t(selector_rank_) * sizeof(float)};
@@ -900,35 +972,35 @@ DFlash2DraftResult DFlash2Drafter::draft_block8(uint32_t k, uint32_t base_positi
             encode_context_commit_chunk(pending_context_.storage(), pending_context_.rows(), pending_context_.start());
             TOKSPUR_OPERATOR_CHECKPOINT(gpu_, "dflash2", "deferred_context_commit", {pending_context_.rows(), hidden_size_, num_layers_, 0});
         }
-        gpu_.rms_rows(GpuRowsF32{draft_hidden_[0], 8u, hidden_size_, hid_stride}, layers_[0].input_norm, norm_rows, hidden_size_, rms_eps_, true);
+        gpu_.rms_rows(GpuRowsF32{draft_hidden_[0], block_rows, hidden_size_, hid_stride}, layers_[0].input_norm, norm_rows, hidden_size_, rms_eps_, true);
         for (uint32_t l = 0; l < num_layers_; ++l) {
             const uint32_t cur = l & 1u;
             const uint32_t nxt = cur ^ 1u;
             const auto& layer = layers_[l];
 
             dense_proj(layer.attn_conv_proj, norm_rows, dyn_rows, false);
-            gpu_.dflash2_conv_f32(draft_norm_, draft_dynamic_, layer.attn_conv_base, draft_hidden_[cur], draft_conv_, hidden_size_, false);
+            gpu_.dflash2_conv_f32(draft_norm_, draft_dynamic_, layer.attn_conv_base, draft_hidden_[cur], draft_conv_, hidden_size_, false, block_rows);
             dense_proj(layer.qkv_proj, conv_rows, qkv_rows, false);
-            gpu_.dflash2_qkv_prepare(draft_qkv_, layer.qk_norm_freq, draft_queries_, draft_query_keys_, draft_query_values_, base_position, 8u, rms_eps_);
-            gpu_.dflash2_attention(draft_queries_, layer.ring_k, layer.ring_v, draft_query_keys_, draft_query_values_, draft_partials_, draft_attn_out_, base_position, sliding_window_);
+            gpu_.dflash2_qkv_prepare(draft_qkv_, layer.qk_norm_freq, draft_queries_, draft_query_keys_, draft_query_values_, base_position, block_rows, rms_eps_);
+            gpu_.dflash2_attention(draft_queries_, layer.ring_k, layer.ring_v, draft_query_keys_, draft_query_values_, draft_partials_, draft_attn_out_, base_position, sliding_window_, block_rows);
             dense_proj(layer.o_proj, attn_rows, proj_rows, false);
             gpu_.dflash2_conv_finish_rms_f32(draft_proj_, draft_dynamic_, layer.attn_conv_base, draft_hidden_[cur],
-                layer.post_attn_norm, draft_residual_, draft_norm_, hidden_size_, rms_eps_);
+                layer.post_attn_norm, draft_residual_, draft_norm_, hidden_size_, rms_eps_, block_rows);
 
             dense_proj(layer.mlp_conv_proj, norm_rows, dyn_rows, false);
-            gpu_.dflash2_conv_f32(draft_norm_, draft_dynamic_, layer.mlp_conv_base, draft_residual_, draft_conv_, hidden_size_, false);
+            gpu_.dflash2_conv_f32(draft_norm_, draft_dynamic_, layer.mlp_conv_base, draft_residual_, draft_conv_, hidden_size_, false, block_rows);
             gpu_.dflash2_gate_up_swiglu(layer.gate_proj, layer.up_proj, conv_rows, inter_rows, precision_ == DFlash2Precision::bf16);
             dense_proj(layer.down_proj, inter_rows, proj_rows, false);
             const GpuView next_gains = (l + 1u < num_layers_) ? layers_[l + 1u].input_norm : final_norm_;
             const GpuView next_norm_out = (l + 1u < num_layers_) ? draft_norm_ : draft_final_;
             gpu_.dflash2_conv_finish_rms_f32(draft_proj_, draft_dynamic_, layer.mlp_conv_base, draft_residual_,
-                next_gains, draft_hidden_[nxt], next_norm_out, hidden_size_, rms_eps_);
+                next_gains, draft_hidden_[nxt], next_norm_out, hidden_size_, rms_eps_, block_rows);
         }
-        TOKSPUR_OPERATOR_CHECKPOINT(gpu_, "dflash2", "draft_layers", {8u, hidden_size_, intermediate_size_, num_layers_});
+        TOKSPUR_OPERATOR_CHECKPOINT(gpu_, "dflash2", "draft_layers", {block_rows, hidden_size_, intermediate_size_, num_layers_});
         gpu_.dflash2_dense_q8(active_output_weight_, final_rows_k, logits_rows_k, false);
         TOKSPUR_OPERATOR_CHECKPOINT(gpu_, "dense_q8", "dflash2_output_logits", {k, hidden_size_, out_vocab, 8});
         dense_proj(selector_proj_, final_rows_k, sel_hid_rows_k, false);
-        gpu_.dflash2_select(logits_slice_k, draft_top_ids_, draft_top_vals_, draft_selector_out_,
+        gpu_.dflash2_select(logits_slice_k, draft_top_ids_, draft_top_vals_, sel_out_slice,
             sel_hid_slice_k, predecessor_codebook_, successor_codebook_, k, out_vocab, anchor_id, vocab_size_, draft_row_token_ids_);
         TOKSPUR_OPERATOR_CHECKPOINT(gpu_, "dflash2", "draft_selector", {k, selector_rank_, out_vocab, 16});
     } catch (...) {
@@ -958,22 +1030,64 @@ DFlash2DraftResult DFlash2Drafter::draft_block8(uint32_t k, uint32_t base_positi
         try { gpu_.abort(); } catch (...) {}
         throw;
     }
-    gpu_.read(draft_selector_out_, host_selector_out_);
+    const auto host_sel_span = std::span(host_selector_out_).first(sel_bytes);
+    gpu_.read(sel_out_slice, host_sel_span);
 
     DFlash2DraftResult out{};
     out.evaluated_proposals = k;
     out.proposal_begin_words = after_anchor.words_consumed();
     out.batch = batch;
 
-    auto drawn = dflash2_selector_proposals(host_selector_out_, k, vocab_size_, base_position, anchor_id, policy, after_anchor);
+    auto drawn = dflash2_selector_proposals(host_sel_span, k, vocab_size_, base_position, anchor_id, policy, after_anchor);
     out.proposals = std::move(drawn.proposals);
     out.confidences = drawn.confidences;
     SamplingRng trial_rng = std::move(drawn.random_after);
 
-    const uint32_t verify_rows = measured_budget_ ? measured_budget_(base_position, out.confidences, 1u + k) : adaptive_budget
-        ? verify_budget_.choose_verify_rows(out.confidences, 1u + k)
-        : (1u + k);
-    require(verify_rows >= 1u && verify_rows <= 1u + k, "DFlash2 verify budget selected out-of-bounds row count");
+    const uint32_t cap_rows = std::clamp(max_verify_rows, 1u, 1u + k);
+    const std::span<const float, DFlash2VerifyBudget::kPositions> first7_conf(out.confidences.data(), DFlash2VerifyBudget::kPositions);
+    uint32_t verify_rows = cap_rows;
+    if (measured_budget_) {
+        verify_rows = measured_budget_(base_position, first7_conf, std::min(cap_rows, 8u));
+    } else if (adaptive_budget) {
+        if (cap_rows <= 8u) {
+            verify_rows = verify_budget_.choose_verify_rows(first7_conf, cap_rows);
+        } else {
+            const uint32_t base8 = verify_budget_.choose_verify_rows(first7_conf, 8u);
+            if (base8 < 7u && !verify_budget_.explores()) {
+                verify_rows = base8;
+            } else if (verify_budget_.explores()) {
+                verify_rows = cap_rows;
+            } else {
+                const auto row_costs = verify_budget_.costs();
+                const auto& acc = verify_budget_.acceptance();
+                const float tail_intercept = std::max(acc.intercepts[DFlash2VerifyBudget::kPositions - 1u], -0.45f);
+                double survival = 1.0;
+                double expected_tokens = 1.0;
+                double best_efficiency = expected_tokens / std::max(double(row_costs[1]), 1.0e-9);
+                uint32_t best_rows = 1u;
+                for (uint32_t pos = 0; pos + 1u < cap_rows; ++pos) {
+                    const double q = std::clamp(double(out.confidences[pos]), 1.0e-6, 1.0 - 1.0e-6);
+                    const double intercept = pos < DFlash2VerifyBudget::kPositions ? double(acc.intercepts[pos]) : double(tail_intercept);
+                    const double z = double(acc.slope) * std::log(q / (1.0 - q)) + intercept;
+                    const double p_prior = 1.0 / (1.0 + std::exp(-z));
+                    const double p = std::max(p_prior, q);
+                    survival *= p;
+                    expected_tokens += survival;
+                    const uint32_t rows = pos + 2u;
+                    const double row_cost = rows <= 8u
+                        ? double(row_costs[rows])
+                        : double(row_costs[8]) * (1.0 + 0.022 * double(rows - 8u));
+                    const double efficiency = expected_tokens / std::max(row_cost, 1.0e-9);
+                    if (efficiency > best_efficiency) {
+                        best_efficiency = efficiency;
+                        best_rows = rows;
+                    }
+                }
+                verify_rows = best_rows;
+            }
+        }
+    }
+    require(verify_rows >= 1u && verify_rows <= cap_rows, "DFlash2 verify budget selected out-of-bounds row count");
     const uint32_t active_k = verify_rows - 1u;
     out.count = active_k;
     if (active_k == k) {
@@ -993,7 +1107,36 @@ DFlash2DraftResult DFlash2Drafter::draft_block8(uint32_t k, uint32_t base_positi
 void DFlash2Drafter::observe_verify_round(
     std::span<const float, DFlash2VerifyBudget::kPositions> confidences,
     uint32_t verify_rows, uint32_t accepted, double milliseconds, bool record_labels) {
-    verify_budget_.observe(confidences, verify_rows, accepted, milliseconds, record_labels);
+    observe_verify_round_any(confidences, verify_rows, accepted, milliseconds, record_labels);
+}
+
+void DFlash2Drafter::observe_verify_round_any(
+    std::span<const float> confidences,
+    uint32_t verify_rows, uint32_t accepted, double milliseconds, bool record_labels) {
+    require(verify_rows >= 1u && verify_rows <= 16u && accepted < verify_rows &&
+        confidences.size() >= DFlash2VerifyBudget::kPositions,
+        "invalid DFlash2 verify round outcome");
+    const uint32_t proposed = verify_rows - 1u;
+    if (!record_labels || proposed == 0u) {
+        consecutive_full_accepts_ = 0u;
+    } else if (accepted == proposed) {
+        if (proposed >= 7u) {
+            consecutive_full_accepts_ = std::min<uint32_t>(consecutive_full_accepts_ + 1u, 8u);
+        }
+    } else if (accepted >= 7u) {
+        consecutive_full_accepts_ = std::max<uint32_t>(consecutive_full_accepts_, 1u);
+    } else {
+        consecutive_full_accepts_ = 0u;
+    }
+
+    const std::span<const float, DFlash2VerifyBudget::kPositions> first7(
+        confidences.data(), DFlash2VerifyBudget::kPositions);
+    if (verify_rows <= DFlash2VerifyBudget::kBlockRows) {
+        verify_budget_.observe(first7, verify_rows, accepted, milliseconds, record_labels);
+    } else {
+        verify_budget_.observe(first7, DFlash2VerifyBudget::kBlockRows,
+            std::min<uint32_t>(accepted, DFlash2VerifyBudget::kPositions), 0.0, record_labels);
+    }
 }
 
 namespace {

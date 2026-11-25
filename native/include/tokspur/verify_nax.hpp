@@ -34,15 +34,16 @@ struct VerifyNaxScopeGuard {
 [[nodiscard]] bool verify_nax_hc_rows_supported(const MetalGraph& g, ResidualShape shape);
 [[nodiscard]] bool verify_nax_router_window_supported(const MetalGraph& g, const MoeWeights& weights, MoeShape shape);
 [[nodiscard]] bool verify_nax_grouped_moe_supported(const MoeWeights& weights, MoeShape shape, uint32_t steps);
+[[nodiscard]] bool verify_nax_grouped_moe_supported(const MetalGraph& g, const MoeWeights& weights, MoeShape shape, uint32_t steps);
 // The dispatch estimator runs before the active scope guard. These predicates
 // depend only on immutable compilation and shape, never transient Graph scope.
 [[nodiscard]] constexpr bool verify_nax_batch_top10_supported(MoeShape shape, uint32_t steps) {
-    return verify_nax_batch_top10_mixture_enabled && steps >= 2 && steps <= 8 &&
+    return verify_nax_batch_top10_mixture_enabled && steps >= 2 && steps <= 16 &&
         shape.experts >= 1 && shape.experts <= 512 && shape.selected >= 1 &&
         shape.selected <= 64 && shape.selected <= shape.experts;
 }
 [[nodiscard]] constexpr bool verify_nax_batch_mixture_supported(MoeShape shape, uint32_t steps) {
-    return verify_nax_batch_top10_mixture_enabled && steps >= 2 && steps <= 8 &&
+    return verify_nax_batch_top10_mixture_enabled && steps >= 2 && steps <= 16 &&
         shape.channels >= 32 && shape.channels <= 2560 && shape.channels % 32 == 0 &&
         shape.selected >= 1 && shape.selected <= 64;
 }

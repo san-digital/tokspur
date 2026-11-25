@@ -343,7 +343,7 @@
     },
     {
       "path": "native/kernels/qsa_prefill.metal",
-      "sha256": "26fb5474af63565a922eea2dfd6d6b834e824d19d9e2157124a273b4ec08b6dd",
+      "sha256": "4f4c1be72851192a86c8c3378eb040a1cef3f6cdd11c1ef8a12efe3f89cc7d62",
       "sources": [
         "llama.cpp"
       ],
@@ -355,7 +355,7 @@
     },
     {
       "path": "native/kernels/nax_prefill.metal",
-      "sha256": "392adfbe3e2581a8e1ffd9ffedadc1a916232fc12e51bc122d30a520ba82926b",
+      "sha256": "ead71ace1d9c9c568b97da620f206f78e4ba8af7e00ddd49928c519ab7c577e7",
       "sources": [
         "llama.cpp",
         "Splash"
@@ -430,7 +430,7 @@
     },
     {
       "path": "native/kernels/dflash2.metal",
-      "sha256": "b84420d57bdde6bb479016908f4fadd57009ba0b53db95a23eed29ef93988eb3",
+      "sha256": "60e0fc6851d6829462ed5b8412a82cc24c82859101e86fab9ccfb42e9a5131c6",
       "sources": [
         "Splash"
       ],
@@ -438,11 +438,11 @@
         "draft convolution, ring attention, candidate selection"
       ],
       "status": "recorded-adaptation",
-      "lines": 1550
+      "lines": 1426
     },
     {
       "path": "native/src/dflash2_drafter.cpp",
-      "sha256": "55379ed49b0e55a2cb00059ac1146f721d8e4e9424d048ac44908abe5e206e3c",
+      "sha256": "9c775065e2be04eb3cdaf9d1b0eacbcb5d406386246c9f61239a520d7862d04f",
       "sources": [
         "Splash"
       ],
@@ -450,11 +450,11 @@
         "DFlash2VerifyBudget"
       ],
       "status": "recorded-adaptation",
-      "lines": 1230
+      "lines": 1373
     },
     {
       "path": "native/include/tokspur/dflash2_drafter.hpp",
-      "sha256": "6b2bf4beccc47c3c23a08d94978c12b153b1323b316362d6129a2ba72c2de596",
+      "sha256": "b439ecf6a6e7183f6a2dabb498362c690fc591d0e0008a32e884d83597206834",
       "sources": [
         "Splash"
       ],
@@ -462,7 +462,7 @@
         "DFlash2VerifyBudget"
       ],
       "status": "recorded-adaptation",
-      "lines": 272
+      "lines": 307
     },
     {
       "path": "native/kernels/gemv.metal",
@@ -496,7 +496,7 @@
     },
     {
       "path": "native/kernels/logit_topk.metal",
-      "sha256": "a2695fdbd37b58282ba7de426674f5deb4168db712a543528499d87c6a4aabb1",
+      "sha256": "dfba3f70e91542e77f6aff9c4895c145489062cb5d2d6c4ef34cae476e964d2f",
       "sources": [
         "Splash"
       ],
@@ -504,7 +504,7 @@
         "top_insert, top_pop, SIMD selection and two-stage top-64"
       ],
       "status": "recorded-adaptation",
-      "lines": 365
+      "lines": 364
     }
   ],
   "rust_files": [
@@ -615,7 +615,7 @@
     "file": "third_party/model-licences/Qwen3.8-Flash-Next/LICENSE",
     "sha256": "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08",
     "source": "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/raw/34567a4712bc9766c4449e2e98e4468bfa24d915/LICENSE",
-    "asset_manifest_sha256": "feb36d211e50b10783aa7568d8ffa0f3b5ecbfbc0fbafbd3a3bd896134e0f623",
+    "asset_manifest_sha256": "df265e5c08309b213d308be079cd64fbe76b6a009f5d42013c473fa48ad5b8d4",
     "review_status": "runtime-only",
     "distribution_scope": {
       "weights": false,

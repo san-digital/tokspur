@@ -401,6 +401,22 @@ Json input(uint32_t n = 8, bool reset = true) {
 }
 void contracts() {
     const auto r = ready(); validate_mtp_ready(r); ++checks;
+    const auto capped = with(r, "mapped_weight_region_limit_bytes", Json::integer(uint64_t(4) << 30));
+    const auto pack = with(with(capped, "derived_pack_schema", Json::integer(3)), "derived_pack_recipe", Json("tokspur-pack-v3"));
+    validate_mtp_ready(pack);
+    for (const auto& wrong : {capped, with(pack, "derived_pack_schema", Json::integer(2)), with(pack, "derived_pack_recipe", Json("tokspur-pack-v2")), with(pack, "mapped_weight_region_limit_bytes", Json::integer(1))}) {
+        try { validate_mtp_ready(wrong); throw std::runtime_error("invalid split mapping admitted"); }
+        catch (const FormatError& error) { check(std::string_view(error.what()) == "MTP unrelated prepared feature"); }
+    }
+    const auto pack_input = input();
+    Fake pack_worker;
+    pack_worker.prepared = pack_worker.previous = pack;
+    const auto pack_done = pack_worker(pack_input, [](const Json&) {});
+    MtpWireReply complete(pack, pack, pack_input);
+    complete.finish(pack_done);
+    MtpWireReply drift(pack, pack, pack_input);
+    refuses([&] { drift.finish(with(pack_done, "mapped_weight_region_limit_bytes", Json::integer(0))); });
+    refuses([&] { MtpWireReply mismatched(pack, r, pack_input); });
 #ifndef TOKSPUR_PRIVATE_PREFILL_HC_DOWN_F32
     auto uncompiled_hc = r; for (const auto& [name, value] : mtp_hc_down_f32_fields(0, 0)) uncompiled_hc = with(std::move(uncompiled_hc), name, value);
     refuses([&] { validate_mtp_ready(uncompiled_hc); });
@@ -891,9 +907,20 @@ int target(int argc, char** argv) {
     if (path.filename() == "hc-down-ready-missing") prepared = without(prepared, "native_prefill_hc_down_f32_kernel");
 #endif
     { std::ofstream started(path.parent_path() / "started"); started << "explicit sampled MTP arguments\n"; }
+    bool pressure_sent = false;
     emit(prepared); std::string line;
     while (std::getline(std::cin, line)) {
         const auto job = parse_json(line);
+        const bool pressure_mode = path.filename() == "host-pressure" || path.filename() == "malformed-pressure";
+        if (pressure_mode && integer(job, "generate") && !pressure_sent) {
+            pressure_sent = true;
+            const auto skipped = fake(job, [](const Json&) {});
+            auto terminal = parse_json(R"({"event":"error","code":"host_memory_pressure","fatal":false,"automatic_retry_safe":false,"continuation_allowed":false,"logits_available":false,"status":"error","finish_reason":"error","committed_prefix":0})");
+            terminal = with(terminal, "committed_prefix", *skipped.find("committed_prefix"));
+            if (path.filename() == "malformed-pressure") terminal = with(terminal, "logits_available", Json(true));
+            emit(terminal);
+            continue;
+        }
         auto done = fake(job, [](const Json& value) { emit(value); });
 #ifdef TOKSPUR_PRIVATE_RAW_DECODE
         if (integer(job, "generate") && path.filename() == "decode-selector-drift") done = with(done, "native_raw_decode_fp_contract", Json("fast"));
@@ -1001,6 +1028,35 @@ void workers(const std::filesystem::path& executable) {
         worker.request(input(), Clock::now() + 3s, [] { return false; }); worker.close();
     }
 }
+void pressure_workers(const std::filesystem::path& executable) {
+    for (const bool malformed : {false, true}) {
+        scalar_fixture::Files files(executable, malformed ? "malformed-pressure" : "host-pressure");
+        files.options.mtp_sidecar = files.directory / "mtp-sidecar";
+        files.options.mtp_request_carry = true;
+        { std::ofstream sidecar(files.options.mtp_sidecar); sidecar << "generated CPU-only sidecar\n"; }
+        OwnedWorker worker(files.options);
+        const auto run = [&](const Json& command) { return worker.request(command, Clock::now() + 3s, {}); };
+        run(input());
+        size_t callbacks = 0;
+        bool recoverable = false;
+        try {
+            worker.request(scope_job(generation_job(2), 1, true, 4), Clock::now() + 3s, {}, [&](const Json&) { ++callbacks; });
+            throw std::runtime_error("pressure terminal admitted as a completion");
+        } catch (const WorkerHostMemoryPressure& error) {
+            check(std::string_view(error.what()) == "generation stopped because of host memory pressure");
+            recoverable = true;
+        } catch (const WorkerError&) {}
+        check(!callbacks && recoverable == !malformed && worker.alive() == !malformed);
+        if (malformed) continue;
+        worker.abort_mtp_generation(Clock::now() + 3s);
+        try { run(input(1, false)); throw std::runtime_error("continued a discarded context"); }
+        catch (const WorkerError& error) { check(std::string_view(error.what()) == "host memory pressure requires a fresh input with reset"); }
+        const auto reset = run(input());
+        check(integer(reset, "committed_prefix") == 8 && worker.alive());
+        run(scope_job(generation_job(2), 2, true, 2));
+        worker.close();
+    }
+}
 void generation_workers(const std::filesystem::path& executable, uint32_t depth = 1) {
     for (const bool slow : {false, true}) {
         scalar_fixture::Files files(executable, slow ? "slow-done" : "generation-carry");
@@ -1104,6 +1160,50 @@ void expanded_prefill_packet_contracts() {
         auto grouped_f32 = with(prepared, "native_prefill_grouped", Json("f32"));
         grouped_f32 = with(std::move(grouped_f32), "native_prefill_grouped_kernel", Json("graph_grouped_mm_f32"));
         refuses([&] { validate_mtp_ready(grouped_f32, "tiled128", true, 2); });
+    }
+    // Regression: 513-token packet restoring 512 tokens replays 1 token via ordinary attention (12 calls, 0 HC chunks).
+    {
+        auto prepared = with(tiled, "native_mtp_input_packet_max", Json::integer(1024));
+        prepared = with(std::move(prepared), "known_token_capacity", Json::integer(1024));
+        prepared = with(std::move(prepared), "native_mtp_priming_batch_capacity", Json::integer(1024));
+#ifdef TOKSPUR_PRIVATE_HTTP_HC_ROWS
+        prepared = hc_rows_fields(std::move(prepared));
+#endif
+#ifdef TOKSPUR_PRIVATE_HTTP_ROUTER_WINDOW
+        prepared = router_window_fields(std::move(prepared));
+#endif
+#ifdef TOKSPUR_PRIVATE_HTTP_HC_DOWN_WINDOW
+        prepared = hc_down_window_fields(std::move(prepared));
+#endif
+#ifdef TOKSPUR_PRIVATE_HTTP_GDN_PORTED
+        prepared = gdn_ported_fields(std::move(prepared));
+#endif
+        validate_mtp_ready(prepared, "tiled128", true, 2);
+        Fake fake; fake.prepared = prepared;
+        // Generate baseline 1-token DONE to populate exact single-token ordinary counters, then adjust prefix/primes for 513 (512 restored + 1 replayed).
+        auto done = fake(input(1), [](const Json&) {});
+        done = with(std::move(done), "committed_prefix", Json::integer(513));
+        auto samp = *done.find("sampling");
+        samp = with(std::move(samp), "entropy_prefix", Json::integer(513));
+        done = with(std::move(done), "sampling", std::move(samp));
+        done = with(std::move(done), "native_mtp_prime_calls", Json::integer(512));
+        done = with(std::move(done), "native_mtp_priming_batch_submits", Json::integer(1));
+        done = with(std::move(done), "checkpoint_restored_tokens", Json::integer(512));
+        done = with(std::move(done), "replayed_input_tokens", Json::integer(1));
+        const auto job513 = input(513);
+        MtpWireReply reply(prepared, prepared, job513);
+        reply.finish(done);
+        check(reply.restored_input_tokens() == 512, "513->1 restore failed to report 512 restored tokens");
+        refuses([&] {
+            MtpWireReply bad(prepared, prepared, job513);
+            bad.finish(with(done, "qsa_stage_v8_request_calls", Json::integer(0)));
+        });
+#ifdef TOKSPUR_PRIVATE_HTTP_HC_ROWS
+        refuses([&] {
+            MtpWireReply bad(prepared, prepared, job513);
+            bad.finish(hc_rows_fields(done, 96, 96));
+        });
+#endif
     }
 }
 #endif
@@ -1327,6 +1427,287 @@ void lane_workers(const std::filesystem::path& executable) {
     }
 }
 #endif
+void lane_prompt_contracts() {
+    const auto prepared = ready();
+    auto job = input(2);
+    job = with(std::move(job), "lane_prompt", Json(Json::Array{Json::integer(65), Json::integer(65), Json::integer(3), Json::integer(4), Json::integer(5), Json::integer(6)}));
+    const auto done_at = [&](uint32_t prefix, bool continuation, std::optional<uint32_t> lane_restored) {
+        Fake f; f.prepared = prepared;
+        auto done = f(input(2), [](const Json&) {});
+        done = with(std::move(done), "committed_prefix", Json::integer(prefix));
+        auto samp = *done.find("sampling");
+        samp = with(std::move(samp), "entropy_prefix", Json::integer(prefix));
+        done = with(std::move(done), "sampling", std::move(samp));
+        done = with(std::move(done), "continuation_allowed", Json(continuation));
+        if (lane_restored) done = with(std::move(done), "lane_restored_prefix", Json::integer(*lane_restored));
+        return done;
+    };
+    {
+        MtpWireReply reply(prepared, prepared, job);
+        reply.finish(done_at(2, true, std::nullopt));
+        check(reply.lane_restored_prefix() == 0 && !reply.lane_seed().has_value());
+    }
+    {
+        MtpWireReply reply(prepared, prepared, job);
+        reply.finish(done_at(5, false, 5));
+        check(reply.lane_restored_prefix() == 5);
+    }
+    for (const auto& bad : {done_at(6, false, 6), done_at(5, true, 5), done_at(4, false, 5), done_at(2, false, 2)}) {
+        MtpWireReply reply(prepared, prepared, job);
+        refuses([&] { reply.finish(bad); });
+    }
+    {
+        MtpWireReply plain(prepared, prepared, input(2));
+        refuses([&] { plain.finish(done_at(5, false, 5)); });
+    }
+    const auto opted_in = with(job, "lane_inherit_seed", Json(true));
+    auto hit = done_at(5, false, 5);
+    hit = with(std::move(hit), "known_qsa_rows_physical_tiles", Json::integer(0));
+    hit = with(std::move(hit), "known_qsa_rows_logical_rows", Json::integer(0));
+    hit = with(std::move(hit), "checkpoint_restored_tokens", Json::integer(2));
+    hit = with(std::move(hit), "replayed_input_tokens", Json::integer(0));
+    hit = with(std::move(hit), "lane_restored_tokens", Json::integer(5));
+    hit = with(std::move(hit), "lane_seed", Json::integer(44));
+    {
+        MtpWireReply reply(prepared, prepared, opted_in);
+        reply.finish(hit);
+        check(reply.lane_seed() == std::optional<uint64_t>(44) && reply.restored_input_tokens() == 2 && reply.lane_restored_prefix() == 5);
+    }
+    // Regression: full sub-512 restore (replayed_input_tokens == 0) must emit 0 verify_tiles and 0 logical_rows.
+    refuses([&] {
+        MtpWireReply stale_tiles(prepared, prepared, opted_in);
+        stale_tiles.finish(with(hit, "known_qsa_rows_physical_tiles", Json::integer(12)));
+    });
+    refuses([&] {
+        MtpWireReply stale_rows(prepared, prepared, opted_in);
+        stale_rows.finish(with(hit, "known_qsa_rows_logical_rows", Json::integer(24)));
+    });
+    {
+        auto full_sub512 = done_at(4, true, std::nullopt);
+        full_sub512 = with(std::move(full_sub512), "native_mtp_prime_calls", Json::integer(3));
+        full_sub512 = with(std::move(full_sub512), "known_qsa_rows_physical_tiles", Json::integer(0));
+        full_sub512 = with(std::move(full_sub512), "known_qsa_rows_logical_rows", Json::integer(0));
+        full_sub512 = with(std::move(full_sub512), "checkpoint_restored_tokens", Json::integer(4));
+        full_sub512 = with(std::move(full_sub512), "replayed_input_tokens", Json::integer(0));
+        const auto job4 = input(4);
+        MtpWireReply reply(prepared, prepared, job4);
+        reply.finish(full_sub512);
+        check(reply.restored_input_tokens() == 4, "full sub-512 restore failed");
+        refuses([&] {
+            MtpWireReply bad(prepared, prepared, job4);
+            bad.finish(with(full_sub512, "known_qsa_rows_physical_tiles", Json::integer(12)));
+        });
+    }
+    {
+        MtpWireReply no_opt_in(prepared, prepared, job);
+        refuses([&] { no_opt_in.finish(hit); });
+    }
+    for (const auto& [key, val] : std::vector<std::pair<const char*, Json>>{
+        {"lane_seed", Json()}, {"lane_seed", Json::integer(1)}, {"lane_restored_tokens", Json::integer(0)},
+        {"lane_restored_tokens", Json::integer(1)}, {"lane_restored_tokens", Json::integer(4)}, {"lane_restored_tokens", Json::integer(6)}}) {
+        MtpWireReply bad(prepared, prepared, opted_in);
+        refuses([&] { bad.finish(with(hit, key, val)); });
+    }
+    for (const auto& bad_inherit : {Json(false), Json(), Json::integer(1)}) {
+        refuses([&] { MtpWireReply bad(prepared, prepared, with(job, "lane_inherit_seed", bad_inherit)); });
+    }
+    refuses([&] { MtpWireReply bad(prepared, prepared, with(input(2), "lane_prompt", Json(Json::Array{Json::integer(65), Json::integer(65)}))); });
+    refuses([&] { MtpWireReply bad(prepared, prepared, with(input(2), "lane_prompt", Json(Json::Array{Json::integer(65), Json::integer(9), Json::integer(3)}))); });
+    refuses([&] { MtpWireReply bad(prepared, prepared, with(input(1, false), "lane_prompt", Json(Json::Array{Json::integer(65), Json::integer(3)}))); });
+}
+
+void parked_lane_sessions() {
+    auto codec = session_codec();
+    // Use 300 as a non-canonical token spelling "Vi".
+    auto base_encode = codec.encode;
+    auto base_decode = codec.decode;
+    std::vector<uint32_t> force_next_ids;
+    codec.render = [](const Json& req) {
+        std::string prompt;
+        for (const auto& msg : req.find("messages")->array()) {
+            const auto role = msg.find("role")->string();
+            const auto content = msg.find("content")->string();
+            if (role == "assistant") {
+                if (const auto* r = msg.find("reasoning_content"); r && !r->is_null()) {
+                    prompt += std::string(r->string()) + "</think>";
+                }
+                prompt += std::string(content) + "<|im_end|>";
+            } else {
+                prompt += std::string(content);
+            }
+        }
+        return RenderedChat{std::move(prompt), Json(Json::Array{}), 0, 0};
+    };
+    codec.encode = [&](const RenderedChat& r) {
+        if (!force_next_ids.empty()) {
+            auto out = std::move(force_next_ids);
+            force_next_ids.clear();
+            return out;
+        }
+        std::vector<uint32_t> out;
+        const std::string& s = r.prompt;
+        for (size_t i = 0; i < s.size();) {
+            if (s.substr(i).starts_with("<|im_end|>")) { out.push_back(248046); i += 10; }
+            else if (s.substr(i).starts_with("</think>")) { out.push_back(248047); i += 8; }
+            else { out.push_back(uint32_t(static_cast<unsigned char>(s[i++])) + 1U); }
+        }
+        return out;
+    };
+    codec.decode = [&](std::span<const uint32_t> ids) {
+        std::string out;
+        for (const auto id : ids) {
+            if (id == 300) out += "Vi";
+            else if (id == 248046) out += "<|im_end|>";
+            else if (id == 248047) out += "</think>";
+            else out += char(id - 1U);
+        }
+        return out;
+    };
+    codec.nonordinary_ids = {248047};
+
+    const auto prepared = ready();
+    ServeSession session(codec, "tokspur", "direct", Json(), false, Json(), false,
+        ToolEnumValidation::strict, false, prepared,
+#ifdef TOKSPUR_PRIVATE_LANE_LAYOUT
+        Json(),
+#endif
+        std::nullopt, ToolArgValidation::strict, 65536, true);
+
+    std::vector<uint32_t> queued_out;
+    uint32_t active_prefix = 0;
+    uint64_t active_seed = 44;
+    Json active_sampling = scalar_fixture::sampled_policy();
+    uint64_t primes = 0, tiles = 0, rows = 0, stage = 0;
+    std::vector<uint32_t> parked_lane_tokens;
+    uint64_t parked_lane_seed = 0;
+    bool saw_lane_prompt = false, saw_inherit_seed = false;
+    std::vector<uint32_t> last_submitted_prompt;
+
+    const auto target = [&](const Json& job, const std::function<void(const Json&)>& event) -> Json {
+        const bool reset = job.find("reset")->boolean();
+        const auto n = uint32_t(job.find("tokens")->array().size());
+        const auto maximum = uint32_t(integer(job, "generate"));
+        if (reset) {
+            active_prefix = 0;
+            active_seed = integer(job, "seed");
+            active_sampling = *job.find("sampling");
+            if (const auto* inherit = job.find("lane_inherit_seed"); inherit && inherit->boolean()) saw_inherit_seed = true;
+            if (const auto* lp = job.find("lane_prompt")) {
+                saw_lane_prompt = true;
+                last_submitted_prompt.clear();
+                for (const auto& t : lp->array()) last_submitted_prompt.push_back(uint32_t(t.unsigned_integer()));
+            }
+        }
+        std::optional<uint32_t> restored_len;
+        if (n > 0 && reset && !parked_lane_tokens.empty()) {
+            const auto* lp_field = job.find("lane_prompt");
+            if (lp_field) {
+                const auto& lp = lp_field->array();
+                if (lp.size() > parked_lane_tokens.size()) {
+                    bool match = true;
+                    for (size_t i = 0; i < parked_lane_tokens.size(); ++i) {
+                        if (lp[i].unsigned_integer() != parked_lane_tokens[i]) { match = false; break; }
+                    }
+                    if (match && parked_lane_tokens.size() > n) {
+                        restored_len = uint32_t(parked_lane_tokens.size());
+                        active_seed = parked_lane_seed;
+                    }
+                }
+            }
+        }
+        Json::Array gen_ids;
+        uint32_t ordinary = 0;
+        bool stopped = false;
+        if (n > 0) {
+            const uint32_t restored_in_packet = restored_len ? std::min<uint32_t>(n, *restored_len) : 0u;
+            const uint32_t replayed = n - restored_in_packet;
+            active_prefix = restored_len ? *restored_len : (active_prefix + n);
+            primes += n - (reset ? 1u : 0u);
+            if (replayed > 0) {
+                tiles += 12;
+                rows += 12 * replayed;
+            }
+        } else {
+            while (gen_ids.size() < maximum && !queued_out.empty() && !stopped) {
+                const auto id = queued_out.front(); queued_out.erase(queued_out.begin());
+                ++active_prefix; ++ordinary; ++primes; stage += 12;
+                gen_ids.push_back(Json::integer(id));
+                event(Json(Json::Object{{"event", Json("token")}, {"id", Json::integer(id)}, {"source_logit", number(0.5)},
+                    {"committed_prefix", Json::integer(active_prefix)}, {"entropy_words", Json::integer(0)}, {"gpu_profile", Json()}}));
+                stopped = (id == 248046);
+            }
+        }
+        auto done = with(prepared, "event", Json("done"));
+        for (const auto name : sampled_prefill_fixture::ready_only_fields) done = without(done, name);
+        done = with(std::move(done), "committed_prefix", Json::integer(active_prefix));
+        done = with(std::move(done), "generated_ids", Json(std::move(gen_ids)));
+        done = with(std::move(done), "known_token_prefill", Json(true));
+        done = with(std::move(done), "status", Json(n ? "prefilled" : stopped ? "stopped" : "length"));
+        done = with(std::move(done), "finish_reason", n ? Json() : Json(stopped ? "stop" : "length"));
+        done = with(std::move(done), "stop_id", stopped ? Json::integer(248046) : Json());
+        done = with(std::move(done), "continuation_allowed", Json(!stopped && !restored_len));
+        auto samp = active_sampling.object();
+        for (const auto& item : Json::Object{{"valid", Json(true)}, {"seed", Json::integer(active_seed)}, {"entropy_prefix", Json::integer(active_prefix)},
+            {"entropy_words", Json::integer(0)}, {"filter_order", Json("fixture-filter")}, {"rng", Json("fixture-rng")}, {"ownership", Json("fixture-owner")}})
+            samp.push_back(item);
+        done = with(std::move(done), "sampling", Json(std::move(samp)));
+        for (size_t i = 0; i < counter_names.size(); ++i) done = with(std::move(done), counter_names[i], Json::integer(i == 1 ? primes : 0));
+        for (const auto name : clock_names) done = with(std::move(done), name, number(0));
+        done = with(std::move(done), "qsa_stage_v8_calls", Json::integer(stage));
+        done = with(std::move(done), "qsa_stage_v8_extra_dispatches", Json::integer(stage));
+        done = with(std::move(done), "qsa_stage_v8_physical_dispatches", Json::integer(2 * stage));
+        done = with(std::move(done), "qsa_channel_calls", Json::integer(stage));
+        done = with(std::move(done), "qsa_channel_extra_dispatches", Json::integer(stage));
+        done = with(std::move(done), "known_qsa_rows_physical_tiles", Json::integer(tiles));
+        done = with(std::move(done), "known_qsa_rows_logical_rows", Json::integer(rows));
+        for (const auto name : {"qsa_stage_v8_request_calls", "qsa_channel_request_calls"})
+            done = with(std::move(done), name, Json::integer(12 * ordinary));
+        done = with(std::move(done), "hc_exact_routes", hc({0, 0, 0, 0, 0}));
+        done = with(std::move(done), "hc_exact_request_routes", hc({0, 0, 0, 0, 0}));
+        if (restored_len) {
+            done = with(std::move(done), "lane_restored_prefix", Json::integer(*restored_len));
+            done = with(std::move(done), "checkpoint_restored_tokens", Json::integer(n));
+            done = with(std::move(done), "replayed_input_tokens", Json::integer(0));
+            done = with(std::move(done), "lane_seed", Json::integer(active_seed));
+            done = with(std::move(done), "lane_restored_tokens", Json::integer(*restored_len));
+        }
+        return done;
+    };
+
+    const ServeSink sink{{}, [] { return false; }, [] { return uint64_t(44); }};
+    // Turn 1 (Conv A, enable_thinking: false, non-canonical token 300 = "Vi" + "sible<|im_end|>").
+    queued_out = {300};
+    for (char c : std::string_view("sible")) queued_out.push_back(uint32_t(static_cast<unsigned char>(c)) + 1U);
+    queued_out.push_back(248046);
+    const auto req_a1 = with(chat("AAAAAAAAAA", false, 32), "seed", Json::integer(77));
+    const auto res_a1 = session.complete(req_a1, "a1", target, sink);
+    check(res_a1.find("choices")->array()[0].find("message")->find("content")->string() == "Visible");
+    parked_lane_tokens.clear();
+    for (char c : std::string_view("AAAAAAAAAA")) parked_lane_tokens.push_back(uint32_t(static_cast<unsigned char>(c)) + 1U);
+    parked_lane_tokens.push_back(300);
+    for (char c : std::string_view("sible")) parked_lane_tokens.push_back(uint32_t(static_cast<unsigned char>(c)) + 1U);
+    parked_lane_tokens.push_back(248046);
+    parked_lane_seed = 77;
+
+    // Turn 2 (Conv B, switches lane -> parks A with empty turns, sampling, seed=77).
+    queued_out = {uint32_t('B') + 1U, 248046};
+    static_cast<void>(session.complete(with(chat("BBBBBBBBBB", false, 32), "seed", Json::integer(88)), "b1", target, sink));
+
+    // Turn 3 (Return to Conv A with seed omitted -> inherits 77, respells on parked A, restores past packet).
+    queued_out = {uint32_t('O') + 1U, uint32_t('K') + 1U, 248046};
+    auto req_a2 = without(chat("AAAAAAAAAA", false, 32), "seed");
+    req_a2 = with(std::move(req_a2), "messages", Json(Json::Array{
+        Json(Json::Object{{"role", Json("user")}, {"content", Json("AAAAAAAAAA")}}),
+        Json(Json::Object{{"role", Json("assistant")}, {"content", Json("Visible")}}),
+        Json(Json::Object{{"role", Json("user")}, {"content", Json("NEXT")}})}));
+    const auto res_a2 = session.complete(req_a2, "a2", target, sink);
+    check(saw_lane_prompt, "missing lane_prompt");
+    check(saw_inherit_seed, "missing lane_inherit_seed");
+    check(last_submitted_prompt.size() == parked_lane_tokens.size() + 4, "unexpected submitted prompt length");
+    check(last_submitted_prompt[10] == 300, "respelled token 300 missing");
+    check(res_a2.find("usage")->find("prompt_tokens_details")->find("cached_tokens")->unsigned_integer() == parked_lane_tokens.size(), "cached_tokens mismatch");
+}
+
 void actual_ready(const char* path, std::string_view expected_mode, bool expected_scope = false) {
     constexpr size_t limit = 8'000'000;
     std::ifstream input(path, std::ios::binary); check(bool(input), "cannot open private MTP ready capture");
@@ -1350,7 +1731,8 @@ int TOKSPUR_MTP_WIRE_TEST_ENTRY(int argc, char** argv) {
             mtp_fixture::actual_ready(argv[2], argc >= 4 ? std::string_view(argv[3]) : std::string_view("serial"), argc == 5); return 0;
         }
         check(argc == 1, "unexpected MTP wire test arguments");
-        mtp_fixture::contracts(); mtp_fixture::generation_contracts(); mtp_fixture::generation_sessions(); mtp_fixture::cold_generation_resync(mtp_fixture::scoped_ready()); mtp_fixture::sessions(); mtp_fixture::context_budget_sessions(); mtp_fixture::workers(std::filesystem::canonical(argv[0])); mtp_fixture::generation_workers(std::filesystem::canonical(argv[0]));
+        mtp_fixture::contracts(); mtp_fixture::lane_prompt_contracts(); mtp_fixture::parked_lane_sessions(); mtp_fixture::generation_contracts(); mtp_fixture::generation_sessions(); mtp_fixture::cold_generation_resync(mtp_fixture::scoped_ready()); mtp_fixture::sessions(); mtp_fixture::context_budget_sessions(); mtp_fixture::workers(std::filesystem::canonical(argv[0])); mtp_fixture::generation_workers(std::filesystem::canonical(argv[0]));
+        mtp_fixture::pressure_workers(std::filesystem::canonical(argv[0]));
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP_DEPTH2
 #if defined(TOKSPUR_PRIVATE_HTTP_PREFILL512) && defined(TOKSPUR_PRIVATE_DENSE_Q8_STAGED) && defined(TOKSPUR_PRIVATE_GROUPED_MM_F32)
         mtp_fixture::expanded_prefill_packet_contracts();

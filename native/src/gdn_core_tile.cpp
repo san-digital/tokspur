@@ -86,7 +86,7 @@ void encode_gdn_core_tile(MetalGraph& g, const GdnWeights& w, const GdnScratch& 
         const auto workspace = s.views(); std::copy(workspace.begin(), workspace.end(), writes.begin() + 3);
         g.validate_disjoint(reads, writes);
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
-        const bool use_verify_nax = g.verify_nax_active() && tile.steps >= 2 && tile.steps <= 8;
+        const bool use_verify_nax = g.verify_nax_active() && tile.steps >= 2 && tile.steps <= 16;
         if (use_verify_nax) {
             encode_verify_nax_projection(g, w.qkv, input, s.projected, shape.channels, raw, tile.steps);
             encode_verify_nax_projection(g, w.gate, input, s.gate, shape.channels, value, tile.steps);

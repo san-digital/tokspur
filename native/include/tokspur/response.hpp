@@ -2,12 +2,15 @@
 
 #include "tokspur/json.hpp"
 
+#include <array>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace tokspur {
+
+inline constexpr std::array<std::string_view, 4> response_control_markers{"<think>", "</think>", "<tool_call>", "</tool_call>"};
 
 enum class ParameterType { raw_string, boolean, number, object, array, null_value, json_value };
 struct ParameterSpec { std::string name; ParameterType type; bool required = false; };
@@ -54,9 +57,12 @@ class ResponseParser {
 public:
     ResponseParser(std::vector<ToolSpec> tools, bool initial_thinking,
                    ResponseLimits limits = {}, bool executor_parameters = false, bool token_framing = false);
+    // Call before the first feed when the tokenizer provides all four added markers.
+    void enable_control_tokens() noexcept { token_framing_ = true; control_tokens_ = true; }
+    ResponseStatus feed_control(std::string_view bytes);
     ResponseStatus feed(std::string_view bytes);
     ResponseStatus finish();
-    void prepare_forced_thinking_close() noexcept;
+    void prepare_forced_thinking_close();
     [[nodiscard]] bool in_thinking() const noexcept;
     [[nodiscard]] bool has_incomplete_utf8() const noexcept;
     [[nodiscard]] bool thinking_ends_with_newline() const noexcept;
@@ -77,6 +83,8 @@ private:
     void process(bool final);
     void process_token_framed(bool final);
     size_t token_framed_call_end();
+    bool control_at(size_t offset) const;
+    void mark_control();
     void emit(ResponseKind kind, std::string_view value);
     void parse_call(std::string_view body);
     void fail(std::string_view message);
@@ -91,7 +99,8 @@ private:
     uint32_t point_ = 0, minimum_ = 0;
     unsigned remaining_ = 0;
     bool thought_ = false, visible_ = false, had_calls_ = false, executor_parameters_ = false;
-    bool token_framing_ = false;
+    bool token_framing_ = false, control_tokens_ = false;
+    std::vector<size_t> control_offsets_;
     bool call_in_parameter_ = false;
 };
 

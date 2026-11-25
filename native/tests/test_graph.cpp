@@ -2,6 +2,9 @@
 #include "tokspur/gguf.hpp"
 #include "tokspur/numeric.hpp"
 #include "tokspur/operators.hpp"
+#ifdef TOKSPUR_PRIVATE_QSA_STAGE_V8
+#include "tokspur/qsa_stage_v8.hpp"
+#endif
 #ifdef TOKSPUR_PRIVATE_OPERATOR_CHECKPOINTS
 #include "tokspur/grouped_mm.hpp"
 #endif
@@ -69,8 +72,8 @@ struct Arena {
     }
 };
 
-void done(tokspur::MetalGraph& gpu, uint64_t dispatches, uint64_t allocations) {
-    const auto result = gpu.submit();
+void done(tokspur::MetalGraph& gpu, uint64_t dispatches, uint64_t allocations, std::optional<tokspur::CommandTiming>* timing = nullptr) {
+    const auto result = gpu.submit(timing);
     require(result.dispatches == dispatches, "wrong number of encoded dispatches");
     require(std::isfinite(result.wall_ms) && result.wall_ms > 0 && std::isfinite(result.gpu_ms) && result.gpu_ms > 0, "invalid batch timing");
     require(gpu.memory().allocations == allocations, "hidden allocation during graph execution");
@@ -106,6 +109,41 @@ void format_cases(tokspur::MetalGraph& gpu) {
             done(gpu, 1, allocations);
             close(read(gpu, output), expected);
         }
+    }
+}
+
+void residual_rounding(tokspur::MetalGraph& gpu) {
+    constexpr uint32_t branches = 4, channels = 64, width = branches * channels;
+    std::mt19937 rng(24);
+    const auto values = random_values(width, rng, 3.0f);
+    const auto scores = random_values(width, rng, 4.0f);
+    const auto update = random_values(channels, rng, 2.0f);
+    const std::array<float, branches> coefficients{2.0f / 7, 3.0f / 13, -11.0f / 17, 19.0f / 23};
+    Arena arena{gpu, {}};
+    const auto ones = arena.upload(std::vector<float>(width, 1.0f));
+    const auto input = arena.upload(values), logits = arena.upload(scores);
+    const auto factors = arena.zero(width), mixed = arena.zero(channels), residual = arena.zero(channels);
+    const auto injected = arena.zero(branches), scales = arena.zero(branches);
+    const auto delta = arena.upload(update), weights = arena.upload(coefficients), written = arena.zero(width);
+    gpu.begin();
+    gpu.gated_mix(ones, logits, factors, 1, width);
+    gpu.gated_mix(input, logits, mixed, branches, channels);
+    gpu.residual_read(input, logits, injected, residual, scales, branches, channels);
+    gpu.residual_write(input, delta, weights, written);
+    static_cast<void>(gpu.submit());
+    const auto writes = read(gpu, written);
+    const auto gates = read(gpu, factors), actual = read(gpu, mixed), residual_values = read(gpu, residual);
+    for (uint32_t channel = 0; channel < channels; ++channel) {
+        float sum = 0.0f;
+        for (uint32_t branch = 0; branch < branches; ++branch) {
+            const auto index = branch * channels + channel;
+            sum = std::fma(values[index], gates[index], sum);
+            const auto expected_write = std::fma(coefficients[branch], update[channel], values[index]);
+            require(std::bit_cast<uint32_t>(writes[index]) == std::bit_cast<uint32_t>(expected_write), "scalar residual write changed FP32 rounding");
+        }
+        const auto expected = std::bit_cast<uint32_t>(sum / branches);
+        require(std::bit_cast<uint32_t>(actual[channel]) == expected, "scalar gated mix changed FP32 rounding");
+        require(std::bit_cast<uint32_t>(residual_values[channel]) == expected, "scalar residual read changed FP32 rounding");
     }
 }
 
@@ -489,6 +527,7 @@ void concurrent_hazard_cases(const std::filesystem::path& library, std::mt19937&
         gpu.configure_concurrent_dispatch(concurrent);
         Arena arena{gpu, {}};
         const auto x = arena.upload(a), g = arena.upload(gate), b = arena.upload(rows, false), c = arena.zero(width * 2);
+        const auto whole = arena.zero(width * 3);
         const auto row = [&](tokspur::GpuView view, uint32_t at) { return gpu.slice(view, uint64_t(at) * width * 4, uint64_t(width) * 4); };
         const auto allocations = gpu.memory().allocations;
         // Each batch touches rows 0 and 2 of one buffer, then makes one more access. Only the last three accesses conflict.
@@ -507,9 +546,192 @@ void concurrent_hazard_cases(const std::filesystem::path& library, std::mt19937&
         batch({{{true, 0}, {true, 2}, {false, 2}}}, 1, "read of a written row took no barrier");
         batch({{{false, 0}, {false, 2}, {true, 2}}}, 1, "write of a read row took no barrier");
         batch({{{true, 0}, {true, 2}, {true, 0}}}, 1, "rewrite of a written row took no barrier");
+        gpu.begin();
+        for (uint32_t i = 0; i < 3; ++i) gpu.multiply(x, g, row(b, i));
+        gpu.activate(b, whole, tokspur::Activation::identity, 2.0f);
+        gpu.activate(whole, b, tokspur::Activation::identity, 0.25f);
+        gpu.multiply(row(b, 0), row(b, 2), row(c, 0));
+        gpu.multiply(row(b, 1), g, row(c, 1));
+        done(gpu, 7, allocations);
+        require(gpu.concurrent_barriers() == (concurrent ? 3u : 7u), "adjacent writes followed by a whole-buffer read and rewrite");
         auto bytes = gpu.read(b); const auto more = gpu.read(c); bytes.insert(bytes.end(), more.begin(), more.end());
         if (!concurrent) serial = bytes; else require(bytes == serial, "concurrent hazard scope changed results");
     }
+}
+
+void phase_b_asap_and_default_cases(const std::filesystem::path& library) {
+    tokspur::MetalGraph default_graph(library, 16 * 1024 * 1024);
+    require(default_graph.concurrent_dispatch(), "concurrent dispatch must default to true");
+    // Implicit default allows profiling/capture/indirect-compatible transition; explicit true refuses them and locks across abort().
+    {
+        tokspur::MetalGraph profiled(library, 16 * 1024 * 1024);
+        profiled.configure_concurrent_dispatch(false);
+        const auto mode = profiled.configure_profiling(8);
+        require(mode != tokspur::ProfileMode::disabled, "profile mode must activate");
+        rejected([&] { profiled.configure_concurrent_dispatch(true); });
+        require(!profiled.concurrent_dispatch(), "refused selection changed mode");
+
+        tokspur::MetalGraph explicit_conc(library, 16 * 1024 * 1024);
+        explicit_conc.configure_concurrent_dispatch(true);
+        rejected([&] { static_cast<void>(explicit_conc.configure_profiling(8)); });
+        rejected([&] { explicit_conc.begin_capture(8); });
+        rejected([&] { explicit_conc.begin_indirect_compatible(); });
+        explicit_conc.begin(); explicit_conc.abort();
+        rejected([&] { explicit_conc.configure_concurrent_dispatch(false); });
+        require(explicit_conc.concurrent_dispatch(), "aborted first batch left policy mutable");
+    }
+
+    // Interleaved depth-3 diamond DAG: greedy call-order emits 3 barriers, ASAP emits depth - 1 = 2 barriers.
+    const std::array<float, 4> x_vals{1.0f, -2.0f, 3.0f, -0.5f};
+    std::vector<std::byte> serial_out, conc_out, partial_serial_out, partial_conc_out;
+    for (const bool concurrent : {false, true}) {
+        tokspur::MetalGraph gpu(library, 16 * 1024 * 1024);
+        gpu.configure_concurrent_dispatch(concurrent);
+        Arena arena{gpu, {}};
+        const auto x = arena.upload(x_vals);
+        const auto a = arena.zero(4), b = arena.zero(4), c = arena.zero(4), d = arena.zero(4), out = arena.zero(4);
+        const auto allocations = gpu.memory().allocations;
+
+        gpu.begin();
+        gpu.activate(x, a, tokspur::Activation::silu);
+        gpu.activate(a, b, tokspur::Activation::sigmoid);
+        gpu.activate(x, c, tokspur::Activation::identity, 2.0f);
+        gpu.activate(c, d, tokspur::Activation::silu);
+        gpu.multiply(b, d, out, false);
+        done(gpu, 5, allocations);
+        require(gpu.concurrent_barriers() == (concurrent ? 2u : 5u), "interleaved diamond DAG barrier count");
+        if (!concurrent) serial_out = gpu.read(out);
+        else conc_out = gpu.read(out);
+
+        // Multi-window commit_partial() ASAP parity.
+        gpu.begin();
+        gpu.activate(x, a, tokspur::Activation::silu);
+        gpu.activate(a, b, tokspur::Activation::sigmoid);
+        gpu.activate(x, c, tokspur::Activation::identity, 2.0f);
+        gpu.activate(c, d, tokspur::Activation::silu);
+        gpu.multiply(b, d, out, false);
+        require(gpu.commit_partial(), "commit_partial must succeed on concurrent/serial direct batch");
+        gpu.activate(out, a, tokspur::Activation::identity, 0.5f);
+        gpu.activate(a, b, tokspur::Activation::silu);
+        gpu.activate(out, c, tokspur::Activation::sigmoid);
+        gpu.activate(c, d, tokspur::Activation::identity, 1.5f);
+        gpu.multiply(b, d, out, false);
+        std::optional<tokspur::CommandTiming> timing{std::in_place};
+        done(gpu, 10, allocations, &timing);
+        require(!timing, "partial submissions reported a single command timing");
+        require(gpu.concurrent_barriers() == (concurrent ? 4u : 10u), "commit_partial multi-window ASAP barrier count");
+        if (!concurrent) partial_serial_out = gpu.read(out);
+        else partial_conc_out = gpu.read(out);
+    }
+    require(serial_out == conc_out, "ASAP diamond DAG output mismatch vs serial");
+    require(partial_serial_out == partial_conc_out, "commit_partial ASAP output mismatch vs serial");
+}
+
+void error_flag_decoupling_cases(const std::filesystem::path& library) {
+    // 1. Overflow past 16,384 error_flag slots catches error at submit() on slot error_flag_capacity - 1.
+    {
+        tokspur::MetalGraph overflow_gpu(library, 1024 * 1024);
+        require(overflow_gpu.concurrent_dispatch(), "overflow graph default concurrent");
+        Arena arena{overflow_gpu, {}};
+        const std::array<float, 4> ok_vals{1.0f, 2.0f, 3.0f, 4.0f};
+        const std::array<float, 4> nan_vals{std::numeric_limits<float>::quiet_NaN(), 2.0f, 3.0f, 4.0f};
+        const auto ok_in = arena.upload(ok_vals), nan_in = arena.upload(nan_vals);
+        const auto out_ok = arena.zero(4), out_bad = arena.zero(4);
+
+        overflow_gpu.begin();
+        for (uint32_t i = 0; i < 16390u; ++i) overflow_gpu.activate(ok_in, out_ok, tokspur::Activation::identity);
+        done(overflow_gpu, 16390, overflow_gpu.memory().allocations);
+        require(read(overflow_gpu, out_ok) == std::vector<float>(ok_vals.begin(), ok_vals.end()), "overflow >16384 valid output");
+
+        overflow_gpu.begin();
+        for (uint32_t i = 0; i < 16386u; ++i) overflow_gpu.activate(ok_in, out_ok, tokspur::Activation::identity);
+        overflow_gpu.activate(nan_in, out_bad, tokspur::Activation::identity);
+        overflow_gpu.activate(ok_in, out_ok, tokspur::Activation::identity);
+        rejected([&] { static_cast<void>(overflow_gpu.submit()); });
+
+        overflow_gpu.begin();
+        overflow_gpu.activate(ok_in, out_ok, tokspur::Activation::identity);
+        done(overflow_gpu, 1, overflow_gpu.memory().allocations);
+    }
+
+    // 2. Middle-dispatch sticky error and abort() recovery across commit_partial() + submit() failure.
+    {
+        tokspur::MetalGraph gpu(library, 64 * 1024 * 1024);
+        Arena arena{gpu, {}};
+        const std::array<float, 4> ok_vals{1.0f, 2.0f, 3.0f, 4.0f};
+        const std::array<float, 4> inf_vals{1.0f, std::numeric_limits<float>::infinity(), 3.0f, 4.0f};
+        const auto ok_in = arena.upload(ok_vals), inf_in = arena.upload(inf_vals);
+        std::vector<tokspur::GpuView> outs;
+        for (int i = 0; i < 8; ++i) outs.push_back(arena.zero(4));
+
+        gpu.begin();
+        for (int i = 0; i < 8; ++i) gpu.activate(i == 3 ? inf_in : ok_in, outs[size_t(i)], tokspur::Activation::identity);
+        rejected([&] { static_cast<void>(gpu.submit()); });
+
+        // commit_partial() with poisoned first window followed by abort().
+        gpu.begin();
+        gpu.activate(inf_in, outs[0], tokspur::Activation::identity);
+        require(gpu.commit_partial(), "commit_partial in abort recovery");
+        gpu.activate(ok_in, outs[1], tokspur::Activation::identity);
+        gpu.abort();
+
+        gpu.begin();
+        gpu.activate(ok_in, outs[2], tokspur::Activation::identity);
+        done(gpu, 1, gpu.memory().allocations);
+        require(read(gpu, outs[2]) == std::vector<float>(ok_vals.begin(), ok_vals.end()), "clean recovery after abort");
+    }
+
+#ifdef TOKSPUR_PRIVATE_QSA_STAGE_V8
+    // 3. QsaStageErrorScope decouples QSA FLAG_READERS from unrelated dispatches (no global false barriers).
+    {
+        constexpr tokspur::QsaShape qshape{32, 3, 1, 34, 2, 32, 16, 4, 16, 8192};
+        constexpr uint32_t prefix = 12;
+        const auto b = tokspur::qsa_stage_v8_bytes(prefix, qshape);
+        const std::array<float, 4> x_vals{0.25f, 0.5f, 0.75f, 1.0f};
+        std::vector<float> q_vals(qshape.query_heads * qshape.head_width, 0.25f);
+        std::vector<uint16_t> kv_bits(size_t(prefix) * qshape.kv_heads * qshape.head_width, tokspur::finite_bf16(0.5f));
+        std::vector<uint32_t> id_vals(tokspur::qsa_block_budget(qshape));
+        for (uint32_t i = 0; i < id_vals.size(); ++i) id_vals[i] = i;
+
+        std::vector<std::byte> serial_qsa, conc_qsa, serial_b, conc_b;
+        for (const bool concurrent : {false, true}) {
+            tokspur::MetalGraph gpu(library, 64 * 1024 * 1024);
+            gpu.configure_concurrent_dispatch(concurrent);
+            gpu.prepare_qsa_score_stage();
+            Arena arena{gpu, {}};
+            const auto x = arena.upload(x_vals), a = arena.zero(4), out_b = arena.zero(4);
+            const auto q = arena.upload(q_vals);
+            const auto k = gpu.upload(std::as_bytes(std::span(kv_bits)), "qsa k");
+            const auto v = gpu.upload(std::as_bytes(std::span(kv_bits)), "qsa v");
+            arena.buffers.push_back(k); arena.buffers.push_back(v);
+            const auto ids = gpu.upload(std::as_bytes(std::span(id_vals)), "qsa ids");
+            arena.buffers.push_back(ids);
+            const auto scores = gpu.zeros(b.scores, "qsa scores");
+            const auto out_qsa = arena.zero(q_vals.size());
+            arena.buffers.push_back(scores);
+
+            const auto allocations = gpu.memory().allocations;
+            gpu.begin();
+            // Level 0: activate(x->a) and qsa_score_stage(->scores)
+            // Level 1: qsa_score_accumulate(scores->out_qsa) and activate(a->out_b)
+            // Total depth = 2 -> 1 barrier (no global error_flag barrier between QSA and activate(a->out_b)).
+            gpu.activate(x, a, tokspur::Activation::silu);
+            gpu.sparse_attention_stage_v8(q, k, v, ids, out_qsa, scores, prefix, qshape);
+            gpu.activate(a, out_b, tokspur::Activation::sigmoid);
+            done(gpu, 4, allocations);
+            require(gpu.concurrent_barriers() == (concurrent ? 1u : 4u),
+                "QSA stage error_flag must be decoupled from unrelated dispatches");
+            if (!concurrent) {
+                serial_qsa = gpu.read(out_qsa);
+                serial_b = gpu.read(out_b);
+            } else {
+                conc_qsa = gpu.read(out_qsa);
+                conc_b = gpu.read(out_b);
+            }
+        }
+        require(serial_qsa == conc_qsa && serial_b == conc_b, "decoupled QSA + activate parity mismatch");
+    }
+#endif
 }
 #endif
 
@@ -555,12 +777,15 @@ int main(int argc, char** argv) {
         std::mt19937 rng(0x67726170);
         format_cases(gpu);
         residual_cases(gpu, rng);
+        residual_rounding(gpu);
         delta_cases(gpu, rng);
         convolution_cases(gpu, rng);
         safety_cases(gpu, argv[1]);
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
         row_gemv_cases(argv[1], rng);
         concurrent_hazard_cases(argv[1], rng);
+        phase_b_asap_and_default_cases(argv[1]);
+        error_flag_decoupling_cases(argv[1]);
 #endif
 #ifdef TOKSPUR_PRIVATE_LANE_LAYOUT
         packed_storage_cases(argv[1]);

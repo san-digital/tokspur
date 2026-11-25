@@ -76,10 +76,10 @@ AttentionLayerScratch assemble(const std::array<GpuView, 43>& v) {
 }
 GpuView row(MetalGraph& g, GpuView v, uint64_t width, uint32_t i) { return g.slice(v, uint64_t(i) * width * 4, width * 4); }
 void bytes(GpuView v, uint64_t n) { require(v.bytes == n, "attention tile buffer geometry mismatch"); }
-void workspace(const AttentionTileScratch& s, AttentionLayerShape shape) {
+void workspace(const AttentionTileScratch& s, AttentionLayerShape shape, uint32_t capacity = 8) {
     const auto n = counts(shape); const auto views = s.rows.views();
-    for (size_t i = 0; i < n.size(); ++i) bytes(views[i], checked_mul(checked_mul(n[i], 8), 4));
-    bytes(s.prefix_sums, 7ull * shape.attention.index_width * 4); bytes(s.core_scores, maximum_qsa_verify_rows_scores); bytes(s.core_factors, maximum_qsa_verify_rows_factors);
+    for (size_t i = 0; i < n.size(); ++i) bytes(views[i], checked_mul(checked_mul(n[i], capacity), 4));
+    bytes(s.prefix_sums, uint64_t(capacity - 1) * shape.attention.index_width * 4); bytes(s.core_scores, maximum_qsa_verify_rows_scores); bytes(s.core_factors, maximum_qsa_verify_rows_factors);
 }
 void matrix(GpuMatrix w, uint32_t columns, uint32_t rows, uint32_t experts = 1) {
     require(can_decode(w.encoding), "unsupported attention tile matrix encoding"); const auto& e = encoding(w.encoding);
@@ -163,12 +163,13 @@ AttentionTileScratch allocate_attention_tile_scratch(MetalGraph& g, AttentionLay
     }
     return s;
 }
-QsaScratch allocate_attention_tile_qsa_scratch(MetalGraph& g, AttentionLayerShape shape) {
+QsaScratch allocate_attention_tile_qsa_scratch(MetalGraph& g, AttentionLayerShape shape, uint32_t capacity) {
+    require(capacity == 8 || capacity == 16, "attention tile QSA scratch capacity");
     const auto n = counts(shape); std::array<GpuView, 43> views{};
     try {
         for (size_t i = 6; i < 30; ++i) {
-            require(n[i] * 8 <= 16'777'216, "attention tile QSA scratch count bound");
-            views[i] = g.zeros(checked_mul(checked_mul(n[i], 8), 4), "private known-prefill QSA rows");
+            require(n[i] * capacity <= 16'777'216, "attention tile QSA scratch count bound");
+            views[i] = g.zeros(checked_mul(checked_mul(n[i], capacity), 4), "private known-prefill QSA rows");
         }
     } catch (...) { for (auto v : views) if (v.owner) g.release(v); throw; }
     return assemble(views).attention;
@@ -215,11 +216,26 @@ void encode_attention_layer_tile(MetalGraph& g, const AttentionLayerWeights& w, 
 #endif
     ) {
     try {
-        static_cast<void>(attention_tile_dispatches(g, w, base, steps, shape, mode, hc)); validate_qsa_policy(policy);
-        require(uint32_t(router) <= 1, "invalid attention tile router policy"); workspace(s, shape);
+        const uint32_t tile_capacity = (shape.attention.index_width && s.prefix_sums.bytes == 15ull * shape.attention.index_width * 4ull) ? 16u : 8u;
+        if (steps <= 8) {
+            static_cast<void>(attention_tile_dispatches(g, w, base, steps, shape, mode, hc));
+        } else {
+#if defined(TOKSPUR_PRIVATE_GROUPED_MM_F32) && defined(TOKSPUR_PRIVATE_QSA_PREFILL) && defined(TOKSPUR_PRIVATE_GDN_CHUNK)
+            require(tile_capacity == 16 && steps <= 16 && g.verify_nax_active() && verify_nax_moe &&
+                mode == AttentionTileMode::core_and_q8 && verify_nax_qsa_batch_supported(shape.attention) &&
+                g.verify_nax_qsa_attention_supported(shape.attention) &&
+                base < shape.attention.capacity && steps <= shape.attention.capacity - base,
+                "attention tile >8 rows requires capacity16 active verify NAX QSA batch mode");
+            geometry(shape); graph_policy(g, hc); weight_shapes(g, w, shape);
+#else
+            static_cast<void>(attention_tile_dispatches(g, w, base, steps, shape, mode, hc));
+#endif
+        }
+        validate_qsa_policy(policy);
+        require(uint32_t(router) <= 1, "invalid attention tile router policy"); workspace(s, shape, tile_capacity);
         const auto a = shape.attention; const auto c = a.channels, q = a.query_heads * a.head_width, k = a.kv_heads * a.head_width;
         const auto width = uint64_t(shape.residual.branches) * c;
-        bytes(input, 8 * width * 4); bytes(output, input.bytes); bytes(sum, a.index_width * 4ull); bytes(next, sum.bytes);
+        bytes(input, uint64_t(tile_capacity) * width * 4); bytes(output, input.bytes); bytes(sum, a.index_width * 4ull); bytes(next, sum.bytes);
         bytes(cache.keys, uint64_t(a.capacity) * k * 2); bytes(cache.values, cache.keys.bytes);
         bytes(cache.index_keys, uint64_t(qsa_block_capacity(a)) * a.index_width * 2);
         std::array<GpuView, 29> reads{input, sum}; const auto weights = weight_views(w); std::copy(weights.begin(), weights.end(), reads.begin() + 2);
@@ -229,7 +245,7 @@ void encode_attention_layer_tile(MetalGraph& g, const AttentionLayerWeights& w, 
         g.validate_disjoint(protected_reads, writes); // Every late capability/alias checked before encoding.
         bool use_verify_nax = false;
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
-        use_verify_nax = g.verify_nax_active() && verify_nax_moe && mode == AttentionTileMode::core_and_q8 && steps >= 2 && steps <= 8;
+        use_verify_nax = g.verify_nax_active() && verify_nax_moe && mode == AttentionTileMode::core_and_q8 && steps >= 2 && steps <= tile_capacity;
         if (use_verify_nax) {
             if (next_rms_gains.owner != 0) g.validate_disjoint(std::array{next_rms_gains}, writes);
             std::vector<GpuView> all_protected(protected_reads.begin(), protected_reads.end());

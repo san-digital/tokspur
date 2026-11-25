@@ -25,8 +25,9 @@ kernel void qsa_rotary(device const float* input [[buffer(0)]], device const flo
         if (!isfinite(frequency[d]) || frequency[d] <= 0) { atomic_fetch_or_explicit(error, 1u, memory_order_relaxed); return; }
         const uint a = base + (mode ? 2 * d : d), b = a + (mode ? 1 : s.z);
         const float angle = float(s.w) * frequency[d], c = cos(angle), t = sin(angle);
-        qsa_store(output, a, input[a] * c - input[b] * t, error);
-        qsa_store(output, b, input[b] * c + input[a] * t, error);
+        const float x = input[a], y = input[b];
+        qsa_store(output, a, fma(x, c, (-y) * t), error);
+        qsa_store(output, b, fma(y, c, x * t), error);
     } else if (d >= 2 * s.z) qsa_store(output, i, input[i], error);
 }
 

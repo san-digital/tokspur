@@ -299,13 +299,13 @@ options:
   --native-ple-ram-resident {off,on}          Explicit native PLE RAM residency mode (default: off)
   --native-mtp-fast-round {off,on}            Opt-in GPU-resident MTP fast round and fused priming (default: off)
   --native-verify-hc-gdn-fused {off,on}       Opt-in fused HC+GDN multi-row verification (default: off)
-  --native-dflash2-defer-context {off,on}     Opt-in native deferred DFlash2 context (default: off)
+  --native-dflash2-defer-context {off,on}     Deferred DFlash2 context mode (default: on for dflash2)
   --native-prepared-validation {off,on}     Opt-in scoped sampling scan reuse (default: off)
   --worker-burst-pacing {off,on}            Opt-in pacing between worker packets (default: off)
   --native-verify-cost-profile PATH         Qualified measured controller costs (default: absent)
   --native-dflash2-draft-policy {always,auto} Opt-in DFlash2 drafting decisions (default: always)
   --native-dflash2-verify-rows {all,auto}     Opt-in DFlash2 verify row budget (default: all)
-  --dflash2-max-drafts <1..7>                 Opt-in DFlash2 maximum drafted proposals per round
+  --dflash2-max-drafts <1..15>                Opt-in DFlash2 maximum drafted proposals per round
   --dflash2-vocab-slice <n>                   Opt-in DFlash2 draft vocabulary slice (0 or multiple of 32)
   --dflash2-vocab-gather <spec>               Opt-in DFlash2 gathered draft vocabulary (control32k, cjk48k, cjk64k, cjk80k, or ID ranges)
   --mtp-draft-slice, --no-mtp-draft-slice     Opt-in top-32K MTP draft vocabulary slice (default: off)
@@ -329,11 +329,11 @@ options:
   --qsa-prefill-fused, --no-qsa-prefill-fused Fused QSA prefill operator (default: on)
   --hc-consumer-fused, --no-hc-consumer-fused Fused HC consumer operator (default: on)
   --ple-overlap, --no-ple-overlap             Chunk-ahead PLE prefill overlap (default: on)
-  --shared-prefix-cache, --no-shared-prefix-cache Host-RAM shared system-prefix cache (default: on for mtp)
-  --parked-lanes-mib <mib>                    Host RAM for conversations parked on a switch (0..16384, default: 0, 4096 with the MTP speed preset and shared prefix cache)
-  --mtp-lookup {off,bypass,hybrid}            Opt-in MTP prompt-lookup mode (default: off)
+  --shared-prefix-cache, --no-shared-prefix-cache Host-RAM shared system-prefix cache (default: on)
+  --parked-lanes-mib <mib>                    Host RAM for conversations parked on a switch (0..16384, default: 4096 when shared prefix cache is enabled)
+  --mtp-lookup {off,bypass,hybrid}            MTP prompt-lookup mode (default: hybrid for mtp)
   --mtp-lookup-match <2..16>                  Opt-in MTP prompt-lookup match length
-  --dflash2-lookup {off,bypass,hybrid}        Opt-in DFlash2 prompt-lookup mode (default: off)
+  --dflash2-lookup {off,bypass,hybrid}        DFlash2 prompt-lookup mode (default: hybrid for dflash2)
   --dflash2-lookup-match <2..16>              Opt-in DFlash2 prompt-lookup match length
   --tool-enum-validation {strict,executor}    OpenAI tool enum schema policy (default: strict)
   --tool-arg-validation {strict,executor}     OpenAI tool argument schema policy (default: strict)
@@ -728,6 +728,8 @@ where
             let mut prepared_validation_explicit = false;
             let mut output_packet_explicit = false;
             let mut parked_lanes_explicit = false;
+            let mut mtp_lookup_explicit = false;
+            let mut dflash2_lookup_explicit = false;
             let mut tool_enum_explicit = false;
             let mut tool_arg_explicit = false;
             let mut i = 0;
@@ -1092,13 +1094,13 @@ where
                         opts.dflash2_precision = Some(val);
                     }
                     "--dflash2-max-drafts" | "--native-dflash2-max-drafts" => {
-                        let val = take_val(flag, inline_val, &mut i, "requires 1..7")?;
+                        let val = take_val(flag, inline_val, &mut i, "requires 1..15")?;
                         let md = val.parse::<u32>().map_err(|_| {
                             CliError::Usage(format!("invalid {flag} integer: {val}"))
                         })?;
-                        if !(1..=7).contains(&md) {
+                        if !(1..=15).contains(&md) {
                             return Err(CliError::Usage(format!(
-                                "invalid {flag} '{md}' (expected 1..7)"
+                                "invalid {flag} '{md}' (expected 1..15)"
                             )));
                         }
                         opts.dflash2_max_drafts = Some(md);
@@ -1234,6 +1236,7 @@ where
                             )));
                         }
                         opts.mtp_lookup = val;
+                        mtp_lookup_explicit = true;
                     }
                     "--mtp-lookup-match" => {
                         let val = take_val(flag, inline_val, &mut i, "requires an integer 2..16")?;
@@ -1256,6 +1259,7 @@ where
                             )));
                         }
                         opts.dflash2_lookup = val;
+                        dflash2_lookup_explicit = true;
                     }
                     "--dflash2-lookup-match" => {
                         let val = take_val(flag, inline_val, &mut i, "requires an integer 2..16")?;
@@ -1453,19 +1457,27 @@ where
                         opts.dflash2_verify_rows = Some("auto".to_owned());
                     }
                 }
-                if !parked_lanes_explicit
-                    && opts.drafter == "mtp"
-                    && opts.shared_prefix_cache.unwrap_or(true)
-                    && opts.checkpoint_cap_gib.unwrap_or(0.0) <= 0.0
-                {
-                    opts.parked_lanes_mib = SPEED_PRESET_PARKED_LANES_MIB;
-                }
                 if !output_packet_explicit {
                     opts.output_packet = 64;
                 }
                 if opts.output_packet == 64 && opts.first_output_packet.is_none() {
                     opts.first_output_packet = Some(8);
                 }
+            }
+            if opts.drafter == "dflash2" && opts.dflash2_defer_context.is_none() {
+                opts.dflash2_defer_context = Some(true);
+            }
+            if !mtp_lookup_explicit && opts.drafter == "mtp" && opts.verify_cost_profile.is_none() {
+                opts.mtp_lookup = "hybrid".to_owned();
+            }
+            if !dflash2_lookup_explicit
+                && opts.drafter == "dflash2"
+                && opts.verify_cost_profile.is_none()
+            {
+                opts.dflash2_lookup = "hybrid".to_owned();
+            }
+            if !parked_lanes_explicit && opts.shared_prefix_cache.unwrap_or(true) {
+                opts.parked_lanes_mib = SPEED_PRESET_PARKED_LANES_MIB;
             }
             Command::Serve(Box::new(opts))
         }
@@ -2053,6 +2065,65 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_dir_rejects_symlinks_and_accepts_clean_paths() {
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("tokspur-ckpt-symlink-test-{}", std::process::id()));
+        let _cleanup = std::fs::remove_dir_all(&base);
+        let real_dir = base.join("real_ckpt");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let sym_dir = base.join("sym_ckpt");
+        std::os::unix::fs::symlink(&real_dir, &sym_dir).unwrap();
+
+        let build_with_dir = |ckpt: &Path| {
+            let ckpt_str = ckpt.to_str().unwrap();
+            let Command::Serve(opts) = parse_args([
+                "serve",
+                "--checkpoint-cap-gib",
+                "2.0",
+                "--checkpoint-dir",
+                ckpt_str,
+            ])
+            .unwrap()
+            .command
+            else {
+                panic!("expected Serve");
+            };
+            build_carrier_flags(
+                &opts,
+                SpeculativeAsset::MtpSidecar(Path::new("/tmp/mtp.gguf")),
+                &base,
+            )
+        };
+
+        let sym_err = build_with_dir(&sym_dir).unwrap_err();
+        assert_eq!(
+            sym_err.to_string(),
+            "checkpoint directory must not traverse symlinks"
+        );
+        let nested_sym_err = build_with_dir(&sym_dir.join("nested")).unwrap_err();
+        assert_eq!(
+            nested_sym_err.to_string(),
+            "checkpoint directory must not traverse symlinks"
+        );
+        let rel_err = build_with_dir(Path::new("../escape")).unwrap_err();
+        assert_eq!(
+            rel_err.to_string(),
+            "checkpoint directory must not contain relative traversal components"
+        );
+
+        let clean_nested = real_dir.join("nested");
+        let ok_flags = build_with_dir(&clean_nested).unwrap();
+        assert!(
+            ok_flags
+                .windows(2)
+                .any(|w| { w[0] == "--checkpoint-dir" && w[1] == clean_nested.to_str().unwrap() })
+        );
+
+        let _cleanup_after = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn configure_and_pack_accept_inline_flag_values() {
         for (inline, spaced) in [
             (
@@ -2215,6 +2286,8 @@ mod tests {
             ["--native-hc-consumer-fused", "on"],
             ["--native-ple-overlap", "on"],
             ["--shared-prefix-cache", "on"],
+            ["--native-parked-lanes-mib", "4096"],
+            ["--native-mtp-lookup", "hybrid"],
             ["--tool-enum-validation", "strict"],
         ] {
             assert!(
@@ -2232,7 +2305,6 @@ mod tests {
             "--native-dflash2-verify-rows",
             "--native-drafter",
             "--native-mtp-draft-slice",
-            "--native-mtp-lookup",
             "--native-mtp-lookup-match",
             "--overlap-prefill",
             "--private-prefix-trace",
@@ -2282,7 +2354,6 @@ mod tests {
             "--native-qsa-prefill-fused",
             "--native-hc-consumer-fused",
             "--native-ple-overlap",
-            "--shared-prefix-cache",
             "--checkpoint-ssd",
         ] {
             assert!(
@@ -2290,6 +2361,37 @@ mod tests {
                 "opt-out failed to disable {disabled}: {opt_out_carrier:?}"
             );
         }
+        assert!(
+            opt_out_carrier
+                .windows(2)
+                .any(|w| w == ["--shared-prefix-cache", "off"])
+        );
+        assert!(
+            opt_out_carrier
+                .windows(2)
+                .any(|w| w == ["--native-parked-lanes-mib", "0"])
+        );
+
+        let park_zero = parse_args(["serve", "--parked-lanes-mib", "0"]).unwrap();
+        let Command::Serve(park_zero_opts) = park_zero.command else {
+            panic!("expected Serve");
+        };
+        let park_zero_carrier = build_carrier_flags(
+            &park_zero_opts,
+            SpeculativeAsset::MtpSidecar(sidecar),
+            state,
+        )
+        .unwrap();
+        assert!(
+            park_zero_carrier
+                .windows(2)
+                .any(|w| w == ["--shared-prefix-cache", "on"])
+        );
+        assert!(
+            park_zero_carrier
+                .windows(2)
+                .any(|w| w == ["--native-parked-lanes-mib", "0"])
+        );
 
         let opt_in = parse_args([
             "serve",
@@ -2365,7 +2467,7 @@ mod tests {
             );
         }
 
-        // DFlash2 leaves checkpoint caches off unless explicitly requested.
+        // DFlash2 enables shared prefix cache, parked lanes, deferred context and hybrid lookup by default; SSD checkpoints remain opt-in.
         let nax_dflash2 = parse_args([
             "serve",
             "--prefill-dense",
@@ -2393,6 +2495,10 @@ mod tests {
             ["--native-prefill-dense", "nax"],
             ["--native-prefill-grouped", "nax"],
             ["--native-verify-nax", "on"],
+            ["--shared-prefix-cache", "on"],
+            ["--native-parked-lanes-mib", "4096"],
+            ["--native-dflash2-defer-context", "on"],
+            ["--native-dflash2-lookup", "hybrid"],
         ] {
             assert!(
                 dflash2_carrier.windows(2).any(|w| w == pair),
@@ -2400,7 +2506,6 @@ mod tests {
             );
         }
         assert!(!dflash2_carrier.iter().any(|f| f == "--checkpoint-ssd"));
-        assert!(!dflash2_carrier.iter().any(|f| f == "--shared-prefix-cache"));
 
         let mut cached_dflash2 = dflash2_opts.clone();
         cached_dflash2.shared_prefix_cache = Some(true);
@@ -2817,7 +2922,7 @@ mod tests {
         assert_eq!(parked(&[]), SPEED_PRESET_PARKED_LANES_MIB);
         assert_eq!(
             parked(&["--drafter", "dflash2", "--shared-prefix-cache"]),
-            0
+            SPEED_PRESET_PARKED_LANES_MIB
         );
         assert_eq!(
             parked(&[
@@ -2829,15 +2934,35 @@ mod tests {
             ]),
             1024
         );
-        assert_eq!(parked(&["--drafter", "dflash2"]), 0);
+        assert_eq!(
+            parked(&["--drafter", "dflash2"]),
+            SPEED_PRESET_PARKED_LANES_MIB
+        );
         assert_eq!(parked(&["--no-shared-prefix-cache"]), 0);
-        assert_eq!(parked(&["--checkpoint-cap-gib", "8"]), 0);
+        assert_eq!(
+            parked(&["--checkpoint-cap-gib", "8"]),
+            SPEED_PRESET_PARKED_LANES_MIB
+        );
         assert_eq!(parked(&["--parked-lanes-mib", "0"]), 0);
         assert_eq!(parked(&["--parked-lanes-mib", "1024"]), 1024);
         let Command::Serve(plain) = parse_args(["serve"]).unwrap().command else {
             panic!("expected Serve");
         };
-        assert_eq!(plain.parked_lanes_mib, 0);
+        assert_eq!(plain.parked_lanes_mib, SPEED_PRESET_PARKED_LANES_MIB);
+        assert_eq!(plain.mtp_lookup, "hybrid");
+
+        let Command::Serve(cost_profiled) = parse_args([
+            "serve",
+            "--native-verify-cost-profile",
+            "/tmp/verify-costs.json",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("expected Serve");
+        };
+        assert_eq!(cost_profiled.mtp_lookup, "off");
+        assert_eq!(cost_profiled.dflash2_lookup, "off");
     }
 
     #[test]

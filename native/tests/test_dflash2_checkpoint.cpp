@@ -1,5 +1,6 @@
 #include "tokspur/dflash2_checkpoint.hpp"
 #include "tokspur/derived_pack.hpp"
+#include "tokspur/shared_prefix_eviction.hpp"
 
 #include <array>
 #include <cstddef>
@@ -73,7 +74,7 @@ void intermediate_prefill_checkpoint(uint32_t total_rows, uint32_t chunk_rows, b
         check_live(restored, base + 8);
     }
     check_live(ring, total_rows);
-    std::vector<bool> needed(total_rows, shared_prefix_cache && !bounded_work);
+    std::vector<bool> needed(total_rows, false);
     if (shared_prefix_cache) std::fill_n(needed.begin(), std::min(total_rows, 2048u), true);
     for (uint32_t begin = 0; begin < total_rows; begin += packet_rows) {
         const uint32_t end = std::min(total_rows, begin + packet_rows);
@@ -82,7 +83,7 @@ void intermediate_prefill_checkpoint(uint32_t total_rows, uint32_t chunk_rows, b
     check(captures == (shared_prefix_cache ? 2048 / chunk_rows : 0), "intermediate anchor coverage changed");
     check(skipped == uint32_t(std::count(needed.begin(), needed.end(), false)), "prefill retained unnecessary rows or skipped required context");
     if (total_rows == 32768 && packet_rows == 8192 && shared_prefix_cache)
-        check(total_rows - skipped == (bounded_work ? 10240u : 32768u), "32K prefill context projection count differs");
+        check(total_rows - skipped == 10240u, "32K prefill context projection count differs");
 }
 
 void checkpoint_identity() {
@@ -165,6 +166,51 @@ int main() {
         }
         intermediate_prefill_checkpoint(32768, 2048, false, 8192);
         intermediate_prefill_checkpoint(32768, 2048, true, 8192);
+        // F18 retain_window preserves ring history (returns 0 remaining_after) up to 131072, while retaining=false passes through remaining_after past max_prefix_tokens.
+        check(dflash2_prefill_remaining_after(120000, true, 4096, 131072, true) == 0,
+            "retain_window=true failed to keep DFlash2 prefill ring rows up to 131072");
+        check(dflash2_prefill_remaining_after(120000, true, 131072, 131072, true) == 0,
+            "retain_window=true failed at 131072 max_prefix_tokens");
+        check(dflash2_prefill_remaining_after(120000, false, 4096, 2048, true) == 0,
+            "retain_window=true with shared_prefix_cache=false (SSD milestone) failed to retain window");
+        check(dflash2_prefill_remaining_after(120000, false, 4096, 2048, false) == 120000,
+            "retain_window=false with shared_prefix_cache=false did not preserve remaining_after");
+        check(dflash2_prefill_remaining_after(120000, true, 4096, 2048, false) == 120000,
+            "4/5-arg non-retained clamp changed above max_prefix_tokens");
+        // 128K prefill sweep: <=2048 chunks and 14 sqrt milestones return 0; all 49 interior non-milestone chunks skip via remaining > 0.
+        uint32_t zero_retained = 0, skipped_interior = 0;
+        for (uint32_t base = 0; base < 131072; base += 2048) {
+            const uint32_t frontier = base + 2048;
+            const uint64_t remaining = 131072u - frontier;
+            const bool retain_window = sqrt_milestone_window_target(base, frontier, 131072u, 2048u) != 0;
+            const uint64_t eff = dflash2_prefill_remaining_after(remaining, true, frontier, 2048u, retain_window);
+            if (base < 2048 || retain_window) {
+                check(eff == 0, "128K sweep failed to retain <=2048 or sqrt milestone window");
+                ++zero_retained;
+            } else if (remaining > 0) {
+                check(eff == remaining, "128K sweep failed to skip non-milestone interior chunk");
+                ++skipped_interior;
+            }
+        }
+        check(zero_retained == 15 && skipped_interior == 49, "128K prefill sweep retained/skipped counts mismatch");
+        // Non-milestone-aligned prompt tail (11000 rows, chunks of 2048): final 2048 trailing rows [8952, 11000) must stay live.
+        {
+            constexpr uint32_t total_rows = 11000, chunk = 2048, window = 2048;
+            std::vector<bool> written(total_rows, false);
+            for (uint32_t base = 0; base < total_rows;) {
+                const uint32_t rows = std::min(chunk, total_rows - base);
+                const uint32_t frontier = base + rows;
+                const uint64_t remaining = total_rows - frontier;
+                const bool retain_window = sqrt_milestone_window_target(base, frontier, 131072u, window) != 0;
+                const uint64_t eff = dflash2_prefill_remaining_after(remaining, true, frontier, window, retain_window);
+                const auto plan = dflash2_context_commit_plan(rows, eff, window);
+                for (uint32_t r = plan.keep_from; r < rows; ++r) written[base + r] = true;
+                base = frontier;
+            }
+            for (uint32_t pos = total_rows - window; pos < total_rows; ++pos) {
+                check(written[pos], "unaligned 11000-row prompt missed trailing 2048-row window");
+            }
+        }
         check(!dflash2_context_commit_plan(8, 0, 2048).discard_pending, "short commit discarded preceding pending context");
         check(dflash2_context_commit_plan(2048, 0, 2048).discard_pending, "complete replacement retained obsolete pending context");
         for (uint32_t prefix : {0u, 1u, 512u, 2047u, 2048u, 2049u, 4095u, 4096u, 65536u}) roundtrip(prefix);

@@ -11,7 +11,7 @@ use tokspur_text::response::{
 };
 use tokspur_text::response_protocol::{
     RESPONSE_MAXIMUM_IDS, RESPONSE_REQUEST_BYTES, ResponseAdmission, ResponseDecoder,
-    parse_native_response,
+    parse_native_response_with_controls,
 };
 
 use crate::fixture::{FIXTURE, FixtureError};
@@ -62,6 +62,8 @@ pub enum Decoder {
     WrongTerminal = 2,
     /// One byte over `response_request_bytes`.
     Oversized = 3,
+    /// The four added response markers occupy IDs 259 to 262.
+    ControlTokens = 4,
 }
 
 pub enum Case {
@@ -492,13 +494,39 @@ fn protocol(out: &mut Wire, admission: ResponseAdmission, envelope: &[u8], decod
         calls.set(calls.get() + 1);
         Ok::<_, FixtureError>(vec![b'x'; RESPONSE_REQUEST_BYTES + 1])
     };
+    let with_controls = |ids: &[u32]| {
+        calls.set(calls.get() + 1);
+        let mut bytes = Vec::new();
+        for &id in ids {
+            if (259..=262).contains(&id) {
+                bytes.extend_from_slice(
+                    tokspur_text::response::CONTROL_MARKERS[(id - 259) as usize],
+                );
+            } else {
+                bytes.extend(FIXTURE.decode_bytes(&[id])?);
+            }
+        }
+        Ok(bytes)
+    };
     let decode: Option<&ResponseDecoder<'_, FixtureError>> = match decoder {
         Decoder::Fixture => Some(&fixture),
         Decoder::Missing => None,
         Decoder::WrongTerminal => Some(&wrong),
         Decoder::Oversized => Some(&oversized),
+        Decoder::ControlTokens => Some(&with_controls),
     };
-    match parse_native_response(&envelope, admission, decode, RESPONSE_MAXIMUM_IDS) {
+    let controls: &[u32] = if matches!(decoder, Decoder::ControlTokens) {
+        &[259, 260, 261, 262]
+    } else {
+        &[]
+    };
+    match parse_native_response_with_controls(
+        &envelope,
+        admission,
+        decode,
+        RESPONSE_MAXIMUM_IDS,
+        controls,
+    ) {
         Ok(result) => {
             out.u8(b'O');
             dump_or_error(out, &result);

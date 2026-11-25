@@ -88,6 +88,11 @@ impl Range {
 pub enum Target {
     /// The shared error flag every kernel may OR into (`buffer(7)`).
     ErrorFlag,
+    /// A disjoint byte slice of the error flag (`buffer(7)`).
+    ErrorFlagSlot {
+        offset: u64,
+        bytes: u64,
+    },
     Range(Range, Access),
 }
 
@@ -117,6 +122,8 @@ pub struct Dispatch {
     pub bindings: Vec<Binding>,
     /// Sorted by index.
     pub constants: Vec<Constant>,
+    /// 12-byte indirect dispatch-arguments read span when encoded via `dispatch_indirect`.
+    pub indirect: Option<Range>,
 }
 
 impl Dispatch {
@@ -131,9 +138,18 @@ impl Dispatch {
             "{}|{}|{:?}|{:?}",
             self.pipeline, self.aligned, self.grid, self.group
         );
+        if let Some(range) = self.indirect {
+            text.push_str(&format!(
+                "|ind={}:{}+{}",
+                range.slot, range.offset, range.bytes
+            ));
+        }
         for binding in &self.bindings {
             match binding.target {
                 Target::ErrorFlag => text.push_str(&format!("|b{}=flag", binding.index)),
+                Target::ErrorFlagSlot { offset, bytes } => {
+                    text.push_str(&format!("|b{}=flag:{offset}+{bytes}", binding.index))
+                }
                 Target::Range(range, access) => text.push_str(&format!(
                     "|b{}={}:{}+{}:{:?}",
                     binding.index, range.slot, range.offset, range.bytes, access
@@ -311,10 +327,27 @@ fn binding(record: &Record<'_>) -> Result<Binding, TraceError> {
     let index = record.number("index")?;
     if let Ok(Some(buffer)) = record.json.find("buffer") {
         return match buffer.string() {
-            Ok(b"error_flag") => Ok(Binding {
-                index,
-                target: Target::ErrorFlag,
-            }),
+            Ok(b"error_flag") => {
+                let has_offset = matches!(record.json.find("offset"), Ok(Some(_)));
+                let has_bytes = matches!(record.json.find("bytes"), Ok(Some(_)));
+                let target = match (has_offset, has_bytes) {
+                    (false, false) => Target::ErrorFlag,
+                    (true, true) => {
+                        let offset = record.number("offset")?;
+                        let bytes = record.number("bytes")?;
+                        if bytes == 0 {
+                            return Err(record.malformed("error_flag slot bytes must be nonzero"));
+                        }
+                        Target::ErrorFlagSlot { offset, bytes }
+                    }
+                    _ => {
+                        return Err(
+                            record.malformed("error_flag slot requires both offset and bytes")
+                        );
+                    }
+                };
+                Ok(Binding { index, target })
+            }
             _ => Err(record.malformed("unknown named buffer")),
         };
     }
@@ -361,13 +394,40 @@ fn dispatch(record: &Record<'_>) -> Result<Dispatch, TraceError> {
     {
         return Err(record.malformed("constant index set twice"));
     }
+    let is_indirect = match record.json.find("indirect") {
+        Ok(Some(value)) => value
+            .boolean()
+            .map_err(|_| record.malformed("expected a boolean field"))?,
+        Ok(None) => false,
+        Err(_) => return Err(record.malformed("record is not an object")),
+    };
+    let (grid, indirect) = if is_indirect {
+        let grid = match record.json.find("grid") {
+            Ok(Some(_)) => record.triple("grid")?,
+            Ok(None) => [0, 0, 0],
+            Err(_) => return Err(record.malformed("record is not an object")),
+        };
+        let indirect = match record.json.find("indirect_slot") {
+            Ok(Some(_)) => Some(Range {
+                slot: record.number("indirect_slot")?,
+                offset: record.number("indirect_offset")?,
+                bytes: 12,
+            }),
+            Ok(None) => None,
+            Err(_) => return Err(record.malformed("record is not an object")),
+        };
+        (grid, indirect)
+    } else {
+        (record.triple("grid")?, None)
+    };
     Ok(Dispatch {
         pipeline: record.text("pipeline")?,
         aligned: record.flag("aligned")?,
-        grid: record.triple("grid")?,
+        grid,
         group: record.triple("group")?,
         bindings,
         constants,
+        indirect,
     })
 }
 
@@ -455,6 +515,10 @@ pub fn parse_trace(text: &[u8]) -> Result<Trace, TraceError> {
                 }
             }
             ("allocation", false) => {
+                let bytes = record.number("bytes")?;
+                if bytes == 0 {
+                    return Err(record.malformed("allocation bytes must be nonzero"));
+                }
                 let sha256 = match record.field("sha256")? {
                     value if value.is_null() => None,
                     _ => Some(record.text("sha256")?),
@@ -463,7 +527,7 @@ pub fn parse_trace(text: &[u8]) -> Result<Trace, TraceError> {
                     slot: record.number("slot")?,
                     label: record.text("label")?,
                     kind: record.text("kind")?,
-                    bytes: record.number("bytes")?,
+                    bytes,
                     immutable: record.flag("immutable")?,
                     sha256,
                 }));
@@ -644,6 +708,58 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "trace line 1: expected a schema 1 trace header first"
+        );
+    }
+
+    #[test]
+    fn parses_error_flag_slot_and_indirect_dispatch_records() {
+        let text = [
+            HEADER,
+            r#"{"event":"begin","batch":0}"#,
+            r#"{"event":"dispatch","pipeline":"prep:4294967295","aligned":true,"grid":[1,1,1],"group":[32,1,1],"bindings":[{"index":7,"buffer":"error_flag","offset":0,"bytes":4},{"index":0,"slot":2,"offset":16,"bytes":12,"access":"write"}],"constants":[]}"#,
+            r#"{"event":"dispatch","pipeline":"run:4294967295","aligned":true,"indirect":true,"indirect_slot":2,"indirect_offset":16,"group":[128,1,1],"bindings":[{"index":7,"buffer":"error_flag","offset":4,"bytes":4},{"index":0,"slot":3,"offset":0,"bytes":64,"access":"write"}],"constants":[]}"#,
+            r#"{"event":"submit","batch":0,"dispatches":2}"#,
+        ]
+        .join("\n");
+
+        let trace = parse_trace(text.as_bytes()).unwrap();
+        let dispatches: Vec<&Dispatch> = trace.batches().next().unwrap().dispatches().collect();
+        assert_eq!(
+            dispatches[0].bindings[1].target,
+            Target::ErrorFlagSlot {
+                offset: 0,
+                bytes: 4
+            }
+        );
+        assert_eq!(dispatches[0].indirect, None);
+        assert_eq!(
+            dispatches[1].bindings[1].target,
+            Target::ErrorFlagSlot {
+                offset: 4,
+                bytes: 4
+            }
+        );
+        assert_eq!(
+            dispatches[1].indirect,
+            Some(Range {
+                slot: 2,
+                offset: 16,
+                bytes: 12
+            })
+        );
+    }
+
+    #[test]
+    fn refuses_zero_byte_allocation() {
+        let text = [
+            HEADER,
+            r#"{"event":"allocation","slot":0,"label":"z","kind":"buffer","bytes":0,"immutable":true,"sha256":null}"#,
+        ]
+        .join("\n");
+        let error = parse_trace(text.as_bytes()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "trace line 2: allocation bytes must be nonzero"
         );
     }
 }

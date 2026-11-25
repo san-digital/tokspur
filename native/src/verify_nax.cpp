@@ -26,8 +26,8 @@ GpuRowsF32 tight(MetalGraph& g, GpuView view, uint32_t rows, uint32_t columns) {
     return {g.slice(view, 0, checked_mul(checked_mul(rows, columns), 4)), rows, columns, checked_mul(columns, 4)};
 }
 
-bool verify_fused_hc_q8_supported(const MetalGraph& g, GpuMatrix matrix, uint32_t columns, uint32_t rows) {
-    if (!g.verify_hc_gdn_fused_enabled() || matrix.encoding != 8 ||
+bool verify_fused_hc_q8_supported(const MetalGraph& g, GpuMatrix matrix, uint32_t columns, uint32_t rows, uint32_t steps) {
+    if (!g.verify_hc_gdn_fused_enabled() || matrix.encoding != 8 || steps < 1 || steps > 8 ||
         columns < 32 || columns > 65536 || columns % 32 != 0 || rows < 1 || rows > 65536) {
         return false;
     }
@@ -128,10 +128,16 @@ bool verify_nax_grouped_moe_supported(const MoeWeights& weights, MoeShape shape,
         ok_mat(weights.down.encoding, shape.hidden);
 }
 
+bool verify_nax_grouped_moe_supported(const MetalGraph& g, const MoeWeights& weights, MoeShape shape, uint32_t steps) {
+    if (steps <= 8) return verify_nax_grouped_moe_supported(weights, shape, steps);
+    return steps <= 16 && is_planar_moe(g, weights, shape) &&
+        verify_nax_grouped_moe_supported(weights, shape, 8u);
+}
+
 uint64_t verify_nax_projection_dispatches(const MetalGraph& g, GpuMatrix matrix, uint32_t columns, uint32_t rows, uint32_t steps) {
     if (verify_nax_dense_q8_supported(g, matrix, columns, rows) ||
         verify_nax_bf16_supported(g, matrix, columns, rows) ||
-        verify_fused_hc_q8_supported(g, matrix, columns, rows)) {
+        verify_fused_hc_q8_supported(g, matrix, columns, rows, steps)) {
         return 1ull;
     }
     if (matrix.encoding == 8) {
@@ -149,7 +155,7 @@ void encode_verify_nax_projection(MetalGraph& g, GpuMatrix matrix, GpuView input
         g.verify_nax_bf16(matrix.view, tight(g, input, steps, columns), tight(g, output, steps, rows));
         return;
     }
-    if (verify_fused_hc_q8_supported(g, matrix, columns, rows)) {
+    if (verify_fused_hc_q8_supported(g, matrix, columns, rows, steps)) {
         g.verify_fused_hc_q8(matrix.view, tight(g, input, steps, columns), tight(g, output, steps, rows), false, 1.0f);
         return;
     }
@@ -172,7 +178,7 @@ namespace {
 uint64_t verify_nax_residual_after_rms_dispatches(const MetalGraph& g, const ResidualWeights& weights, ResidualShape shape, uint32_t steps) {
     const uint32_t width = shape.branches * shape.channels;
     const uint64_t down_and_act = (verify_nax_dense_q8_supported(g, weights.down, width, shape.rank) ||
-        verify_fused_hc_q8_supported(g, weights.down, width, shape.rank))
+        verify_fused_hc_q8_supported(g, weights.down, width, shape.rank, steps))
         ? 1ull
         : (verify_nax_projection_dispatches(g, weights.down, width, shape.rank, steps) + 1ull);
     uint64_t count = down_and_act + verify_nax_projection_dispatches(g, weights.up, shape.rank, width, steps);
@@ -202,7 +208,7 @@ void encode_verify_nax_residual_after_rms(MetalGraph& g, const ResidualWeights& 
     if (verify_nax_dense_q8_supported(g, weights.down, width, shape.rank)) {
         g.verify_nax_dense_q8(weights.down.view, tight(g, scratch.normalized, steps, width),
             tight(g, scratch.bottleneck, steps, shape.rank), false, 1.0f / float(shape.branches));
-    } else if (verify_fused_hc_q8_supported(g, weights.down, width, shape.rank)) {
+    } else if (verify_fused_hc_q8_supported(g, weights.down, width, shape.rank, steps)) {
         g.verify_fused_hc_q8(weights.down.view, tight(g, scratch.normalized, steps, width),
             tight(g, scratch.bottleneck, steps, shape.rank), true, 1.0f / float(shape.branches));
     } else {
@@ -264,7 +270,7 @@ uint64_t verify_nax_residual_read_dispatches(const MetalGraph& g, const Residual
 
 void encode_verify_nax_residual_read(MetalGraph& g, const ResidualWeights& weights, const ResidualScratch& scratch,
     GpuView input_streams, ResidualShape shape, uint32_t steps, float epsilon) {
-    need(g.verify_nax_active() && steps >= 2 && steps <= 8, "verify NAX residual read requires active 2..8-row verify scope");
+    need(g.verify_nax_active() && steps >= 2 && steps <= 16, "verify NAX residual read requires active 2..16-row verify scope");
     const uint32_t width = shape.branches * shape.channels;
     g.rms_rows(tight(g, input_streams, steps, width), weights.gains, tight(g, scratch.normalized, steps, width), shape.channels, epsilon, weights.gains.bytes == uint64_t(shape.channels) * 4);
     encode_verify_nax_residual_after_rms(g, weights, scratch, shape, steps);
@@ -272,7 +278,7 @@ void encode_verify_nax_residual_read(MetalGraph& g, const ResidualWeights& weigh
 
 void encode_verify_nax_residual_read_prenorm(MetalGraph& g, const ResidualWeights& weights, const ResidualScratch& scratch,
     ResidualShape shape, uint32_t steps) {
-    need(g.verify_nax_active() && steps >= 2 && steps <= 8, "verify NAX residual read requires active 2..8-row verify scope");
+    need(g.verify_nax_active() && steps >= 2 && steps <= 16, "verify NAX residual read requires active 2..16-row verify scope");
     encode_verify_nax_residual_after_rms(g, weights, scratch, shape, steps);
 }
 
@@ -282,7 +288,7 @@ uint64_t verify_nax_residual_write_dispatches(const MetalGraph& g, ResidualShape
 
 void encode_verify_nax_residual_write(MetalGraph& g, GpuView streams, GpuView values, GpuView scales, GpuView destination,
     ResidualShape shape, uint32_t steps) {
-    need(g.verify_nax_active() && steps >= 2 && steps <= 8, "verify NAX residual write requires active 2..8-row verify scope");
+    need(g.verify_nax_active() && steps >= 2 && steps <= 16, "verify NAX residual write requires active 2..16-row verify scope");
     const uint32_t width = shape.branches * shape.channels;
     if (verify_fused_hc_shape_supported(g, shape)) {
         g.verify_fused_hc_write_rows(g.slice(streams, 0, uint64_t(steps) * width * 4),
@@ -326,9 +332,9 @@ bool verify_nax_hc_write_rms_supported(const MetalGraph& g, const ResidualWeight
 
 void encode_verify_nax_residual_write_rms(MetalGraph& g, GpuView streams, GpuView values, GpuView scales, GpuView next_gains,
     GpuView destination, GpuView next_normalized, ResidualShape shape, uint32_t steps, float next_epsilon) {
-    need(g.verify_nax_active() && steps >= 2 && steps <= 8 &&
+    need(g.verify_nax_active() && steps >= 2 && steps <= 16 &&
         verify_nax_hc_write_rms_gains_supported(g, next_gains, shape),
-        "verify NAX residual write+RMS requires active 2..8-row verify scope and supported gains");
+        "verify NAX residual write+RMS requires active 2..16-row verify scope and supported gains");
     const uint32_t width = shape.branches * shape.channels;
     const uint64_t width_bytes = uint64_t(width) * 4;
     const uint64_t chan_bytes = uint64_t(shape.channels) * 4;
@@ -372,7 +378,7 @@ uint64_t verify_nax_residual_write_read_dispatches(const MetalGraph& g, const Re
 
 void encode_verify_nax_residual_write_read(MetalGraph& g, const ResidualWeights& next_read, const ResidualScratch& scratch,
     GpuView streams, GpuView values, GpuView scales, GpuView destination, ResidualShape shape, uint32_t steps, float epsilon) {
-    need(g.verify_nax_active() && steps >= 2 && steps <= 8, "verify NAX residual write+read requires active 2..8-row verify scope");
+    need(g.verify_nax_active() && steps >= 2 && steps <= 16, "verify NAX residual write+read requires active 2..16-row verify scope");
     const uint32_t width = shape.branches * shape.channels;
     const uint64_t width_bytes = uint64_t(width) * 4;
     const uint64_t chan_bytes = uint64_t(shape.channels) * 4;
@@ -414,7 +420,7 @@ uint64_t verify_nax_moe_dispatches(const MetalGraph& g, const MoeWeights& weight
         : uint64_t(steps) * g.gemv_dispatches(weights.router.encoding, shape.channels, shape.experts);
     const uint64_t router_part = router_win ? 2ull
         : router_proj + (verify_nax_batch_top10_supported(shape, steps) ? 1ull : uint64_t(steps));
-    const uint64_t routed_part = verify_nax_grouped_moe_supported(weights, shape, steps) ? 3ull : uint64_t(steps) * 5ull;
+    const uint64_t routed_part = verify_nax_grouped_moe_supported(g, weights, shape, steps) ? 3ull : uint64_t(steps) * 5ull;
     const bool fuse_shared = verify_nax_dense_q8_supported(g, weights.shared_gate, shape.channels, shape.hidden) &&
         verify_nax_dense_q8_supported(g, weights.shared_up, shape.channels, shape.hidden);
     const bool single_pass_shared = fuse_shared &&
@@ -437,7 +443,7 @@ void encode_verify_nax_moe(MetalGraph& g, const MoeWeights& weights, const MoeSc
     const VerifyNaxMoeScratch& nax_moe, GpuView input, GpuView output, MoeShape shape,
     RouterMode mode, bool normalise, uint32_t steps) {
     static_cast<void>(nax_moe);
-    need(g.verify_nax_active() && steps >= 2 && steps <= 8, "verify NAX MoE requires active 2..8-row verify scope");
+    need(g.verify_nax_active() && steps >= 2 && steps <= 16, "verify NAX MoE requires active 2..16-row verify scope");
     const bool router_win = verify_nax_router_window_supported(g, weights, shape);
 #ifdef TOKSPUR_PRIVATE_MOE_ROUTER_WINDOW
     if (router_win) {
@@ -477,7 +483,7 @@ void encode_verify_nax_moe(MetalGraph& g, const MoeWeights& weights, const MoeSc
     }
 #endif
 
-    if (verify_nax_grouped_moe_supported(weights, shape, steps)) {
+    if (verify_nax_grouped_moe_supported(g, weights, shape, steps)) {
         const auto ids = g.slice(scratch.indices, 0, uint64_t(steps) * shape.selected * 4);
         const auto in_rows = tight(g, input, steps, shape.channels);
         const auto gate_rows = tight(g, scratch.gate, steps * shape.selected, shape.hidden);
@@ -582,7 +588,7 @@ uint64_t verify_nax_gdn_core_dispatches(const MetalGraph& g, const GdnWeights& w
     const uint64_t gates_f32 = ((g.verify_nax_m8() && verify_nax_gdn_gates_supported(weights, shape)) ||
         verify_fused_gdn_gates_supported(g, weights, shape)) ? 1ull : 2ull;
     const uint64_t conv = 1ull;
-    const bool batch_rows = verify_gdn_row_batch && steps >= 2 && steps <= 8;
+    const bool batch_rows = verify_gdn_row_batch && steps >= 2 && steps <= 16;
     const uint64_t core = ported ? 4ull : (gdn_core_batch_elementwise ?
         (batch_rows ? 4ull : (4ull + 2ull * steps)) : (1ull + 5ull * steps));
     const uint64_t proj_out = verify_nax_projection_dispatches(g, weights.output, value, shape.channels, steps);
@@ -717,9 +723,9 @@ void encode_verify_nax_ple(MetalGraph& g, const PleWeights& weights, const PleSc
     const RecurrentScratch& batch_scratch, GpuView embeddings, GpuView streams, GpuView current_memory,
     GpuView prefix_memory, GpuView next_memory, GpuView output, PleShape shape, uint32_t steps, float epsilon) {
     validate_ple_shape(shape);
-    need(g.verify_nax_active() && steps >= 2 && steps <= 8 &&
+    need(g.verify_nax_active() && steps >= 2 && steps <= 16 &&
         verify_nax_ple_supported(g, weights, batch_scratch, shape),
-        "verify NAX PLE requires active 2..8-row verify scope and supported geometry");
+        "verify NAX PLE requires active 2..16-row verify scope and supported geometry");
     const uint32_t width = shape.branches * shape.channels, c = shape.channels, emb = shape.embedding;
     const auto emb_rows = tight(g, embeddings, steps, emb);
     const auto in_rows = tight(g, streams, steps, width);
@@ -755,7 +761,7 @@ uint64_t verify_nax_final_dispatches(const MetalGraph& g, const MixerWeights& mi
     need(verify_nax_final_supported(g, mixer, output, scratch, shape, vocabulary), "verify NAX final head unsupported");
     const uint32_t width = shape.branches * shape.channels;
     const uint64_t down_and_act = (verify_nax_dense_q8_supported(g, mixer.down, width, shape.rank) ||
-        verify_fused_hc_q8_supported(g, mixer.down, width, shape.rank))
+        verify_fused_hc_q8_supported(g, mixer.down, width, shape.rank, steps))
         ? 1ull
         : (verify_nax_projection_dispatches(g, mixer.down, width, shape.rank, steps) + 1ull);
     return (input_prenormalized ? 0ull : 1ull) + down_and_act +
@@ -766,9 +772,9 @@ uint64_t verify_nax_final_dispatches(const MetalGraph& g, const MixerWeights& mi
 void encode_verify_nax_final_logits(MetalGraph& g, const MixerWeights& mixer, GpuMatrix output,
     const ResidualScratch& scratch, GpuView streams, GpuView mixed, GpuView logits,
     ResidualShape shape, uint32_t vocabulary, uint32_t steps, float epsilon, bool input_prenormalized) {
-    need(g.verify_nax_active() && steps >= 2 && steps <= 8 &&
+    need(g.verify_nax_active() && steps >= 2 && steps <= 16 &&
         verify_nax_final_supported(g, mixer, output, scratch, shape, vocabulary),
-        "verify NAX final head requires active 2..8-row verify scope and supported geometry");
+        "verify NAX final head requires active 2..16-row verify scope and supported geometry");
     const uint32_t width = shape.branches * shape.channels;
     if (!input_prenormalized) {
         g.rms_rows(tight(g, streams, steps, width), mixer.gains, tight(g, scratch.normalized, steps, width), shape.channels, epsilon, mixer.gains.bytes == uint64_t(shape.channels) * 4);
@@ -776,7 +782,7 @@ void encode_verify_nax_final_logits(MetalGraph& g, const MixerWeights& mixer, Gp
     if (verify_nax_dense_q8_supported(g, mixer.down, width, shape.rank)) {
         g.verify_nax_dense_q8(mixer.down.view, tight(g, scratch.normalized, steps, width),
             tight(g, scratch.bottleneck, steps, shape.rank), false, 1.0f / float(shape.branches));
-    } else if (verify_fused_hc_q8_supported(g, mixer.down, width, shape.rank)) {
+    } else if (verify_fused_hc_q8_supported(g, mixer.down, width, shape.rank, steps)) {
         g.verify_fused_hc_q8(mixer.down.view, tight(g, scratch.normalized, steps, width),
             tight(g, scratch.bottleneck, steps, shape.rank), true, 1.0f / float(shape.branches));
     } else {

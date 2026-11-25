@@ -7,9 +7,10 @@ use std::sync::Arc;
 use std::time::SystemTimeError;
 use tokspur_json::{
     Json, JsonError, JsonLimits, Kind, from_chars_f64, from_chars_i64, parse_json,
-    parse_json_limited, to_chars_shortest,
+    parse_json_limited, scalar_str, to_chars_shortest, unicode_scalars,
 };
 
+use crate::pattern::compile;
 use tokspur_text::response::{ParameterSpec, ParameterType, ResponseError, ToolSpec};
 use tokspur_wire::mtp_wire::MtpWireError;
 
@@ -148,6 +149,7 @@ impl fmt::Display for AdmissionError {
             Self::Mtp(MtpWireError::Refused(reason)) => formatter.write_str(reason),
             Self::Mtp(MtpWireError::MissingField(_)) => formatter.write_str("missing field"),
             Self::Mtp(MtpWireError::Json(error)) => error.fmt(formatter),
+            Self::Mtp(MtpWireError::WorkerError(msg)) => formatter.write_str(msg),
         }
     }
 }
@@ -314,6 +316,79 @@ fn compare(left: &Decimal, right: &Decimal) -> i32 {
     if left.negative { -order } else { order }
 }
 
+/// The `multipleOf` divisor as its significant digits and decimal exponent. Eighteen digits keep every remainder step below 10^19, inside `u64`; the shortest lexeme that round-trips a double has at most seventeen.
+fn divisor(value: &Json) -> Result<(u64, i64)> {
+    let step = decimal(value)?;
+    require(
+        !step.negative && step.digits != b"0",
+        "multipleOf must be positive",
+    )?;
+    require(step.digits.len() <= 18, "multipleOf digit bound")?;
+    let digits = step
+        .digits
+        .iter()
+        .fold(0u64, |total, &c| total * 10 + u64::from(c - b'0'));
+    Ok((digits, step.exponent))
+}
+
+/// Whether `value` divided by the divisor is an integer, in exact decimal arithmetic.
+fn multiple(value: &Decimal, (digits, exponent): (u64, i64)) -> bool {
+    if value.digits == b"0" {
+        return true;
+    }
+    // The value's digits do not end in zero, so they are never divisible by the power of ten that a negative shift leaves in the denominator.
+    let shift = value.exponent - exponent;
+    if shift < 0 {
+        return false;
+    }
+    let mut rest = value
+        .digits
+        .iter()
+        .fold(0u64, |rest, &c| (rest * 10 + u64::from(c - b'0')) % digits);
+    // The divisor is below 2^60, so it holds at most 59 factors of two and fewer of five: beyond 60, further powers of ten cannot change whether the remainder is zero.
+    for _ in 0..shift.min(60) {
+        rest = (rest * 10) % digits;
+    }
+    rest == 0
+}
+
+/// Appends a form in which two values are the same bytes exactly when JSON Schema calls them equal: numbers by exact decimal value, object members in name order, everything else as `dump` writes it.
+fn canonical(value: &Json, out: &mut Vec<u8>) -> Result<()> {
+    match value.kind() {
+        Kind::Number => {
+            let n = decimal(value)?;
+            if n.negative {
+                out.push(b'-');
+            }
+            out.extend_from_slice(&n.digits);
+            out.push(b'e');
+            out.extend_from_slice(n.exponent.to_string().as_bytes());
+        }
+        Kind::Array => {
+            out.push(b'[');
+            for item in value.array()? {
+                canonical(item, out)?;
+                out.push(b',');
+            }
+            out.push(b']');
+        }
+        Kind::Object => {
+            let mut members: Vec<&(Vec<u8>, Json)> = value.object()?.iter().collect();
+            members.sort_by(|left, right| left.0.cmp(&right.0));
+            out.push(b'{');
+            for (name, item) in members {
+                out.extend_from_slice(&Json::String(name.clone()).dump()?);
+                out.push(b':');
+                canonical(item, out)?;
+                out.push(b',');
+            }
+            out.push(b'}');
+        }
+        Kind::String | Kind::Boolean | Kind::Null => out.extend_from_slice(&value.dump()?),
+    }
+    Ok(())
+}
+
 fn safe_name(name: &[u8], function: bool) -> Result<()> {
     require(
         !name.is_empty() && name.len() <= if function { 64 } else { 1024 },
@@ -374,10 +449,17 @@ fn schema_admit(schema: &Json, depth: usize, nodes: &mut usize) -> Result<()> {
             "items",
             "minItems",
             "maxItems",
+            "uniqueItems",
+            "minLength",
+            "maxLength",
+            "pattern",
             "enum",
+            "const",
             "minimum",
             "exclusiveMinimum",
             "maximum",
+            "exclusiveMaximum",
+            "multipleOf",
         ],
     )?;
     let kind = schema_type(schema)?;
@@ -478,12 +560,43 @@ fn schema_admit(schema: &Json, depth: usize, nodes: &mut usize) -> Result<()> {
         if let (Some(low), Some(high)) = (low, high) {
             require(low <= high, "inverted schema bounds")?;
         }
+        if let Some(unique) = schema.find("uniqueItems")? {
+            unique.boolean()?;
+        }
     } else {
         require(
             schema.find("items")?.is_none()
                 && schema.find("minItems")?.is_none()
-                && schema.find("maxItems")?.is_none(),
+                && schema.find("maxItems")?.is_none()
+                && schema.find("uniqueItems")?.is_none(),
             "array schema keyword on other type",
+        )?;
+    }
+    if kind == b"string" {
+        let low = match schema.find("minLength")? {
+            Some(low) => Some(low.unsigned_integer()?),
+            None => None,
+        };
+        let high = match schema.find("maxLength")? {
+            Some(high) => Some(high.unsigned_integer()?),
+            None => None,
+        };
+        // The response parser caps a generated tool call at 64 KiB (`ResponseLimits::call_bytes`), and a code point takes at least one byte, so no call this server emits could meet a larger minimum. A larger maximum stays admitted: it only fails to constrain.
+        if let Some(low) = low {
+            require(low <= 65536, "minLength exceeds the tool call byte limit")?;
+        }
+        if let (Some(low), Some(high)) = (low, high) {
+            require(low <= high, "inverted schema bounds")?;
+        }
+        if let Some(pattern) = schema.find("pattern")? {
+            compile(pattern.string()?)?;
+        }
+    } else {
+        require(
+            schema.find("minLength")?.is_none()
+                && schema.find("maxLength")?.is_none()
+                && schema.find("pattern")?.is_none(),
+            "string schema keyword on other type",
         )?;
     }
     if let Some(values) = schema.find("enum")? {
@@ -507,9 +620,24 @@ fn schema_admit(schema: &Json, depth: usize, nodes: &mut usize) -> Result<()> {
             validate_tool_value(&base, value)?;
         }
     }
+    if let Some(value) = schema.find("const")? {
+        require(kind != b"object" && kind != b"array", "unsupported const")?;
+        // Admission checks the constant against the same type, without const.
+        let base = Json::Object(
+            schema
+                .object()?
+                .iter()
+                .filter(|(key, _)| key.as_slice() != b"const")
+                .cloned()
+                .collect(),
+        );
+        validate_tool_value(&base, value)?;
+    }
     if schema.find("minimum")?.is_some()
         || schema.find("maximum")?.is_some()
         || schema.find("exclusiveMinimum")?.is_some()
+        || schema.find("exclusiveMaximum")?.is_some()
+        || schema.find("multipleOf")?.is_some()
     {
         require(
             kind == b"integer" || kind == b"number",
@@ -533,11 +661,31 @@ fn schema_admit(schema: &Json, depth: usize, nodes: &mut usize) -> Result<()> {
                 )?;
             }
         }
+        if let Some(high) = schema.find("exclusiveMaximum")? {
+            number(high, -1e300, 1e300)?;
+            decimal(high)?;
+            if let Some(low) = schema.find("minimum")? {
+                require(
+                    compare(&decimal(low)?, &decimal(high)?) < 0,
+                    "inverted schema bounds",
+                )?;
+            }
+            if let Some(low) = schema.find("exclusiveMinimum")? {
+                require(
+                    compare(&decimal(low)?, &decimal(high)?) < 0,
+                    "inverted schema bounds",
+                )?;
+            }
+        }
         if let (Some(low), Some(high)) = (schema.find("minimum")?, schema.find("maximum")?) {
             require(
                 compare(&decimal(low)?, &decimal(high)?) <= 0,
                 "inverted schema bounds",
             )?;
+        }
+        if let Some(step) = schema.find("multipleOf")? {
+            number(step, -1e300, 1e300)?;
+            divisor(step)?;
         }
     }
     Ok(())
@@ -974,6 +1122,39 @@ pub fn validate_tool_value_with_policy(
             if tool_enums == ToolEnumValidation::Executor {
                 validate_executor_string(value.string()?)?;
             }
+            let minimum = schema.find("minLength")?;
+            let maximum = schema.find("maxLength")?;
+            let pattern = schema.find("pattern")?;
+            if minimum.is_some() || maximum.is_some() || pattern.is_some() {
+                // JSON Schema counts a string's length, and matches a pattern, in Unicode code points, not bytes.
+                let text = value.string()?;
+                let (scalars, length) = if pattern.is_some() {
+                    let scalars = unicode_scalars(text).map_err(JsonError::from)?;
+                    let length = scalars.len();
+                    (scalars, length as u64)
+                } else {
+                    let length = scalar_str(text).map_err(JsonError::from)?.chars().count();
+                    (Vec::new(), length as u64)
+                };
+                if let Some(minimum) = minimum {
+                    require(
+                        length >= minimum.unsigned_integer()?,
+                        "tool string below minLength",
+                    )?;
+                }
+                if let Some(maximum) = maximum {
+                    require(
+                        length <= maximum.unsigned_integer()?,
+                        "tool string above maxLength",
+                    )?;
+                }
+                if let Some(pattern) = pattern {
+                    require(
+                        compile(pattern.string()?)?.matches(&scalars),
+                        "tool string does not match pattern",
+                    )?;
+                }
+            }
         }
         b"boolean" => require(value.kind() == Kind::Boolean, "tool value is not boolean")?,
         b"null" => require(value.is_null(), "tool value is not null")?,
@@ -1008,6 +1189,18 @@ pub fn validate_tool_value_with_policy(
                     "tool value at or below exclusive minimum",
                 )?;
             }
+            if let Some(maximum) = schema.find("exclusiveMaximum")? {
+                require(
+                    compare(&n, &decimal(maximum)?) < 0,
+                    "tool value at or above exclusive maximum",
+                )?;
+            }
+            if let Some(step) = schema.find("multipleOf")? {
+                require(
+                    multiple(&n, divisor(step)?),
+                    "tool value is not a multiple of multipleOf",
+                )?;
+            }
         }
         b"array" => {
             let items = value.array()?;
@@ -1026,6 +1219,17 @@ pub fn validate_tool_value_with_policy(
             }
             for item in items {
                 validate_tool_value_with_policy(field(schema, "items")?, item, tool_enums)?;
+            }
+            // After the items are validated, so every number below has an admitted lexeme and nesting is bounded by the schema.
+            if let Some(unique) = schema.find("uniqueItems")?
+                && unique.boolean()?
+            {
+                let mut seen = BTreeSet::new();
+                for item in items {
+                    let mut key = Vec::new();
+                    canonical(item, &mut key)?;
+                    require(seen.insert(key), "tool array repeats an item")?;
+                }
             }
         }
         _ => {
@@ -1062,6 +1266,17 @@ pub fn validate_tool_value_with_policy(
             }
         }
         require(found, "tool value outside enum")?;
+    }
+    // A constant is an enum of one value, so it follows the enum policy.
+    if tool_enums == ToolEnumValidation::Strict
+        && let Some(expected) = schema.find("const")?
+    {
+        let same = if expected.kind() == Kind::Number && value.kind() == Kind::Number {
+            compare(&decimal(expected)?, &decimal(value)?) == 0
+        } else {
+            expected.dump()? == value.dump()?
+        };
+        require(same, "tool value differs from const")?;
     }
     Ok(())
 }
@@ -1730,6 +1945,588 @@ mod tests {
                 schema_admit(&lexeme(text), 0, &mut 0).is_err(),
                 "expected refusal for {text}"
             );
+        }
+    }
+
+    /// The refusal text of admitting one schema, or empty when it is admitted.
+    fn admitted(text: &str) -> String {
+        match schema_admit(&lexeme(text), 0, &mut 0) {
+            Ok(()) => String::new(),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    /// The refusal text of validating one value, or empty when it is valid.
+    fn validated(schema: &str, value: &str) -> String {
+        match validate_tool_value(&lexeme(schema), &lexeme(value)) {
+            Ok(()) => String::new(),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn exclusive_maximum_mirrors_exclusive_minimum() {
+        let schema = r#"{"type":"number","minimum":0,"exclusiveMaximum":1}"#;
+        assert_eq!(admitted(schema), "");
+        for value in ["0", "-0.0", "0.5", "9.9e-1", "0.99999999999999999999"] {
+            assert_eq!(validated(schema, value), "", "{value}");
+        }
+        for value in ["1", "1.0", "1e0", "1.00000000000000000001", "2"] {
+            assert_eq!(
+                validated(schema, value),
+                "tool value at or above exclusive maximum",
+                "{value}"
+            );
+        }
+        assert_eq!(validated(schema, "-0.1"), "tool value below minimum");
+        let open = r#"{"type":"integer","exclusiveMinimum":1,"exclusiveMaximum":4}"#;
+        assert_eq!(admitted(open), "");
+        assert_eq!(validated(open, "2"), "");
+        assert_eq!(validated(open, "3"), "");
+        assert_eq!(
+            validated(open, "1"),
+            "tool value at or below exclusive minimum"
+        );
+        assert_eq!(
+            validated(open, "4"),
+            "tool value at or above exclusive maximum"
+        );
+
+        // An excluded upper bound leaves nothing when a lower bound reaches it, inclusive or not.
+        for (text, reason) in [
+            (
+                r#"{"type":"number","minimum":1,"exclusiveMaximum":1}"#,
+                "inverted schema bounds",
+            ),
+            (
+                r#"{"type":"number","minimum":2,"exclusiveMaximum":1}"#,
+                "inverted schema bounds",
+            ),
+            (
+                r#"{"type":"number","exclusiveMinimum":1,"exclusiveMaximum":1}"#,
+                "inverted schema bounds",
+            ),
+            (
+                r#"{"type":"number","exclusiveMinimum":2,"exclusiveMaximum":1}"#,
+                "inverted schema bounds",
+            ),
+            (
+                r#"{"type":"number","exclusiveMaximum":true}"#,
+                "expected JSON number",
+            ),
+            (
+                r#"{"type":"number","exclusiveMaximum":1e301}"#,
+                "API number outside supported range",
+            ),
+            (
+                r#"{"type":"string","exclusiveMaximum":0}"#,
+                "numeric bound on other schema type",
+            ),
+            (
+                r#"{"anyOf":[{"type":"number"}],"exclusiveMaximum":1}"#,
+                "unsupported API/schema field",
+            ),
+        ] {
+            assert_eq!(admitted(text), reason, "{text}");
+        }
+        // These bounds are one step apart in the nineteenth decimal place: the same double, ordered as decimals.
+        for text in [
+            r#"{"type":"number","minimum":1,"exclusiveMaximum":1.0000000000000000001}"#,
+            r#"{"type":"number","exclusiveMinimum":1,"exclusiveMaximum":1.0000000000000000001}"#,
+            r#"{"type":"number","maximum":5,"exclusiveMaximum":5}"#,
+        ] {
+            assert_eq!(admitted(text), "", "{text}");
+        }
+    }
+
+    #[test]
+    fn string_length_is_counted_in_code_points() {
+        let schema = r#"{"type":"string","minLength":2,"maxLength":3}"#;
+        assert_eq!(admitted(schema), "");
+        // Two and three code points, whether each takes one, two, three or four bytes, and however it is escaped. A letter with a combining accent is two.
+        for value in [
+            r#""ab""#,
+            r#""abc""#,
+            r#""éé""#,
+            r#""日本語""#,
+            r#""😀😀""#,
+            r#""😀😀😀""#,
+            r#""ab""#,
+            r#""é""#,
+        ] {
+            assert_eq!(validated(schema, value), "", "{value}");
+        }
+        // One code point each, although the last two are four bytes and two UTF-16 units.
+        for value in [r#""""#, r#""a""#, r#""é""#, r#""😀""#, r#""😀""#] {
+            assert_eq!(
+                validated(schema, value),
+                "tool string below minLength",
+                "{value}"
+            );
+        }
+        for value in [r#""abcd""#, r#""日本語x""#, r#""😀😀😀😀""#] {
+            assert_eq!(
+                validated(schema, value),
+                "tool string above maxLength",
+                "{value}"
+            );
+        }
+        assert_eq!(validated(schema, "5"), "tool value is not string");
+        let empty = r#"{"type":"string","minLength":0,"maxLength":0}"#;
+        assert_eq!(admitted(empty), "");
+        assert_eq!(validated(empty, r#""""#), "");
+        assert_eq!(validated(empty, r#""a""#), "tool string above maxLength");
+        // A value built in memory can hold bytes that are not UTF-8. Its length cannot be counted, so it is refused as the JSON codec refuses it.
+        assert_eq!(
+            validate_tool_value(&lexeme(schema), &Json::String(vec![b'a', 0xff]))
+                .unwrap_err()
+                .to_string(),
+            "invalid UTF-8 input"
+        );
+
+        // The minimum is bounded by the 64 KiB a generated call can hold; the maximum is not, because it only fails to constrain.
+        for text in [
+            r#"{"type":"string","minLength":65536}"#,
+            r#"{"type":"string","maxLength":65537}"#,
+            r#"{"type":"string","minLength":65536,"maxLength":18446744073709551615}"#,
+            r#"{"type":"string","enum":["abc"],"minLength":3}"#,
+        ] {
+            assert_eq!(admitted(text), "", "{text}");
+        }
+        for (text, reason) in [
+            (
+                r#"{"type":"string","minLength":65537}"#,
+                "minLength exceeds the tool call byte limit",
+            ),
+            (
+                r#"{"type":"string","minLength":65537,"maxLength":2}"#,
+                "minLength exceeds the tool call byte limit",
+            ),
+            (
+                r#"{"type":"string","minLength":3,"maxLength":2}"#,
+                "inverted schema bounds",
+            ),
+            (
+                r#"{"type":"string","minLength":-1}"#,
+                "JSON unsigned integer out of range or nonintegral",
+            ),
+            (
+                r#"{"type":"string","minLength":1.0}"#,
+                "JSON unsigned integer out of range or nonintegral",
+            ),
+            (
+                r#"{"type":"string","minLength":18446744073709551616}"#,
+                "JSON unsigned integer out of range or nonintegral",
+            ),
+            (
+                r#"{"type":"string","maxLength":"2"}"#,
+                "expected JSON unsigned integer",
+            ),
+            (
+                r#"{"type":"integer","minLength":1}"#,
+                "string schema keyword on other type",
+            ),
+            (
+                r#"{"type":"array","items":{"type":"string"},"maxLength":2}"#,
+                "string schema keyword on other type",
+            ),
+            (
+                r#"{"anyOf":[{"type":"string"}],"minLength":1}"#,
+                "unsupported API/schema field",
+            ),
+            (
+                r#"{"type":"string","enum":["ab"],"minLength":3}"#,
+                "tool string below minLength",
+            ),
+        ] {
+            assert_eq!(admitted(text), reason, "{text}");
+        }
+    }
+
+    #[test]
+    fn unique_items_compare_as_json_schema_equality() {
+        let key = |text: &str| {
+            let mut out = Vec::new();
+            canonical(&lexeme(text), &mut out).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(key("1.50"), "15e-1");
+        assert_eq!(key("-1.5e3"), "-15e2");
+        assert_eq!(key("-0.0"), "0e0");
+        assert_eq!(
+            key(r#"{"b":[1.0,"1"],"a":null}"#),
+            r#"{"a":null,"b":[1e0,"1",],}"#
+        );
+        assert_eq!(
+            key(r#"{"b":[1.0,"1"],"a":null}"#),
+            key(r#"{"a":null,"b":[1,"1"]}"#)
+        );
+        // A number never shares a form with a string, a literal or an array that spells it.
+        for (left, right) in [
+            ("1", r#""1e0""#),
+            ("0", "false"),
+            ("[1,2]", "[2,1]"),
+            ("[[1],2]", "[[1,2]]"),
+            (r#"["a,b"]"#, r#"["a","b"]"#),
+            (r#"{"a":{"b":1}}"#, r#"{"a":{},"b":1}"#),
+        ] {
+            assert_ne!(key(left), key(right), "{left} {right}");
+        }
+
+        let numbers = r#"{"type":"array","items":{"type":"number"},"uniqueItems":true}"#;
+        assert_eq!(admitted(numbers), "");
+        for value in ["[]", "[1]", "[1,2,3]", "[1,1.00000000000000000001]"] {
+            assert_eq!(validated(numbers, value), "", "{value}");
+        }
+        for value in [
+            "[1,1]",
+            "[1,2,1]",
+            "[1,1.0]",
+            "[10,1e1]",
+            "[0,-0.0]",
+            "[1.5,15e-1]",
+        ] {
+            assert_eq!(
+                validated(numbers, value),
+                "tool array repeats an item",
+                "{value}"
+            );
+        }
+        // Items are validated first, so a wrong item is reported before a repeat.
+        assert_eq!(validated(numbers, r#"[1,1,"x"]"#), "expected JSON number");
+        let objects = r#"{"type":"array","items":{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"string"}}},"uniqueItems":true}"#;
+        assert_eq!(
+            validated(objects, r#"[{"a":1,"b":"x"},{"a":1,"b":"y"}]"#),
+            ""
+        );
+        assert_eq!(
+            validated(objects, r#"[{"a":1,"b":"x"},{"b":"x","a":1.0}]"#),
+            "tool array repeats an item"
+        );
+        let repeats = r#"{"type":"array","items":{"type":"number"},"uniqueItems":false}"#;
+        assert_eq!(admitted(repeats), "");
+        assert_eq!(validated(repeats, "[1,1]"), "");
+        // The largest array validation accepts stays unique item by item.
+        let many = format!(
+            "[{}]",
+            (0..4096)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert_eq!(validated(numbers, &many), "");
+        assert_eq!(
+            validated(numbers, &many.replacen("[0,", "[4095.0,", 1)),
+            "tool array repeats an item"
+        );
+
+        for (text, reason) in [
+            (
+                r#"{"type":"array","items":{"type":"string"},"uniqueItems":1}"#,
+                "expected JSON boolean",
+            ),
+            (
+                r#"{"type":"array","items":{"type":"string"},"uniqueItems":"true"}"#,
+                "expected JSON boolean",
+            ),
+            (
+                r#"{"type":"array","items":{"type":"string"},"minItems":3,"maxItems":2,"uniqueItems":1}"#,
+                "inverted schema bounds",
+            ),
+            (
+                r#"{"type":"string","uniqueItems":true}"#,
+                "array schema keyword on other type",
+            ),
+            (
+                r#"{"type":"object","properties":{},"uniqueItems":false}"#,
+                "array schema keyword on other type",
+            ),
+            (
+                r#"{"anyOf":[{"type":"array","items":{"type":"string"}}],"uniqueItems":true}"#,
+                "unsupported API/schema field",
+            ),
+        ] {
+            assert_eq!(admitted(text), reason, "{text}");
+        }
+    }
+
+    #[test]
+    fn constant_is_an_enum_of_one_value() {
+        let text = r#"{"type":"string","const":"a"}"#;
+        assert_eq!(admitted(text), "");
+        assert_eq!(validated(text, r#""a""#), "");
+        assert_eq!(validated(text, r#""a""#), "");
+        assert_eq!(validated(text, r#""b""#), "tool value differs from const");
+        assert_eq!(validated(text, "1"), "tool value is not string");
+        let number = r#"{"type":"number","const":1.50}"#;
+        assert_eq!(admitted(number), "");
+        assert_eq!(validated(number, "1.5"), "");
+        assert_eq!(validated(number, "15e-1"), "");
+        assert_eq!(
+            validated(number, "1.50000000000000000001"),
+            "tool value differs from const"
+        );
+        for (schema, value) in [
+            (r#"{"type":"integer","const":0}"#, "-0"),
+            (r#"{"type":"boolean","const":true}"#, "true"),
+            (r#"{"type":"null","const":null}"#, "null"),
+            (r#"{"type":"string","enum":["a"],"const":"a"}"#, r#""a""#),
+        ] {
+            assert_eq!(admitted(schema), "", "{schema}");
+            assert_eq!(validated(schema, value), "", "{schema}");
+        }
+        // The enum policy defers the constant with the enum; the type is still checked.
+        let schema = lexeme(text);
+        let deferred = ToolEnumValidation::Executor;
+        assert_eq!(
+            validate_tool_value_with_policy(&schema, &lexeme(r#""b""#), deferred),
+            Ok(())
+        );
+        assert_eq!(
+            validate_tool_value_with_policy(&schema, &lexeme("1"), deferred),
+            Err(AdmissionError::Refused("tool value is not string"))
+        );
+
+        // The constant must itself satisfy the rest of the schema, as each enum member must.
+        for (text, reason) in [
+            (r#"{"type":"string","const":1}"#, "tool value is not string"),
+            (
+                r#"{"type":"integer","const":1.0}"#,
+                "tool integer must use exact safe-integer syntax",
+            ),
+            (
+                r#"{"type":"integer","const":5,"maximum":3}"#,
+                "tool value above maximum",
+            ),
+            (
+                r#"{"type":"string","const":"abc","maxLength":2}"#,
+                "tool string above maxLength",
+            ),
+            (
+                r#"{"type":"string","enum":["a","b"],"const":"a"}"#,
+                "tool value differs from const",
+            ),
+            (
+                r#"{"type":"object","properties":{},"const":{}}"#,
+                "unsupported const",
+            ),
+            (
+                r#"{"type":"array","items":{"type":"string"},"const":[]}"#,
+                "unsupported const",
+            ),
+            (
+                r#"{"anyOf":[{"type":"string"}],"const":"a"}"#,
+                "unsupported API/schema field",
+            ),
+        ] {
+            assert_eq!(admitted(text), reason, "{text}");
+        }
+    }
+
+    #[test]
+    fn multiple_of_is_exact_decimal_division() {
+        let is = |value: &str, step: &str| {
+            multiple(
+                &decimal(&lexeme(value)).unwrap(),
+                divisor(&lexeme(step)).unwrap(),
+            )
+        };
+        for (value, step) in [
+            ("0", "7"),
+            ("-10", "5"),
+            ("1.23", "0.01"),
+            // 0.3 / 0.1 is not an integer in binary floating point.
+            ("0.3", "0.1"),
+            ("3", "1.5"),
+            ("3e1", "1.5"),
+            ("1e1", "2.5"),
+            ("1e3", "8"),
+            ("1e300", "8"),
+            ("3e299", "3"),
+            // 2^53 + 1 does not survive a double.
+            ("9007199254740993", "3"),
+            // The largest powers of two and five a divisor can hold.
+            ("1e59", "576460752303423488"),
+            ("1e25", "298023223876953125"),
+            // The largest divisor: every remainder step stays inside u64.
+            ("122999999999999999877", "999999999999999999"),
+            ("999999999999999999e40", "999999999999999999"),
+        ] {
+            assert!(is(value, step), "{value} {step}");
+        }
+        for (value, step) in [
+            ("7", "5"),
+            ("1.234", "0.01"),
+            ("1e-3", "0.01"),
+            ("0.30000000000000004", "0.1"),
+            ("1", "1.5"),
+            ("1e1", "1.5"),
+            ("1e2", "8"),
+            ("1e300", "3"),
+            ("9007199254740992", "3"),
+            ("1e58", "576460752303423488"),
+            ("1e24", "298023223876953125"),
+            ("999999999999999998999999999999999998", "999999999999999999"),
+        ] {
+            assert!(!is(value, step), "{value} {step}");
+        }
+        assert_eq!(
+            divisor(&lexeme("1.50")),
+            Ok((15, -1)),
+            "trailing zeros are not significant"
+        );
+        assert_eq!(divisor(&lexeme("1234567890123456780e3")).unwrap().1, 4);
+
+        let schema = r#"{"type":"integer","minimum":0,"exclusiveMaximum":100,"multipleOf":25}"#;
+        assert_eq!(admitted(schema), "");
+        assert_eq!(validated(schema, "75"), "");
+        assert_eq!(
+            validated(schema, "30"),
+            "tool value is not a multiple of multipleOf"
+        );
+        assert_eq!(
+            validated(schema, "100"),
+            "tool value at or above exclusive maximum"
+        );
+        for (text, reason) in [
+            (
+                r#"{"type":"number","multipleOf":0}"#,
+                "multipleOf must be positive",
+            ),
+            (
+                r#"{"type":"number","multipleOf":-2}"#,
+                "multipleOf must be positive",
+            ),
+            (
+                r#"{"type":"number","multipleOf":1234567890123456789}"#,
+                "multipleOf digit bound",
+            ),
+            (
+                r#"{"type":"number","multipleOf":"2"}"#,
+                "expected JSON number",
+            ),
+            (
+                r#"{"type":"number","multipleOf":1e301}"#,
+                "API number outside supported range",
+            ),
+            (
+                r#"{"type":"string","multipleOf":2}"#,
+                "numeric bound on other schema type",
+            ),
+            (
+                r#"{"anyOf":[{"type":"integer"}],"multipleOf":2}"#,
+                "unsupported API/schema field",
+            ),
+            (
+                r#"{"type":"integer","enum":[4,5],"multipleOf":2}"#,
+                "tool value is not a multiple of multipleOf",
+            ),
+            // The enum members are validated before the divisor is admitted, so validation refuses a zero divisor itself and never divides by it.
+            (
+                r#"{"type":"integer","enum":[4],"multipleOf":0}"#,
+                "multipleOf must be positive",
+            ),
+        ] {
+            assert_eq!(admitted(text), reason, "{text}");
+        }
+    }
+
+    #[test]
+    fn pattern_is_enforced_on_strings() {
+        let schema = r#"{"type":"string","pattern":"^[a-z]+(?:-[a-z]+)*$","maxLength":8}"#;
+        assert_eq!(admitted(schema), "");
+        for value in [r#""a""#, r#""ab-cd""#] {
+            assert_eq!(validated(schema, value), "", "{value}");
+        }
+        for value in [r#""""#, r#""a-""#, r#""A""#, r#""a b""#, r#""a\nb""#] {
+            assert_eq!(
+                validated(schema, value),
+                "tool string does not match pattern",
+                "{value}"
+            );
+        }
+        // The length bounds are checked first.
+        assert_eq!(
+            validated(schema, r#""abcdefghi""#),
+            "tool string above maxLength"
+        );
+        assert_eq!(validated(schema, "1"), "tool value is not string");
+        // A pattern is not anchored unless it says so.
+        let anywhere = r#"{"type":"string","pattern":"b"}"#;
+        assert_eq!(validated(anywhere, r#""abc""#), "");
+        assert_eq!(
+            validated(anywhere, r#""ac""#),
+            "tool string does not match pattern"
+        );
+        // A character is one code point, as it is for the length keywords.
+        let single = r#"{"type":"string","pattern":"^.$"}"#;
+        assert_eq!(validated(single, r#""\ud83d\ude00""#), "");
+        assert_eq!(
+            validated(single, r#""e\u0301""#),
+            "tool string does not match pattern"
+        );
+    }
+
+    #[test]
+    fn pattern_is_admitted_only_inside_the_supported_grammar() {
+        for text in [
+            r#"{"type":"string","pattern":""}"#,
+            r#"{"type":"string","pattern":"^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"}"#,
+            r#"{"type":"string","pattern":"^https\\:\\/\\/"}"#,
+            r#"{"type":"string","enum":["ab","ac"],"pattern":"^a"}"#,
+            r#"{"type":"string","const":"ab","pattern":"^a"}"#,
+            r#"{"type":"array","items":{"type":"string","pattern":"^a"}}"#,
+            r#"{"anyOf":[{"type":"number"},{"type":"string","pattern":"^\\d+$"}]}"#,
+            r#"{"type":"string","pattern":"a{4095}"}"#,
+        ] {
+            assert_eq!(admitted(text), "", "{text}");
+        }
+        for (text, reason) in [
+            (
+                r#"{"type":"string","pattern":"(a)\\1"}"#,
+                "unsupported pattern",
+            ),
+            (
+                r#"{"type":"string","pattern":"(?<n>a)"}"#,
+                "unsupported pattern",
+            ),
+            (
+                r#"{"type":"string","pattern":"\\p{L}"}"#,
+                "unsupported pattern",
+            ),
+            (r#"{"type":"string","pattern":"a{"}"#, "unsupported pattern"),
+            (
+                r#"{"type":"string","pattern":"a{4096}"}"#,
+                "pattern exceeds the tool pattern bound",
+            ),
+            (r#"{"type":"string","pattern":7}"#, "expected JSON string"),
+            (
+                r#"{"type":"integer","pattern":"^1"}"#,
+                "string schema keyword on other type",
+            ),
+            (
+                r#"{"anyOf":[{"type":"string"}],"pattern":"a"}"#,
+                "unsupported API/schema field",
+            ),
+            // Enum members and a constant are checked against the pattern, and the pattern is read before them.
+            (
+                r#"{"type":"string","enum":["ab","b"],"pattern":"^a"}"#,
+                "tool string does not match pattern",
+            ),
+            (
+                r#"{"type":"string","const":"b","pattern":"^a"}"#,
+                "tool string does not match pattern",
+            ),
+            (
+                r#"{"type":"string","enum":[1],"pattern":"("}"#,
+                "unsupported pattern",
+            ),
+            (
+                r#"{"type":"string","minLength":3,"maxLength":2,"pattern":"("}"#,
+                "inverted schema bounds",
+            ),
+        ] {
+            assert_eq!(admitted(text), reason, "{text}");
         }
     }
 

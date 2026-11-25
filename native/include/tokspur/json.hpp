@@ -37,6 +37,7 @@ public:
     [[nodiscard]] uint64_t unsigned_integer() const;
     [[nodiscard]] const Array& array() const;
     [[nodiscard]] const Object& object() const;
+    [[nodiscard]] Object take_object() &&;
     [[nodiscard]] const Json* find(std::string_view key) const;
     [[nodiscard]] std::string dump(size_t byte_limit = 64 * 1024 * 1024) const;
 

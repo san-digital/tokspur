@@ -1,4 +1,5 @@
 #include "tokspur/ssd_checkpoint.hpp"
+#include "tokspur/shared_prefix_eviction.hpp"
 
 #include <CommonCrypto/CommonCrypto.h>
 #include <algorithm>
@@ -1059,6 +1060,153 @@ static void test_orphaned_temporaries_removed_at_start() {
     std::cout << "PASS orphaned checkpoint temporaries removed at start" << std::endl;
 }
 
+static void test_oversized_incoming_preserves_smaller_checkpoints() {
+    const std::filesystem::path test_dir = "/tmp/tokspur_test_oversize_" + std::to_string(::getpid());
+    std::filesystem::remove_all(test_dir);
+    SsdCheckpointManager manager(test_dir, 4ull << 20, 0);
+    manager.set_free_space_query([](int, uint64_t& free_bytes) {
+        free_bytes = 64ull << 30;
+        return true;
+    });
+    SlotHandshake handshake;
+    CheckpointMetadata metadata;
+
+    CheckpointFileHeader small_hdr{};
+    small_hdr.prefix_tokens = 1024;
+    small_hdr.total_payload_bytes = 1ull << 20;
+    small_hdr.is_system_anchor = 1;
+    assert(manager.spill_checkpoint("small_1024.ckpt", handshake, small_hdr, metadata,
+        [](size_t, std::span<std::byte> target) { std::fill(target.begin(), target.end(), std::byte{0x11}); return true; }));
+    const uint64_t occupied_after_small = manager.occupied_bytes();
+    assert(occupied_after_small > 0 && occupied_after_small <= manager.budget_bytes());
+
+    // Attempting to spill a checkpoint larger than budget_bytes() must fail cleanly without evicting smaller ones.
+    CheckpointFileHeader huge_hdr{};
+    huge_hdr.prefix_tokens = 40960;
+    huge_hdr.total_payload_bytes = 8ull << 20;
+    assert(!manager.spill_checkpoint("huge_40960.ckpt", handshake, huge_hdr, metadata,
+        [](size_t, std::span<std::byte> target) { std::fill(target.begin(), target.end(), std::byte{0x22}); return true; }));
+    assert(manager.has_checkpoint("small_1024.ckpt"));
+    assert(manager.occupied_bytes() == occupied_after_small);
+    std::filesystem::remove_all(test_dir);
+    std::cout << "PASS oversized incoming checkpoint preserves smaller checkpoints" << std::endl;
+}
+
+static void test_cross_session_recompute_cost_retention() {
+    // Verify lambda_recompute_prefill prevents sequential epoch drift from evicting a
+    // high-value 61440-token checkpoint from Session A when Session B spills 2048..61440.
+    constexpr uint64_t mib = 1ull << 20;
+    const double sess_a_61k_prio = compute_eviction_priority(10, 61440, 1717 * mib, false);
+    const double sess_b_2k_prio = compute_eviction_priority(21, 2048, 166 * mib, false);
+    const double sess_b_32k_prio = compute_eviction_priority(22, 32768, 968 * mib, false);
+    const double sess_b_51k_prio = compute_eviction_priority(23, 51200, 1450 * mib, false);
+    assert(sess_a_61k_prio > sess_b_2k_prio);
+    assert(sess_a_61k_prio > sess_b_32k_prio);
+    assert(sess_a_61k_prio > sess_b_51k_prio);
+
+    const std::filesystem::path test_dir = "/tmp/tokspur_test_cross_sess_" + std::to_string(::getpid());
+    std::filesystem::remove_all(test_dir);
+    // Budget 24 MiB fits both sessions' 61440-token frontiers (~10 MiB each), but not all intermediates.
+    SsdCheckpointManager manager(test_dir, 24ull << 20, 0, "recompute-cost");
+    manager.set_free_space_query([](int, uint64_t& free_bytes) {
+        free_bytes = 64ull << 30;
+        return true;
+    });
+    SlotHandshake handshake;
+    CheckpointMetadata metadata;
+    auto spill_one = [&](const std::string& name, uint32_t prefix_tokens, uint64_t payload_bytes) {
+        CheckpointFileHeader hdr{};
+        hdr.prefix_tokens = prefix_tokens;
+        hdr.total_payload_bytes = payload_bytes;
+        assert(manager.spill_checkpoint(name, handshake, hdr, metadata,
+            [](size_t, std::span<std::byte> target) {
+                std::fill(target.begin(), target.end(), std::byte{0x5A});
+                return true;
+            }));
+    };
+
+    // Session A spills small + frontier checkpoint.
+    spill_one("sess_a_2048.ckpt", 2048, 1 * mib);
+    spill_one("sess_a_61440.ckpt", 61440, 10 * mib);
+    assert(manager.has_checkpoint("sess_a_61440.ckpt"));
+
+    // Session B spills 2048..61440, advancing access_epoch on every spill.
+    spill_one("sess_b_2048.ckpt", 2048, 1 * mib);
+    spill_one("sess_b_4096.ckpt", 4096, 1 * mib);
+    spill_one("sess_b_32768.ckpt", 32768, 6 * mib);
+    spill_one("sess_b_51200.ckpt", 51200, 9 * mib);
+    spill_one("sess_b_61440.ckpt", 61440, 10 * mib);
+
+    // Session A's 61440-token checkpoint and Session B's 61440-token checkpoint must both survive.
+    assert(manager.has_checkpoint("sess_a_61440.ckpt"));
+    assert(manager.has_checkpoint("sess_b_61440.ckpt"));
+    assert(manager.occupied_bytes() <= manager.budget_bytes());
+
+    std::filesystem::remove_all(test_dir);
+    std::cout << "PASS cross-session recompute-cost retention" << std::endl;
+}
+
+static void test_two_session_64k_cap_preserves_sqrt_milestone() {
+    // Scaled 6.0 GiB / 100 = 60 MiB budget mirroring test_t1_f18_04:
+    // Session A and Session B each spill sqrt(N) milestones 2048..61440 (16.8 MiB at 61440),
+    // while non-milestone leaves (73683, 73731) are gated out by should_spill_ssd_tail().
+    constexpr uint64_t kib = 1024ull;
+    constexpr uint64_t mib = 1024ull * 1024ull;
+    const std::filesystem::path test_dir = "/tmp/tokspur_test_two_sess_64k_" + std::to_string(::getpid());
+    std::filesystem::remove_all(test_dir);
+    SsdCheckpointManager manager(test_dir, 60ull * mib, 0, "recompute-cost");
+    manager.set_free_space_query([](int, uint64_t& free_bytes) {
+        free_bytes = 64ull << 30;
+        return true;
+    });
+    SlotHandshake handshake;
+    CheckpointMetadata metadata;
+    auto spill_session = [&](const std::string& prefix) {
+        struct Step { uint32_t pfx; uint64_t bytes; };
+        const std::vector<Step> steps{
+            {2048, 1620 * kib},
+            {4096, 2200 * kib},
+            {8192, 3200 * kib},
+            {12288, 4300 * kib},
+            {18432, 5800 * kib},
+            {24576, 7400 * kib},
+            {32768, 9500 * kib},
+            {40960, 11500 * kib},
+            {51200, 14200 * kib},
+            {61440, 16800 * kib},
+        };
+        uint32_t last_spilled = 0;
+        for (const auto& step : steps) {
+            assert(is_sqrt_checkpoint_milestone(step.pfx));
+            assert(should_spill_ssd_tail(step.pfx, last_spilled));
+            CheckpointFileHeader hdr{};
+            hdr.prefix_tokens = step.pfx;
+            hdr.total_payload_bytes = step.bytes;
+            const std::string name = prefix + "_" + std::to_string(step.pfx) + ".ckpt";
+            assert(manager.spill_checkpoint(name, handshake, hdr, metadata,
+                [](size_t, std::span<std::byte> target) {
+                    std::fill(target.begin(), target.end(), std::byte{0x6B});
+                    return true;
+                }));
+            last_spilled = step.pfx;
+        }
+        // End-of-prefill coalescing (73683) and park_live_lane fallback (73731) are suppressed.
+        assert(!should_spill_ssd_tail(73683, last_spilled));
+        assert(!should_spill_ssd_tail(73731, last_spilled));
+    };
+
+    spill_session("sess_a");
+    assert(manager.has_checkpoint("sess_a_61440.ckpt"));
+    spill_session("sess_b");
+
+    assert(manager.has_checkpoint("sess_a_61440.ckpt"));
+    assert(manager.has_checkpoint("sess_b_61440.ckpt"));
+    assert(manager.occupied_bytes() <= manager.budget_bytes());
+
+    std::filesystem::remove_all(test_dir);
+    std::cout << "PASS two-session 64k cap preserves sqrt milestone" << std::endl;
+}
+
 int main() {
     test_late_restore_refusal_preserves_valid_checkpoints("lru");
     test_late_restore_refusal_preserves_valid_checkpoints("recompute-cost");
@@ -1070,6 +1218,9 @@ int main() {
     std::cout << "Running SSD Checkpoint unit tests..." << std::endl;
     test_storage_security();
     test_orphaned_temporaries_removed_at_start();
+    test_oversized_incoming_preserves_smaller_checkpoints();
+    test_cross_session_recompute_cost_retention();
+    test_two_session_64k_cap_preserves_sqrt_milestone();
     test_staging_slab_and_budgets();
     test_eviction_scoring_and_system_tools_anchor();
     test_spill_cancellation_between_chunks();

@@ -338,7 +338,7 @@ kernel void graph_residual_read(device const float* normalized [[buffer(0)]],
         for (uint branch = 0; branch < shape.x; ++branch) {
             const uint index = branch * shape.y + channel;
             if (!isfinite(normalized[index]) || !isfinite(scores[index])) { atomic_fetch_or_explicit(error, 1u, memory_order_relaxed); return; }
-            total += normalized[index] * sigmoid_value(scores[index]);
+            total = fma(normalized[index], sigmoid_value(scores[index]), total);
         }
         checked_store(output, channel, total / float(shape.x), error);
     }
@@ -414,7 +414,7 @@ kernel void graph_gated_mix(device const float* normalized [[buffer(0)]], device
     for (uint b = 0; b < shape.x; ++b) {
         const uint at = b * shape.y + c;
         if (!isfinite(normalized[at]) || !isfinite(scores[at])) { atomic_fetch_or_explicit(error, 1u, memory_order_relaxed); return; }
-        result += normalized[at] * sigmoid_value(scores[at]);
+        result = fma(normalized[at], sigmoid_value(scores[at]), result);
     }
     checked_store(output, c, result / float(shape.x), error);
 }

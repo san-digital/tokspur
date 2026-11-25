@@ -10,6 +10,7 @@
 #include <limits>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -45,7 +46,7 @@ void reference_check(std::span<const float> actual, std::span<const double> expe
 template<class F> void refuses(MetalGraph& g,F&& operation) {
     bool rejected=false;try{operation();}catch(const FormatError&){rejected=true;}try{g.abort();}catch(const FormatError&){}need(rejected,"HC row invalid operation accepted");
 }
-enum class SharedCase { projection, rms, rms_gate, hc_inject, hc_write_rms, router };
+enum class SharedCase { projection, rms, rms_gate, hc_inject, hc_write_rms };
 std::vector<std::vector<std::byte>> shared_case(MetalGraph& g, SharedCase kind, uint32_t n, uint32_t width, int poison = -1) {
     Assets a{g,{}};
     std::vector<std::vector<float>> inputs;
@@ -66,12 +67,9 @@ std::vector<std::vector<std::byte>> shared_case(MetalGraph& g, SharedCase kind, 
     } else if (kind == SharedCase::hc_inject) {
         inputs = {values(4 * 10240, 6), values(uint64_t(n) * 10240, 7)};
         output_sizes = {uint64_t(n) * 4 * 16, uint64_t(n) * 4};
-    } else if (kind == SharedCase::hc_write_rms) {
+    } else {
         inputs = {values(uint64_t(n) * 10240, 8), values(uint64_t(n) * 2560, 9), values(uint64_t(n) * 4, 10), values(10240, 11)};
         output_sizes = {uint64_t(n) * 10240, uint64_t(n) * 10240};
-    } else {
-        inputs = {values(2560 * 512, 12), values(uint64_t(n) * 2560, 13)};
-        output_sizes = {uint64_t(n) * 512};
     }
     if (poison >= 0) inputs.at(size_t(poison))[0] = std::numeric_limits<float>::infinity();
     std::vector<GpuView> uploaded;
@@ -104,10 +102,8 @@ std::vector<std::vector<std::byte>> shared_case(MetalGraph& g, SharedCase kind, 
                 {outputs[0].view, n, columns, uint64_t(stride) * 4}, width, 1e-6f, false);
         } else if (kind == SharedCase::hc_inject) {
             g.hc_inject_rows(uploaded[0], uploaded[1], outputs[0].view, outputs[1].view, n);
-        } else if (kind == SharedCase::hc_write_rms) {
-            g.hc_write_rms_rows(uploaded[0], uploaded[1], uploaded[2], uploaded[3], outputs[0].view, outputs[1].view, n, 1e-6f);
         } else {
-            g.moe_router_f32_window(uploaded[0], {uploaded[1], n, 2560, 2560 * 4}, {outputs[0].view, n, 512, 512 * 4});
+            g.hc_write_rms_rows(uploaded[0], uploaded[1], uploaded[2], uploaded[3], outputs[0].view, outputs[1].view, n, 1e-6f);
         }
         const auto batch = g.submit();
         need(batch.dispatches == (kind == SharedCase::hc_inject ? 2u : 1u), "shared kernel dispatch count changed");
@@ -144,23 +140,14 @@ void shared_kernels(const char* library) {
     for (const uint32_t n : {2u, 3u, 17u}) {
         check(SharedCase::hc_inject, n, 0, 2); check(SharedCase::hc_write_rms, n, 0, 4);
     }
-    MetalGraph router_default(library, 128ull << 20), router_nax(library, 128ull << 20);
-    for (auto* graph : {&router_default, &router_nax}) {
-        graph->configure_prefill_router_window(true); graph->prepare_moe_router_window();
+    MetalGraph router(library, 128ull << 20);
+    bool refused_router = false;
+    try {
+        router.configure_prefill_router_window(true);
+    } catch (const FormatError& error) {
+        refused_router = std::string_view(error.what()) == "this optimisation was removed because its source could not be verified";
     }
-    router_nax.configure_verify_nax(true); router_nax.prepare_verify_nax({});
-    for (const uint32_t n : {2u, 3u, 8u}) {
-        const auto expected = shared_case(router_default, SharedCase::router, n, 0);
-        need(expected == shared_case(router_nax, SharedCase::router, n, 0), "inactive NAX scope changed default router");
-        router_nax.set_verify_nax_scope(true);
-        need(expected == shared_case(router_nax, SharedCase::router, n, 0), "NAX small-row router differs from main bytes");
-        for (const int input : {0, 1}) {
-            static_cast<void>(shared_case(router_default, SharedCase::router, n, 0, input));
-            static_cast<void>(shared_case(router_nax, SharedCase::router, n, 0, input));
-        }
-        need(expected == shared_case(router_nax, SharedCase::router, n, 0), "NAX small-row router failed recovery");
-        router_nax.set_verify_nax_scope(false);
-    }
+    need(refused_router, "retired router window must refuse selection");
     std::cout << "shared default/NAX kernels: exact output bytes, input guards, nonfinite refusal and recovery pass; no model or speed qualification\n";
 }
 void test_case(MetalGraph& g,uint32_t n) {

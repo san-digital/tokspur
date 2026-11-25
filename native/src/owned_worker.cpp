@@ -15,6 +15,7 @@
 #include <climits>
 #include <cmath>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -52,6 +53,18 @@ double worker_number(const Json& value) {
     require(parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size() && std::isfinite(number), "invalid owned broker numeric field");
     return number;
 }
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+struct PressureTerminal {};
+bool host_pressure_refusal(const Json& value, uint32_t context_length) {
+    const auto* code = value.find("code");
+    if (!code || code->string() != "host_memory_pressure") return false;
+    require(!worker_field(value, "fatal").boolean() && !worker_field(value, "automatic_retry_safe").boolean() &&
+        !worker_field(value, "continuation_allowed").boolean() && !worker_field(value, "logits_available").boolean() &&
+        worker_field(value, "status").string() == "error" && worker_field(value, "finish_reason").string() == "error" &&
+        worker_integer(value, "committed_prefix") <= context_length, "invalid host memory pressure refusal");
+    return true;
+}
+#endif
 void worker_keys(const Json& value, std::initializer_list<std::string_view> allowed) {
     for (const auto& [name, ignored] : value.object()) {
         static_cast<void>(ignored);
@@ -324,6 +337,7 @@ struct OwnedWorker::Impl {
     pid_t guardian_pid = -1, worker_pid = -1;
     bool armed = false, worker_exited = false, guardian_reaped = false, out_eof = false, err_eof = false, status_eof = false;
     bool failed = false, closed = false, needs_reset = false, starting = true;
+    bool resync_after_pressure = false;
     int worker_status = -1, guardian_status = -1;
     size_t stderr_bytes = 0;
     std::string pending, notice_bytes;
@@ -695,6 +709,10 @@ struct OwnedWorker::Impl {
         if (options.shared_prefix_cache.has_value()) {
             words.insert(words.end(), {"--shared-prefix-cache", *options.shared_prefix_cache ? "on" : "off"});
         }
+        if (options.parked_lanes_mib > 0 || options.parked_lanes_explicit ||
+            options.shared_prefix_cache == std::optional<bool>(true)) {
+            words.insert(words.end(), {"--native-parked-lanes-mib", std::to_string(options.parked_lanes_mib)});
+        }
 #ifdef TOKSPUR_PRIVATE_HTTP_MTP_CONCURRENT
         if (options.concurrent_dispatch.has_value()) words.insert(words.end(), {"--concurrent-dispatch", *options.concurrent_dispatch ? "on" : "off"});
 #endif
@@ -707,11 +725,23 @@ struct OwnedWorker::Impl {
         for (const auto& shard : options.shards) words.push_back(shard.string());
         std::vector<char*> arguments; for (auto& word : words) arguments.push_back(word.data()); arguments.push_back(nullptr);
         // No loader/preload, Python, remote-model or runtime-selection variables.
-        char path_env[] = "PATH=/usr/bin:/bin:/usr/sbin:/sbin", lang_env[] = "LANG=C", locale_env[] = "LC_ALL=C";
-        char* environment[]{path_env, lang_env, locale_env, nullptr};
+        std::vector<std::string> env_storage{
+            "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
+            "LANG=C",
+            "LC_ALL=C",
+        };
+        for (const char* name : {"TOKSPUR_ALLOW_KNOWN_PROFILE", "TOKSPUR_DUMP_VERIFY_PROFILE", "TOKSPUR_DUMP_PLANAR_UNION_PROFILE"}) {
+            if (const char* val = std::getenv(name)) {
+                env_storage.push_back(std::string(name) + "=" + val);
+            }
+        }
+        std::vector<char*> environment;
+        environment.reserve(env_storage.size() + 1);
+        for (auto& entry : env_storage) environment.push_back(entry.data());
+        environment.push_back(nullptr);
         socket_pair(channels.control); pipe_pair(channels.status); socket_pair(channels.input);
         pipe_pair(channels.output); pipe_pair(channels.error); pipe_pair(channels.gate);
-        guardian_pid = fork_guardian(channels, int(limit.rlim_cur), arguments.data(), environment);
+        guardian_pid = fork_guardian(channels, int(limit.rlim_cur), arguments.data(), environment.data());
         require(guardian_pid >= 0, "cannot launch owned worker guardian");
         drop(channels.control[1]); drop(channels.status[1]); drop(channels.input[1]); drop(channels.output[1]); drop(channels.error[1]); drop(channels.gate[0]); drop(channels.gate[1]);
         for (const int fd : {channels.control[0], channels.status[0], channels.input[0], channels.output[0], channels.error[0]}) nonblocking(fd);
@@ -1119,10 +1149,21 @@ Json OwnedWorker::request_locked(const Json& body, WorkerDeadline deadline, cons
                 input_count + output_count == 1,
                 "scalar-channel HTTP requires exactly one input or output step");
             if (p.options.scalar_channel) {
+                const bool allow_lane_parking =
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
-                if (p.options.mtp_request_carry) worker_keys(body, {"tokens", "generate", "reset", "stop_ids", "sampling", "seed", "mtp_generation", "prefill_final"}); else
+                    (!p.options.mtp_sidecar.empty() || !p.options.dflash2_dir.empty()) &&
+#else
+                    false &&
 #endif
-                worker_keys(body, {"tokens", "generate", "reset", "stop_ids", "sampling", "seed"});
+                    p.options.parked_lanes_mib > 0;
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+                if (p.options.mtp_request_carry) {
+                    if (allow_lane_parking) worker_keys(body, {"tokens", "generate", "reset", "stop_ids", "sampling", "seed", "mtp_generation", "prefill_final", "lane_prompt", "lane_inherit_seed"});
+                    else worker_keys(body, {"tokens", "generate", "reset", "stop_ids", "sampling", "seed", "mtp_generation", "prefill_final"});
+                } else
+#endif
+                if (allow_lane_parking) worker_keys(body, {"tokens", "generate", "reset", "stop_ids", "sampling", "seed", "lane_prompt", "lane_inherit_seed"});
+                else worker_keys(body, {"tokens", "generate", "reset", "stop_ids", "sampling", "seed"});
             }
 #endif
             if (p.broker_epoch) {
@@ -1133,6 +1174,7 @@ Json OwnedWorker::request_locked(const Json& body, WorkerDeadline deadline, cons
                 worker_keys(body, {"tokens", "generate", "reset", "stop_ids", "sampling", "seed"});
             }
         }
+        require(!p.resync_after_pressure || reset, "host memory pressure requires a fresh input with reset");
         require(!p.needs_reset || reset || (begin && !allow_restore)
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
             || mtp_abort
@@ -1152,7 +1194,7 @@ Json OwnedWorker::request_locked(const Json& body, WorkerDeadline deadline, cons
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
     std::optional<MtpWireReply> mtp_reply;
     if (!p.options.mtp_sidecar.empty() || !p.options.dflash2_dir.empty()) {
-        try { mtp_reply.emplace(p.ready_value, p.scalar_previous, body); }
+        try { mtp_reply.emplace(p.ready_value, p.scalar_previous, body, p.resync_after_pressure); }
         catch (...) { throw WorkerError("MTP command refused before submission"); }
     }
 #endif
@@ -1215,6 +1257,12 @@ Json OwnedWorker::request_locked(const Json& body, WorkerDeadline deadline, cons
             const auto value = p.next(draining ? drain_deadline : deadline);
             require(value.kind() == Json::Kind::object, "owned target emitted a nonobject event");
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+            if (p.options.scalar_channel && !p.broker_epoch && mtp_reply && event_is(value, "error") &&
+                host_pressure_refusal(value, p.options.context_length)) {
+                p.idle_check();
+                p.resync_after_pressure = true;
+                throw PressureTerminal{};
+            }
             if (mtp_reply && !event_is(value, "done")) { mtp_reply->event(value); continue; }
 #endif
 #ifdef TOKSPUR_PRIVATE_HTTP_VERIFY8
@@ -1252,7 +1300,7 @@ Json OwnedWorker::request_locked(const Json& body, WorkerDeadline deadline, cons
 #else
                     p.ready_value,
 #endif
-                    value);
+                    value, p.resync_after_pressure);
 #endif
 #ifdef TOKSPUR_PRIVATE_HTTP_SCALAR_CHANNEL
                 if (p.options.scalar_channel) {
@@ -1351,17 +1399,21 @@ Json OwnedWorker::request_locked(const Json& body, WorkerDeadline deadline, cons
                     on_token(event); // Callback failures invalidate, not a second drain of an already completed command.
                 }
 #endif
-                p.needs_reset = false; return value;
+                p.needs_reset = false; p.resync_after_pressure = false; return value;
             } else throw WorkerError("owned target rejected or corrupted a command; context invalidated");
         }
-    } catch (const WorkerCancelled&) { throw; }
+    }
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+    catch (const PressureTerminal&) { throw WorkerHostMemoryPressure(); }
+#endif
+    catch (const WorkerCancelled&) { throw; }
     catch (...) { p.invalidate(); throw WorkerError("owned command failed or became ambiguous; worker invalidated without retry"); }
 }
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
 void OwnedWorker::abort_mtp_generation(WorkerDeadline deadline) {
     auto& p = *impl_;
     std::unique_lock lock(p.mutex, std::try_to_lock); require(bool(lock), "cannot abort an active owned command reentrantly");
-    if (!p.options.mtp_request_carry || p.failed || p.closed) return;
+    if (!p.options.mtp_request_carry || p.failed || p.closed || p.resync_after_pressure) return;
     const auto* generation = p.scalar_previous.find("native_mtp_generation");
     if (!generation || !worker_field(*generation, "active").boolean()) return;
     const auto id = worker_integer(*generation, "id");
@@ -1369,7 +1421,8 @@ void OwnedWorker::abort_mtp_generation(WorkerDeadline deadline) {
         static_cast<void>(request_locked(Json(Json::Object{{"tokens", Json(Json::Array{})}, {"generate", Json::integer(0)},
             {"reset", Json(false)}, {"mtp_generation", Json(Json::Object{{"id", Json::integer(id)}, {"abort", Json(true)}})}}),
             deadline, {}, {}));
-    } catch (...) { p.invalidate(); throw; }
+    } catch (const WorkerHostMemoryPressure&) { throw; }
+    catch (...) { p.invalidate(); throw; }
     // The HTTP response failed even though this cleanup command was admitted.
     // Its next model request must still cold reset the target and entropy.
     p.needs_reset = true;

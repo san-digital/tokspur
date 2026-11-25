@@ -66,6 +66,29 @@ void final_logits_state(const Json& value, bool available) {
     need(top.array().size() == 8, "MTP ready-logits top8 differs");
     for (const auto& item : top.array()) { need(integer(item, "id") < 248320, "MTP ready-logits ID bound"); static_cast<void>(real(item, "logit")); }
 }
+uint64_t mapped_weight_limit(const Json& value) {
+    const auto limit = integer(value, "mapped_weight_region_limit_bytes");
+    if (limit == 0) return 0;
+    const auto* schema = value.find("derived_pack_schema");
+    const auto* recipe = value.find("derived_pack_recipe");
+    need(limit == (uint64_t(4) << 30) && schema && schema->kind() == Json::Kind::number && schema->number_lexeme() == "3" &&
+        recipe && recipe->kind() == Json::Kind::string && recipe->string() == "tokspur-pack-v3", "MTP unrelated prepared feature");
+    return limit;
+}
+uint32_t dflash2_max_proposals(const Json& value) {
+    uint32_t cap = 7u;
+    if (const auto* md = value.find("native_dflash2_max_drafts")) {
+        const auto v = md->unsigned_integer();
+        need(v >= 1 && v <= 15, "invalid native_dflash2_max_drafts bound");
+        cap = std::max<uint32_t>(cap, uint32_t(v));
+    }
+    if (const auto* bd = value.find("native_dflash2_burst_max_drafts")) {
+        const auto v = bd->unsigned_integer();
+        need(v >= 8 && v <= 15, "invalid native_dflash2_burst_max_drafts bound");
+        cap = std::max<uint32_t>(cap, uint32_t(v));
+    }
+    return cap;
+}
 void fixed(const Json& value) {
     static_cast<void>(raw_decode_selection(value));
     const auto input_packet = mtp_input_packet(value);
@@ -81,6 +104,7 @@ void fixed(const Json& value) {
     static_cast<void>(mtp_draft_attention(value));
     static_cast<void>(mtp_request_carry(value));
     const auto depth = mtp_depth(value);
+    if (depth == 7) static_cast<void>(dflash2_max_proposals(value));
     const auto proto = get(value, "native_mtp_protocol").string();
     const bool proto_ok = depth == 7 ? (proto == "native-dflash2-depth7-lookahead-v2") :
         depth == 3 ? (proto == "native-mtp-depth3-lookahead-v2") :
@@ -112,7 +136,7 @@ void fixed(const Json& value) {
     need(integer(value, "known_token_capacity") == std::min(input_packet, 2048u), "MTP known-input capacity differs from negotiated bound");
     for (const auto name : {"hc_q8_splits", "hc_q8_scratch_logical_bytes", "hc_q8_scratch_charged_bytes", "hc_exact_scratch_logical_bytes",
         "hc_exact_scratch_charged_bytes", "checkpoint_slots", "checkpoint_combined_budget_bytes", "checkpoint_host_bytes",
-        "checkpoint_store_host_bytes", "checkpoint_gpu_bytes", "recurrent_replay_captures", "mapped_weight_region_limit_bytes",
+        "checkpoint_store_host_bytes", "checkpoint_gpu_bytes", "recurrent_replay_captures",
         "capture_resource_bytes", "capture_binding_aliases", "capture_binding_alias_span_bytes", "capture_binding_alias_resource_bytes",
         "live_captures", "profile_counter_payload_bytes"}) need(integer(value, name) == 0, "MTP unrelated prepared feature");
     need(!value.find("sampled_prefill_protocol") && !value.find("broker_protocol") && !value.find("branch8_session") &&
@@ -589,7 +613,9 @@ bool mtp_request_carry(const Json& value) {
 }
 
 void validate_mtp_ready(const Json& value, std::string_view expected_draft_attention, bool expected_request_carry, uint32_t expected_depth) {
-    validate_worker_ready(value, "direct"); fixed(value);
+    validate_worker_ready(value, "direct");
+    static_cast<void>(mapped_weight_limit(value));
+    fixed(value);
     static_cast<void>(raw_decode_selection(value, true));
     if (mtp_final_input_logits(value)) need(!get(value, "logits_available").boolean(), "MTP ready contains logits");
     if (mtp_gdn_old_order(value)) need(!integer(value, "native_gdn_old_order_encoded_calls") && !integer(value, "native_gdn_old_order_request_encoded_calls"), "MTP ready already encoded old-order GDN calls");
@@ -622,7 +648,8 @@ void validate_mtp_ready(const Json& value, std::string_view expected_draft_atten
     for (const auto name : {"lookup_match_tokens", "lookup_history_tokens", "lookup_proposal_tokens", "lookup_verification_budget_bytes",
         "lookup_caller_host_bytes", "lookup_verification_charged_bytes"}) need(!integer(value, name), "MTP cannot prepare greedy lookup state");
     const auto host = integer(value, "verification_host_bytes"), gpu = integer(value, "verification_gpu_bytes");
-    need(host && gpu && host <= (128ull << 20) && gpu <= (128ull << 20) - host &&
+    const uint64_t verify_budget_cap = (expected_depth == 7 && dflash2_max_proposals(value) > 7u) ? (256ull << 20) : (128ull << 20);
+    need(host && gpu && host <= verify_budget_cap && gpu <= verify_budget_cap - host &&
         integer(value, "verification_tape_payload_bytes") && integer(value, "verification_tape_payload_bytes") <= gpu,
         "MTP verifier workspace/tape budget");
     for (const auto name : counters) need(!integer(value, name), "MTP ready executed work");
@@ -637,6 +664,7 @@ MtpWireReply::MtpWireReply(const Json& ready, const Json& previous, const Json& 
     : ready_(ready), previous_(previous), job_(job) {
     validate_mtp_ready(ready_, mtp_draft_attention(ready_), mtp_request_carry(ready_), mtp_depth(ready_));
     depth_ = mtp_depth(ready_);
+    need(mapped_weight_limit(previous_) == mapped_weight_limit(ready_), "MTP immutable preparation drift");
     validate_raw_decode_previous(ready_, previous_);
 #ifdef TOKSPUR_PRIVATE_Q8_THREE_ROWS
     validate_owned_q8_three_previous(ready_,previous_);
@@ -675,13 +703,17 @@ MtpWireReply::MtpWireReply(const Json& ready, const Json& previous, const Json& 
         mtp_output_packet(ready_) == mtp_output_packet(previous_), "MTP previous output-packet mode differs");
     need(mtp_request_carry(previous_) == scoped_, "MTP previous carry scope differs");
     need(mtp_draft_attention(previous_) == mtp_draft_attention(ready_), "MTP previous draft-attention mode differs");
-    if (scoped_) keys(job_, {"tokens", "generate", "reset", "stop_ids", "sampling", "seed", "mtp_generation", "prefill_final"});
-    else keys(job_, {"tokens", "generate", "reset", "stop_ids", "sampling", "seed"});
+    if (scoped_) keys(job_, {"tokens", "generate", "reset", "stop_ids", "sampling", "seed", "mtp_generation", "prefill_final", "lane_prompt", "lane_inherit_seed"});
+    else keys(job_, {"tokens", "generate", "reset", "stop_ids", "sampling", "seed", "lane_prompt", "lane_inherit_seed"});
     if (const auto* command = job_.find("mtp_generation")) {
         need(scoped_, "MTP generation command lacks explicit scope"); generation_ = mtp_generation_command(*command); abort_ = generation_.abort;
     }
     reset_ = get(job_, "reset").boolean(); inputs_ = uint32_t(get(job_, "tokens").array().size());
     const auto outputs = integer(job_, "generate");
+    if (const auto* inherit = job_.find("lane_inherit_seed")) {
+        need(inherit->boolean() && reset_ && inputs_ > 0 && outputs == 0,
+            "MTP lane seed inheritance requires a fresh input packet");
+    }
     need((inputs_ >= 1 && inputs_ <= mtp_input_packet(ready_) && !outputs) || (!inputs_ && outputs >= 1 && outputs <= mtp_output_packet(ready_)) || (abort_ && !inputs_ && !outputs), "MTP packet exceeds negotiated input or output bound");
     maximum_ = uint32_t(outputs);
     const auto* final = job_.find("prefill_final");
@@ -713,7 +745,7 @@ MtpWireReply::MtpWireReply(const Json& ready, const Json& previous, const Json& 
     need(before <= context_limit, "MTP previous context bound"); base_ = position_ = reset_ ? 0 : uint32_t(before);
     const uint32_t pending_overflow = (generation_.v2 && !generation_.begin) ? generation_.pending : 0;
     if (pending_overflow) {
-        need(pending_overflow <= (depth_ == 7 ? 7u : depth_) && pending_overflow <= position_, "invalid MTP pending overflow bound");
+        need(pending_overflow <= (depth_ == 7 ? dflash2_max_proposals(ready_) : depth_) && pending_overflow <= position_, "invalid MTP pending overflow bound");
         position_ -= pending_overflow;
         pending_tokens_ = std::min(pending_overflow, maximum_);
         round_end_ = base_;
@@ -765,6 +797,20 @@ MtpWireReply::MtpWireReply(const Json& ready, const Json& previous, const Json& 
         }
     }
     for (const auto& token : get(job_, "tokens").array()) need(token.unsigned_integer() < 248320, "MTP input token bound");
+    if (const auto* lane = job_.find("lane_prompt")) {
+        const auto& all = lane->array();
+        const auto& tokens_arr = get(job_, "tokens").array();
+        need(reset_ && inputs_ > 0 && outputs == 0 && all.size() > tokens_arr.size() && uint64_t(all.size()) < context_limit,
+            "MTP lane prompt requires a fresh input packet it extends");
+        for (size_t i = 0; i < all.size(); ++i) {
+            const auto id = all[i].unsigned_integer();
+            need(id < 248320, "MTP lane prompt token bound");
+            if (i < tokens_arr.size()) {
+                need(tokens_arr[i].unsigned_integer() == id, "MTP lane prompt differs from its packet");
+            }
+        }
+        lane_prompt_ = uint32_t(all.size());
+    }
     if (const auto* stops = job_.find("stop_ids")) {
         need(stops->array().size() <= 16, "MTP stop set bound");
         std::array<uint32_t, 16> seen{}; size_t count = 0;
@@ -776,8 +822,16 @@ MtpWireReply::MtpWireReply(const Json& ready, const Json& previous, const Json& 
 }
 
 void MtpWireReply::event(const Json& value) {
-    need(!finished_ && maximum_ && event_count_ < events_.size() && !stopped_, "MTP unsolicited/excess/post-terminal event");
+    need(!finished_, "MTP unsolicited/excess/post-terminal event");
     const auto type = get(value, "event").string();
+    if (type == "error") {
+        const auto* msg = value.find("message");
+        if (msg && msg->kind() == Json::Kind::string) {
+            throw FormatError(std::string(msg->string()));
+        }
+        throw FormatError("owned target emitted error event");
+    }
+    need(maximum_ && event_count_ < events_.size() && !stopped_, "MTP unsolicited/excess/post-terminal event");
     if (type == "mtp_round") {
         const auto proposals = ((depth_ == 2 || depth_ == 3 || depth_ == 7) && value.find("proposed")) ? uint32_t(integer(value, "proposed")) : depth_;
         if (depth_ == 2 || depth_ == 3) {
@@ -797,7 +851,7 @@ void MtpWireReply::event(const Json& value) {
                     "verification_gpu_ms", "recovery_wall_ms", "recovery_gpu_ms", "materialization_wall_ms", "lookahead_anchor", "used_carried_anchor",
                     "pending_anchor", "round_wall_ms", "timings_qualified"});
             }
-            need(proposals >= 1 && proposals <= depth_, "variable-depth round omitted actual proposal count");
+            need(proposals >= 1 && proposals <= dflash2_max_proposals(ready_), "variable-depth round omitted actual proposal count");
         } else {
         keys(value, {"event", "base", "committed_prefix", "count", "accepted", "draft_wall_ms", "draft_gpu_ms", "verification_wall_ms",
             "verification_gpu_ms", "recovery_wall_ms", "recovery_gpu_ms", "materialization_wall_ms", "lookahead_anchor", "used_carried_anchor",
@@ -848,7 +902,8 @@ void MtpWireReply::event(const Json& value) {
 }
 
 void MtpWireReply::finish(const Json& done) {
-    for (const char* name : {"native_controller_policy_digest", "native_prepared_validation", "native_measured_controller", "native_measured_timing_schema", "native_dflash2_draft_policy", "native_target_m8_split_digest", "native_verify_narrow_rows", "native_pack_shared_mapping"}) {
+    need(mapped_weight_limit(done) == mapped_weight_limit(ready_), "MTP immutable preparation drift");
+    for (const char* name : {"native_controller_policy_digest", "native_prepared_validation", "native_measured_controller", "native_measured_timing_schema", "native_dflash2_draft_policy", "native_dflash2_burst_max_drafts", "native_target_m8_split_digest", "native_verify_narrow_rows", "native_pack_shared_mapping"}) {
         const auto* policy = ready_.find(name), *observed = done.find(name);
         need(bool(policy) == bool(observed) && (!policy || policy->dump() == observed->dump()), "controller or validation policy differs from startup negotiation");
     }
@@ -859,6 +914,22 @@ void MtpWireReply::finish(const Json& done) {
         "MTP immutable dense-kernel identity drift before counter resynchronisation");
     if (dense_kernel) static_cast<void>(mtp_input_packet(done));
     const auto input_packet = mtp_input_packet(ready_);
+    uint32_t restored_input_tokens = 0;
+    {
+        const auto* restored_tok = done.find("checkpoint_restored_tokens");
+        const auto* replayed_tok = done.find("replayed_input_tokens");
+        if (restored_tok && replayed_tok) {
+            const auto restored_n = restored_tok->unsigned_integer();
+            const auto replayed_n = replayed_tok->unsigned_integer();
+            need(restored_n <= inputs_ && replayed_n == inputs_ - restored_n,
+                "MTP restored/replayed input accounting differs");
+            restored_input_tokens = uint32_t(restored_n);
+        } else {
+            need(!restored_tok && !replayed_tok, "MTP restored/replayed input metadata incomplete");
+        }
+    }
+    const uint32_t replayed_inputs = inputs_ - restored_input_tokens;
+    const uint32_t replay_base = base_ + restored_input_tokens;
     const auto* dense_field = done.find("native_prefill_dense");
     const bool dense_nax = dense_field && dense_field->string() == "nax";
     const auto* grouped_field = done.find("native_prefill_grouped");
@@ -869,19 +940,19 @@ void MtpWireReply::finish(const Json& done) {
         ? std::min<uint64_t>(input_packet, 2048ull)
         : 512ull;
     uint64_t hc_chunks = 0;
-    if (input_packet >= 512 && inputs_ >= 2) {
+    if (input_packet >= 512 && replayed_inputs >= 2) {
         uint64_t at = 0;
-        while (at < inputs_) {
-            uint64_t n = std::min<uint64_t>(chunk_cap, inputs_ - at);
+        while (at < replayed_inputs) {
+            uint64_t n = std::min<uint64_t>(chunk_cap, replayed_inputs - at);
             if (ple_overlap) {
-                const uint64_t abs_pos = base_ + at;
-                if (chunk_cap <= 512 && at == 0 && inputs_ >= 1024 && n > 512) {
+                const uint64_t abs_pos = replay_base + at;
+                if (chunk_cap <= 512 && at == 0 && replayed_inputs >= 1024 && n > 512) {
                     n = 512;
                 } else if (chunk_cap == 2048 && (abs_pos % 512 == 0) && (abs_pos % 2048 != 0)) {
                     n = std::min<uint64_t>(n, 2048 - (abs_pos % 2048));
                 }
             }
-            if (n > 2 && (inputs_ - at - n == 1)) --n;
+            if (n > 2 && (replayed_inputs - at - n == 1)) --n;
             if (n >= 2) ++hc_chunks;
             at += n;
         }
@@ -894,7 +965,7 @@ void MtpWireReply::finish(const Json& done) {
     }
     const bool router_window = mtp_router_window(ready_); need(mtp_router_window(done) == router_window, "MTP DONE router window selection differs");
     if (router_window) for (size_t i = 0; i < 4; ++i) {
-        const uint64_t router_chunks = grouped_nax ? (inputs_ <= chunk_cap ? (inputs_ >= 2 ? 1 : 0) : hc_chunks) : hc_chunks;
+        const uint64_t router_chunks = grouped_nax ? (replayed_inputs <= chunk_cap ? (replayed_inputs >= 2 ? 1 : 0) : hc_chunks) : hc_chunks;
         const uint64_t expected = 48ull * (ple_overlap ? hc_chunks : router_chunks);
         need(integer(done, mtp_router_window_request_names[i]) == expected, "MTP router window per-packet encoded calls differ");
         delta(previous_, done, mtp_router_window_counter_names[i], expected, resync_);
@@ -916,12 +987,12 @@ void MtpWireReply::finish(const Json& done) {
     if (hc_down) {
         const auto calls = integer(done, "native_prefill_hc_down_f32_request_encoded_calls");
         // Two residual reads per layer and the architecture's 128-layer ceiling bound a packet. No per-round ratio is inferred.
-        need(inputs_ == 512 ? calls && calls <= 256 : !calls, "MTP HC down batching used an ineligible packet or exceeded its bound");
+        need(replayed_inputs == 512 ? calls && calls <= 256 : !calls, "MTP HC down batching used an ineligible packet or exceeded its bound");
         delta(previous_, done, "native_prefill_hc_down_f32_encoded_calls", calls, resync_);
     }
     const bool old_order = mtp_gdn_old_order(ready_); need(mtp_gdn_old_order(done) == old_order, "MTP DONE old-order GDN selection differs");
     if (old_order) {
-        const uint64_t calls = inputs_ > 1 ? 36 : 0;
+        const uint64_t calls = replayed_inputs > 1 ? 36 : 0;
         need(integer(done, "native_gdn_old_order_request_encoded_calls") == calls, "MTP old-order GDN per-packet encoded calls differ");
         delta(previous_, done, "native_gdn_old_order_encoded_calls", calls, resync_);
     }
@@ -954,23 +1025,55 @@ void MtpWireReply::finish(const Json& done) {
     need(mtp_draft_attention(done) == mtp_draft_attention(ready_), "MTP immutable draft-attention mode drift");
     for (const auto name : immutable) need(get(done, name).dump() == get(ready_, name).dump(), "MTP immutable preparation drift");
     for (const auto name : resources) need(get(done, name).dump() == get(ready_, name).dump(), "MTP fixed resource ledger drift");
-    const auto expected_committed_prefix = (round_end_ && generation_.v2) ? std::max(round_end_, position_) : (base_ + inputs_ + count_);
-    need(get(done, "known_token_prefill").boolean() && integer(done, "committed_prefix") == expected_committed_prefix &&
+    const auto base_expected_prefix = (round_end_ && generation_.v2) ? std::max(round_end_, position_) : (base_ + inputs_ + count_);
+    const auto actual_prefix = integer(done, "committed_prefix");
+    std::optional<uint32_t> lane_restored;
+    if (const auto* restored_val = done.find("lane_restored_prefix")) {
+        const auto length = restored_val->unsigned_integer();
+        need(lane_prompt_ > 0 && length > base_expected_prefix && length < lane_prompt_ &&
+            actual_prefix == length && !get(done, "continuation_allowed").boolean(),
+            "MTP parked-lane restore differs from its lane prompt");
+        lane_restored = uint32_t(length);
+    }
+    const auto expected_committed_prefix = lane_restored ? uint64_t(*lane_restored) : uint64_t(base_expected_prefix);
+    need(get(done, "known_token_prefill").boolean() && actual_prefix == expected_committed_prefix &&
         (inputs_ ? !count_ : (stopped_ ? count_ >= 1 : count_ == maximum_)), "MTP completion prefix/count differs");
+    const bool inherit_seed = job_.find("lane_inherit_seed") != nullptr;
+    std::optional<uint64_t> lane_seed;
+    {
+        const auto* seed_val = done.find("lane_seed");
+        const auto* tokens_val = done.find("lane_restored_tokens");
+        if (seed_val && tokens_val) {
+            const auto s = seed_val->unsigned_integer();
+            const auto t = tokens_val->unsigned_integer();
+            const uint64_t packet = inputs_;
+            const uint64_t prompt_len = lane_prompt_ ? uint64_t(lane_prompt_) : packet;
+            need(inherit_seed && t > 0 && t < prompt_len &&
+                std::min<uint64_t>(t, packet) == restored_input_tokens &&
+                lane_restored == (t > packet ? std::optional<uint32_t>(uint32_t(t)) : std::nullopt) &&
+                integer(get(done, "sampling"), "seed") == s,
+                "MTP inherited seed differs from its parked restore");
+            lane_seed = s;
+        } else {
+            need(!seed_val && !tokens_val, "MTP parked seed metadata incomplete");
+            need(!inherit_seed || !lane_restored, "MTP parked restore omitted its inherited seed");
+        }
+    }
     const auto& ids = get(done, "generated_ids").array(); need(ids.size() == count_, "MTP completion ID count differs");
     for (size_t i = 0; i < count_; ++i) need(ids[i].unsigned_integer() == ids_[i], "MTP token/DONE ID disagreement");
     const auto& sampled = get(done, "sampling"), policy = reset_ ? get(job_, "sampling") : get(previous_, "sampling");
+    const uint64_t expected_seed = lane_seed.value_or(reset_ ? integer(job_, "seed") : integer(policy, "seed"));
     need(get(sampled, "valid").boolean() && integer(sampled, "entropy_prefix") == expected_committed_prefix &&
-        integer(sampled, "seed") == (reset_ ? integer(job_, "seed") : integer(policy, "seed")), "MTP sampler ancestry differs");
+        integer(sampled, "seed") == expected_seed, "MTP sampler ancestry differs");
     for (const auto name : {"temperature", "top_k", "top_p", "min_p"}) need(real(sampled, name) == real(policy, name), "MTP target sampling policy changed");
     for (const auto name : {"filter_order", "rng", "ownership"}) need(get(sampled, name).dump() == get(get(ready_, "sampling"), name).dump(), "MTP sampler algorithm changed");
     const auto words = integer(sampled, "entropy_words"), before_words = reset_ ? 0 : integer(policy, "entropy_words");
     const uint64_t max_words_delta = (real(policy, "temperature") == 0 || inputs_) ? 0 :
-        (depth_ == 7 ? 130ull * (depth_ * rounds_ + ordinary_) + count_ : 130ull * depth_ * rounds_ + count_);
+        (depth_ == 7 ? 130ull * (uint64_t(dflash2_max_proposals(ready_)) * rounds_ + ordinary_) + count_ : 130ull * depth_ * rounds_ + count_);
     need(words >= before_words && words - before_words <= max_words_delta,
         "MTP entropy advance exceeds bounded rejection draws");
     if (count_) need(token_words_[count_ - 1] == words, "MTP last token/DONE entropy differs");
-    const bool available = !final_input_logits_ || !inputs_ || final_input_;
+    const bool available = (!final_input_logits_ || !inputs_ || final_input_) && !lane_restored;
     need(get(done, "continuation_allowed").boolean() == (available && !stopped_), "MTP continuation flag differs");
     if (final_input_logits_) {
         final_logits_state(done, available);
@@ -983,11 +1086,13 @@ void MtpWireReply::finish(const Json& done) {
     const std::array<uint64_t, 8> expected{head_calls_, primes + prime_extra_, rounds_, proposed_, accepted_, rejected_, carried_, discarded_};
     for (size_t i = 0; i < counters.size(); ++i) delta(previous_, done, counters[i], expected[i], resync_);
     for (const auto name : clocks) need(real(done, name) >= real(previous_, name), "MTP execution clock rewound");
-    const uint64_t ordinary_attention = ordinary_ + (input_packet >= 512 && inputs_ == 1 ? 1 : 0);
+    const uint64_t ordinary_attention = ordinary_ + (input_packet >= 512 && replayed_inputs == 1 ? 1 : 0);
     const uint64_t legacy_ordinary_attention = qsa_sparse ? 0 : 12ull * ordinary_attention;
     for (const auto name : {"qsa_stage_v8_calls", "qsa_channel_calls"}) delta(previous_, done, name, legacy_ordinary_attention, resync_);
     need(integer(done, "qsa_stage_v8_request_calls") == legacy_ordinary_attention && integer(done, "qsa_channel_request_calls") == legacy_ordinary_attention, "MTP per-packet attention counters differ");
-    const uint64_t verify_tiles = 12ull * (inputs_ ? (input_packet >= 512 ? 0 : 1) : rounds_);
+    const uint64_t verify_tiles = inputs_
+        ? (replayed_inputs == 0 ? 0ull : (input_packet >= 512 ? 0ull : 12ull))
+        : 12ull * rounds_;
     if (qsa_sparse) {
         const std::array<uint64_t, 2> expected_sparse{12ull * ordinary_attention, verify_tiles};
         for (size_t i = 0; i < 2; ++i) {
@@ -996,9 +1101,9 @@ void MtpWireReply::finish(const Json& done) {
         }
     }
     if (gdn_ported) {
-        const uint64_t prefill_gdn = 36ull * ((ple_overlap || input_packet > 2048) ? hc_chunks : (input_packet >= 512 && inputs_ >= 2 ? (inputs_ + chunk_cap - 1) / chunk_cap : 0));
+        const uint64_t prefill_gdn = 36ull * ((ple_overlap || input_packet > 2048) ? hc_chunks : (input_packet >= 512 && replayed_inputs >= 2 ? (replayed_inputs + chunk_cap - 1) / chunk_cap : 0));
         const uint64_t decode_gdn = 36ull * ordinary_attention;
-        const uint64_t verify_gdn = 36ull * (inputs_ ? (input_packet >= 512 ? 0 : 1) : rounds_);
+        const uint64_t verify_gdn = 36ull * (inputs_ ? (replayed_inputs == 0 || input_packet >= 512 ? 0 : 1) : rounds_);
         const uint64_t replay_gdn = 36ull * (inputs_ ? 0 : rejected_);
         const std::array<uint64_t, 5> expected_gdn{prefill_gdn, decode_gdn, verify_gdn, replay_gdn, decode_gdn + verify_gdn};
         for (size_t i = 0; i < 5; ++i) {
@@ -1008,17 +1113,29 @@ void MtpWireReply::finish(const Json& done) {
     }
     delta(previous_, done, "known_qsa_rows_physical_tiles", verify_tiles, resync_);
     delta(previous_, done, "known_qsa_rows_logical_rows",
-        12ull * (inputs_ ? (input_packet >= 512 ? 0 : inputs_) : (rounds_ + proposed_)), resync_);
+        12ull * (inputs_ ? (input_packet >= 512 ? 0 : replayed_inputs) : (rounds_ + proposed_)), resync_);
     const auto& routes = get(done, "hc_exact_routes"), request_routes = get(done, "hc_exact_request_routes");
     need(request_routes.object().size() == hc_names.size(), "MTP request HC route shape");
     for (const auto name : hc_names) {
         const auto before = integer(get(previous_, "hc_exact_routes"), name), after = integer(routes, name), request = integer(request_routes, name);
         need(after >= before && (resync_ ? after - before >= request : after - before == request), "MTP HC request/lifetime counter differs");
     }
+    restored_input_tokens_ = restored_input_tokens;
+    lane_restored_prefix_ = lane_restored.value_or(0);
+    lane_seed_ = lane_seed;
     finished_ = true;
 }
 std::span<const Json> MtpWireReply::events() const {
     need(finished_, "MTP events cannot publish before completion admission"); return {events_.data(), event_count_};
+}
+std::optional<uint64_t> MtpWireReply::lane_seed() const {
+    need(finished_, "MTP lane seed requires admitted completion"); return lane_seed_;
+}
+uint32_t MtpWireReply::lane_restored_prefix() const {
+    need(finished_, "MTP lane accounting requires admitted completion"); return lane_restored_prefix_;
+}
+uint32_t MtpWireReply::restored_input_tokens() const {
+    need(finished_, "MTP input accounting requires admitted completion"); return restored_input_tokens_;
 }
 } // namespace tokspur
 #endif

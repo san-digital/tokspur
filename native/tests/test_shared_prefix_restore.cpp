@@ -124,6 +124,26 @@ void refusal_and_success() {
 
 }
 
+void split_candidate_lcp() {
+    const std::vector<uint32_t> tokens{10, 11, 12, 13, 14, 15};
+    const auto candidate = std::span(tokens);
+    for (size_t match = 0; match <= tokens.size(); ++match) {
+        std::vector<std::vector<uint32_t>> recent{{}, {9, 11}, tokens};
+        if (match < tokens.size()) recent.back()[match] = 99;
+        recent.emplace_back(tokens.begin(), tokens.begin() + match);
+        for (size_t split = 0; split <= tokens.size(); ++split) {
+            for (size_t limit = 0; limit <= tokens.size() + 1; ++limit) {
+                for (size_t boundary = 0; boundary <= tokens.size() + 1; ++boundary) {
+                    const size_t exact = std::min(match, limit);
+                    const size_t expected = boundary && exact >= boundary ? exact : 0;
+                    check(shared_prefix_best_lcp(recent, candidate.first(split), boundary, limit, candidate.subspan(split)) == expected,
+                        "split packet changed the exact common prefix");
+                }
+            }
+        }
+    }
+}
+
 void sub2k_nax_slice_clamping_and_exact_lcp() {
     std::vector<std::vector<uint32_t>> recent;
     std::vector<uint32_t> p1(1484);
@@ -160,7 +180,7 @@ void sub2k_nax_slice_clamping_and_exact_lcp() {
 int main() {
     try {
         for (bool empty : {false, true}) for (bool fail_stack : {false, true}) for (Fault fault : {Fault::refuse, Fault::exception}) failed_restore(empty, fail_stack, fault);
-        rollback_failures(); refusal_and_success(); sub2k_nax_slice_clamping_and_exact_lcp();
+        rollback_failures(); refusal_and_success(); split_candidate_lcp(); sub2k_nax_slice_clamping_and_exact_lcp();
         std::cout << "Shared-prefix production transaction checks=" << checks << "; fault-injected checkpoint interfaces, no GPU state qualification\n";
         return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

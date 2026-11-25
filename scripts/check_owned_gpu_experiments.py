@@ -72,8 +72,9 @@ ARTIFACT_NAMES = ("tokspur-native", "tokspur-server", "tokspur-owned.metallib") 
 )
 LINK_COMMAND_INDICES = (3, 4)
 PROTOCOL_COMMAND_INDEX = 5
-BASE_PROTOCOL_CHECKS, STACK_PROTOCOL_CHECKS = 245, 59
-PROTOCOL_CHECKS = BASE_PROTOCOL_CHECKS + STACK_PROTOCOL_CHECKS
+BASE_PROTOCOL_CHECKS, STACK_PROTOCOL_CHECKS = 245, 76
+PARKED_PROTOCOL_CHECKS = 17
+PROTOCOL_CHECKS = BASE_PROTOCOL_CHECKS + PARKED_PROTOCOL_CHECKS + STACK_PROTOCOL_CHECKS
 
 
 def generated_commands(build, python):
@@ -105,13 +106,16 @@ def system_only_links(output):
 
 
 def complete_protocol_output(output):
-    return re.findall(
-        r"^Owned CPU target protocol checks passed: (.*)$", output, re.M
-    ) == [str(BASE_PROTOCOL_CHECKS)] and re.findall(
-        r"^Owned CPU target stack-experiment protocol checks passed: (.*)$",
-        output,
-        re.M,
-    ) == [str(STACK_PROTOCOL_CHECKS)]
+    counts = (
+        ("target protocol", BASE_PROTOCOL_CHECKS),
+        ("parked conversation", PARKED_PROTOCOL_CHECKS),
+        ("target stack-experiment protocol", STACK_PROTOCOL_CHECKS),
+    )
+    return all(
+        re.findall(rf"^Owned CPU {label} checks passed: (.*)$", output, re.M)
+        == [str(count)]
+        for label, count in counts
+    )
 
 
 def main(argv: list[str] | tuple[str, ...] = ()) -> int:

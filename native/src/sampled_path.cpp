@@ -369,7 +369,7 @@ SampledPathDecision decide_sampled_path(SampledPathIdentity proposals_identity,
     std::span<const SampledTargetRow> target_rows, SamplingPolicy policy, uint32_t remaining,
     std::span<const uint32_t> stops, const SamplingRng& after_proposals, uint64_t proposal_begin_words,
     SampledPathCancellation cancellation) {
-    std::array<SamplingRowScan, 8> scans;
+    std::array<SamplingRowScan, sampled_path_maximum_proposals + 1> scans;
     const bool prepared = prepared_sampling();
     return sampled_path_detail::decide_sampled_path_core(
         proposals_identity, proposals, target_identity, target_rows, policy, remaining,

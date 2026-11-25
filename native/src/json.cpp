@@ -55,7 +55,7 @@ private:
         while (true) {
             const auto c = static_cast<unsigned char>(take());
             if (c == '"') {
-                static_cast<void>(unicode_scalars(output));
+                static_cast<void>(unicode_scalar_count(output));
                 return output;
             }
             if (c < 0x20) throw FormatError("unescaped JSON control character");
@@ -196,6 +196,11 @@ const Json::Object& Json::object() const {
     if (!value) throw FormatError("expected JSON object");
     return *value;
 }
+Json::Object Json::take_object() && {
+    auto* value = std::get_if<Object>(&data_);
+    if (!value) throw FormatError("expected JSON object");
+    return std::move(*value);
+}
 const Json* Json::find(std::string_view key) const {
     for (const auto& [name, value] : object()) if (name == key) return &value;
     return nullptr;
@@ -208,7 +213,7 @@ std::string Json::dump(size_t byte_limit) const {
         output.append(text);
     };
     const auto quoted = [&](std::string_view text) {
-        static_cast<void>(unicode_scalars(text));
+        static_cast<void>(unicode_scalar_count(text));
         append("\"");
         for (const unsigned char c : text) {
             if (c == '"' || c == '\\') { const std::array<char, 2> escaped{'\\', static_cast<char>(c)}; append({escaped.data(), escaped.size()}); }

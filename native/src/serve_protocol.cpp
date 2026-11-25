@@ -1,7 +1,5 @@
 #include "tokspur/serve.hpp"
-#if defined(TOKSPUR_PRIVATE_LANE_LAYOUT) || defined(TOKSPUR_PRIVATE_Q8_THREE_ROWS)
 #include "tokspur/owned_worker.hpp"
-#endif
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
 #include "tokspur/mtp_wire.hpp"
 #ifdef TOKSPUR_PRIVATE_RAW_DECODE
@@ -9,6 +7,7 @@
 #endif
 #endif
 #include "tokspur/gguf.hpp"
+#include "tokspur/unicode.hpp"
 #ifdef TOKSPUR_PRIVATE_HTTP_VERIFY8
 #include "tokspur/serve_verify8.hpp"
 #endif
@@ -179,6 +178,451 @@ int compare(const Decimal& left, const Decimal& right) {
     }
     return left.negative ? -order : order;
 }
+// The multipleOf divisor as its significant digits and decimal exponent. Eighteen digits keep every remainder step below 10^19, inside uint64_t; the shortest lexeme that round-trips a double has at most seventeen.
+std::pair<uint64_t, int64_t> divisor(const Json& value) {
+    const auto step = decimal(value);
+    require(!step.negative && step.digits != "0", "multipleOf must be positive");
+    require(step.digits.size() <= 18, "multipleOf digit bound");
+    uint64_t digits = 0; for (const char c : step.digits) digits = digits * 10 + uint64_t(c - '0');
+    return {digits, step.exponent};
+}
+// Whether value divided by the divisor is an integer, in exact decimal arithmetic.
+bool multiple(const Decimal& value, std::pair<uint64_t, int64_t> step) {
+    const auto [digits, exponent] = step;
+    if (value.digits == "0") return true;
+    // The value's digits do not end in zero, so they are never divisible by the power of ten that a negative shift leaves in the denominator.
+    const int64_t shift = value.exponent - exponent;
+    if (shift < 0) return false;
+    uint64_t rest = 0; for (const char c : value.digits) rest = (rest * 10 + uint64_t(c - '0')) % digits;
+    // The divisor is below 2^60, so it holds at most 59 factors of two and fewer of five: beyond 60, further powers of ten cannot change whether the remainder is zero.
+    for (int64_t i = 0; i < std::min<int64_t>(shift, 60); ++i) rest = (rest * 10) % digits;
+    return rest == 0;
+}
+// Appends a form in which two values are the same bytes exactly when JSON Schema calls them equal: numbers by exact decimal value, object members in name order, everything else as dump writes it.
+void canonical(const Json& value, std::string& out) {
+    if (value.kind() == Json::Kind::number) {
+        const auto n = decimal(value);
+        if (n.negative) out += '-';
+        out += n.digits; out += 'e'; out += std::to_string(n.exponent);
+    } else if (value.kind() == Json::Kind::array) {
+        out += '[';
+        for (const auto& item : value.array()) { canonical(item, out); out += ','; }
+        out += ']';
+    } else if (value.kind() == Json::Kind::object) {
+        std::vector<const Json::Object::value_type*> members;
+        for (const auto& member : value.object()) members.push_back(&member);
+        std::stable_sort(members.begin(), members.end(), [](const auto* left, const auto* right) { return left->first < right->first; });
+        out += '{';
+        for (const auto* member : members) { out += Json(member->first).dump(); out += ':'; canonical(member->second, out); out += ','; }
+        out += '}';
+    } else out += value.dump();
+}
+// The JSON Schema pattern keyword for tool parameters. A pattern is an ECMA-262 regular expression read the way JSON Schema recommends, in Unicode mode with no flags. It works on code points, ^ and $ match only at the two ends of the string, . matches anything but the four line terminators, \d, \w and \b are ASCII, \s is the ECMA-262 white space set, and the pattern matches when it matches anywhere in the string. One reading goes beyond Unicode mode: a backslash before any character of the Basic Multilingual Plane that is not an ASCII letter or digit means that character. Unicode mode allows that only before syntax characters, but zod-to-json-schema escapes every literal this way.
+// Refused: backreferences, named groups, Unicode property escapes, escapes that name a lone surrogate, and everything Unicode mode calls a syntax error.
+// Without captures or backreferences a pattern describes a regular language, and whether a lookaround assertion holds depends on the position alone. So each lookaround body is scanned once over the whole string to tabulate where it holds, and the pattern itself is then scanned with those tables. A scan follows every thread at once and visits each step at most once per position: the time is the string length times the compiled size, whatever the pattern. No backtracking order is involved, so a lazy quantifier matches the same strings as a greedy one.
+namespace pattern {
+using Ranges = std::vector<std::pair<uint32_t, uint32_t>>;
+// The most steps a compiled pattern may hold, over its own sequence and every lookaround body. A scan visits at most this many steps per code point.
+constexpr uint64_t steps_bound = 4096;
+// The deepest group nesting, which bounds the recursion of the parser and the compiler.
+constexpr size_t depth_bound = 32;
+// The most lookaround assertions. Each one costs a table of one flag per position of the matched string.
+constexpr size_t looks_bound = 16;
+// The most bytes of pattern text, which bounds what the parser builds before the step count is known.
+constexpr size_t bytes_bound = 16384;
+constexpr const char* unsupported = "unsupported pattern";
+constexpr const char* bound = "pattern exceeds the tool pattern bound";
+// A parsed pattern. A node is empty exactly when it compiles to no step.
+struct Node {
+    enum class Kind { empty, set, start, end, word, look, concat, either, repeat };
+    Kind kind = Kind::empty;
+    size_t index = 0; // The set, or the lookaround body.
+    bool wanted = false; // Whether a word boundary, or a match of the lookaround body, is required or forbidden.
+    uint64_t low = 0, high = 0; // The counts of a repeat.
+    bool open = false; // A repeat with no upper count.
+    std::vector<Node> items; // The members of a sequence or a choice, or the one body of a repeat.
+};
+struct Step {
+    enum class Kind { set, split, jump, start, end, word, look, match };
+    Kind kind = Kind::match;
+    size_t first = 0, second = 0;
+    bool wanted = false;
+};
+// One step sequence. A lookahead body is compiled in reverse and scanned from the end of the string, which finds the positions where it starts.
+struct Piece { std::vector<Step> steps; bool backward = false; };
+// A compiled pattern: its character sets, then one piece per lookaround body in the order the bodies close, then the pattern's own piece.
+struct Pattern {
+    std::vector<Ranges> sets;
+    std::vector<Piece> pieces;
+    bool matches(const std::vector<uint32_t>& text) const;
+    std::vector<bool> scan(const Piece& piece, const std::vector<uint32_t>& text, const std::vector<std::vector<bool>>& tables, bool once) const;
+};
+// The character as an ASCII byte, or zero for anything else.
+char ascii(uint32_t c) { return c < 128 ? char(c) : '\0'; }
+bool digit(char c) { return c >= '0' && c <= '9'; }
+bool letter(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+bool word(uint32_t c) { return digit(ascii(c)) || letter(ascii(c)) || c == '_'; }
+// Sorts and merges the ranges, then takes the complement when negate is set.
+Ranges normal(Ranges ranges, bool negate) {
+    std::sort(ranges.begin(), ranges.end());
+    Ranges merged;
+    for (const auto& [low, high] : ranges) {
+        if (!merged.empty() && low <= merged.back().second + 1) merged.back().second = std::max(merged.back().second, high);
+        else merged.emplace_back(low, high);
+    }
+    if (!negate) return merged;
+    Ranges rest; uint32_t next = 0;
+    for (const auto& [low, high] : merged) {
+        if (low > next) rest.emplace_back(next, low - 1);
+        next = high + 1;
+    }
+    if (next <= 0x10ffff) rest.emplace_back(next, 0x10ffff);
+    return rest;
+}
+// The set a \d, \w or \s escape names, complemented for the capital letter.
+std::optional<Ranges> shorthand(uint32_t c) {
+    Ranges ranges;
+    switch (ascii(c)) {
+        case 'd': case 'D': ranges = {{0x30, 0x39}}; break;
+        case 'w': case 'W': ranges = {{0x30, 0x39}, {0x41, 0x5a}, {0x5f, 0x5f}, {0x61, 0x7a}}; break;
+        // ECMA-262 WhiteSpace and LineTerminator: the ASCII controls, the byte order mark and the Unicode space separators.
+        case 's': case 'S': ranges = {{0x09, 0x0d}, {0x20, 0x20}, {0xa0, 0xa0}, {0x1680, 0x1680}, {0x2000, 0x200a}, {0x2028, 0x2029}, {0x202f, 0x202f}, {0x205f, 0x205f}, {0x3000, 0x3000}, {0xfeff, 0xfeff}}; break;
+        default: return std::nullopt;
+    }
+    return normal(std::move(ranges), ascii(c) < 'a');
+}
+struct Parser {
+    std::vector<uint32_t> source;
+    size_t at = 0;
+    std::vector<Ranges> sets;
+    // Lookaround bodies in the order they close, so a body never refers to a later one. true marks a lookahead.
+    std::vector<std::pair<Node, bool>> looks;
+    // The next character as an ASCII byte, or zero at the end and for anything else.
+    char peek() const { return at < source.size() ? ascii(source[at]) : '\0'; }
+    bool eat(char c) {
+        const bool found = at < source.size() && source[at] == uint32_t(c);
+        if (found) ++at;
+        return found;
+    }
+    uint32_t take() { require(at < source.size(), unsupported); return source[at++]; }
+    Node set(Ranges ranges) {
+        sets.push_back(std::move(ranges));
+        Node node; node.kind = Node::Kind::set; node.index = sets.size() - 1; return node;
+    }
+    Node disjunction(size_t depth) {
+        Node choices; choices.kind = Node::Kind::either;
+        choices.items.push_back(sequence(depth));
+        while (eat('|')) choices.items.push_back(sequence(depth));
+        if (choices.items.size() == 1) return std::move(choices.items[0]);
+        return choices;
+    }
+    Node sequence(size_t depth) {
+        Node items; items.kind = Node::Kind::concat;
+        while (at < source.size() && peek() != '|' && peek() != ')') {
+            auto item = term(depth);
+            if (item.kind != Node::Kind::empty) items.items.push_back(std::move(item));
+        }
+        if (items.items.empty()) return Node{};
+        if (items.items.size() == 1) return std::move(items.items[0]);
+        return items;
+    }
+    Node term(size_t depth) {
+        const uint32_t c = take();
+        Node atom;
+        switch (ascii(c)) {
+            case '^': atom.kind = Node::Kind::start; return atom;
+            case '$': atom.kind = Node::Kind::end; return atom;
+            case '(': {
+                require(depth < depth_bound, bound);
+                const auto look = eat('?') ? group() : std::nullopt;
+                auto body = disjunction(depth + 1);
+                require(eat(')'), unsupported);
+                if (!look) return quantified(std::move(body));
+                // An assertion takes no quantifier in Unicode mode.
+                require(looks.size() < looks_bound, bound);
+                looks.emplace_back(std::move(body), look->first);
+                atom.kind = Node::Kind::look; atom.index = looks.size() - 1; atom.wanted = look->second; return atom;
+            }
+            case '[': atom = bracket(); break;
+            case '.': atom = set(normal({{0x0a, 0x0a}, {0x0d, 0x0d}, {0x2028, 0x2029}}, true)); break;
+            case '\\': {
+                const uint32_t escaped = take();
+                if (ascii(escaped) == 'b' || ascii(escaped) == 'B') { atom.kind = Node::Kind::word; atom.wanted = ascii(escaped) == 'b'; return atom; }
+                if (auto ranges = shorthand(escaped)) atom = set(std::move(*ranges));
+                else { const uint32_t point = escape(escaped, false); atom = set({{point, point}}); }
+                break;
+            }
+            // A quantifier with nothing to repeat, or a bracket or brace that Unicode mode does not take literally.
+            case '*': case '+': case '?': case '{': case '}': case ']': require(false, unsupported); break;
+            default: atom = set({{c, c}}); break;
+        }
+        return quantified(std::move(atom));
+    }
+    // What follows (?: nothing to record for a plain group, otherwise whether the assertion looks ahead and whether its body must match.
+    std::optional<std::pair<bool, bool>> group() {
+        switch (ascii(take())) {
+            case ':': return std::nullopt;
+            case '=': return std::pair{true, true};
+            case '!': return std::pair{true, false};
+            case '<':
+                switch (ascii(take())) {
+                    case '=': return std::pair{false, true};
+                    case '!': return std::pair{false, false};
+                    default: break;
+                }
+                break;
+            default: break;
+        }
+        require(false, unsupported);
+        return std::nullopt;
+    }
+    Node quantified(Node atom) {
+        uint64_t low = 0, high = 0; bool open = false;
+        switch (peek()) {
+            case '*': open = true; break;
+            case '+': low = 1; open = true; break;
+            case '?': high = 1; break;
+            case '{':
+                ++at;
+                low = high = count();
+                if (eat(',')) {
+                    if (digit(peek())) high = count();
+                    else open = true;
+                }
+                require(peek() == '}' && (open || low <= high), unsupported);
+                break;
+            default: return atom;
+        }
+        ++at;
+        // A lazy quantifier changes which match is found first, never whether one exists.
+        eat('?');
+        if (atom.kind == Node::Kind::empty || (!open && high == 0)) return Node{};
+        Node repeat; repeat.kind = Node::Kind::repeat; repeat.low = low; repeat.high = high; repeat.open = open;
+        repeat.items.push_back(std::move(atom));
+        return repeat;
+    }
+    uint64_t count() {
+        const size_t start = at; uint64_t value = 0;
+        while (digit(peek())) { value = std::min(value * 10 + uint64_t(peek() - '0'), steps_bound + 1); ++at; }
+        require(at > start, unsupported);
+        require(value <= steps_bound, bound);
+        return value;
+    }
+    Node bracket() {
+        const bool negate = eat('^');
+        Ranges ranges;
+        while (true) {
+            const uint32_t c = take();
+            if (c == ']') break;
+            const auto low = member(c, ranges);
+            // A dash is literal at either end of the class and makes a range anywhere else.
+            if (peek() == '-' && at + 1 < source.size() && source[at + 1] != ']') {
+                ++at;
+                const auto high = member(take(), ranges);
+                require(low && high && *low <= *high, unsupported);
+                ranges.emplace_back(*low, *high);
+            } else if (low) ranges.emplace_back(*low, *low);
+        }
+        return set(normal(std::move(ranges), negate));
+    }
+    // One member of a class: its code point, or nothing after adding the ranges of a shorthand set, which cannot end a range.
+    std::optional<uint32_t> member(uint32_t c, Ranges& ranges) {
+        if (c != '\\') return c;
+        const uint32_t escaped = take();
+        if (const auto named = shorthand(escaped)) { ranges.insert(ranges.end(), named->begin(), named->end()); return std::nullopt; }
+        return escape(escaped, true);
+    }
+    // The code point an escape names, given the character after the backslash.
+    uint32_t escape(uint32_t c, bool bracketed) {
+        switch (ascii(c)) {
+            case 't': return 0x09;
+            case 'n': return 0x0a;
+            case 'v': return 0x0b;
+            case 'f': return 0x0c;
+            case 'r': return 0x0d;
+            case '0': require(!digit(peek()), unsupported); return 0;
+            case 'c': { const uint32_t control = take(); require(letter(ascii(control)), unsupported); return control % 32; }
+            case 'x': return hex(2);
+            case 'u': {
+                uint32_t point = 0;
+                if (eat('{')) {
+                    size_t digits = 0;
+                    while (!eat('}')) { point = point * 16 + hex(1); require(point <= 0x10ffff, unsupported); ++digits; }
+                    require(digits > 0, unsupported);
+                } else {
+                    point = hex(4);
+                    if (point >= 0xd800 && point < 0xdc00) {
+                        // Two escapes that form a surrogate pair name one code point.
+                        require(eat('\\') && eat('u'), unsupported);
+                        const uint32_t trail = hex(4);
+                        require(trail >= 0xdc00 && trail < 0xe000, unsupported);
+                        point = 0x10000 + ((point - 0xd800) << 10) + (trail - 0xdc00);
+                    }
+                }
+                // A surrogate on its own never occurs in a string of scalars.
+                require(point < 0xd800 || point >= 0xe000, unsupported);
+                return point;
+            }
+            default: break;
+        }
+        if (bracketed && ascii(c) == 'b') return 0x08;
+        // An ASCII letter or digit reaching here is a backreference, a property escape or no escape at all. Any other character of the Basic Multilingual Plane stands for itself. Beyond that plane engines that take such an escape disagree on what it means.
+        require(!digit(ascii(c)) && !letter(ascii(c)) && c < 0x10000, unsupported);
+        return c;
+    }
+    uint32_t hex(size_t count) {
+        uint32_t value = 0;
+        for (size_t i = 0; i < count; ++i) {
+            const char c = ascii(take());
+            require(digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'), unsupported);
+            value = value * 16 + uint32_t(digit(c) ? c - '0' : (c | 0x20) - 'a' + 10);
+        }
+        return value;
+    }
+};
+// The steps a node compiles to, clamped just above the bound so that no sum overflows.
+uint64_t size(const Node& node) {
+    uint64_t total = 0;
+    switch (node.kind) {
+        case Node::Kind::empty: break;
+        case Node::Kind::set: case Node::Kind::start: case Node::Kind::end: case Node::Kind::word: case Node::Kind::look: total = 1; break;
+        case Node::Kind::either: total = 2 * (uint64_t(node.items.size()) - 1); [[fallthrough]];
+        case Node::Kind::concat: for (const auto& item : node.items) total = std::min(total + size(item), steps_bound + 1); break;
+        case Node::Kind::repeat: {
+            const uint64_t body = size(node.items[0]);
+            if (!node.open) total = node.low * body + (node.high - node.low) * (body + 1);
+            else if (node.low == 0) total = body + 2;
+            else total = node.low * body + 1;
+            break;
+        }
+    }
+    return std::min(total, steps_bound + 1);
+}
+// Appends the node's steps. A backward piece consumes the string from its end, so a sequence is laid out last item first.
+void emit(const Node& node, bool backward, std::vector<Step>& steps) {
+    const auto push = [&](Step::Kind kind, size_t first = 0, size_t second = 0, bool wanted = false) { steps.push_back({kind, first, second, wanted}); };
+    switch (node.kind) {
+        case Node::Kind::empty: break;
+        case Node::Kind::set: push(Step::Kind::set, node.index); break;
+        case Node::Kind::start: push(Step::Kind::start); break;
+        case Node::Kind::end: push(Step::Kind::end); break;
+        case Node::Kind::word: push(Step::Kind::word, 0, 0, node.wanted); break;
+        case Node::Kind::look: push(Step::Kind::look, node.index, 0, node.wanted); break;
+        case Node::Kind::concat:
+            if (backward) for (size_t i = node.items.size(); i-- > 0;) emit(node.items[i], backward, steps);
+            else for (const auto& item : node.items) emit(item, backward, steps);
+            break;
+        case Node::Kind::either: {
+            std::vector<size_t> exits;
+            for (size_t i = 0; i < node.items.size(); ++i) {
+                if (i + 1 == node.items.size()) { emit(node.items[i], backward, steps); break; }
+                const size_t split = steps.size();
+                push(Step::Kind::split, split + 1);
+                emit(node.items[i], backward, steps);
+                exits.push_back(steps.size());
+                push(Step::Kind::jump);
+                steps[split].second = steps.size();
+            }
+            for (const size_t exit : exits) steps[exit].first = steps.size();
+            break;
+        }
+        case Node::Kind::repeat: {
+            const auto& body = node.items[0];
+            size_t last = steps.size();
+            for (uint64_t i = 0; i < node.low; ++i) { last = steps.size(); emit(body, backward, steps); }
+            if (!node.open) {
+                std::vector<size_t> splits;
+                for (uint64_t i = node.low; i < node.high; ++i) {
+                    splits.push_back(steps.size());
+                    push(Step::Kind::split, steps.size() + 1);
+                    emit(body, backward, steps);
+                }
+                for (const size_t split : splits) steps[split].second = steps.size();
+            } else if (node.low == 0) {
+                const size_t split = steps.size();
+                push(Step::Kind::split, split + 1);
+                emit(body, backward, steps);
+                push(Step::Kind::jump, split);
+                steps[split].second = steps.size();
+            } else push(Step::Kind::split, last, steps.size() + 1);
+            break;
+        }
+    }
+}
+// Parses and compiles a pattern, refusing one outside the supported grammar or over a bound.
+Pattern compile(std::string_view source) {
+    require(source.size() <= bytes_bound, bound);
+    Parser parser;
+    parser.source = unicode_scalars(source);
+    auto root = parser.disjunction(0);
+    // Only an unmatched closing parenthesis stops the parser early.
+    require(parser.at == parser.source.size(), unsupported);
+    // The pattern itself is the last piece and scans forward, as a lookbehind body does.
+    parser.looks.emplace_back(std::move(root), false);
+    uint64_t total = 0;
+    for (const auto& [body, backward] : parser.looks) total = std::min(total + size(body) + 1, steps_bound + 1);
+    require(total <= steps_bound, bound);
+    Pattern compiled;
+    for (const auto& [body, backward] : parser.looks) {
+        Piece piece; piece.backward = backward;
+        emit(body, backward, piece.steps);
+        piece.steps.push_back({});
+        compiled.pieces.push_back(std::move(piece));
+    }
+    compiled.sets = std::move(parser.sets);
+    return compiled;
+}
+// Whether the pattern matches anywhere in the string, given as code points.
+bool Pattern::matches(const std::vector<uint32_t>& text) const {
+    std::vector<std::vector<bool>> tables;
+    // A lookaround table needs every position. The pattern's own piece comes last and needs one match.
+    for (size_t index = 0; index < pieces.size(); ++index) tables.push_back(scan(pieces[index], text, tables, index + 1 == pieces.size()));
+    const auto& hits = tables.back();
+    return std::find(hits.begin(), hits.end(), true) != hits.end();
+}
+// The positions at which a match of the piece ends, for a backward piece the positions at which one starts. A thread starts at every position. With once set the scan stops at its first match.
+std::vector<bool> Pattern::scan(const Piece& piece, const std::vector<uint32_t>& text, const std::vector<std::vector<bool>>& tables, bool once) const {
+    std::vector<bool> hits(text.size() + 1);
+    // The scan pass in which each step was last entered, so a step is entered once per position however many threads reach it.
+    std::vector<size_t> entered(piece.steps.size()), stack, waiting;
+    for (size_t pass = 1; pass <= text.size() + 1; ++pass) {
+        const size_t at = piece.backward ? text.size() + 1 - pass : pass - 1;
+        stack.push_back(0);
+        waiting.clear();
+        while (!stack.empty()) {
+            const size_t step = stack.back(); stack.pop_back();
+            if (entered[step] == pass) continue;
+            entered[step] = pass;
+            const auto& now = piece.steps[step];
+            bool proceed = false;
+            switch (now.kind) {
+                case Step::Kind::set: waiting.push_back(step); break;
+                case Step::Kind::split: stack.push_back(now.first); stack.push_back(now.second); break;
+                case Step::Kind::jump: stack.push_back(now.first); break;
+                case Step::Kind::start: proceed = at == 0; break;
+                case Step::Kind::end: proceed = at == text.size(); break;
+                case Step::Kind::word: {
+                    const bool before = at > 0 && word(text[at - 1]), after = at < text.size() && word(text[at]);
+                    proceed = (before != after) == now.wanted;
+                    break;
+                }
+                case Step::Kind::look: proceed = tables[now.first][at] == now.wanted; break;
+                case Step::Kind::match: hits[at] = true; break;
+            }
+            if (proceed) stack.push_back(step + 1);
+        }
+        if (pass > text.size() || (once && hits[at])) break;
+        const uint32_t c = piece.backward ? text[at - 1] : text[at];
+        // The stack is empty here, so it carries the threads that consumed this character into the next position.
+        for (const size_t step : waiting) {
+            const auto& ranges = sets[piece.steps[step].first];
+            const auto range = std::partition_point(ranges.begin(), ranges.end(), [c](const auto& item) { return item.second < c; });
+            if (range != ranges.end() && range->first <= c) stack.push_back(step + 1);
+        }
+    }
+    return hits;
+}
+} // namespace pattern
 void safe_name(std::string_view name, bool function) {
     require(!name.empty() && name.size() <= (function ? 64 : 1024), "tool name bound");
     for (const unsigned char c : name) {
@@ -194,7 +638,7 @@ std::string_view schema_type(const Json& schema) {
 }
 void schema_admit(const Json& schema, size_t depth, size_t& nodes) {
     require(depth <= 16 && ++nodes <= 4096, "tool schema complexity bound");
-    keys(schema, {"type", "anyOf", "title", "default", "examples", "format", "$schema", "description", "properties", "required", "additionalProperties", "items", "minItems", "maxItems", "enum", "minimum", "exclusiveMinimum", "maximum"});
+    keys(schema, {"type", "anyOf", "title", "default", "examples", "format", "$schema", "description", "properties", "required", "additionalProperties", "items", "minItems", "maxItems", "uniqueItems", "minLength", "maxLength", "pattern", "enum", "const", "minimum", "exclusiveMinimum", "maximum", "exclusiveMaximum", "multipleOf"});
     const auto type = schema_type(schema);
     if (const auto* dialect = schema.find("$schema")) require(depth == 0 && dialect->string() == "https://json-schema.org/draft/2020-12/schema", "unsupported tool schema dialect");
     if (const auto* p = schema.find("description")) require(p->string().size() <= 16384, "schema description bound");
@@ -230,14 +674,31 @@ void schema_admit(const Json& schema, size_t depth, size_t& nodes) {
         // Validation refuses any array above 4096 items, so a larger minimum could never be met. A larger maximum stays admitted: the same cap still applies at validation.
         if (low) require(low->unsigned_integer() <= 4096, "minItems exceeds the tool array bound");
         if (low && high) require(low->unsigned_integer() <= high->unsigned_integer(), "inverted schema bounds");
-    } else require(!schema.find("items") && !schema.find("minItems") && !schema.find("maxItems"), "array schema keyword on other type");
+        if (const auto* unique = schema.find("uniqueItems")) static_cast<void>(unique->boolean());
+    } else require(!schema.find("items") && !schema.find("minItems") && !schema.find("maxItems") && !schema.find("uniqueItems"), "array schema keyword on other type");
+    if (type == "string") {
+        const auto* low = schema.find("minLength");
+        const auto* high = schema.find("maxLength");
+        if (low) static_cast<void>(low->unsigned_integer());
+        if (high) static_cast<void>(high->unsigned_integer());
+        // The response parser caps a generated tool call at 64 KiB (ResponseLimits::call_bytes), and a code point takes at least one byte, so no call this server emits could meet a larger minimum. A larger maximum stays admitted: it only fails to constrain.
+        if (low) require(low->unsigned_integer() <= 65536, "minLength exceeds the tool call byte limit");
+        if (low && high) require(low->unsigned_integer() <= high->unsigned_integer(), "inverted schema bounds");
+        if (const auto* p = schema.find("pattern")) static_cast<void>(pattern::compile(p->string()));
+    } else require(!schema.find("minLength") && !schema.find("maxLength") && !schema.find("pattern"), "string schema keyword on other type");
     if (const auto* values = schema.find("enum")) {
         require(type != "object" && type != "array" && !values->array().empty() && values->array().size() <= 128, "unsupported enum");
         // Admission checks enum members against the same type, without enum.
         Json::Object base; for (const auto& [key, value] : schema.object()) if (key != "enum") base.emplace_back(key, value);
         for (const auto& value : values->array()) validate_tool_value(Json(base), value);
     }
-    if (schema.find("minimum") || schema.find("maximum") || schema.find("exclusiveMinimum")) {
+    if (const auto* value = schema.find("const")) {
+        require(type != "object" && type != "array", "unsupported const");
+        // Admission checks the constant against the same type, without const.
+        Json::Object base; for (const auto& [key, item] : schema.object()) if (key != "const") base.emplace_back(key, item);
+        validate_tool_value(Json(base), *value);
+    }
+    if (schema.find("minimum") || schema.find("maximum") || schema.find("exclusiveMinimum") || schema.find("exclusiveMaximum") || schema.find("multipleOf")) {
         require(type == "integer" || type == "number", "numeric bound on other schema type");
         if (const auto* low = schema.find("minimum")) { static_cast<void>(number(*low, -1e300, 1e300)); static_cast<void>(decimal(*low)); }
         if (const auto* high = schema.find("maximum")) { static_cast<void>(number(*high, -1e300, 1e300)); static_cast<void>(decimal(*high)); }
@@ -245,7 +706,13 @@ void schema_admit(const Json& schema, size_t depth, size_t& nodes) {
             static_cast<void>(number(*low, -1e300, 1e300)); static_cast<void>(decimal(*low));
             if (const auto* high = schema.find("maximum")) require(compare(decimal(*low), decimal(*high)) < 0, "inverted schema bounds");
         }
+        if (const auto* high = schema.find("exclusiveMaximum")) {
+            static_cast<void>(number(*high, -1e300, 1e300)); static_cast<void>(decimal(*high));
+            if (const auto* low = schema.find("minimum")) require(compare(decimal(*low), decimal(*high)) < 0, "inverted schema bounds");
+            if (const auto* low = schema.find("exclusiveMinimum")) require(compare(decimal(*low), decimal(*high)) < 0, "inverted schema bounds");
+        }
         if (schema.find("minimum") && schema.find("maximum")) require(compare(decimal(*schema.find("minimum")), decimal(*schema.find("maximum"))) <= 0, "inverted schema bounds");
+        if (const auto* step = schema.find("multipleOf")) { static_cast<void>(number(*step, -1e300, 1e300)); static_cast<void>(divisor(*step)); }
     }
 }
 ParameterType parameter_type(std::string_view type) {
@@ -451,6 +918,17 @@ void validate_tool_value(const Json& schema, const Json& value, ToolEnumValidati
     if (type == "string") {
         require(value.kind() == Json::Kind::string, "tool value is not string");
         if (tool_enums == ToolEnumValidation::executor) validate_executor_string(value.string());
+        const auto* minimum = schema.find("minLength");
+        const auto* maximum = schema.find("maxLength");
+        const auto* expression = schema.find("pattern");
+        if (minimum || maximum || expression) {
+            // JSON Schema counts a string's length, and matches a pattern, in Unicode code points, not bytes.
+            const auto scalars = expression ? unicode_scalars(value.string()) : std::vector<uint32_t>{};
+            const auto length = expression ? scalars.size() : unicode_scalar_count(value.string());
+            if (minimum) require(length >= minimum->unsigned_integer(), "tool string below minLength");
+            if (maximum) require(length <= maximum->unsigned_integer(), "tool string above maxLength");
+            if (expression) require(pattern::compile(expression->string()).matches(scalars), "tool string does not match pattern");
+        }
     }
     else if (type == "boolean") require(value.kind() == Json::Kind::boolean, "tool value is not boolean");
     else if (type == "null") require(value.is_null(), "tool value is not null");
@@ -461,12 +939,19 @@ void validate_tool_value(const Json& schema, const Json& value, ToolEnumValidati
         if (const auto* minimum = schema.find("minimum")) require(compare(n, decimal(*minimum)) >= 0, "tool value below minimum");
         if (const auto* maximum = schema.find("maximum")) require(compare(n, decimal(*maximum)) <= 0, "tool value above maximum");
         if (const auto* minimum = schema.find("exclusiveMinimum")) require(compare(n, decimal(*minimum)) > 0, "tool value at or below exclusive minimum");
+        if (const auto* maximum = schema.find("exclusiveMaximum")) require(compare(n, decimal(*maximum)) < 0, "tool value at or above exclusive maximum");
+        if (const auto* step = schema.find("multipleOf")) require(multiple(n, divisor(*step)), "tool value is not a multiple of multipleOf");
     } else if (type == "array") {
         const auto& items = value.array();
         require(items.size() <= 4096, "tool array bound");
         if (const auto* minimum = schema.find("minItems")) require(uint64_t(items.size()) >= minimum->unsigned_integer(), "tool array below minItems");
         if (const auto* maximum = schema.find("maxItems")) require(uint64_t(items.size()) <= maximum->unsigned_integer(), "tool array above maxItems");
         for (const auto& item : items) validate_tool_value(field(schema, "items"), item, tool_enums);
+        // After the items are validated, so every number below has an admitted lexeme and nesting is bounded by the schema.
+        if (const auto* unique = schema.find("uniqueItems"); unique && unique->boolean()) {
+            std::set<std::string> seen;
+            for (const auto& item : items) { std::string key; canonical(item, key); require(seen.insert(std::move(key)).second, "tool array repeats an item"); }
+        }
     } else {
         const auto* properties = schema.find("properties");
         for (const auto& [name, item] : value.object()) {
@@ -481,6 +966,12 @@ void validate_tool_value(const Json& schema, const Json& value, ToolEnumValidati
             else found |= candidate.dump() == value.dump();
         }
         require(found, "tool value outside enum");
+    }
+    // A constant is an enum of one value, so it follows the enum policy.
+    if (const auto* expected = schema.find("const"); expected && tool_enums == ToolEnumValidation::strict) {
+        const bool same = expected->kind() == Json::Kind::number && value.kind() == Json::Kind::number
+            ? compare(decimal(*expected), decimal(value)) == 0 : expected->dump() == value.dump();
+        require(same, "tool value differs from const");
     }
 }
 
@@ -669,6 +1160,7 @@ ServeSession::ServeSession(ServeCodec codec, std::string alias, std::string stac
 #endif
     , ToolArgValidation tool_args
     , uint32_t context_length
+    , bool lane_parking
     )
     : codec_(std::move(codec)), alias_(std::move(alias)), stack_execution_(std::move(stack_execution)), tool_enums_(tool_enums), tool_args_(tool_args), context_length_(context_length)
 #ifdef TOKSPUR_PRIVATE_HTTP_SAMPLED_PREFILL
@@ -684,7 +1176,15 @@ ServeSession::ServeSession(ServeCodec codec, std::string alias, std::string stac
 #ifdef TOKSPUR_PRIVATE_HTTP_BRANCH8
     , branch8_(branch8)
 #endif
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+    , lane_parking_(lane_parking && mtp_)
+#else
+    , lane_parking_(false)
+#endif
     {
+#ifndef TOKSPUR_PRIVATE_NATIVE_MTP
+    static_cast<void>(lane_parking);
+#endif
     static_cast<void>(tool_enum_validation_name(tool_enums_));
     static_cast<void>(tool_arg_validation_name(tool_args_));
     require(bool(codec_.render) && bool(codec_.encode) && bool(codec_.decode) && !alias_.empty(), "invalid serving codec");
@@ -749,13 +1249,95 @@ ServeSession::ServeSession(ServeCodec codec, std::string alias, std::string stac
         committed_.reserve(context_length_); // Before any restore publication.
     }
 }
-void ServeSession::invalidate() noexcept { saved_reasoning_.clear(); committed_.clear(); sampling_.clear(); reusable_ = false; seed_ = 0; broker_resync_ = true;
+void ServeSession::invalidate() noexcept { saved_reasoning_.clear(); parked_reasoning_.clear(); committed_.clear(); sampling_.clear(); reusable_ = false; seed_ = 0; broker_resync_ = true;
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
     mtp_resync_ = true;
 #endif
 #ifdef TOKSPUR_PRIVATE_HTTP_VERIFY8
     verify_resync_ = true;
 #endif
+}
+
+std::optional<Json> ServeSession::fill_saved_reasoning(
+    const Json& render, const std::vector<std::pair<size_t, std::string>>& saved) {
+    if (saved.empty()) return std::nullopt;
+    auto fields = render.object();
+    auto messages_it = std::find_if(fields.begin(), fields.end(),
+        [](const auto& item) { return item.first == "messages"; });
+    if (messages_it == fields.end()) return std::nullopt;
+    auto messages = messages_it->second.array();
+    size_t ordinal = 0;
+    bool filled = false;
+    for (auto& message : messages) {
+        if (field(message, "role").string() != "assistant") continue;
+        const auto* present = message.find("reasoning_content");
+        const auto found = std::find_if(saved.begin(), saved.end(),
+            [&](const auto& entry) { return entry.first == ordinal; });
+        if ((!present || present->is_null()) && found != saved.end()) {
+            auto entry = message.object();
+            std::erase_if(entry, [](const auto& item) { return item.first == "reasoning_content"; });
+            entry.emplace_back("reasoning_content", Json(found->second));
+            message = Json(std::move(entry));
+            filled = true;
+        }
+        ++ordinal;
+    }
+    if (!filled) return std::nullopt;
+    messages_it->second = Json(std::move(messages));
+    return Json(std::move(fields));
+}
+
+void ServeSession::park_active_reasoning() {
+    if (!lane_parking_ || !reusable_ || committed_.empty()) return;
+    auto committed = committed_;
+    auto turns = std::move(saved_reasoning_);
+    saved_reasoning_.clear();
+    const auto sampling = sampling_;
+    const uint64_t seed = seed_;
+    std::erase_if(parked_reasoning_, [&](const ParkedReasoning& old) {
+        return old.sampling == sampling && old.seed == seed &&
+            old.committed.size() <= committed.size() &&
+            std::equal(old.committed.begin(), old.committed.end(), committed.begin());
+    });
+    if (parked_reasoning_.size() >= max_parked_reasoning_lanes) {
+        parked_reasoning_.erase(parked_reasoning_.begin());
+    }
+    parked_reasoning_.push_back(ParkedReasoning{
+        std::move(committed), std::move(turns), sampling, seed});
+}
+
+std::optional<std::vector<uint32_t>> ServeSession::respelled_on_committed(
+    std::span<const uint32_t> committed, std::span<const uint32_t> canonical) const {
+    const auto frame = [&](uint32_t id) {
+        return id == codec_.admission.im_start || codec_.admission.is_stop(id) ||
+            std::ranges::find(codec_.control_ids, id) != codec_.control_ids.end() ||
+            std::binary_search(codec_.nonordinary_ids.begin(), codec_.nonordinary_ids.end(), id);
+    };
+    if (committed.empty() || !codec_.admission.is_stop(committed.back())) return std::nullopt;
+    size_t shared = 0;
+    while (shared < committed.size() && shared < canonical.size() && committed[shared] == canonical[shared]) ++shared;
+    size_t live = shared, fresh = shared;
+    while (live < committed.size()) {
+        const auto live_end = size_t(std::find_if(committed.begin() + ptrdiff_t(live), committed.end(), frame) - committed.begin());
+        const auto fresh_end = size_t(std::find_if(canonical.begin() + ptrdiff_t(fresh), canonical.end(), frame) - canonical.begin());
+        if (live_end == committed.size() || fresh_end == canonical.size() || committed[live_end] != canonical[fresh_end]) {
+            return std::nullopt;
+        }
+        auto live_changed = live_end, fresh_changed = fresh_end;
+        while (live < live_changed && fresh < fresh_changed && committed[live] == canonical[fresh]) { ++live; ++fresh; }
+        while (live < live_changed && fresh < fresh_changed && committed[live_changed - 1] == canonical[fresh_changed - 1]) {
+            --live_changed; --fresh_changed;
+        }
+        if ((live < live_changed || fresh < fresh_changed) &&
+            codec_.decode(committed.subspan(live, live_changed - live)) !=
+                codec_.decode(canonical.subspan(fresh, fresh_changed - fresh))) {
+            return std::nullopt;
+        }
+        live = live_end + 1; fresh = fresh_end + 1;
+    }
+    std::vector<uint32_t> respelled(committed.begin(), committed.end());
+    respelled.insert(respelled.end(), canonical.begin() + ptrdiff_t(fresh), canonical.end());
+    return respelled;
 }
 
 Json ServeSession::complete(const Json& input, std::string_view response_id, const ServeTarget& target, const ServeSink& sink) {
@@ -776,7 +1358,7 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
     Json::Object q8_three_admitted_routes{{"raw",Json::integer(0)},{"packed",Json::integer(0)},{"hc_raw",Json::integer(0)},{"wide_qkv_raw",Json::integer(0)},{"wide_output_raw",Json::integer(0)}};
 #endif
 #endif
-    [[maybe_unused]] uint64_t input_batches = 0, output_batches = 0, generation_rounds = 0, verified_rounds = 0, accepted_tokens = 0;
+    [[maybe_unused]] uint64_t input_batches = 0, restored_input_tokens = 0, output_batches = 0, generation_rounds = 0, verified_rounds = 0, accepted_tokens = 0;
     [[maybe_unused]] size_t input_width = 0, output_width = 0;
 #ifdef TOKSPUR_PRIVATE_HTTP_VERIFY8
     require(!verify8_ || number(field(request.sampling, "temperature"), 0, 100) == 0,
@@ -802,56 +1384,80 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
 #endif
     const auto policy = request.sampling.dump();
     const bool compatible_sampling = sampling_ == policy && (!request.seed || *request.seed == seed_);
-    const auto rendered = codec_.render(request.render); auto prompt = codec_.encode(rendered);
+    const auto rendered = codec_.render(request.render);
+    const auto base_prompt = codec_.encode(rendered);
+    auto prompt = base_prompt;
+    std::optional<std::vector<std::pair<size_t, std::string>>> restored_reasoning;
+    std::optional<size_t> restored_lane_idx;
+    std::vector<std::pair<const std::vector<std::pair<size_t, std::string>>*, std::optional<std::vector<uint32_t>>>> cached_by_turns;
     const auto matches_committed = [&](const auto& value) { return value.size() >= committed_.size() && std::equal(committed_.begin(), committed_.end(), value.begin()); };
     // Sampling can commit a token split that re-encoding the same bytes does not reproduce. Reuse requires matching added tokens, reserved padding slots and admission markers, with equal bytes between them. Only the canonical tail after the committed terminal is appended.
-    const auto respelled_on_committed = [&](const std::vector<uint32_t>& canonical) -> std::optional<std::vector<uint32_t>> {
-        const auto frame = [&](uint32_t id) { return id == codec_.admission.im_start || codec_.admission.is_stop(id) || std::binary_search(codec_.nonordinary_ids.begin(), codec_.nonordinary_ids.end(), id); };
-        if (committed_.empty() || !codec_.admission.is_stop(committed_.back())) return std::nullopt;
-        size_t shared = 0; while (shared < committed_.size() && shared < canonical.size() && committed_[shared] == canonical[shared]) ++shared;
-        size_t live = shared, fresh = shared;
-        while (live < committed_.size()) {
-            const auto live_end = size_t(std::find_if(committed_.begin() + live, committed_.end(), frame) - committed_.begin());
-            const auto fresh_end = size_t(std::find_if(canonical.begin() + fresh, canonical.end(), frame) - canonical.begin());
-            if (live_end == committed_.size() || fresh_end == canonical.size() || committed_[live_end] != canonical[fresh_end]) return std::nullopt;
-            auto live_changed = live_end, fresh_changed = fresh_end;
-            while (live < live_changed && fresh < fresh_changed && committed_[live] == canonical[fresh]) { ++live; ++fresh; }
-            while (live < live_changed && fresh < fresh_changed && committed_[live_changed - 1] == canonical[fresh_changed - 1]) { --live_changed; --fresh_changed; }
-            if ((live < live_changed || fresh < fresh_changed) &&
-                codec_.decode(std::span<const uint32_t>(committed_).subspan(live, live_changed - live)) !=
-                    codec_.decode(std::span<const uint32_t>(canonical).subspan(fresh, fresh_changed - fresh))) return std::nullopt;
-            live = live_end + 1; fresh = fresh_end + 1;
-        }
-        auto respelled = committed_; respelled.insert(respelled.end(), canonical.begin() + fresh, canonical.end());
-        return respelled;
-    };
-    std::optional<std::vector<uint32_t>> restored;
-    if (reusable_ && !matches_committed(prompt) && !saved_reasoning_.empty()) {
-        auto fields = request.render.object(); bool filled = false;
-        for (auto& [name, value] : fields) if (name == "messages") {
-            auto messages = value.array(); size_t ordinal = 0;
-            for (auto& message : messages) {
-                if (field(message, "role").string() != "assistant") continue;
-                const auto* present = message.find("reasoning_content");
-                const auto found = std::find_if(saved_reasoning_.begin(), saved_reasoning_.end(), [&](const auto& entry) { return entry.first == ordinal; });
-                if ((!present || present->is_null()) && found != saved_reasoning_.end()) {
-                    auto entry = message.object();
-                    std::erase_if(entry, [](const auto& field) { return field.first == "reasoning_content"; });
-                    entry.emplace_back("reasoning_content", Json(found->second)); message = Json(std::move(entry));
-                    filled = true;
-                }
-                ++ordinal;
+    if (reusable_ && !matches_committed(prompt)) {
+        std::optional<std::vector<uint32_t>> restored;
+        if (!saved_reasoning_.empty()) {
+            if (auto filled = fill_saved_reasoning(request.render, saved_reasoning_)) {
+                auto candidate = codec_.encode(codec_.render(*filled));
+                cached_by_turns.emplace_back(&saved_reasoning_, candidate);
+                if (candidate.size() < context_length_ && matches_committed(candidate)) prompt = std::move(candidate);
+                else restored = std::move(candidate);
+            } else {
+                cached_by_turns.emplace_back(&saved_reasoning_, std::nullopt);
             }
-            value = Json(std::move(messages));
         }
-        if (filled) {
-            auto candidate = codec_.encode(codec_.render(Json(std::move(fields))));
-            if (candidate.size() < context_length_ && matches_committed(candidate)) prompt = std::move(candidate);
-            else restored = std::move(candidate);
+        if (compatible_sampling && !matches_committed(prompt)) {
+            if (auto respelled = respelled_on_committed(committed_, restored ? *restored : prompt);
+                respelled && respelled->size() < context_length_) {
+                prompt = std::move(*respelled);
+            }
         }
     }
-    if (reusable_ && compatible_sampling && !matches_committed(prompt))
-        if (auto respelled = respelled_on_committed(restored ? *restored : prompt); respelled && respelled->size() < context_length_) prompt = std::move(*respelled);
+    if (lane_parking_ && (!reusable_ || !compatible_sampling || !matches_committed(prompt)) && !parked_reasoning_.empty()) {
+        std::optional<size_t> best_idx;
+        std::vector<uint32_t> best_prompt;
+        bool ambiguous_seed = false;
+        for (size_t idx = 0; idx < parked_reasoning_.size(); ++idx) {
+            const auto& lane = parked_reasoning_[idx];
+            if (best_idx && lane.committed.size() < parked_reasoning_[*best_idx].committed.size()) continue;
+            if (lane.sampling != policy || (request.seed && *request.seed != lane.seed)) continue;
+            const std::vector<uint32_t>* candidate_ptr = &base_prompt;
+            if (!lane.turns.empty()) {
+                const auto cached_it = std::find_if(cached_by_turns.begin(), cached_by_turns.end(),
+                    [&](const auto& entry) { return *entry.first == lane.turns; });
+                if (cached_it != cached_by_turns.end()) {
+                    if (cached_it->second) candidate_ptr = &*cached_it->second;
+                } else if (auto filled = fill_saved_reasoning(request.render, lane.turns)) {
+                    auto encoded = codec_.encode(codec_.render(*filled));
+                    cached_by_turns.emplace_back(&lane.turns, std::move(encoded));
+                    candidate_ptr = &*cached_by_turns.back().second;
+                } else {
+                    cached_by_turns.emplace_back(&lane.turns, std::nullopt);
+                }
+            }
+            const auto& candidate = *candidate_ptr;
+            std::optional<std::vector<uint32_t>> matched;
+            if (candidate.size() > lane.committed.size() && candidate.size() < context_length_ &&
+                std::equal(lane.committed.begin(), lane.committed.end(), candidate.begin())) {
+                matched = candidate;
+            } else if (auto respelled = respelled_on_committed(lane.committed, candidate);
+                respelled && respelled->size() > lane.committed.size() && respelled->size() < context_length_) {
+                matched = std::move(*respelled);
+            } else {
+                continue;
+            }
+            if (!best_idx || lane.committed.size() > parked_reasoning_[*best_idx].committed.size()) {
+                best_idx = idx;
+                best_prompt = std::move(*matched);
+                ambiguous_seed = false;
+            } else if (lane.seed != parked_reasoning_[*best_idx].seed) {
+                ambiguous_seed = true;
+            }
+        }
+        if (best_idx && !ambiguous_seed) {
+            prompt = std::move(best_prompt);
+            restored_reasoning = parked_reasoning_[*best_idx].turns;
+            restored_lane_idx = *best_idx;
+        }
+    }
     require(!prompt.empty() && prompt.size() < context_length_,
         context_length_ == 131072 ? "request leaves no generation space in the 128K context" : "request leaves no generation space in the 64K context");
     const auto maximum_tokens = std::min(request.maximum_tokens, context_length_ - uint32_t(prompt.size()));
@@ -863,9 +1469,15 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
     size_t cached_prefix = append ? committed_.size() : 0;
     size_t common = 0;
     if (reusable_) while (common < committed_.size() && common < prompt.size() && committed_[common] == prompt[common]) ++common;
-    const uint64_t seed = append ? seed_ : request.seed ? *request.seed : sink.new_seed();
+    uint64_t seed = append ? seed_ : request.seed ? *request.seed : sink.new_seed();
     require(!response_id.empty() && response_id.size() <= 96, "response ID bound");
-    ResponseParser parser(request.manifest, request.thinking, {}, tool_args_ == ToolArgValidation::executor, true); std::string streamed_content, streamed_thinking;
+    ResponseParser parser(request.manifest, request.thinking, {}, tool_args_ == ToolArgValidation::executor, true);
+    if (!codec_.control_ids.empty()) parser.enable_control_tokens();
+    const auto feed_id = [&](uint32_t id) {
+        const auto bytes = codec_.decode(std::span(&id, 1));
+        return std::ranges::find(codec_.control_ids, id) != codec_.control_ids.end() ? parser.feed_control(bytes) : parser.feed(bytes);
+    };
+    std::string streamed_content, streamed_thinking;
     std::vector<uint32_t> generated; generated.reserve(maximum_tokens);
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
     std::optional<PrivateMtpRequestTrace> native_trace;
@@ -883,16 +1495,26 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
             sink.chunk(value);
         }
     };
+    size_t record_index = 0, record_offset = 0;
     const auto flush = [&] {
-        std::string content, thinking;
-        for (const auto& record : parser.records()) {
-            if (record.kind == ResponseKind::text) content += record.text;
-            else if (record.kind == ResponseKind::thinking) thinking += record.text;
+        const auto records = parser.records();
+        if (records.empty()) {
+            require(record_index == 0 && record_offset == 0, "nonmonotonic response parser");
+            return;
         }
-        require(content.starts_with(streamed_content) && thinking.starts_with(streamed_thinking), "nonmonotonic response parser");
-        if (thinking.size() != streamed_thinking.size()) emit(Json(Json::Object{{"reasoning_content", Json(thinking.substr(streamed_thinking.size()))}}));
-        if (content.size() != streamed_content.size()) emit(Json(Json::Object{{"content", Json(content.substr(streamed_content.size()))}}));
-        streamed_content = std::move(content); streamed_thinking = std::move(thinking);
+        const auto thinking_size = streamed_thinking.size(), content_size = streamed_content.size();
+        require(record_index < records.size(), "nonmonotonic response parser");
+        for (const auto& record : records.subspan(record_index)) {
+            require(record_offset <= record.text.size(), "nonmonotonic response parser");
+            if (record.kind == ResponseKind::thinking) streamed_thinking.append(record.text, record_offset);
+            else if (record.kind == ResponseKind::text) streamed_content.append(record.text, record_offset);
+            record_offset = 0;
+        }
+        // Only the last record can grow between successful feeds.
+        record_index = records.size() - 1;
+        record_offset = records.back().text.size();
+        if (request.stream && streamed_thinking.size() > thinking_size) emit(Json(Json::Object{{"reasoning_content", Json(streamed_thinking.substr(thinking_size))}}));
+        if (request.stream && streamed_content.size() > content_size) emit(Json(Json::Object{{"content", Json(streamed_content.substr(content_size))}}));
     };
     bool state_touched = false;
     try {
@@ -923,10 +1545,10 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
                 "serving broker retained count exceeds capacity");
             broker_command_ = command; broker_lease_ = lease; broker_resync_ = false;
         };
-        const auto sampling_matches = [&](const Json& value, size_t prefix) {
+        const auto sampling_matches = [&](const Json& value, size_t prefix, uint64_t expected_seed) {
             const auto& sampled = field(value, "sampling");
             require(field(sampled, "valid").boolean() && field(sampled, "entropy_prefix").unsigned_integer() == prefix &&
-                field(sampled, "seed").unsigned_integer() == seed, "worker sampling prefix/seed mismatch");
+                field(sampled, "seed").unsigned_integer() == expected_seed, "worker sampling prefix/seed mismatch");
             for (const auto& [name, value] : request.sampling.object())
                 require(number(field(sampled, name), 0, 1e9) == number(value, 0, 1e9), "worker sampling policy changed");
         };
@@ -947,7 +1569,7 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
 #endif
             broker_reply(done, fresh);
             const auto prefix = field(done, "committed_prefix").unsigned_integer();
-            require(prefix <= prompt.size(), "broker restored beyond future prompt"); sampling_matches(done, prefix);
+            require(prefix <= prompt.size(), "broker restored beyond future prompt"); sampling_matches(done, prefix, seed);
             const bool logits = field(done, "logits_available").boolean(); const auto& stop = field(done, "stop_id");
             require(logits == bool(prefix) && (stop.is_null() || (logits && codec_.admission.is_stop(stop.unsigned_integer()))) &&
                 field(done, "continuation_allowed").boolean() == (logits && stop.is_null()), "invalid broker terminal metadata");
@@ -967,7 +1589,14 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
             require(prefix < prompt.size() || field(done, "stop_id").is_null(), "terminal restored prompt cannot generate without new input");
             // Reserved at preparation; shrinking cannot allocate after restore.
             committed_.resize(size_t(prefix)); position = size_t(prefix); cached_prefix = position; began = true;
-        } else if (!append) committed_.clear();
+        } else if (!append) {
+            if (restored_lane_idx) {
+                parked_reasoning_.erase(parked_reasoning_.begin() + ptrdiff_t(*restored_lane_idx));
+                restored_lane_idx.reset();
+            }
+            park_active_reasoning();
+            committed_.clear();
+        }
         if (!append) reusable_ = false;
         const auto input_start = position;
         const auto run = [&](Json job, std::optional<uint32_t> input_token, bool decode) {
@@ -982,7 +1611,7 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
             });
             require(field(done, "event").string() == "done" && field(done, "committed_prefix").unsigned_integer() == position + 1, "worker completion prefix mismatch");
             worker_execution(done, stack_execution_);
-            broker_reply(done, field(job, "reset").boolean()); sampling_matches(done, position + 1);
+            broker_reply(done, field(job, "reset").boolean()); sampling_matches(done, position + 1, seed);
             const auto& ids = field(done, "generated_ids").array(); require(ids.size() == (decode ? 1U : 0U) && events.size() == ids.size(), "worker generated count mismatch");
             if (decode) require(ids[0].unsigned_integer() == events[0], "worker token/done disagreement");
             ++position; committed_.push_back(input_token ? *input_token : events.at(0));
@@ -1001,7 +1630,8 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
                 if (const auto* pending = generation->find("overflow")) controller_pending = pending->unsigned_integer();
                 if (const auto* feedback = generation->find("stage_a_controller")) controller_feedback = *feedback;
             }
-            worker_execution(done, stack_execution_); sampling_matches(done, field(done, "committed_prefix").unsigned_integer());
+            const uint64_t effective_seed = reply.lane_seed().value_or(seed);
+            worker_execution(done, stack_execution_); sampling_matches(done, field(done, "committed_prefix").unsigned_integer(), effective_seed);
             const auto& inputs = field(job, "tokens").array();
 #ifdef TOKSPUR_PRIVATE_RAW_DECODE
             if (mtp_ready_.find("native_raw_decode_mode")) {
@@ -1049,6 +1679,7 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
             }
 #endif
             if (!inputs.empty()) {
+                restored_input_tokens += reply.restored_input_tokens();
                 ++input_batches; input_width = std::max(input_width, inputs.size());
                 for (const auto& id : inputs) committed_.push_back(uint32_t(id.unsigned_integer()));
             } else {
@@ -1058,6 +1689,7 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
                 accepted_tokens += field(done, "native_mtp_accepted").unsigned_integer() - field(mtp_previous_, "native_mtp_accepted").unsigned_integer();
                 for (const auto& id : outputs) committed_.push_back(uint32_t(id.unsigned_integer()));
             }
+            seed = effective_seed;
             position = size_t(field(done, "committed_prefix").unsigned_integer()); mtp_previous_ = done; mtp_resync_ = false;
             return done;
         };
@@ -1134,15 +1766,31 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
                 const auto n = std::min(input_packet, prompt.size() - position);
                 Json::Array ids; ids.reserve(n);
                 for (size_t t = 0; t < n; ++t) ids.push_back(Json::integer(prompt[position + t]));
+                const bool fresh = !append && !began && position == 0;
                 Json::Object job{{"tokens", Json(std::move(ids))}, {"generate", Json::integer(0)},
-                    {"reset", Json(!append && !began && position == 0)}};
-                if (!append && !began && position == 0) {
+                    {"reset", Json(fresh)}};
+                if (fresh) {
                     job.emplace_back("sampling", request.sampling); job.emplace_back("seed", Json::integer(seed));
                 }
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
                 if (mtp_) {
+                    if (fresh && lane_parking_ && !request.seed) job.emplace_back("lane_inherit_seed", Json(true));
+                    const bool lane_prompt = fresh && lane_parking_ && n < prompt.size();
+                    if (lane_prompt) {
+                        Json::Array all; all.reserve(prompt.size());
+                        for (const auto id : prompt) all.push_back(Json::integer(id));
+                        job.emplace_back("lane_prompt", Json(std::move(all)));
+                    }
                     if (mtp_final_input_logits(mtp_ready_)) job.emplace_back("prefill_final", Json(position + n == prompt.size()));
-                    static_cast<void>(run_mtp(Json(std::move(job)))); continue;
+                    const size_t packet_end = position + n;
+                    static_cast<void>(run_mtp(Json(std::move(job))));
+                    if (lane_prompt && position > packet_end) {
+                        require(position < prompt.size() && committed_.size() == packet_end,
+                            "parked-lane restore exceeds the prompt");
+                        committed_.insert(committed_.end(), prompt.begin() + ptrdiff_t(packet_end), prompt.begin() + ptrdiff_t(position));
+                        restored_input_tokens += uint64_t(position - packet_end);
+                    }
+                    continue;
                 }
 #endif
                 const auto done = target(Json(std::move(job)), [](const Json&) { throw FormatError("known input emitted a generated token"); });
@@ -1152,7 +1800,7 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
                     field(done, "committed_prefix").unsigned_integer() == position + n &&
                     field(done, "generated_ids").array().empty() && field(done, "status").string() == "prefilled" &&
                     field(done, "finish_reason").is_null() && field(done, "stop_id").is_null(), "invalid sampled input8 completion");
-                worker_execution(done, stack_execution_); sampling_matches(done, position + n);
+                worker_execution(done, stack_execution_); sampling_matches(done, position + n, seed);
                 for (size_t t = 0; t < n; ++t) committed_.push_back(prompt[position + t]);
                 position += n;
             }
@@ -1174,6 +1822,8 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
                 field(done, "common_prefix").unsigned_integer() == position, "broker input-boundary capture mismatch");
         }
         const size_t prefill_committed_end = position;
+        require(restored_input_tokens <= prompt.size() - cached_prefix, "restored input accounting exceeds uncached prompt");
+        cached_prefix += size_t(restored_input_tokens);
         const auto generation_start = std::chrono::steady_clock::now();
         bool stopped = false;
         std::optional<size_t> forced_thinking_close_index;
@@ -1223,8 +1873,9 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
                         const auto id = uint32_t(token.unsigned_integer());
                         require(id != codec_.admission.im_start && !stopped, "MTP unexpected generated role/terminal");
                         stopped = codec_.admission.is_stop(id); generated.push_back(id); ++phase_emitted;
-                        require(stopped || parser.feed(codec_.decode(std::span<const uint32_t>(&generated.back(), 1))) != ResponseStatus::error,
-                            "MTP response bytes/frame validation failed"); flush();
+                        require(stopped || feed_id(generated.back()) != ResponseStatus::error,
+                            "response bytes/frame validation failed");
+                        if (request.stream) flush();
                     }
                     if (stopped) break;
                 }
@@ -1240,7 +1891,8 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
                         const auto id = uint32_t(token.unsigned_integer());
                         require(id != codec_.admission.im_start && !stopped, "private V8 unexpected generated role/terminal");
                         stopped = codec_.admission.is_stop(id); generated.push_back(id);
-                        require(stopped || parser.feed(codec_.decode(std::span<const uint32_t>(&generated.back(), 1))) != ResponseStatus::error, "response bytes/frame validation failed"); flush();
+                        require(stopped || feed_id(generated.back()) != ResponseStatus::error, "response bytes/frame validation failed");
+                        if (request.stream) flush();
                     }
                     if (stopped) break;
                 }
@@ -1255,7 +1907,8 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
                 require(field(done, "finish_reason").string() == (stopped ? "stop" : "length") && field(done, "status").string() == (stopped ? "stopped" : "length"), "worker termination mismatch");
                 if (stopped) require(field(done, "stop_id").unsigned_integer() == id && !field(done, "continuation_allowed").boolean(), "invalid terminal admission");
                 else require(field(done, "stop_id").is_null() && field(done, "continuation_allowed").boolean(), "invalid continuation admission");
-                generated.push_back(id); require(stopped || parser.feed(codec_.decode(std::span<const uint32_t>(&generated.back(), 1))) != ResponseStatus::error, "response bytes/frame validation failed"); flush();
+                generated.push_back(id); require(stopped || feed_id(generated.back()) != ResponseStatus::error, "response bytes/frame validation failed");
+                if (request.stream) flush();
                 if (stopped) break;
             }
         };
@@ -1315,7 +1968,7 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
                         field(done, "committed_prefix").unsigned_integer() == position + n &&
                         field(done, "generated_ids").array().empty() && field(done, "status").string() == "prefilled" &&
                         field(done, "finish_reason").is_null() && field(done, "stop_id").is_null(), "invalid sampled input8 completion");
-                    worker_execution(done, stack_execution_); sampling_matches(done, position + n);
+                    worker_execution(done, stack_execution_); sampling_matches(done, position + n, seed);
                     for (size_t t = 0; t < n; ++t) committed_.push_back(inject[at + t]);
                     position += n;
                     at += n;
@@ -1330,8 +1983,8 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
             for (size_t i = 0; i < inject.size(); ++i) {
                 if (i == close_offset) parser.prepare_forced_thinking_close();
                 generated.push_back(inject[i]);
-                require(parser.feed(codec_.decode(std::span<const uint32_t>(&generated.back(), 1))) != ResponseStatus::error, "response bytes/frame validation failed");
-                flush();
+                require(feed_id(generated.back()) != ResponseStatus::error, "response bytes/frame validation failed");
+                if (request.stream) flush();
             }
         };
         if (request.thinking && request.thinking_budget && *request.thinking_budget < maximum_tokens) {
@@ -1348,12 +2001,13 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
         } else {
             run_generation_phase(maximum_tokens);
         }
+        if (!request.stream) flush();
         Json::Array ids; for (const auto id : generated) ids.push_back(Json::integer(id));
         Json::Object final_req{{"ids", Json(std::move(ids))}, {"tools", parser_manifest(request.manifest)}, {"initial_thinking", Json(request.thinking)},
             {"finish_reason", Json(stopped ? "stop" : "length")}, {"stop_id", stopped ? Json::integer(generated.back()) : Json()}};
         if (tool_args_ == ToolArgValidation::executor) final_req.emplace_back("executor_parameters", Json(true));
         if (forced_thinking_close_index) final_req.emplace_back("forced_thinking_close_index", Json::integer(*forced_thinking_close_index));
-        const auto final = parse_native_response(Json(std::move(final_req)), codec_.admission, codec_.decode, response_maximum_accumulated_ids);
+        const auto final = parse_native_response_with_controls(Json(std::move(final_req)), codec_.admission, codec_.decode, response_maximum_accumulated_ids, codec_.control_ids);
         require(!request.single_tool_call || field(final, "tool_calls").array().size() <= 1, "parallel tool calls are disabled for this request");
         Json::Array calls;
         for (const auto& call : field(final, "tool_calls").array()) {
@@ -1377,7 +2031,7 @@ Json ServeSession::complete(const Json& input, std::string_view response_id, con
         const std::string finish = !calls.empty() ? "tool_calls" : stopped ? "stop" : "length";
         emit(Json(Json::Object{}), Json(finish));
         sampling_ = policy; seed_ = seed; reusable_ = true;
-        if (!append) saved_reasoning_.clear();
+        if (!append) saved_reasoning_ = restored_reasoning ? std::move(*restored_reasoning) : std::vector<std::pair<size_t, std::string>>{};
         if (!thinking.empty()) {
             size_t ordinal = 0;
             for (const auto& message : field(request.render, "messages").array()) ordinal += field(message, "role").string() == "assistant";
@@ -1748,12 +2402,14 @@ void PrefixTraceLog::write(const Json& record) {
 }
 
 std::string_view job_failure_kind(const std::exception& error, bool target_started) noexcept {
+    if (dynamic_cast<const WorkerHostMemoryPressure*>(&error)) return "host_memory_pressure";
     if (dynamic_cast<const PrefixTraceError*>(&error) != nullptr) return "server_error";
     return target_started ? "generation_failed_no_retry" : "invalid_request_error";
 }
 
 int job_failure_status(const std::exception& error, bool expired, bool target_started) noexcept {
     if (expired) return 408;
+    if (dynamic_cast<const WorkerHostMemoryPressure*>(&error)) return 503;
     if (dynamic_cast<const PrefixTraceError*>(&error) != nullptr) return 500;
     return target_started ? 502 : 400;
 }

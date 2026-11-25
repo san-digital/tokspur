@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "model_asset_manifest_sha256": "feb36d211e50b10783aa7568d8ffa0f3b5ecbfbc0fbafbd3a3bd896134e0f623",
+  "model_asset_manifest_sha256": "df265e5c08309b213d308be079cd64fbe76b6a009f5d42013c473fa48ad5b8d4",
   "scope": "existing derived tokenizer/template metadata; not additional model weights or engine code",
   "tokenizer": {
     "name": "tokenizer.json",

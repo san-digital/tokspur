@@ -15,19 +15,66 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def extract(source):
+def extract(source, *, include_prefill_timing=False):
     def between(start, end):
         at = source.index(start)
         return source[at : source.index(end, at)]
 
-    return "\n".join(
-        (
-            between("void require(bool ok,", "\nJson number("),
-            between("const Json& field(", "\nuint32_t choice("),
-            between("void keys(", "\nJson policy_file("),
-            between("// BEGIN owned target protocol:", "// END owned target protocol."),
+    parts = [
+        between("void require(bool ok,", "\nJson number("),
+        between("const Json& field(", "\nuint32_t choice("),
+        between("void keys(", "\nJson policy_file("),
+        between("// BEGIN owned target protocol:", "// END owned target protocol."),
+    ]
+    if include_prefill_timing:
+        parts.extend(
+            (
+                between("using Clock =", "\ndouble milliseconds("),
+                between("Json number(", "\n#ifdef TOKSPUR_PRIVATE_GROUPED_MM"),
+                between(
+                    "Json prefill_timing_json(", "\nJson verify_nax_batch_metadata("
+                ),
+            )
         )
-    )
+    return "\n".join(parts)
+
+
+PREFILL_TIMING_CHECKS = r"""
+void check_saved_prefill_timing() {
+    SavedPrefillTiming saved;
+    const auto empty = prefill_timing_json(PrefillTiming{}).dump();
+    require(prefill_timing_record(saved).dump() == empty, "initial prefill timing differs");
+    PrefillTiming sample;
+    for (size_t i = 0; i <= PrefillTiming::max_recorded_chunks; ++i) {
+        PrefillChunkTiming chunk{};
+        chunk.tokens = 512;
+        chunk.wall_ms = 0.25 + i;
+        if (i == 1) chunk.stack_command = CommandTiming{1, 2, 3, 4, 0.5};
+        sample.add(chunk);
+    }
+    const auto expected = prefill_timing_json(sample).dump();
+    saved = std::move(sample);
+    const auto& first = prefill_timing_record(saved);
+    require(first.dump() == expected, "replacement prefill timing differs");
+    const auto& chunks = field(first, "recorded_chunks").array();
+    require(chunks.size() == PrefillTiming::max_recorded_chunks && field(chunks[0], "stack_command").is_null(), "missing command timing or chunk bound differs");
+    const auto& command = field(chunks[1], "stack_command");
+    require(field(command, "host_record_ms").unsigned_integer() == 1 && field(command, "host_flush_ms").unsigned_integer() == 2 &&
+        field(command, "host_commit_ms").unsigned_integer() == 3 && field(command, "host_wait_and_check_ms").unsigned_integer() == 4 &&
+        field(command, "metal_schedule_ms").number_lexeme() == "0.5", "prefill command clocks differ");
+    require(!chunks[2].find("stack_command"), "later chunks reported command clocks");
+    PrefillTiming missing_clock;
+    PrefillChunkTiming only_host;
+    only_host.stack_command.emplace();
+    missing_clock.add(only_host);
+    const auto host_record = prefill_timing_json(missing_clock);
+    require(field(field(field(host_record, "recorded_chunks").array().front(), "stack_command"), "metal_schedule_ms").is_null(), "missing Metal scheduling clock reported as zero");
+    const auto* entries = first.object().data();
+    require(prefill_timing_record(saved).object().data() == entries, "continuation rebuilt the prefill timing");
+    saved = PrefillTiming{};
+    require(prefill_timing_record(saved).dump() == empty, "reset retained a previous prefill timing");
+}
+"""
 
 
 CHECKS = r"""
@@ -85,6 +132,39 @@ void check_parked_lanes() {
     parked.bytes = 237;
     check(parked.reclaim() == 237 && parked.bytes == 0 && parked.lanes.empty() && parked.evictions == 4, "parked reclaim must release every accounted entry");
     check(parked.reclaim() == 0 && parked.evictions == 4, "repeated parked reclaim must be idempotent");
+
+    // sync_parked_lane_tokens lifecycle checks: cold, SSD restore, RAM restore, continuation, and overflow guard.
+    const std::vector<Json> gen_one{Json::integer(99)};
+    // (a) Cold prefill -> gen
+    std::vector<uint32_t> lt_cold;
+    bool lt_cold_valid = true;
+    const std::vector<uint32_t> prompt_a{10, 20, 30, 40};
+    sync_parked_lane_tokens(lt_cold, lt_cold_valid, prompt_a, gen_one, 0, 0, 5);
+    check(lt_cold_valid && lt_cold == (std::vector<uint32_t>{10, 20, 30, 40, 99}), "cold prefill lane_tokens sync mismatch");
+
+    // (b) job.reset SSD restore (prefix 3 tokens, suffix 2 tokens) -> gen
+    std::vector<uint32_t> lt_ssd{10, 20, 30};
+    bool lt_ssd_valid = true;
+    const std::vector<uint32_t> prompt_b{10, 20, 30, 41, 42};
+    sync_parked_lane_tokens(lt_ssd, lt_ssd_valid, prompt_b, gen_one, 0, 3, 6);
+    check(lt_ssd_valid && lt_ssd == (std::vector<uint32_t>{10, 20, 30, 41, 42, 99}), "SSD restore double-appended or dropped suffix tokens");
+
+    // (c) RAM restore (prefix 3 tokens, suffix 2 tokens) -> gen
+    std::vector<uint32_t> lt_ram{10, 20, 30};
+    bool lt_ram_valid = true;
+    sync_parked_lane_tokens(lt_ram, lt_ram_valid, prompt_b, gen_one, 3, 0, 6);
+    check(lt_ram_valid && lt_ram == (std::vector<uint32_t>{10, 20, 30, 41, 42, 99}), "RAM restore lane_tokens sync mismatch");
+
+    // (d) Continuation (!job.reset): appends only new turn tokens + generated
+    const std::vector<uint32_t> turn_2{50, 51};
+    sync_parked_lane_tokens(lt_ssd, lt_ssd_valid, turn_2, gen_one, 0, 0, 9);
+    check(lt_ssd_valid && lt_ssd == (std::vector<uint32_t>{10, 20, 30, 41, 42, 99, 50, 51, 99}), "continuation lane_tokens sync mismatch");
+
+    // Overflow guard: lane_tokens.size() > stack_position clears lane_tokens and invalidates
+    std::vector<uint32_t> lt_over{10, 20, 30};
+    bool lt_over_valid = true;
+    sync_parked_lane_tokens(lt_over, lt_over_valid, turn_2, gen_one, 0, 0, 5);
+    check(!lt_over_valid && lt_over.empty(), "overflow guard failed to clear oversized lane_tokens");
 }
 void run() {
     const int before_parking = checks;
@@ -479,15 +559,15 @@ def main():
     )
     args = parser.parse_args()
     source = (ROOT / "native/src/target.cpp").read_text()
-    protocol = extract(source)
+    protocol = extract(source, include_prefill_timing=True)
     fingerprint = hashlib.sha256(protocol.encode()).hexdigest()
     if args.source_only:
         print(f"CPU protocol extracted, not compiled or executed: {fingerprint}")
         return
     unit = (
-        '#include "tokspur/json.hpp"\n#include "tokspur/gguf.hpp"\n#include "tokspur/sampling.hpp"\n#include "tokspur/prompt_lookup.hpp"\n'
+        '#include "tokspur/graph.hpp"\n#include "tokspur/json.hpp"\n#include "tokspur/gguf.hpp"\n#include "tokspur/sampling.hpp"\n#include "tokspur/prompt_lookup.hpp"\n'
         "#include <algorithm>\n#include <array>\n#include <charconv>\n#include <cmath>\n#include <limits>\n"
-        "#include <iostream>\n#include <optional>\n#include <set>\n"
+        "#include <chrono>\n#include <iostream>\n#include <optional>\n#include <set>\n#include <variant>\n"
         "#include <type_traits>\n#include <utility>\n"
         "namespace tokspur { namespace {\n"
         + (
@@ -496,8 +576,9 @@ def main():
             else ""
         )
         + protocol
+        + PREFILL_TIMING_CHECKS
         + CHECKS
-        + "\n} }\nint main() { try { tokspur::run(); tokspur::run_stack_experiments(); "
+        + "\n} }\nint main() { try { tokspur::check_saved_prefill_timing(); tokspur::run(); tokspur::run_stack_experiments(); "
         + 'std::cout << "Owned CPU target protocol checks passed: " << tokspur::checks - tokspur::parked_checks << "\\n" '
         + '<< "Owned CPU parked conversation checks passed: " << tokspur::parked_checks << "\\n" '
         + '<< "Owned CPU target stack-experiment protocol checks passed: " << tokspur::stack_checks << "\\n"; return 0; } '

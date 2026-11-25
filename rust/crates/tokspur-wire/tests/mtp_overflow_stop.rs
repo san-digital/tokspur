@@ -59,6 +59,7 @@ fn generation(active: bool, remaining: u64) -> Json {
 fn ready() -> Json {
     Json::new_object([
         ("event", Json::from("ready")),
+        ("mapped_weight_region_limit_bytes", int(0)),
         ("native_mtp_depth", int(2)),
         ("native_mtp_carry_scope", Json::from("http-generation-v2")),
         ("native_mtp_generation", generation(false, 0)),
@@ -90,6 +91,7 @@ fn done(d: &Done<'_>) -> Json {
     let stopped = d.stop.is_some();
     let mut fields = vec![
         ("event", Json::from("done")),
+        ("mapped_weight_region_limit_bytes", int(0)),
         ("committed_prefix", int(d.prefix)),
         (
             "generated_ids",

@@ -29,6 +29,10 @@ namespace tokspur {
 
 using WorkerDeadline = std::chrono::steady_clock::time_point;
 class WorkerError : public std::runtime_error { public: using std::runtime_error::runtime_error; };
+class WorkerHostMemoryPressure : public WorkerError {
+public:
+    WorkerHostMemoryPressure() : WorkerError("generation stopped because of host memory pressure") {}
+};
 class WorkerCancelled : public std::runtime_error { public: using std::runtime_error::runtime_error; };
 
 struct OwnedWorkerOptions {
@@ -143,6 +147,8 @@ struct OwnedWorkerOptions {
     std::optional<bool> hc_consumer_fused;
     std::optional<bool> ple_overlap;
     std::optional<bool> shared_prefix_cache;
+    uint32_t parked_lanes_mib = 0;
+    bool parked_lanes_explicit = false;
 };
 
 #ifdef TOKSPUR_PRIVATE_LANE_LAYOUT

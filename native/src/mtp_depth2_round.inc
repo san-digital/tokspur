@@ -15,6 +15,14 @@ if (mtp && (mtp_depth == 2 || mtp_depth == 3)) {
     const auto anchor = pending ? pending->id : sample(sampling_distribution(current.logits, sampler.options().policy), random);
     const auto anchor_score = pending ? pending->source_logit : current.logits[anchor];
     const bool anchor_stop = std::find(job.stops.begin(), job.stops.end(), anchor) != job.stops.end();
+    const auto* carried_metrics = pending ? mtp_anchor.peek_metrics(base) : nullptr;
+    const AnchorEntropyMetrics anchor_metrics = carried_metrics
+        ? *carried_metrics
+        : ((!pending && !current.logits.empty())
+            ? compute_anchor_entropy_metrics(current.logits, sampler.options().policy)
+            : AnchorEntropyMetrics{});
+    const AnchorWidthGate width_gate = decide_anchor_width_gate(
+        anchor_metrics, mtp_depth, mtp_lookup_mode != MtpLookupMode::off);
     MeasuredRoundObserver measured_observer(
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
         carrier_mode == CarrierDiagnosticMode::off ? measured_controller.get() : nullptr,
@@ -30,23 +38,34 @@ if (mtp && (mtp_depth == 2 || mtp_depth == 3)) {
     const bool use_verify_nax_costs = gpu.verify_nax();
     auto& controller = mtp_generation.controller_state();
 
-    const auto measured_before = measured_controller ? measured_controller->before_draft(base, std::min(mtp_depth + 1, compute_remaining)) : MeasuredChoice{};
+    const uint32_t gate_cap_rows = measured_controller
+        ? std::min({verify_cost_profile->maximum_rows(), compute_remaining, width_gate.max_mtp_depth + 1u})
+        : std::min(mtp_depth + 1u, compute_remaining);
+    const auto measured_before = measured_controller ? measured_controller->before_draft(base, gate_cap_rows) : MeasuredChoice{};
 
     if (measured_controller) measured_observer.probabilities = measured_controller->acceptance();
 
-    if (!measured_controller && is_v2 && controller.current_mode == uint8_t(StageAMode::Speculative)) {
-        const double r_ord = 1.0 / double(StageACostTable::lookup_t_ord_us(context_length, use_verify_nax_costs));
-        const double spec_tp = StageACostTable::max_speculative_throughput(controller.ewma_alpha1, use_verify_nax_costs);
-        if (spec_tp < (1.0 + StageACostTable::eta_exit) * r_ord) {
-            controller.current_mode = uint8_t(StageAMode::OrdinaryK0);
+    if (!measured_controller && is_v2) {
+        if (controller.current_mode == uint8_t(StageAMode::OrdinaryK0) && anchor_metrics.valid &&
+            width_gate.max_mtp_depth >= 2 && anchor_metrics.entropy_nats <= 0.50 && anchor_metrics.top2_logit_margin >= 2.50) {
+            controller.current_mode = uint8_t(StageAMode::Speculative);
             controller.consecutive_ordinary_steps = 0;
+        } else if (controller.current_mode == uint8_t(StageAMode::Speculative) &&
+                   (!anchor_metrics.valid || (use_verify_nax_costs && width_gate.max_mtp_depth == 1))) {
+            const double r_ord = 1.0 / double(StageACostTable::lookup_t_ord_us(context_length, use_verify_nax_costs));
+            const double spec_tp = StageACostTable::max_speculative_throughput(controller.ewma_alpha1, use_verify_nax_costs);
+            if (spec_tp < (1.0 + StageACostTable::eta_exit) * r_ord) {
+                controller.current_mode = uint8_t(StageAMode::OrdinaryK0);
+                controller.consecutive_ordinary_steps = 0;
+            }
         }
     }
 
     const bool is_probe_round = !measured_controller && (is_v2 && controller.current_mode == uint8_t(StageAMode::OrdinaryK0) &&
                                  controller.consecutive_ordinary_steps >= StageACostTable::probe_interval - 1 &&
                                  compute_remaining >= 2);
-    const bool is_ordinary_step = measured_controller ? (compute_remaining < 2 || anchor_stop || measured_before.rows == 1) : (is_v2 ? (is_probe_round ? compute_remaining < 2 : compute_remaining < 3) : std::min(job.generate - i, max_context_steps) < mtp_depth + 1) ||
+    const uint32_t min_spec_compute = (is_probe_round || (anchor_metrics.valid && width_gate.max_mtp_depth == 1)) ? 2u : 3u;
+    const bool is_ordinary_step = measured_controller ? (compute_remaining < 2 || anchor_stop || measured_before.rows == 1) : (is_v2 ? (compute_remaining < min_spec_compute) : std::min(job.generate - i, max_context_steps) < mtp_depth + 1) ||
         anchor_stop || (is_v2 && controller.current_mode == uint8_t(StageAMode::OrdinaryK0) && !is_probe_round);
 
     // This declared tail/ordinary policy uses only ordinary target rows. It is not an
@@ -81,7 +100,7 @@ if (mtp && (mtp_depth == 2 || mtp_depth == 3)) {
     if (mtp_lookup && mtp_lookup_valid) {
         require(mtp_lookup->committed_length() == base, "depth-two MTP lookup prefix differs from target frontier");
         mtp_lookup->append(mtp_lookup->epoch(), base, std::span(&anchor, 1));
-        if (!is_probe_round && mtp_lookup_mode != MtpLookupMode::off) {
+        if (!is_probe_round && width_gate.allow_lookup && width_gate.max_lookup_width >= 1) {
             const auto prop = mtp_lookup->propose(mtp_lookup->epoch(), base + 1);
             if (prop.outcome == LookupOutcome::proposed && prop.count >= 1) {
                 lookup_proposed[0] = prop.tokens[0];
@@ -89,9 +108,9 @@ if (mtp && (mtp_depth == 2 || mtp_depth == 3)) {
                 if (prop.count >= 3) lookup_proposed[2] = prop.tokens[2];
                 const bool p0_stop = std::find(job.stops.begin(), job.stops.end(), lookup_proposed[0]) != job.stops.end();
                 const bool p1_stop = prop.count >= 2 && std::find(job.stops.begin(), job.stops.end(), lookup_proposed[1]) != job.stops.end();
-                if (mtp_depth == 3 && compute_remaining >= 4 && prop.count >= 3 && !p0_stop && !p1_stop) {
+                if (mtp_depth == 3 && width_gate.max_lookup_width >= 3 && compute_remaining >= 4 && prop.count >= 3 && !p0_stop && !p1_stop) {
                     lookup_bypass_depth = 3;
-                } else if (compute_remaining >= 3 && prop.count >= 2 && !p0_stop) {
+                } else if (width_gate.max_lookup_width >= 2 && compute_remaining >= 3 && prop.count >= 2 && !p0_stop) {
                     lookup_bypass_depth = 2;
                 } else if (mtp_lookup_mode == MtpLookupMode::hybrid && prop.count >= 1) {
                     lookup_bypass_depth = 1;
@@ -312,13 +331,19 @@ if (mtp && (mtp_depth == 2 || mtp_depth == 3)) {
             return {std::move(law), token, begin, std::move(rng)};
         };
         const auto measured_after = measured_controller ? measured_controller->after_draft(base,
-            std::min(mtp_depth + 1, compute_remaining), measured_controller->acceptance(), 2) : MeasuredChoice{};
+            gate_cap_rows, measured_controller->acceptance(), 2) : MeasuredChoice{};
+        const bool stage_a_d2 = anchor_metrics.valid
+            ? (width_gate.max_mtp_depth >= 2)
+            : (StageACostTable::expected_speculative_throughput(controller.ewma_alpha1, 2, use_verify_nax_costs) >
+               StageACostTable::expected_speculative_throughput(controller.ewma_alpha1, 1, use_verify_nax_costs));
+        const bool stage_a_d3 = anchor_metrics.valid
+            ? (width_gate.max_mtp_depth >= 3)
+            : (StageACostTable::expected_speculative_throughput(controller.ewma_alpha1, 3, use_verify_nax_costs) >
+               StageACostTable::expected_speculative_throughput(controller.ewma_alpha1, 2, use_verify_nax_costs));
         const bool want_d2_pre = measured_controller ? measured_after.rows >= 3 : !is_probe_round && compute_remaining >= 3 &&
-            (StageACostTable::expected_speculative_throughput(controller.ewma_alpha1, 2, use_verify_nax_costs) >
-             StageACostTable::expected_speculative_throughput(controller.ewma_alpha1, 1, use_verify_nax_costs));
+            width_gate.max_mtp_depth >= 2 && stage_a_d2;
         const bool want_d3_pre = measured_controller ? measured_after.rows >= 4 : want_d2_pre && mtp_depth == 3 && compute_remaining >= 4 &&
-            (StageACostTable::expected_speculative_throughput(controller.ewma_alpha1, 3, use_verify_nax_costs) >
-             StageACostTable::expected_speculative_throughput(controller.ewma_alpha1, 2, use_verify_nax_costs));
+            width_gate.max_mtp_depth >= 3 && stage_a_d3;
         const uint32_t greedy_chain_depth = (mtp_fast_round && mtp->can_greedy_chain() && want_d2_pre &&
             token_table.type == 8 && (draft_policy.temperature == 0.0 || draft_policy.top_k == 1))
             ? (want_d3_pre ? 3u : 2u) : 0u;

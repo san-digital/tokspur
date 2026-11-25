@@ -587,10 +587,10 @@ pub fn validate_serve_options(opts: &ServeOptions) -> Result<(), CliError> {
         )));
     }
     if let Some(md) = opts.dflash2_max_drafts
-        && !(1..=7).contains(&md)
+        && !(1..=15).contains(&md)
     {
         return Err(CliError::Validation(format!(
-            "Unsupported dflash2_max_drafts: {md} (expected 1..7)"
+            "Unsupported dflash2_max_drafts: {md} (expected 1..15)"
         )));
     }
     if let Some(vs) = opts.dflash2_vocab_slice
@@ -764,6 +764,19 @@ pub fn build_derived_pack_flags(opts: &ServeOptions, pack_file: &Path) -> Vec<St
         flags.push(opts.derived_pack_trust_mode.clone());
     }
     flags
+}
+
+fn resolve_checkpoint_dir(custom: Option<&Path>, state_dir: &Path) -> Result<PathBuf, CliError> {
+    match custom {
+        Some(path) if path.is_absolute() => Ok(path.to_path_buf()),
+        Some(path) => Ok(std::env::current_dir()
+            .map_err(|source| CliError::Io {
+                context: "cannot resolve relative checkpoint directory".to_owned(),
+                source,
+            })?
+            .join(path)),
+        None => Ok(state_dir.join("checkpoints")),
+    }
 }
 
 /// Builds the carrier and runtime argument slice forwarded to `tokspur-server`.
@@ -993,21 +1006,17 @@ pub fn build_carrier_flags(
         flags.push("--native-ple-overlap".to_owned());
         flags.push("on".to_owned());
     }
-    let effective_shared_prefix = opts.shared_prefix_cache.unwrap_or(opts.drafter == "mtp");
-    if effective_shared_prefix {
-        flags.push("--shared-prefix-cache".to_owned());
-        flags.push("on".to_owned());
+    let effective_shared_prefix = opts.shared_prefix_cache.unwrap_or(true);
+    flags.push("--shared-prefix-cache".to_owned());
+    flags.push(if effective_shared_prefix { "on" } else { "off" }.to_owned());
+    if opts.parked_lanes_mib > 0 && !effective_shared_prefix {
+        return Err(CliError::Validation(
+            "--parked-lanes-mib requires the shared prefix cache".to_owned(),
+        ));
     }
-    if opts.parked_lanes_mib > 0 {
-        if !effective_shared_prefix {
-            return Err(CliError::Validation(
-                "--parked-lanes-mib requires the shared prefix cache".to_owned(),
-            ));
-        }
-        flags.push("--native-parked-lanes-mib".to_owned());
-        flags.push(opts.parked_lanes_mib.to_string());
-    }
-    if opts.mtp_lookup != "off" {
+    flags.push("--native-parked-lanes-mib".to_owned());
+    flags.push(opts.parked_lanes_mib.to_string());
+    if opts.mtp_lookup != "off" || (opts.drafter == "mtp" && opts.verify_cost_profile.is_none()) {
         flags.push("--native-mtp-lookup".to_owned());
         flags.push(opts.mtp_lookup.clone());
     }
@@ -1015,7 +1024,9 @@ pub fn build_carrier_flags(
         flags.push("--native-mtp-lookup-match".to_owned());
         flags.push(match_len.to_string());
     }
-    if opts.dflash2_lookup != "off" {
+    if opts.dflash2_lookup != "off"
+        || (opts.drafter == "dflash2" && opts.verify_cost_profile.is_none())
+    {
         flags.push("--native-dflash2-lookup".to_owned());
         flags.push(opts.dflash2_lookup.clone());
     }
@@ -1039,16 +1050,13 @@ pub fn build_carrier_flags(
     }
     let effective_checkpoint_cap = opts.checkpoint_cap_gib.unwrap_or(0.0);
     if effective_checkpoint_cap > 0.0 {
-        let resolved_ckpt_dir = match opts.checkpoint_dir.as_ref() {
-            Some(custom) if custom.is_absolute() => custom.clone(),
-            Some(custom) => std::env::current_dir()
-                .map_err(|source| CliError::Io {
-                    context: "cannot resolve relative checkpoint directory".to_owned(),
-                    source,
-                })?
-                .join(custom),
-            None => state_dir.join("checkpoints"),
-        };
+        let resolved_ckpt_dir = resolve_checkpoint_dir(opts.checkpoint_dir.as_deref(), state_dir)?;
+        if opts.checkpoint_dir.is_some() {
+            crate::layout::ensure_no_symlink_components(
+                &resolved_ckpt_dir,
+                "checkpoint directory",
+            )?;
+        }
         let ckpt_dir_str = resolved_ckpt_dir.to_str().ok_or_else(|| {
             CliError::Validation("checkpoint directory path is not valid UTF-8".to_owned())
         })?;
@@ -1508,6 +1516,10 @@ pub fn serve_foreground(layout: &RuntimeLayout, opts: &ServeOptions) -> Result<i
 
     let tokspur_base = layout.tokspur_base()?;
     let state = private_dir(&tokspur_base, Path::new("state"))?;
+    if opts.checkpoint_cap_gib.unwrap_or(0.0) > 0.0 {
+        let resolved_ckpt_dir = resolve_checkpoint_dir(opts.checkpoint_dir.as_deref(), &state)?;
+        crate::layout::ensure_no_symlink_components(&resolved_ckpt_dir, "checkpoint directory")?;
+    }
     let _lock = StateLock::acquire(&tokspur_base)?;
 
     let assets_profile = read_json_file(&layout.assets_profile_path())?;

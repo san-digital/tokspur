@@ -2,6 +2,7 @@
 #include "tokspur/response.hpp"
 #include "tokspur/gguf.hpp"
 
+#include <algorithm>
 #include <set>
 
 namespace tokspur {
@@ -52,6 +53,10 @@ Json native_response_error(std::string_view message) {
     auto fields = out.object(); fields.emplace_back("message", Json(std::string(message.substr(0, 2048)))); return Json(std::move(fields));
 }
 Json parse_native_response(const Json& data, ResponseAdmission admission, const ResponseDecoder& decode, size_t maximum_ids) {
+    return parse_native_response_with_controls(data, admission, decode, maximum_ids, {});
+}
+Json parse_native_response_with_controls(const Json& data, ResponseAdmission admission, const ResponseDecoder& decode,
+                                        size_t maximum_ids, std::span<const uint32_t> control_ids) {
     require(admission.vocabulary && admission.vocabulary <= 1'048'576 && admission.im_end < admission.vocabulary &&
         admission.end_of_text < admission.vocabulary && admission.im_start < admission.vocabulary &&
         admission.im_end != admission.end_of_text && admission.im_end != admission.im_start && admission.end_of_text != admission.im_start,
@@ -76,6 +81,7 @@ Json parse_native_response(const Json& data, ResponseAdmission admission, const 
     }
     if (finish == "stop") require(!ids.empty() && ids.back() == stop.unsigned_integer(), "stopped response lacks exact final stop token");
     ResponseParser parser(tools(field(data, "tools")), field(data, "initial_thinking").boolean(), {}, executor_parameters, true);
+    if (!control_ids.empty()) parser.enable_control_tokens();
     if (finish == "error") return native_response_error("target reported an error; response is not executable");
     require(bool(decode), "missing raw response decoder"); auto bytes = decode(ids);
     require(bytes.size() <= response_request_bytes, "decoded response byte limit");
@@ -84,8 +90,31 @@ Json parse_native_response(const Json& data, ResponseAdmission admission, const 
         require(bytes.ends_with(marker), "response decoder/terminal identity mismatch"); bytes.resize(bytes.size() - marker.size());
     }
     const size_t body_len = finish == "stop" ? ids.size() - 1 : ids.size();
-    if (forced_thinking_close_index) {
-        require(*forced_thinking_close_index <= body_len, "forced thinking close index out of bounds");
+    if (forced_thinking_close_index) require(*forced_thinking_close_index <= body_len, "forced thinking close index out of bounds");
+    if (!control_ids.empty()) {
+        // Check individual decodes against the admitted body before parsing so decoder failures keep their precedence.
+        std::vector<size_t> ends;
+        ends.reserve(body_len);
+        size_t offset = 0;
+        bool matches = true;
+        for (const auto& id : std::span(ids).first(body_len)) {
+            const auto piece = decode(std::span(&id, 1));
+            if (matches) {
+                matches = std::string_view(bytes).substr(offset).starts_with(piece);
+                if (matches) offset += piece.size();
+            }
+            ends.push_back(offset);
+        }
+        require(matches && offset == bytes.size(), "response decoder/terminal identity mismatch");
+        offset = 0;
+        for (size_t i = 0; i < body_len; ++i) {
+            if (forced_thinking_close_index == i) parser.prepare_forced_thinking_close();
+            const auto piece = std::string_view(bytes).substr(offset, ends[i] - offset);
+            const auto status = std::ranges::find(control_ids, ids[i]) != control_ids.end() ? parser.feed_control(piece) : parser.feed(piece);
+            require(status != ResponseStatus::error, "invalid response bytes or frames");
+            offset = ends[i];
+        }
+    } else if (forced_thinking_close_index) {
         const auto split = size_t(*forced_thinking_close_index);
         const auto prefix = decode(std::span<const uint32_t>(ids).first(split));
         const auto suffix = decode(std::span<const uint32_t>(ids).subspan(split, body_len - split));

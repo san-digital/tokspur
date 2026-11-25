@@ -383,6 +383,123 @@ int main() {
         stage_a_controller_transitions();
         deferred_stop_drain();
 #endif
+        {
+            // F19: Shannon entropy / top-k margin anchor width gating + MtpAnchorCarry::peek_metrics + M4 finiteness
+            const SamplingPolicy pol{0.8, 32, 0.95, 0.0};
+            std::vector<float> sharp(64, -10.0f);
+            sharp[7] = 10.0f;
+            const auto m_sharp = compute_anchor_entropy_metrics(sharp, pol);
+            check(m_sharp.valid && m_sharp.topk_count == 64u && m_sharp.top1_prob > 0.99 &&
+                m_sharp.normalized_entropy < 0.05 && m_sharp.top2_logit_margin > 15.0 &&
+                m_sharp.top4_logit_margin >= m_sharp.top2_logit_margin,
+                "sharp distribution did not produce low entropy / high margin");
+            check(compute_anchor_entropy_metrics(cpu_logit_topk_row(sharp), pol) == m_sharp,
+                "GpuLogitTopKRow and span anchor entropy metrics diverged");
+
+            const std::array<float, 1> single_logit{3.5f};
+            const auto m_single = compute_anchor_entropy_metrics(single_logit, pol);
+            check(m_single.valid && m_single.topk_count == 1u && m_single.entropy_nats == 0.0 &&
+                m_single.normalized_entropy == 0.0 && m_single.top1_prob == 1.0 &&
+                m_single.top2_prob_margin == 1.0 && std::isinf(m_single.top2_logit_margin) &&
+                std::isinf(m_single.top4_logit_margin),
+                "vocab-1 anchor entropy metrics invariants differed");
+
+            const auto g_sharp = decide_anchor_width_gate(m_sharp, 7u, true);
+            check(g_sharp.max_dflash2_verify_rows == 8u && g_sharp.max_mtp_depth == 3u && g_sharp.allow_lookup &&
+                g_sharp.max_lookup_width == 7u, "sharp anchor width gate did not open full speculative width");
+            const auto g_sharp_no_lookup = decide_anchor_width_gate(m_sharp, 2u, false);
+            check(g_sharp_no_lookup.max_dflash2_verify_rows == 8u && g_sharp_no_lookup.max_mtp_depth == 2u &&
+                !g_sharp_no_lookup.allow_lookup, "sharp gate enabled lookup when lookup_enabled=false");
+
+            const auto g_invalid = decide_anchor_width_gate(AnchorEntropyMetrics{}, 7u, true);
+            check(g_invalid.max_dflash2_verify_rows == 8u && g_invalid.max_mtp_depth == 3u && g_invalid.allow_lookup &&
+                g_invalid.max_lookup_width == 7u, "invalid metrics gate did not fall back to full width");
+
+            std::vector<float> flat(64, 0.0f);
+            const auto m_flat = compute_anchor_entropy_metrics(flat, pol);
+            check(m_flat.valid && m_flat.normalized_entropy > 0.9 && m_flat.top2_logit_margin < 1e-4 &&
+                m_flat.top2_prob_margin < 1e-4,
+                "flat uniform distribution did not produce high entropy / near-zero margin");
+            const auto g_flat = decide_anchor_width_gate(m_flat, 3u, true);
+            check(g_flat.max_dflash2_verify_rows == 2u && g_flat.max_mtp_depth == 1u && !g_flat.allow_lookup &&
+                g_flat.max_lookup_width == 0u,
+                "extreme high-entropy anchor width gate failed to narrow width and suppress lookup");
+
+            const AnchorEntropyMetrics m_mod_high{.entropy_nats = 2.0, .top2_logit_margin = 0.6, .valid = true};
+            const auto g_mod_high = decide_anchor_width_gate(m_mod_high, 3u, true);
+            check(g_mod_high.max_dflash2_verify_rows == 3u && g_mod_high.max_mtp_depth == 1u &&
+                !g_mod_high.allow_lookup && g_mod_high.max_lookup_width == 0u,
+                "moderate high-entropy anchor width gate did not select verify_rows=3");
+
+            const AnchorEntropyMetrics m_mid_lo{.entropy_nats = 1.1, .top1_prob = 0.5, .top2_logit_margin = 1.2, .valid = true};
+            const auto g_mid_lo = decide_anchor_width_gate(m_mid_lo, 7u, true);
+            check(g_mid_lo.max_dflash2_verify_rows == 4u && g_mid_lo.max_mtp_depth == 3u &&
+                g_mid_lo.allow_lookup && g_mid_lo.max_lookup_width == 4u,
+                "medium-entropy anchor width gate did not halve lookup width to 4");
+
+            const AnchorEntropyMetrics m_mid_hi{.entropy_nats = 1.4, .top1_prob = 0.4, .top2_logit_margin = 0.8, .valid = true};
+            const auto g_mid_hi = decide_anchor_width_gate(m_mid_hi, 3u, true);
+            check(g_mid_hi.max_dflash2_verify_rows == 4u && g_mid_hi.max_mtp_depth == 2u &&
+                g_mid_hi.allow_lookup && g_mid_hi.max_lookup_width == 2u,
+                "upper-medium entropy anchor width gate did not clamp depth/lookup to 2");
+
+            const AnchorEntropyMetrics m_mid_nolookup{.entropy_nats = 1.6, .top1_prob = 0.4, .top2_logit_margin = 1.1, .valid = true};
+            const auto g_mid_nolookup = decide_anchor_width_gate(m_mid_nolookup, 3u, true);
+            check(g_mid_nolookup.max_dflash2_verify_rows == 4u && g_mid_nolookup.max_mtp_depth == 2u &&
+                !g_mid_nolookup.allow_lookup && g_mid_nolookup.max_lookup_width == 0u,
+                "transitional entropy (>1.50) did not disable lookup");
+
+            std::vector<float> bad_nan = sharp;
+            bad_nan[3] = std::numeric_limits<float>::quiet_NaN();
+            refused([&] { static_cast<void>(compute_anchor_entropy_metrics(bad_nan, pol)); });
+
+            std::vector<float> bad_inf = sharp;
+            bad_inf[2] = std::numeric_limits<float>::infinity();
+            refused([&] { static_cast<void>(compute_anchor_entropy_metrics(bad_inf, pol)); });
+
+            std::vector<float> bad_sub = sharp;
+            bad_sub[4] = std::numeric_limits<float>::denorm_min();
+            refused([&] { static_cast<void>(compute_anchor_entropy_metrics(bad_sub, pol)); });
+
+            auto bad_row = cpu_logit_topk_row(sharp);
+            bad_row.first_nonfinite_col = 2u;
+            refused([&] { static_cast<void>(compute_anchor_entropy_metrics(bad_row, pol)); });
+            bad_row = cpu_logit_topk_row(sharp);
+            bad_row.first_subnormal_col = 2u;
+            refused([&] { static_cast<void>(compute_anchor_entropy_metrics(bad_row, pol)); });
+            refused([&] { static_cast<void>(compute_anchor_entropy_metrics(sharp, SamplingPolicy{-0.1, 32, 0.95, 0.0})); });
+
+            MtpAnchorCarry carry_metrics;
+            carry_metrics.publish(MtpAnchorPublication{
+                500, 1, false, SampledPathToken{42u, 10.0f, false}, m_sharp});
+            const auto* peeked_tok = carry_metrics.peek(500);
+            const auto* peeked = carry_metrics.peek_metrics(500);
+            check(peeked_tok && peeked_tok->id == 42u && peeked_tok->source_logit == 10.0f && !peeked_tok->accepted_proposal,
+                "anchor carry lost published token");
+            check(peeked && *peeked == m_sharp, "anchor carry lost published metrics");
+            refused([&] { static_cast<void>(carry_metrics.peek_metrics(501)); });
+            check(carry_metrics.clear() && !carry_metrics.clear(),
+                "anchor carry clear did not consume pending metrics exactly once");
+            check(!carry_metrics.peek_metrics(500) && !carry_metrics.peek_metrics(501),
+                "anchor carry clear retained metrics");
+
+            // accepted_stop (!pending) must discard metrics even if anchor_metrics is populated on the publication.
+            carry_metrics.publish(MtpAnchorPublication{
+                500, 1, false, SampledPathToken{42u, 10.0f, false}, m_sharp});
+            carry_metrics.publish(MtpAnchorPublication{
+                502, 2, true, std::nullopt, m_sharp});
+            check(!carry_metrics.peek(502) && !carry_metrics.peek_metrics(502) && !carry_metrics.peek_metrics(503),
+                "accepted_stop publication retained carried anchor or metrics");
+            check(!carry_metrics.clear(), "accepted_stop publication left clearable pending anchor");
+
+            // Pending anchor without metrics yields nullptr from peek_metrics but still enforces prefix match.
+            carry_metrics.publish(MtpAnchorPublication{
+                600, 1, false, SampledPathToken{43u, 5.0f, false}, std::nullopt});
+            check(carry_metrics.peek(600) && !carry_metrics.peek_metrics(600),
+                "anchor carry fabricated metrics when none were published");
+            refused([&] { static_cast<void>(carry_metrics.peek_metrics(601)); });
+            check(carry_metrics.clear(), "anchor carry clear failed for anchor without metrics");
+        }
         std::cout << "MTP carried-anchor transition checks passed: " << checks << '\n'; return 0; }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

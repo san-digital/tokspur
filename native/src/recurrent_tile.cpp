@@ -180,7 +180,7 @@ void encode_recurrent_layer_tile(MetalGraph& g, const RecurrentWeights& w, const
         }
 #endif
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
-        if (g.verify_nax_active() && verify_nax_moe && tile.steps >= 2 && tile.steps <= 8) {
+        if (g.verify_nax_active() && verify_nax_moe && tile.steps >= 2 && tile.steps <= 16) {
             if (next_rms_gains.owner != 0) g.validate_disjoint(std::array{next_rms_gains}, writes);
             std::vector<GpuView> protected_reads(reads.begin(), reads.end());
             protected_reads.insert(protected_reads.end(), writes.begin(), writes.end());

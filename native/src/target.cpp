@@ -116,8 +116,10 @@
 #include <optional>
 #include <random>
 #include <set>
+#include <thread>
 #include <tuple>
 #include <type_traits>
+#include <variant>
 #ifdef TOKSPUR_PRIVATE_OPERATOR_CHECKPOINTS
 #include <iomanip>
 #include <sstream>
@@ -157,11 +159,81 @@ Json number(double v) {
     const auto r = std::to_chars(data.data(), data.data() + data.size(), v); require(r.ec == std::errc{}, "target JSON number encoding failed");
     return parse_json({data.data(), size_t(r.ptr - data.data())});
 }
+double milliseconds_between(Clock::time_point from, Clock::time_point to) {
+    return std::chrono::duration<double, std::milli>(to - from).count();
+}
+// Record host preparation, stack wall and GPU time, and the wait for the next PLE chunk. Totals include every chunk. The wire event carries the first 64 individual records.
+struct PrefillChunkTiming {
+    uint32_t tokens = 0;
+    std::optional<CommandTiming> stack_command;
+    double wall_ms = 0, pre_advance_ms = 0, advance_ms = 0, stack_wall_ms = 0, stack_gpu_ms = 0;
+    double mtp_prime_gpu_ms = 0, prefetch_join_wait_ms = 0, capture_ms = 0;
+};
+struct PrefillTiming {
+    static constexpr size_t max_recorded_chunks = 64, command_timing_chunks = 2;
+    double total_ms = 0, before_chunks_ms = 0, chunks_ms = 0, after_chunks_ms = 0;
+    double pre_advance_ms = 0, advance_ms = 0, stack_wall_ms = 0, stack_gpu_ms = 0;
+    double mtp_prime_gpu_ms = 0, prefetch_join_wait_ms = 0, capture_ms = 0;
+    uint64_t chunks = 0, slowest_chunk = 0;
+    double slowest_chunk_ms = 0;
+    std::vector<PrefillChunkTiming> recorded;
+    void add(const PrefillChunkTiming& c) {
+        if (chunks == 0 || c.wall_ms > slowest_chunk_ms) { slowest_chunk = chunks; slowest_chunk_ms = c.wall_ms; }
+        ++chunks; chunks_ms += c.wall_ms; pre_advance_ms += c.pre_advance_ms; advance_ms += c.advance_ms;
+        stack_wall_ms += c.stack_wall_ms; stack_gpu_ms += c.stack_gpu_ms; mtp_prime_gpu_ms += c.mtp_prime_gpu_ms;
+        prefetch_join_wait_ms += c.prefetch_join_wait_ms; capture_ms += c.capture_ms;
+        if (recorded.size() < max_recorded_chunks) recorded.push_back(c);
+    }
+    void finish(double total, std::optional<Clock::time_point> started, std::optional<Clock::time_point> loop_started,
+                std::optional<Clock::time_point> loop_finished, Clock::time_point finished) {
+        total_ms = total;
+        if (started && loop_started && loop_finished) {
+            before_chunks_ms = milliseconds_between(*started, *loop_started);
+            after_chunks_ms = milliseconds_between(*loop_finished, finished);
+        } else {
+            before_chunks_ms = total;
+        }
+    }
+};
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM
+Json prefill_timing_json(const PrefillTiming& t) {
+    Json::Array chunks;
+    for (const auto& c : t.recorded) {
+        Json::Object chunk{{"tokens", Json::integer(c.tokens)}, {"wall_ms", number(c.wall_ms)},
+            {"pre_advance_ms", number(c.pre_advance_ms)}, {"advance_ms", number(c.advance_ms)},
+            {"stack_wall_ms", number(c.stack_wall_ms)}, {"stack_gpu_ms", number(c.stack_gpu_ms)},
+            {"mtp_prime_gpu_ms", number(c.mtp_prime_gpu_ms)}, {"prefetch_join_wait_ms", number(c.prefetch_join_wait_ms)},
+            {"capture_ms", number(c.capture_ms)}};
+        if (chunks.size() < PrefillTiming::command_timing_chunks) {
+            Json command;
+            if (c.stack_command) {
+                const auto& s = *c.stack_command;
+                command = Json(Json::Object{{"host_record_ms", number(s.host_record_ms)}, {"host_flush_ms", number(s.host_flush_ms)},
+                    {"host_commit_ms", number(s.host_commit_ms)}, {"host_wait_and_check_ms", number(s.host_wait_and_check_ms)},
+                    {"metal_schedule_ms", s.metal_schedule_ms ? number(*s.metal_schedule_ms) : Json()}});
+            }
+            chunk.emplace_back("stack_command", std::move(command));
+        }
+        chunks.emplace_back(std::move(chunk));
+    }
+    return Json(Json::Object{{"schema", Json::integer(1)}, {"total_ms", number(t.total_ms)},
+        {"before_chunks_ms", number(t.before_chunks_ms)}, {"chunks_ms", number(t.chunks_ms)}, {"after_chunks_ms", number(t.after_chunks_ms)},
+        {"chunks", Json::integer(t.chunks)}, {"pre_advance_ms", number(t.pre_advance_ms)}, {"advance_ms", number(t.advance_ms)},
+        {"stack_wall_ms", number(t.stack_wall_ms)}, {"stack_gpu_ms", number(t.stack_gpu_ms)},
+        {"mtp_prime_gpu_ms", number(t.mtp_prime_gpu_ms)}, {"prefetch_join_wait_ms", number(t.prefetch_join_wait_ms)},
+        {"capture_ms", number(t.capture_ms)}, {"slowest_chunk", Json::integer(t.slowest_chunk)},
+        {"slowest_chunk_ms", number(t.slowest_chunk_ms)}, {"recorded_chunks", Json(std::move(chunks))},
+        {"recorded_chunks_truncated", Json(t.chunks > t.recorded.size())}});
+}
+using SavedPrefillTiming = std::variant<PrefillTiming, Json>;
+const Json& prefill_timing_record(SavedPrefillTiming& saved) {
+    if (const auto* timing = std::get_if<PrefillTiming>(&saved)) saved = prefill_timing_json(*timing);
+    return std::get<Json>(saved);
+}
 Json verify_nax_batch_metadata(Json value, const MetalGraph& gpu) {
     const auto* event = value.find("event");
     if (!event || (event->string() != "ready" && event->string() != "done")) return value;
-    auto fields = value.object();
+    auto fields = std::move(value).take_object();
     const auto t = gpu.verify_nax_top10_mixture_telemetry();
     fields.emplace_back("native_verify_nax_batch_top10_mixture_enabled", Json(verify_nax_batch_top10_mixture_enabled));
     fields.emplace_back("native_verify_nax_ops_counter_scope", Json("worker-lifetime completed verification operator encodings; includes subsequently aborted submissions; excludes prefill and drafter"));
@@ -180,7 +252,7 @@ Json cache_memory_metadata(Json value, const MetalGraph& gpu) {
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM
     value = verify_nax_batch_metadata(std::move(value), gpu);
 #endif
-    auto fields = value.object();
+    auto fields = std::move(value).take_object();
     // The selected limit remains stable if pressure reclamation releases the cache.
     fields.emplace_back("host_row_cache_budget_bytes", Json::integer(cache_budget));
     const auto tile64 = gpu.q8_tile64_cache_stats();
@@ -203,7 +275,7 @@ Json ple_gate_metadata(Json value, std::optional<PleGateTransform> transform) {
     if (!transform) return value;
     const auto* event = value.find("event");
     if (!event || (event->string() != "ready" && event->string() != "done")) return value;
-    auto fields = value.object();
+    auto fields = std::move(value).take_object();
     fields.emplace_back("ple_gate_transform", Json(*transform == PleGateTransform::plain ? "plain" : "signed-root"));
     fields.emplace_back("ple_gate_transform_schema", Json::integer(1));
     return Json(std::move(fields));
@@ -216,7 +288,7 @@ Json qsa_channel_metadata(Json value, const MetalGraph& gpu) {
     const auto* event = value.find("event");
     if (!event || (event->string() != "ready" && event->string() != "done")) return value;
     const auto calls = gpu.qsa_channel_calls();
-    auto fields = value.object();
+    auto fields = std::move(value).take_object();
     fields.emplace_back("qsa_channel_chronological_mode", Json(policy.enabled ? "on" : "off"));
     fields.emplace_back("qsa_channel_chronological_schema", Json::integer(1));
     fields.emplace_back("qsa_channel_factor_logical_bytes", Json::integer(policy.factor_logical_bytes));
@@ -233,7 +305,7 @@ Json qsa_channel_metadata(Json value, const MetalGraph& gpu) {
     if (!state.selected) return value; // Absent selector preserves the old wire.
     const auto* event = value.find("event");
     if (!event || (event->string() != "ready" && event->string() != "done")) return value;
-    auto fields = value.object();
+    auto fields = std::move(value).take_object();
     fields.emplace_back("batch_phase_clock_mode", Json(state.enabled ? "on" : "off"));
     fields.emplace_back("batch_phase_clock_schema", Json::integer(1));
     fields.emplace_back("batch_phase_clock_batches", Json::integer(state.successful_batches));
@@ -326,6 +398,10 @@ void own_memory_guard(const std::function<bool()>& reclaim = {}) {
     if (!memory_work_admitted({m.current, m.pressure}, native_limit) && reclaim && reclaim()) {
         malloc_zone_pressure_relief(nullptr, 0);
         m = memory();
+        for (int attempt = 0; attempt < 20 && m.current <= native_limit && m.pressure != 1; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            m = memory();
+        }
     }
     // Lifetime peak remains diagnostic because releasing memory cannot lower it.
     if (!memory_work_admitted({m.current, m.pressure}, native_limit))
@@ -577,6 +653,8 @@ template<class Handle, class Result> class BranchSession {
         uint32_t mtp_rows = 0;
         std::optional<SampledPathToken> carried_anchor{};
         uint32_t pending_overflow = 0;
+        bool has_dflash2_verify_budget = false;
+        DFlash2VerifyBudget dflash2_verify_budget{};
 #endif
     };
     std::vector<Record> records_;
@@ -714,7 +792,7 @@ public:
     }
     template<class Retain> void capture(uint32_t prefix, const CommittedResult<Result>& retained, Retain&& retain) {
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
-        capture(prefix, retained, nullptr, nullptr, 1, 0, std::nullopt, 0, std::forward<Retain>(retain));
+        capture(prefix, retained, nullptr, nullptr, 1, 0, std::nullopt, 0, nullptr, std::forward<Retain>(retain));
 #else
         require(matches(prefix) && prefix && retained.matches(prefix), "branch capture prefix/logits mismatch");
         require(order_ < std::numeric_limits<uint64_t>::max(), "branch capture order exhausted");
@@ -736,6 +814,7 @@ public:
                                          uint32_t mtp_first, uint32_t mtp_rows,
                                          std::optional<SampledPathToken> carried_anchor,
                                          uint32_t pending_overflow,
+                                         const DFlash2VerifyBudget* dflash2_verify_budget,
                                          Retain&& retain) {
         require(matches(prefix) && prefix && retained.matches(prefix), "branch capture prefix/logits mismatch");
         require(order_ < std::numeric_limits<uint64_t>::max(), "branch capture order exhausted");
@@ -757,6 +836,9 @@ public:
         record.mtp_rows = mtp_rows;
         record.carried_anchor = carried_anchor;
         record.pending_overflow = pending_overflow;
+        record.has_dflash2_verify_budget = (dflash2_verify_budget != nullptr);
+        if (dflash2_verify_budget) record.dflash2_verify_budget = *dflash2_verify_budget;
+        else record.dflash2_verify_budget.reset();
     }
 #endif
     template<class Restore> uint32_t restore(size_t index, CommittedResult<Result>& retained, TargetSampler& sampler,
@@ -765,7 +847,9 @@ public:
                                              , StageAControllerState* out_controller_state = nullptr,
                                              uint32_t* out_mtp_rows = nullptr,
                                              std::optional<SampledPathToken>* out_carried_anchor = nullptr,
-                                             uint32_t* out_pending_overflow = nullptr
+                                             uint32_t* out_pending_overflow = nullptr,
+                                             DFlash2VerifyBudget* out_dflash2_verify_budget = nullptr,
+                                             bool* out_has_dflash2_verify_budget = nullptr
 #endif
                                              ) {
         require(valid_ && index < records_.size() && records_[index].valid && retained.matches(used_) && sampler.matches(used_),
@@ -804,6 +888,11 @@ public:
         if (out_mtp_rows) *out_mtp_rows = record.mtp_rows;
         if (out_carried_anchor) *out_carried_anchor = record.carried_anchor;
         if (out_pending_overflow) *out_pending_overflow = record.pending_overflow;
+        if (out_has_dflash2_verify_budget) *out_has_dflash2_verify_budget = record.has_dflash2_verify_budget;
+        if (out_dflash2_verify_budget) {
+            if (record.has_dflash2_verify_budget) *out_dflash2_verify_budget = record.dflash2_verify_budget;
+            else out_dflash2_verify_budget->reset();
+        }
         uint32_t sum = 0; size_t keep = 0;
         for (size_t i = 0; i < partitions_.size(); ++i) {
             if (sum + partitions_[i] <= prefix) {
@@ -1208,6 +1297,26 @@ template<class Anchor> struct ParkedLanes {
         return ambiguous_seed ? std::pair{lanes.size(), ParkedMatch::miss} : std::pair{best, match};
     }
 };
+[[maybe_unused]] inline void sync_parked_lane_tokens(
+    std::vector<uint32_t>& lane_tokens,
+    bool& lane_tokens_valid,
+    std::span<const uint32_t> job_tokens,
+    std::span<const Json> generated,
+    size_t lane_restored,
+    size_t ssd_restored_prefix,
+    uint32_t stack_position) {
+    if (!lane_tokens_valid) return;
+    const size_t skip = std::max(
+        lane_restored ? std::min<size_t>(lane_restored, job_tokens.size()) : size_t(0),
+        std::min<size_t>(ssd_restored_prefix, job_tokens.size()));
+    lane_tokens.insert(lane_tokens.end(), job_tokens.begin() + ptrdiff_t(skip), job_tokens.end());
+    for (const auto& tok : generated) lane_tokens.push_back(uint32_t(tok.unsigned_integer()));
+    // Pending overflow rows may lag the history; a longer history than the committed prefix is never valid.
+    if (lane_tokens.size() > stack_position) {
+        lane_tokens_valid = false;
+        lane_tokens.clear();
+    }
+}
 Request request(const Json& data, uint32_t position, uint32_t current_splits, uint32_t current_block_formats, bool allow_kernel_experiments,
                 bool has_logits, bool continuable, bool sampling_matches = true,
                 uint32_t current_execution = 0, bool allow_stack_experiments = false, bool replay_prepared = false,
@@ -1427,6 +1536,11 @@ struct TargetMtpSelection {
         require(self.decision->accepted <= 1 && self.decision->count >= 1 && self.decision->count <= 2,
             "native MTP sampled decision shape mismatch");
         self.anchor_publication.emplace(prepare_mtp_anchor_publication(self.base, *self.decision, self.context_limit));
+        if (self.anchor_publication->pending) {
+            self.anchor_publication->anchor_metrics = rows.has_topk
+                ? compute_anchor_entropy_metrics(rows.topk[self.decision->accepted], self.policy)
+                : compute_anchor_entropy_metrics(rows.logits[self.decision->accepted], self.policy);
+        }
         return 1 + self.decision->accepted;
     }
 };
@@ -1559,6 +1673,11 @@ struct TargetMtpSelection2 {
             }
         }
         self.publication.emplace(prepare_mtp_anchor_publication2(self.base, *self.decision, self.context_limit));
+        if (self.publication->pending) {
+            self.publication->anchor_metrics = rows.has_topk
+                ? compute_anchor_entropy_metrics(rows.topk[self.decision->accepted], self.policy)
+                : compute_anchor_entropy_metrics(rows.logits[self.decision->accepted], self.policy);
+        }
         return 1 + self.decision->accepted;
     }
 };
@@ -1573,12 +1692,12 @@ struct TargetDFlash2Selection {
     static uint32_t choose(void* raw, const StackSampledVerificationRows& rows) {
         auto& self = *static_cast<TargetDFlash2Selection*>(raw);
         require(rows.position == self.base && rows.count == 1 + self.draft.count &&
-            rows.residual_width == 10240 && self.draft.count >= 1 && self.draft.count <= 7,
+            rows.residual_width == 10240 && self.draft.count >= 1 && self.draft.count <= 15,
             "DFlash2 target verification row identity mismatch");
         const uint32_t prefix = self.base + 1;
         if (rows.has_topk) {
             const SampledPathIdentity identity{1, 1, 1, prefix, rows.vocabulary, self.anchor};
-            std::array<SampledTargetTopKRow, 8> target_rows{};
+            std::array<SampledTargetTopKRow, 16> target_rows{};
             for (uint32_t i = 0; i <= self.draft.count; ++i) target_rows[i] = {prefix + i, rows.topk[i]};
             self.decision.emplace(decide_sampled_path_topk(
                 identity, std::span(self.draft.proposals).first(self.draft.count),
@@ -1587,7 +1706,7 @@ struct TargetDFlash2Selection {
                 self.draft.random_after, self.draft.proposal_begin_words));
         } else {
             const SampledPathIdentity identity{1, 1, 1, prefix, uint32_t(rows.logits[0].size()), self.anchor};
-            std::array<SampledTargetRow, 8> target_rows{};
+            std::array<SampledTargetRow, 16> target_rows{};
             for (uint32_t i = 0; i <= self.draft.count; ++i) target_rows[i] = {prefix + i, rows.logits[i]};
             self.decision.emplace(decide_sampled_path(
                 identity, std::span(self.draft.proposals).first(self.draft.count),
@@ -1595,7 +1714,14 @@ struct TargetDFlash2Selection {
                 self.policy, 1 + self.draft.count, self.stops,
                 self.draft.random_after, self.draft.proposal_begin_words));
         }
-        self.publication.emplace(prepare_mtp_anchor_publication8(self.base, *self.decision, self.context_limit));
+        self.publication.emplace(self.draft.count <= 7u
+            ? prepare_mtp_anchor_publication8(self.base, *self.decision, self.context_limit)
+            : prepare_mtp_anchor_publication16(self.base, *self.decision, self.context_limit));
+        if (self.publication->pending) {
+            self.publication->anchor_metrics = rows.has_topk
+                ? compute_anchor_entropy_metrics(rows.topk[self.decision->accepted], self.policy)
+                : compute_anchor_entropy_metrics(rows.logits[self.decision->accepted], self.policy);
+        }
         return 1 + self.decision->accepted;
     }
 };
@@ -1604,7 +1730,7 @@ struct TargetDFlash2Selection {
 class PleAsyncGatherer {
 public:
     static constexpr size_t kWorkers = 8;
-    static constexpr size_t kMaxSlots = 8 * 16;
+    static constexpr size_t kMaxSlots = 16 * 16;
     static constexpr size_t kRowWidth = 160;
 
     PleAsyncGatherer(EmbeddingRows& cache, const NgramSpec& spec, NgramPolicy policy,
@@ -1642,7 +1768,7 @@ public:
     PleAsyncGatherer& operator=(const PleAsyncGatherer&) = delete;
 
     void start_tokens(NgramHistory entry_history, std::span<const uint32_t> tokens, std::span<float> dst) {
-        require(!tokens.empty() && tokens.size() <= 8 && dst.size() == tokens.size() * 2560ull,
+        require(!tokens.empty() && tokens.size() <= 16 && dst.size() == tokens.size() * 2560ull,
             "invalid async PLE gather token batch");
         require(!busy_, "concurrent async PLE gather overlap");
 
@@ -2266,6 +2392,9 @@ int target_cli(int argc, char** argv) {
     bool prefill_multiseg = false, prefill_swizzle = false, qsa_prefill_fused = false, hc_consumer_fused = false;
     bool ple_overlap = false, shared_prefix_cache_enabled = false;
     uint64_t parked_lane_budget_bytes = 0;
+    bool mtp_lookup_explicit = false, dflash2_lookup_explicit = false;
+    bool dflash2_defer_context_explicit = false;
+    bool shared_prefix_cache_explicit = false, parked_lanes_explicit = false;
     std::filesystem::path policy_path; auto library = std::filesystem::absolute(argv[0]).parent_path() / "tokspur-owned.metallib";
     std::vector<std::filesystem::path> paths; std::set<std::string> seen; bool allow = false, dry = false, profiling = false;
 #ifdef TOKSPUR_PRIVATE_OPERATOR_CHECKPOINTS
@@ -2428,7 +2557,7 @@ int target_cli(int argc, char** argv) {
     std::optional<bool> batch_phase_clock;
 #endif
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
-    bool concurrent_dispatch = false, concurrent_selected = false, concurrent_state_proof = false;
+    bool concurrent_dispatch = true, concurrent_selected = false, concurrent_state_proof = false;
 #endif
     uint32_t checkpoint_slots = 0; uint64_t checkpoint_budget = 0; bool worker_broker = false, prompt_lookup = false;
     bool checkpoint_ssd = false; uint64_t checkpoint_ssd_budget = 8ull << 30; uint64_t checkpoint_ssd_floor = 20ull << 30;
@@ -2539,6 +2668,7 @@ int target_cli(int argc, char** argv) {
         else if (option == "--native-dflash2-defer-context") {
             require(value == "off" || value == "on", "native DFlash2 deferred context must be off or on");
             dflash2_defer_context = value == "on";
+            dflash2_defer_context_explicit = true;
         }
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
         else if (option == "--carrier-diagnostic-cost-tape") {
@@ -2952,6 +3082,7 @@ int target_cli(int argc, char** argv) {
             else if (value == "bypass") mtp_lookup_mode = MtpLookupMode::bypass;
             else if (value == "hybrid") mtp_lookup_mode = MtpLookupMode::hybrid;
             else throw FormatError("MTP lookup bypass requires off, bypass or hybrid");
+            mtp_lookup_explicit = true;
             candidate_opt_selected = true;
         }
         else if (option == "--mtp-lookup-match" || option == "--native-mtp-lookup-match") {
@@ -2965,6 +3096,7 @@ int target_cli(int argc, char** argv) {
             else if (value == "bypass") dflash2_lookup_mode = MtpLookupMode::bypass;
             else if (value == "hybrid") dflash2_lookup_mode = MtpLookupMode::hybrid;
             else throw FormatError("DFlash2 lookup bypass requires off, bypass or hybrid");
+            dflash2_lookup_explicit = true;
             candidate_opt_selected = true;
         }
         else if (option == "--dflash2-lookup-match" || option == "--native-dflash2-lookup-match") {
@@ -3004,13 +3136,13 @@ int target_cli(int argc, char** argv) {
         }
         else if (option == "--shared-prefix-cache" || option == "--native-shared-prefix-cache") {
             require(value == "on" || value == "off", "shared prefix cache requires on or off");
-            shared_prefix_cache_enabled = value == "on"; candidate_opt_selected = true;
+            shared_prefix_cache_enabled = value == "on"; shared_prefix_cache_explicit = true; candidate_opt_selected = true;
         }
         else if (option == "--parked-lanes-mib" || option == "--native-parked-lanes-mib") {
             uint64_t mib = 0;
             const auto parsed = std::from_chars(value.data(), value.data() + value.size(), mib);
             require(parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size() && mib <= 16384, "parked lanes require 0..16384 MiB");
-            parked_lane_budget_bytes = mib << 20; candidate_opt_selected = true;
+            parked_lane_budget_bytes = mib << 20; parked_lanes_explicit = true; candidate_opt_selected = true;
         }
 #ifdef TOKSPUR_PRIVATE_RAW_DECODE
         else if (option == "--raw-decode") {
@@ -3142,6 +3274,48 @@ int target_cli(int argc, char** argv) {
 #endif
     }
     const bool has_speculative = mtp_sidecar.has_value() || dflash2_dir.has_value();
+    const bool direct_speculative_defaults = has_speculative && execution == StackExecution::direct &&
+        !dry && !profiling && !worker_broker && !checkpoint_slots && !prompt_lookup &&
+        !allow_kernel_experiments && !allow_stack_experiments && !allow_prefill_experiments &&
+        !allow_lookup_experiments
+#ifdef TOKSPUR_PRIVATE_OPERATOR_CHECKPOINTS
+        && !operator_checkpoints.has_value()
+#endif
+#ifdef TOKSPUR_PRIVATE_KERNEL_SEARCH_CAPTURE
+        && !kernel_search_capture_path.has_value()
+#endif
+#ifdef TOKSPUR_PRIVATE_TASK4_PROFILE
+        && !task4_profile.has_value()
+#endif
+#ifdef TOKSPUR_PRIVATE_VERIFICATION_COST
+        && !verification_cost_manifest.has_value()
+#endif
+#ifdef TOKSPUR_PRIVATE_SAMPLED_VERIFICATION_COST
+        && !sampled_cost_manifest.has_value()
+#endif
+#ifdef TOKSPUR_PRIVATE_LOGIT_TRACE
+        && !logit_trace_path.has_value()
+#endif
+#ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
+        && carrier_mode == CarrierDiagnosticMode::off && carrier_identity_path.empty()
+#endif
+#ifdef TOKSPUR_PRIVATE_HTTP_BRANCH8
+        && !worker_broker8
+#endif
+        ;
+    if (direct_speculative_defaults) {
+        if (!shared_prefix_cache_explicit) shared_prefix_cache_enabled = true;
+        if (!parked_lanes_explicit && shared_prefix_cache_enabled) parked_lane_budget_bytes = 4096ull << 20;
+        if (dflash2_dir.has_value() && !dflash2_defer_context_explicit) dflash2_defer_context = true;
+        if (!verify_cost_profile_path.has_value()) {
+            if (mtp_sidecar.has_value() && (mtp_depth == 2 || mtp_depth == 3) && !mtp_lookup_explicit) {
+                mtp_lookup_mode = MtpLookupMode::hybrid;
+            }
+            if (dflash2_dir.has_value() && mtp_depth == 7 && !dflash2_lookup_explicit) {
+                dflash2_lookup_mode = MtpLookupMode::hybrid;
+            }
+        }
+    }
     require(!host_logit_views || has_speculative, "native host logit views require a sampled speculative verifier");
     require(!native_logit_topk.value_or(false) || has_speculative, "native logit top-k requires a sampled speculative verifier");
     require(!native_ple_async_gather.value_or(false) || has_speculative, "native PLE async gather requires a sampled speculative verifier");
@@ -3698,6 +3872,19 @@ int target_cli(int argc, char** argv) {
 #endif
 #endif
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
+    if (!concurrent_selected && (execution != StackExecution::direct || profiling || allow_kernel_experiments || allow_stack_experiments || allow_prefill_experiments
+#ifdef TOKSPUR_PRIVATE_MTP_DISPATCH_PROFILE
+        || mtp_profile_rounds
+#endif
+#ifdef TOKSPUR_PRIVATE_TASK4_PROFILE
+        || task4_profile.has_value()
+#endif
+#ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
+        || carrier_mode == CarrierDiagnosticMode::dispatch
+#endif
+    )) {
+        concurrent_dispatch = false;
+    }
     require(!concurrent_state_proof || concurrent_selected, "private concurrent state proof requires an explicit arm selector");
     require(!concurrent_dispatch || (execution == StackExecution::direct && !profiling && !allow_kernel_experiments && !allow_stack_experiments && !allow_prefill_experiments),
         "private concurrent dispatch requires fixed direct unprofiled execution");
@@ -3722,7 +3909,7 @@ int target_cli(int argc, char** argv) {
     require((prefill_m64 == PrefillM64Mode::off && !prefill_multiseg && !prefill_swizzle && !qsa_prefill_fused && !hc_consumer_fused && !ple_overlap) ||
         (execution == StackExecution::direct && !allow_kernel_experiments && !allow_stack_experiments && !allow_prefill_experiments),
         "exact prefill candidates require fixed direct target execution without request-time overrides");
-    require(!parked_lane_budget_bytes || (shared_prefix_cache_enabled && !checkpoint_ssd), "parked lanes require the shared prefix cache without SSD checkpoints");
+    require(!parked_lane_budget_bytes || shared_prefix_cache_enabled, "parked lanes require the shared prefix cache");
     require(!shared_prefix_cache_enabled || (execution == StackExecution::direct && !worker_broker && !checkpoint_slots && !prompt_lookup &&
         !allow_kernel_experiments && !allow_stack_experiments && !allow_prefill_experiments
 #ifdef TOKSPUR_PRIVATE_OPERATOR_CHECKPOINTS
@@ -3898,7 +4085,7 @@ int target_cli(int argc, char** argv) {
     // Counters are chunked into buffers no larger than this M5's 32 KiB limit.
     auto counter_sampling = profiling ? gpu.configure_profiling(4096) : ProfileMode::disabled;
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
-    gpu.configure_concurrent_dispatch(concurrent_dispatch);
+    if (concurrent_selected || !concurrent_dispatch) gpu.configure_concurrent_dispatch(concurrent_dispatch);
 #endif
 #ifdef TOKSPUR_PRIVATE_Q8_THREE_ROWS
     gpu.configure_q8_three_rows(q8_three_rows);
@@ -4202,11 +4389,29 @@ int target_cli(int argc, char** argv) {
         if (!admitted) refuse_memory_work(observed);
     };
 #else
+    std::function<uint64_t()> reclaim_shared_prefix;
     const auto own_memory_guard = [&]() {
         tokspur::own_memory_guard([&]() {
             const bool ended = gpu.suspend_mapped_weight_residency();
-            const auto bytes = reclaim_parked ? reclaim_parked() : 0;
-            return ended || bytes > 0;
+            const uint64_t ple_bytes = cache.reclaim();
+            const uint64_t shared_bytes = reclaim_shared_prefix ? reclaim_shared_prefix() : 0;
+            const uint64_t parked_bytes = reclaim_parked ? reclaim_parked() : 0;
+            bool evicted_clean = false;
+            for (const auto& shard : files.shards()) {
+                if (const auto* map = shard.backing_mapping()) {
+                    map->evict_clean_pages(0, map->size());
+                    evicted_clean = true;
+                }
+            }
+            if (pack_model) {
+                for (const auto& shard : pack_model->shards()) {
+                    if (const auto* map = shard.backing_mapping()) {
+                        map->evict_clean_pages(0, map->size());
+                        evicted_clean = true;
+                    }
+                }
+            }
+            return ended || ple_bytes > 0 || shared_bytes > 0 || parked_bytes > 0 || evicted_clean;
         });
     };
 #endif
@@ -4358,6 +4563,7 @@ int target_cli(int argc, char** argv) {
     std::unique_ptr<MtpSharedBinding> mtp_binding;
     std::unique_ptr<MtpHead> mtp;
     std::unique_ptr<DFlash2Drafter> dflash2;
+    bool dflash2_verify16 = false;
     std::unique_ptr<PromptLookup> mtp_lookup;
     bool mtp_lookup_valid = false;
     uint64_t mtp_head_calls = 0, mtp_proposed = 0, mtp_prime_calls = 0, mtp_rounds = 0, mtp_accepted = 0, mtp_recoveries = 0;
@@ -4368,6 +4574,15 @@ int target_cli(int argc, char** argv) {
 #endif
     MtpGenerationCarry mtp_generation;
     double mtp_head_gpu_ms = 0, mtp_head_wall_ms = 0, mtp_prime_gpu_ms = 0, mtp_prime_wall_ms = 0;
+#ifdef TOKSPUR_PRIVATE_DFLASH2_PHASE_TIMING
+    struct DFlash2PhaseTotals {
+        uint64_t rounds = 0, accepted = 0;
+        double round_wall_ms = 0, draft_wall_ms = 0;
+        double verification_wall_ms = 0, verification_gpu_ms = 0;
+        double recovery_wall_ms = 0, recovery_gpu_ms = 0;
+    };
+    std::array<DFlash2PhaseTotals, 17> dflash2_phase_totals{};
+#endif
     if (mtp_sidecar) {
         stack.prepare_final_hc_tap(
 #ifdef TOKSPUR_PRIVATE_HTTP_PREFILL512
@@ -4447,11 +4662,11 @@ int target_cli(int argc, char** argv) {
         }
         if (dflash2_lookup_mode != MtpLookupMode::off) {
             mtp_lookup_mode = dflash2_lookup_mode;
-            // DFlash2 proposes up to 7 tokens (entering the 8-row M8 NAX tile and flushing staged context), so require a 10-token exact suffix match by default unless explicitly overridden via --dflash2-lookup-match.
+            // DFlash2 proposes up to 7 lookup tokens (entering the 8-row M8 NAX tile and flushing staged context), so require a 10-token exact suffix match by default unless explicitly overridden via --dflash2-lookup-match.
             mtp_lookup_match = dflash2_lookup_match.value_or(10u);
             LookupConfig lookup_cfg{};
             lookup_cfg.match_tokens = mtp_lookup_match;
-            lookup_cfg.proposal_tokens = dflash2->max_drafts();
+            lookup_cfg.proposal_tokens = std::min(7u, dflash2->max_drafts());
             lookup_cfg.history_tokens = target_context_length;
             lookup_cfg.token_limit = shape.vocabulary;
             lookup_cfg.memory_budget_bytes = target_context_length > 65536 ? (8ull << 20) : (4ull << 20);
@@ -4460,12 +4675,18 @@ int target_cli(int argc, char** argv) {
         } else if (dflash2_lookup_match.has_value()) {
             mtp_lookup_match = *dflash2_lookup_match;
         }
+        dflash2_verify16 = !verify_cost_profile && dflash2->burst_max_drafts() > 7u;
+        const uint32_t dflash_tap_verify_rows = dflash2_verify16 ? 16u : 8u;
         stack.prepare_dflash_tap(dflash2->target_layer_ids(), dflash2_tap_budget(
 #ifdef TOKSPUR_PRIVATE_HTTP_PREFILL512
             mtp_chunked_prefill ? known_token_capacity :
 #endif
-            8));
-        stack.prepare_sampled_verification2(maximum_stack_verification_budget, {true, QsaVerifyRowsMode::core_and_q8});
+            8u, dflash_tap_verify_rows), dflash_tap_verify_rows);
+        if (dflash2_verify16) {
+            stack.prepare_sampled_verification16(maximum_stack_verification16_budget, {true, QsaVerifyRowsMode::core_and_q8});
+        } else {
+            stack.prepare_sampled_verification2(maximum_stack_verification_budget, {true, QsaVerifyRowsMode::core_and_q8});
+        }
         own_memory_guard();
     }
 #ifdef TOKSPUR_DFLASH2_TAP_DUMP_ENABLED
@@ -4503,6 +4724,14 @@ int target_cli(int argc, char** argv) {
 #ifdef TOKSPUR_PRIVATE_PREFILL_CHUNK
     if (grouped_prefill_ffn) stack.configure_known_grouped_ffn(*grouped_prefill_ffn);
     if (prefill_layer_submissions) stack.configure_known_layer_submissions(*prefill_layer_submissions);
+    if (known_token_capacity == 512
+#ifdef TOKSPUR_PRIVATE_CHUNKED_PREFILL
+        && !native_prefill_chunks
+#endif
+    ) {
+        stack.prepare_tiled_prefill512();
+        own_memory_guard();
+    }
     if (prefill_hc_residual_rows) stack.configure_known_hc_residual_rows(*prefill_hc_residual_rows);
 #endif
 #ifdef TOKSPUR_PRIVATE_VERIFY8_BRANCH
@@ -4975,22 +5204,30 @@ int target_cli(int argc, char** argv) {
         TargetSampling lane_sampling{};
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
         StageAControllerState controller_state{};
+        bool has_dflash2_verify_budget = false;
+        DFlash2VerifyBudget dflash2_verify_budget{};
 #endif
         std::vector<float> logits;
         std::vector<std::byte> payload;
         uint64_t last_access_tick = 0;
         uint64_t ram_bytes() const {
-            return uint64_t(payload.size()) + uint64_t(logits.size()) * sizeof(float) + uint64_t(tokens.size()) * sizeof(uint32_t);
+            uint64_t bytes = uint64_t(payload.size()) + uint64_t(logits.size()) * sizeof(float) + uint64_t(tokens.size()) * sizeof(uint32_t);
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+            if (has_dflash2_verify_budget) {
+                bytes += uint64_t(dflash2_verify_budget.label_count()) * sizeof(DFlash2VerifyBudget::Label);
+            }
+#endif
+            return bytes;
         }
     };
     struct SharedPrefixCacheState {
-        enum : uint64_t { max_ram_bytes = 768ull << 20 };
         enum : size_t {
-            max_anchors = 8,
+            max_anchors = 16,
             max_recent_sessions = 8,
             boundary_tokens = 512,
-            max_prefix_tokens = 2048,
         };
+        uint64_t max_ram_bytes = 768ull << 20;
+        uint32_t max_prefix_tokens = 2048;
         std::vector<SharedPrefixAnchor> anchors;
         std::vector<std::vector<uint32_t>> recent_prefixes;
         std::vector<uint32_t> active_tokens;
@@ -5000,6 +5237,8 @@ int target_cli(int argc, char** argv) {
         SharedPrefixEvictionCounters evictions{};
 #endif
     } shared_prefix_cache;
+    shared_prefix_cache.max_prefix_tokens = target_context_length;
+    shared_prefix_cache.max_ram_bytes = std::max<uint64_t>(768ull << 20, parked_lane_budget_bytes);
     // Whole conversations parked in host RAM when another conversation takes the single live lane. Exact token keys; the Rust
     // session names the whole new prompt on its first fresh packet so a lane longer than one input packet can be matched.
     ParkedLanes<SharedPrefixAnchor> parked;
@@ -5008,7 +5247,7 @@ int target_cli(int argc, char** argv) {
     std::vector<uint32_t> lane_tokens;
     bool lane_tokens_valid = false;
     if (shared_prefix_cache_enabled) {
-        shared_prefix_cache.active_tokens.reserve(SharedPrefixCacheState::max_prefix_tokens);
+        shared_prefix_cache.active_tokens.reserve(shared_prefix_cache.max_prefix_tokens);
     }
 #if defined(TOKSPUR_PRIVATE_CACHE_PRESSURE_RECLAIM) && TOKSPUR_PRIVATE_CACHE_PRESSURE_RECLAIM
     reclaim_shared_prefix = [&]() {
@@ -5019,6 +5258,18 @@ int target_cli(int argc, char** argv) {
         std::vector<uint32_t>().swap(shared_prefix_cache.active_tokens);
         shared_prefix_cache.occupied_bytes = 0; shared_prefix_cache.active_valid = false;
         cache_reclaimed_bytes = checked_add(cache_reclaimed_bytes, released);
+    };
+#else
+    reclaim_shared_prefix = [&]() -> uint64_t {
+        uint64_t released = 0;
+        for (const auto& anchor : shared_prefix_cache.anchors) released = checked_add(released, anchor.ram_bytes());
+        const bool had_state = !shared_prefix_cache.anchors.empty() || !shared_prefix_cache.recent_prefixes.empty() ||
+            !shared_prefix_cache.active_tokens.empty() || shared_prefix_cache.occupied_bytes > 0;
+        std::vector<SharedPrefixAnchor>().swap(shared_prefix_cache.anchors);
+        std::vector<std::vector<uint32_t>>().swap(shared_prefix_cache.recent_prefixes);
+        std::vector<uint32_t>().swap(shared_prefix_cache.active_tokens);
+        shared_prefix_cache.occupied_bytes = 0; shared_prefix_cache.active_valid = false;
+        return released > 0 ? released : (had_state ? 1ull : 0ull);
     };
 #endif
     uint64_t ple_overlap_chunks = 0;
@@ -5110,13 +5361,13 @@ int target_cli(int argc, char** argv) {
 #ifdef TOKSPUR_PRIVATE_HTTP_QSA_STAGE_V8
     const auto stage_envelope = [&](Json value) {
         if (!qsa_stage_v8_present) {
-            // These are locally constructed diagnostic members, never incoming
-            // wire data. An absent selector retains the historical wire shape.
-            Json::Object fields;
+            auto fields = std::move(value).take_object();
             constexpr std::array<std::string_view, 9> names{"qsa_stage_v8_prepared", "qsa_stage_v8_enabled", "qsa_stage_v8_scratch_logical_bytes",
                 "qsa_stage_v8_scratch_charged_bytes", "qsa_stage_v8_calls", "qsa_stage_v8_physical_dispatches", "qsa_stage_v8_extra_dispatches",
                 "qsa_stage_v8_request_calls", "qsa_stage_v8_round_calls"};
-            for (const auto& entry : value.object()) if (std::find(names.begin(), names.end(), entry.first) == names.end()) fields.push_back(entry);
+            std::erase_if(fields, [&](const auto& entry) {
+                return std::find(names.begin(), names.end(), entry.first) != names.end();
+            });
             value = Json(std::move(fields));
         }
         return value;
@@ -5177,7 +5428,7 @@ int target_cli(int argc, char** argv) {
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
         const auto* concurrent_event = value.find("event");
         if (concurrent_selected && concurrent_event && (concurrent_event->string() == "ready" || concurrent_event->string() == "done")) {
-            const bool terminal = concurrent_event->string() == "done"; auto fields = value.object();
+            const bool terminal = concurrent_event->string() == "done"; auto fields = std::move(value).take_object();
             fields.emplace_back("concurrent_dispatch_schema", Json::integer(1));
             fields.emplace_back("concurrent_dispatch_mode", Json(gpu.concurrent_dispatch() ? "on" : "off"));
             fields.emplace_back("concurrent_dispatch_barriers", Json::integer(gpu.concurrent_barriers()));
@@ -5199,7 +5450,7 @@ int target_cli(int argc, char** argv) {
 #ifdef TOKSPUR_PRIVATE_SAMPLED_VERIFICATION_COST
         if (sampled_cost_manifest) {
             require(!mtp_head_calls && !mtp_prime_calls && !mtp_rounds, "sampled COST must not execute draft or prime work");
-            auto fields = value.object();
+            auto fields = std::move(value).take_object();
             fields.emplace_back("sampled_verification_cost_protocol",Json("sampled-current-cost-v1"));
             fields.emplace_back("sampled_verification_cost_source_sha256",Json(sampled_cost_manifest->sealed_source_sha256));
             fields.emplace_back("sampled_verification_cost_max_rows",Json::integer(3));
@@ -5229,7 +5480,7 @@ int target_cli(int argc, char** argv) {
         const auto* lane_event = value.find("event");
         if (lane_weights && lane_event && (lane_event->string() == "ready" || lane_event->string() == "done" || lane_event->string() == "control_done")) {
             lane_weights->model->assert_unchanged();
-            auto fields = value.object();
+            auto fields = std::move(value).take_object();
             fields.emplace_back("weight_lanes_schema", Json::integer(lanes::sidecar_version));
             fields.emplace_back("weight_lanes_manifest_sha256", Json(lane_weights->manifest_sha256));
             fields.emplace_back("weight_lanes_tensor_count", Json::integer(lane_weights->plan.tensors.size()));
@@ -5245,7 +5496,7 @@ int target_cli(int argc, char** argv) {
         const auto* pack_event = value.find("event");
         if ((pack || pack_v3) && pack_event && (pack_event->string() == "ready" || pack_event->string() == "done" || pack_event->string() == "control_done")) {
             pack_model->assert_unchanged();
-            auto fields = value.object();
+            auto fields = std::move(value).take_object();
             if (pack) {
                 fields.emplace_back("derived_pack_schema", Json::integer(derived_pack::pack_version));
                 fields.emplace_back("derived_pack_recipe", Json(derived_pack::pack_recipe));
@@ -5279,10 +5530,10 @@ int target_cli(int argc, char** argv) {
 #endif
 #ifdef TOKSPUR_PRIVATE_HTTP_FAST_MATH
         if (!qsa_channel_chronological.has_value()) {
-            // Strip only our two locally constructed optional diagnostic fields.
-            // Incoming wire data is never rewritten or granted unknown fields.
-            Json::Object fields;
-            for (const auto& entry : value.object()) if (entry.first != "qsa_channel_request_calls" && entry.first != "qsa_channel_round_calls") fields.push_back(entry);
+            auto fields = std::move(value).take_object();
+            std::erase_if(fields, [](const auto& entry) {
+                return entry.first == "qsa_channel_request_calls" || entry.first == "qsa_channel_round_calls";
+            });
             value = Json(std::move(fields));
         }
 #endif
@@ -5291,7 +5542,7 @@ int target_cli(int argc, char** argv) {
         if (verification_qsa_rows.has_value() && rows_event && (rows_event->string() == "ready" ||
             rows_event->string() == "done" || rows_event->string() == "verification_cost_case")) {
             const auto memory = stack.verification_qsa_rows_memory(); const auto routes = gpu.qsa_verify_rows_routes();
-            auto fields = value.object();
+            auto fields = std::move(value).take_object();
             fields.emplace_back("verification_qsa_rows_schema", Json::integer(1));
             fields.emplace_back("verification_qsa_rows_mode", Json(qsa_verify_rows_name(memory.config.mode)));
             fields.emplace_back("verification_qsa_rows_logical_bytes", Json::integer(memory.logical_bytes));
@@ -5316,7 +5567,7 @@ int target_cli(int argc, char** argv) {
             ) && known_rows_event &&
             (known_rows_event->string() == "ready" || known_rows_event->string() == "done")) {
             const auto memory = stack.known_qsa_rows_memory(); const auto routes = gpu.qsa_verify_rows_routes();
-            auto fields = value.object();
+            auto fields = std::move(value).take_object();
             fields.emplace_back("known_qsa_rows_schema", Json::integer(1));
             fields.emplace_back("known_qsa_rows_mode", Json(memory.enabled ? "q8" : "off"));
             fields.emplace_back("known_qsa_rows_logical_bytes", Json::integer(memory.logical_bytes));
@@ -5338,7 +5589,7 @@ int target_cli(int argc, char** argv) {
         if (sampled_prefill_input8) {
             const auto* event = value.find("event");
             if (event && (event->string() == "ready" || event->string() == "done")) {
-                auto fields = value.object();
+                auto fields = std::move(value).take_object();
                 fields.emplace_back("sampled_prefill_protocol", Json("sampled-prefill-input8-v1"));
                 value = Json(std::move(fields));
             }
@@ -5348,12 +5599,13 @@ int target_cli(int argc, char** argv) {
         if (mtp || dflash2) {
             const auto* event = value.find("event");
             if (event && (event->string() == "ready" || event->string() == "done")) {
-                auto fields = value.object();
+                const bool ready = event->string() == "ready";
+                auto fields = std::move(value).take_object();
                 if (verify_cost_profile) {
                     Json::Array policy; for (auto byte : mtp_generation.controller_policy()) policy.push_back(Json::integer(byte));
                     fields.emplace_back("native_controller_policy_digest", Json(std::move(policy)));
                     fields.emplace_back("native_measured_controller", Json(true));
-                    if (event->string() == "ready") {
+                    if (ready) {
                         Json::Array modes;
                         for (const auto sampling : {MeasuredSampling::greedy, MeasuredSampling::full, MeasuredSampling::topk, MeasuredSampling::coding})
                             if (verify_cost_profile->supports_sampling(sampling)) modes.emplace_back(std::string(measured_sampling_name(sampling)));
@@ -5399,6 +5651,9 @@ int target_cli(int argc, char** argv) {
                     fields.emplace_back("native_dflash2_precision", Json(dflash2->precision() == DFlash2Precision::bf16 ? "bf16" : "q8_0"));
                     fields.emplace_back("native_dflash2_verify_rows", Json(dflash2->adaptive_budget() ? "auto" : "all"));
                     if (dflash2_max_drafts.has_value()) fields.emplace_back("native_dflash2_max_drafts", Json::integer(dflash2->max_drafts()));
+                    if (!verify_cost_profile && dflash2->burst_max_drafts() > 7u) {
+                        fields.emplace_back("native_dflash2_burst_max_drafts", Json::integer(dflash2->burst_max_drafts()));
+                    }
                     if (dflash2_vocab_slice.has_value()) fields.emplace_back("native_dflash2_vocab_slice", Json::integer(dflash2->draft_vocab_slice()));
                     if (dflash2_vocab_gather.has_value()) {
                         fields.emplace_back("native_dflash2_vocab_gather", Json(*dflash2_vocab_gather));
@@ -5513,6 +5768,22 @@ int target_cli(int argc, char** argv) {
                     fields.emplace_back("native_dflash2_first_cache_position", Json::integer(dflash2->first_absolute_position()));
                     fields.emplace_back("native_dflash2_cache_rows", Json::integer(dflash2->cache_rows()));
                     fields.emplace_back("native_dflash2_weight_bytes", Json::integer(dflash2->weight_bytes()));
+#ifdef TOKSPUR_PRIVATE_DFLASH2_PHASE_TIMING
+                    if (!ready) {
+                        Json::Array timings;
+                        for (size_t rows = 2; rows < dflash2_phase_totals.size(); ++rows) {
+                            const auto& t = dflash2_phase_totals[rows];
+                            if (!t.rounds) continue;
+                            timings.emplace_back(Json::Object{
+                                {"rows", Json::integer(rows)}, {"rounds", Json::integer(t.rounds)},
+                                {"accepted", Json::integer(t.accepted)}, {"round_wall_ms", number(t.round_wall_ms)},
+                                {"draft_wall_ms", number(t.draft_wall_ms)}, {"verification_wall_ms", number(t.verification_wall_ms)},
+                                {"verification_gpu_ms", number(t.verification_gpu_ms)}, {"recovery_wall_ms", number(t.recovery_wall_ms)},
+                                {"recovery_gpu_ms", number(t.recovery_gpu_ms)}});
+                        }
+                        fields.emplace_back("native_dflash2_phase_totals", Json(std::move(timings)));
+                    }
+#endif
                 }
                 if (native_mtp_draft_slice) {
                     fields.emplace_back("native_mtp_draft_slice", Json(true));
@@ -5526,7 +5797,7 @@ int target_cli(int argc, char** argv) {
         if (ssd_manager && ssd_manager->enabled()) {
             const auto* ssd_event = value.find("event");
             if (ssd_event && (ssd_event->string() == "ready" || ssd_event->string() == "done" || ssd_event->string() == "control_done")) {
-                auto fields = value.object();
+                auto fields = std::move(value).take_object();
                 fields.emplace_back("checkpoint_ssd_enabled", Json(true));
                 fields.emplace_back("checkpoint_ssd_policy", Json(ssd_manager->eviction_policy()));
                 fields.emplace_back("checkpoint_ssd_budget_bytes", Json::integer(ssd_manager->budget_bytes()));
@@ -5541,7 +5812,7 @@ int target_cli(int argc, char** argv) {
         if (overlap_prefill) {
             const auto* ov_event = value.find("event");
             if (ov_event && ov_event->string() == "ready") {
-                auto fields = value.object();
+                auto fields = std::move(value).take_object();
                 fields.emplace_back("overlap_prefill_enabled", Json(true));
                 value = Json(std::move(fields));
             }
@@ -5617,8 +5888,9 @@ int target_cli(int argc, char** argv) {
                     q8_gemv_rg4 == Q8GemvRg4Mode::wide ? "wide" : "off";
                 const char* msg_name = q8_three_msg == Q8ThreeMsgMode::on ? "on" :
                     q8_three_msg == Q8ThreeMsgMode::wide ? "wide" : "off";
-                const char* lookup_name = mtp_lookup_mode == MtpLookupMode::bypass ? "bypass" :
-                    mtp_lookup_mode == MtpLookupMode::hybrid ? "hybrid" : "off";
+                const auto active_lookup_mode = dflash2 ? dflash2_lookup_mode : mtp_lookup_mode;
+                const char* lookup_name = active_lookup_mode == MtpLookupMode::bypass ? "bypass" :
+                    active_lookup_mode == MtpLookupMode::hybrid ? "hybrid" : "off";
                 auto fields = value.object();
                 fields.emplace_back("exact_candidate_swiglu_fused", Json(gpu.swiglu_fused_enabled()));
                 fields.emplace_back("exact_candidate_swiglu_calls", Json::integer(gpu.swiglu_fused_calls()));
@@ -5657,6 +5929,20 @@ int target_cli(int argc, char** argv) {
                     {"bytes", Json::integer(shared_prefix_cache.evictions.bytes)},
                     {"count", Json::integer(shared_prefix_cache.evictions.count)},
                     {"both", Json::integer(shared_prefix_cache.evictions.both)}}));
+#endif
+                value = Json(std::move(fields));
+            }
+        } else if (mtp_lookup_mode != MtpLookupMode::off || dflash2_lookup_mode != MtpLookupMode::off) {
+            if (const auto* event = value.find("event"); event && (event->string() == "ready" || event->string() == "done")) {
+                const auto active_mode = dflash2 ? dflash2_lookup_mode : mtp_lookup_mode;
+                const char* lookup_name = active_mode == MtpLookupMode::bypass ? "bypass" :
+                    active_mode == MtpLookupMode::hybrid ? "hybrid" : "off";
+                auto fields = value.object();
+                fields.emplace_back("exact_candidate_mtp_lookup", Json(lookup_name));
+                fields.emplace_back("exact_candidate_mtp_lookup_match", Json::integer(mtp_lookup_match));
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+                fields.emplace_back("exact_candidate_mtp_lookup_rounds", Json::integer(mtp_lookup_rounds));
+                fields.emplace_back("exact_candidate_mtp_lookup_accepted", Json::integer(mtp_lookup_accepted));
 #endif
                 value = Json(std::move(fields));
             }
@@ -5858,7 +6144,7 @@ int target_cli(int argc, char** argv) {
         counter_sampling = gpu.configure_profiling(16384);
     }
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
-    const bool parked_weight_residency = parked_lane_budget_bytes && pack_v3 && !split_pack_weights && mtp && gpu.prepare_mapped_weight_residency();
+    const bool parked_weight_residency = parked_lane_budget_bytes && pack_v3 && !split_pack_weights && (mtp || dflash2) && gpu.prepare_mapped_weight_residency();
 #else
     constexpr bool parked_weight_residency = false;
 #endif
@@ -5989,7 +6275,8 @@ int target_cli(int argc, char** argv) {
         {"memory", describe(memory())}, {"timings_qualified", Json(false)}})).dump() << std::endl;
     std::vector<float> row(2560), embedding(2560); const auto& token_table = files.tensor("token_embd.weight"); const auto row_bytes = token_table.bytes / 248320;
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
-    std::vector<float> mtp_previous_hc(mtp ? 10240 : 0), mtp_candidate_rows((mtp || dflash2) ? 2560 * (mtp_depth + 1) : 0), mtp_candidate_memory((mtp || dflash2) ? 2560 * (mtp_depth + 1) : 0);
+    const size_t spec_cand_cap = dflash2 ? (dflash2_verify16 ? 16u : 8u) : (mtp ? (mtp_depth + 1u) : 0u);
+    std::vector<float> mtp_previous_hc(mtp ? 10240 : 0), mtp_candidate_rows(2560 * spec_cand_cap), mtp_candidate_memory(2560 * spec_cand_cap);
     std::vector<float> mtp_lookup_prime_hc((mtp && mtp_lookup) ? 10240 * (mtp_depth + 1) : 0);
     std::optional<StackResult> mtp_spare;
     if (mtp || dflash2) { mtp_spare.emplace(); mtp_spare->logits.resize(shape.vocabulary); }
@@ -6086,10 +6373,12 @@ int target_cli(int argc, char** argv) {
     std::vector<float> ple_prefetch_rows(ple_overlap ? known_rows.size() : 0), ple_prefetch_embeddings(ple_overlap ? known_embeddings.size() : 0);
     std::vector<uint64_t> ple_chunk_ids(ple_host_cap * 16), ple_prefetch_ids(ple_host_cap * 16);
     PleGatherScratch ple_gather_scratch, ple_prefetch_scratch;
-    const auto advance_known_prepared = [&](std::span<const uint32_t> tokens, uint32_t base, bool emit_logits = true,
-                                            [[maybe_unused]] uint64_t remaining_after = 0) {
+    BatchResult last_known_step_batch{};
+    const auto advance_known_prepared = [&](std::span<const uint32_t> tokens, uint32_t base, bool emit_logits,
+                                            [[maybe_unused]] uint64_t remaining_after, std::optional<CommandTiming>* timing) {
         auto result = stack.step_known(tokens, std::span(known_rows).first(tokens.size() * 2560),
-            std::span(known_embeddings).first(tokens.size() * 2560), emit_logits);
+            std::span(known_embeddings).first(tokens.size() * 2560), emit_logits, timing);
+        last_known_step_batch = result.batch;
         require(result.logits_available == emit_logits && (emit_logits ? result.logits.size() == 248320 : result.logits.empty()),
             "known-token result logits readiness differs");
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
@@ -6156,10 +6445,28 @@ int target_cli(int argc, char** argv) {
             dump_dflash2_taps(DFlash2TapDump::Source::prefill, cap, base, tokens);
 #endif
             const auto started = Clock::now();
-            // Keep every ring row while a shared anchor can still be captured. Later packets only need their final sliding window.
+            const uint32_t df2_window = dflash2->sliding_window();
+            const uint32_t frontier = base + uint32_t(tokens.size());
+            const bool ssd_active = ssd_manager && ssd_manager->enabled();
+            const bool retain_candidates = shared_prefix_cache_enabled || ssd_active;
+            bool retain_window = false;
+            if (retain_candidates) {
+                if (const uint32_t target_m = sqrt_milestone_window_target(
+                        base, frontier, shared_prefix_cache.max_prefix_tokens, df2_window);
+                    target_m > 0) {
+                    const uint64_t mtp_bytes = checkpoint_owner ? checkpoint_owner->ssd_cache_bytes() : 0;
+                    const uint64_t est_bytes = checked_add(stack.ssd_checkpoint_payload_bytes(target_m), mtp_bytes) +
+                        uint64_t(target_m) * sizeof(uint32_t);
+                    const uint64_t cap_bytes = std::max(
+                        shared_prefix_cache_enabled ? shared_prefix_cache.max_ram_bytes : 0ull,
+                        ssd_active ? ssd_manager->budget_bytes() : 0ull);
+                    retain_window = est_bytes <= cap_bytes;
+                }
+            }
+            // Keep <= sliding_window rows while early anchors can be captured and ~sqrt(N) milestone trailing windows; later chunks only need their final sliding window.
             const auto batch = dflash2->commit_context(cap.rows, uint32_t(tokens.size()), base,
-                dflash2_prefill_remaining_after(remaining_after, shared_prefix_cache_enabled,
-                    base + tokens.size(), SharedPrefixCacheState::max_prefix_tokens));
+                dflash2_prefill_remaining_after(remaining_after, retain_candidates,
+                    frontier, df2_window, retain_window));
             mtp_prime_calls += tokens.size();
 #ifdef TOKSPUR_PRIVATE_HTTP_PREFILL512
             if (mtp_chunked_prefill) ++mtp_priming_batch_submits;
@@ -6218,7 +6525,7 @@ int target_cli(int argc, char** argv) {
         }
         return hist;
     };
-    const auto advance_known = [&](std::span<const uint32_t> tokens, bool emit_logits = true) {
+    const auto advance_known = [&](std::span<const uint32_t> tokens, bool emit_logits, uint64_t remaining_after, std::optional<CommandTiming>* timing) {
         own_memory_guard(); const auto base = stack.position();
         require(sampler.matches(base), "invalid sampling prefix before known-token input; reset required");
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
@@ -6363,7 +6670,7 @@ int target_cli(int argc, char** argv) {
                     std::span(known_rows).subspan(i * 2560, 2560));
             }
         }
-        advance_known_prepared(tokens, base, emit_logits);
+        advance_known_prepared(tokens, base, emit_logits, remaining_after, timing);
     };
     bool pressure_reset_required = false;
     const auto emit_error = [&](const std::exception& error, bool fatal) {
@@ -6452,6 +6759,39 @@ int target_cli(int argc, char** argv) {
         const auto fname = ssd_filename_for_digest(prefix_tokens, has_logits, exec_digest);
         const uint64_t stack_bytes = stack.ssd_checkpoint_payload_bytes(pfx);
         const uint64_t mtp_bytes = checkpoint_owner ? checkpoint_owner->ssd_cache_bytes() : 0;
+        const uint64_t total_payload = checked_add(stack_bytes, mtp_bytes);
+        const uint32_t chunk_count = uint32_t((total_payload + checkpoint_chunk_bytes - 1) / checkpoint_chunk_bytes);
+        const uint64_t est_file_bytes = sizeof(CheckpointFileHeader) + uint64_t(chunk_count) * 32ull + sizeof(uint32_t) +
+            (has_logits ? uint64_t(shape.vocabulary) * sizeof(float) : 0ull) + total_payload + 512ull;
+        if (est_file_bytes > ssd_manager->budget_bytes()) return false;
+        while (ssd_manager->occupied_bytes() + est_file_bytes > ssd_manager->budget_bytes()) {
+            auto entries = ssd_manager->list_entries();
+            std::vector<SsdCheckpointManager::EntryInfo> same_lineage;
+            for (const auto& entry : entries) {
+                if (!entry.prefix_tokens || entry.prefix_tokens >= pfx) continue;
+                const auto pfx_slice = prefix_tokens.first(entry.prefix_tokens);
+                if (entry.filename == ssd_filename_for_digest(pfx_slice, false, exec_digest) ||
+                    entry.filename == ssd_filename_for_digest(pfx_slice, true, exec_digest)) {
+                    same_lineage.push_back(entry);
+                }
+            }
+            if (same_lineage.size() < 2) break;
+            std::sort(same_lineage.begin(), same_lineage.end(), [](const auto& a, const auto& b) {
+                return a.prefix_tokens < b.prefix_tokens;
+            });
+            std::vector<uint32_t> positions;
+            std::vector<uint64_t> epochs;
+            positions.reserve(same_lineage.size() + 1);
+            epochs.reserve(same_lineage.size() + 1);
+            for (const auto& e : same_lineage) {
+                positions.push_back(e.prefix_tokens);
+                epochs.push_back(e.access_epoch);
+            }
+            positions.push_back(pfx);
+            epochs.push_back(UINT64_MAX);
+            const size_t victim = sqrt_thinning_victim(positions, epochs, 1024);
+            if (victim >= same_lineage.size() || !ssd_manager->remove_checkpoint(same_lineage[victim].filename)) break;
+        }
         CheckpointFileHeader hdr{};
         hdr.prefix_tokens = pfx;
         hdr.total_payload_bytes = checked_add(stack_bytes, mtp_bytes);
@@ -6592,6 +6932,7 @@ int target_cli(int argc, char** argv) {
         if (has_speculative) {
             mtp_generation.controller_state() = restore_controller_policy(out_meta.controller_state, mtp_generation.controller_policy(), mtp_generation.controller_policy() != default_controller_policy_digest);
         }
+        if (dflash2) dflash2->reset_verify_budget();
         ssd_token_history.assign(prefix_tokens.begin(), prefix_tokens.end());
         if (mtp_lookup) {
             static_cast<void>(mtp_lookup->reset());
@@ -6629,7 +6970,7 @@ int target_cli(int argc, char** argv) {
             shared_prefix_cache.active_tokens.size() < SharedPrefixCacheState::boundary_tokens) {
             return;
         }
-        const size_t capped = std::min<size_t>(shared_prefix_cache.active_tokens.size(), SharedPrefixCacheState::max_prefix_tokens);
+        const size_t capped = std::min<size_t>(shared_prefix_cache.active_tokens.size(), shared_prefix_cache.max_prefix_tokens);
         const auto cand = std::span<const uint32_t>(shared_prefix_cache.active_tokens).first(capped);
         for (size_t idx = 0; idx < shared_prefix_cache.recent_prefixes.size(); ++idx) {
             auto& prev = shared_prefix_cache.recent_prefixes[idx];
@@ -6649,20 +6990,13 @@ int target_cli(int argc, char** argv) {
         }
         shared_prefix_cache.recent_prefixes.emplace_back(cand.begin(), cand.end());
     };
-    const auto shared_prefix_best_lcp_len = [&](std::span<const uint32_t> cand) -> size_t {
-        if (!shared_prefix_cache_enabled) return 0;
-        return shared_prefix_best_lcp(shared_prefix_cache.recent_prefixes, cand,
-            SharedPrefixCacheState::boundary_tokens, SharedPrefixCacheState::max_prefix_tokens);
-    };
-    const auto shared_prefix_lcp_boundary = [&](std::span<const uint32_t> cand) -> size_t {
-        return (shared_prefix_best_lcp_len(cand) / SharedPrefixCacheState::boundary_tokens) *
-            SharedPrefixCacheState::boundary_tokens;
-    };
     const auto capture_shared_prefix = [&](std::span<const uint32_t> prefix_tokens, bool allow_exact_boundary = false) -> bool {
         if (!shared_prefix_cache_enabled) return false;
         const uint32_t pfx = stack.position();
-        if (!pfx || pfx < SharedPrefixCacheState::boundary_tokens || pfx > SharedPrefixCacheState::max_prefix_tokens ||
-            (!allow_exact_boundary && pfx % SharedPrefixCacheState::boundary_tokens != 0) || prefix_tokens.size() != pfx) {
+        const bool sqrt_or_boundary = pfx <= 2048 ? (pfx % SharedPrefixCacheState::boundary_tokens == 0) :
+            is_sqrt_checkpoint_milestone(pfx, SharedPrefixCacheState::boundary_tokens, 2048);
+        if (!pfx || pfx < SharedPrefixCacheState::boundary_tokens || pfx > shared_prefix_cache.max_prefix_tokens ||
+            (!allow_exact_boundary && !sqrt_or_boundary) || prefix_tokens.size() != pfx) {
             return false;
         }
         const auto kp = gpu.kernel_policy();
@@ -6678,7 +7012,7 @@ int target_cli(int argc, char** argv) {
                 existing.last_access_tick = ++shared_prefix_cache.tick;
                 if (has_logits && !existing.has_logits) {
                     const uint64_t extra = uint64_t(shape.vocabulary) * sizeof(float);
-                    if (shared_prefix_cache.occupied_bytes + extra <= SharedPrefixCacheState::max_ram_bytes) {
+                    if (shared_prefix_cache.occupied_bytes + extra <= shared_prefix_cache.max_ram_bytes) {
                         existing.logits = retained.get(pfx).logits;
                         existing.has_logits = true;
                         shared_prefix_cache.occupied_bytes += extra;
@@ -6689,24 +7023,54 @@ int target_cli(int argc, char** argv) {
         }
         const uint64_t stack_bytes = stack.ssd_checkpoint_payload_bytes(pfx);
         uint64_t mtp_bytes = 0;
+        uint64_t verify_budget_bytes = 0;
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
         if (checkpoint_owner) mtp_bytes = checkpoint_owner->ssd_cache_bytes();
+        if (dflash2) verify_budget_bytes = uint64_t(dflash2->verify_budget().label_count()) * sizeof(DFlash2VerifyBudget::Label);
 #endif
         const uint64_t total_payload = checked_add(stack_bytes, mtp_bytes);
-        const uint64_t needed_ram = total_payload + (has_logits ? uint64_t(shape.vocabulary) * sizeof(float) : 0) + uint64_t(pfx) * sizeof(uint32_t);
-        if (needed_ram > SharedPrefixCacheState::max_ram_bytes) return false;
-        while ((shared_prefix_cache.occupied_bytes + needed_ram > SharedPrefixCacheState::max_ram_bytes ||
+        const uint64_t needed_ram = total_payload + (has_logits ? uint64_t(shape.vocabulary) * sizeof(float) : 0) + uint64_t(pfx) * sizeof(uint32_t) + verify_budget_bytes;
+        if (needed_ram > shared_prefix_cache.max_ram_bytes) return false;
+        const auto mem_check = memory();
+        if (!memory_work_admitted({checked_add(mem_check.current, needed_ram), mem_check.pressure}, native_limit)) return false;
+        while ((shared_prefix_cache.occupied_bytes + needed_ram > shared_prefix_cache.max_ram_bytes ||
                 shared_prefix_cache.anchors.size() >= SharedPrefixCacheState::max_anchors) &&
                !shared_prefix_cache.anchors.empty()) {
 #if defined(TOKSPUR_PRIVATE_SHARED_PREFIX_EVICTION_COUNTERS) && TOKSPUR_PRIVATE_SHARED_PREFIX_EVICTION_COUNTERS
             shared_prefix_cache.evictions.record(shared_prefix_eviction_cause(
-                shared_prefix_cache.occupied_bytes + needed_ram > SharedPrefixCacheState::max_ram_bytes,
+                shared_prefix_cache.occupied_bytes + needed_ram > shared_prefix_cache.max_ram_bytes,
                 shared_prefix_cache.anchors.size() >= SharedPrefixCacheState::max_anchors));
 #endif
-            const size_t victim = shared_prefix_victim(SharedPrefixEvictionPolicy::lru, shared_prefix_cache.anchors,
-                std::span<const uint32_t>(prefix_tokens.data(), prefix_tokens.size()),
-                [](const SharedPrefixAnchor& item) -> const std::vector<uint32_t>& { return item.tokens; },
-                [](const SharedPrefixAnchor& item) { return item.last_access_tick; });
+            bool all_own_prefix = !shared_prefix_cache.anchors.empty();
+            for (const auto& item : shared_prefix_cache.anchors) {
+                if (!(item.tokens.size() < prefix_tokens.size() &&
+                      std::equal(item.tokens.begin(), item.tokens.end(), prefix_tokens.begin()))) {
+                    all_own_prefix = false;
+                    break;
+                }
+            }
+            size_t victim = 0;
+            if (all_own_prefix && shared_prefix_cache.anchors.size() >= 2) {
+                std::vector<size_t> order(shared_prefix_cache.anchors.size());
+                for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+                std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+                    const size_t sa = shared_prefix_cache.anchors[a].tokens.size();
+                    const size_t sb = shared_prefix_cache.anchors[b].tokens.size();
+                    return sa != sb ? sa < sb : a < b;
+                });
+                std::vector<uint32_t> positions(order.size());
+                std::vector<uint64_t> epochs(order.size());
+                for (size_t i = 0; i < order.size(); ++i) {
+                    positions[i] = uint32_t(shared_prefix_cache.anchors[order[i]].tokens.size());
+                    epochs[i] = shared_prefix_cache.anchors[order[i]].last_access_tick;
+                }
+                victim = order[sqrt_thinning_victim(positions, epochs, 1024)];
+            } else {
+                victim = shared_prefix_victim(SharedPrefixEvictionPolicy::lru, shared_prefix_cache.anchors,
+                    std::span<const uint32_t>(prefix_tokens.data(), prefix_tokens.size()),
+                    [](const SharedPrefixAnchor& item) -> const std::vector<uint32_t>& { return item.tokens; },
+                    [](const SharedPrefixAnchor& item) { return item.last_access_tick; });
+            }
             shared_prefix_cache.occupied_bytes -= shared_prefix_cache.anchors[victim].ram_bytes();
             shared_prefix_cache.anchors.erase(shared_prefix_cache.anchors.begin() + ptrdiff_t(victim));
         }
@@ -6723,6 +7087,10 @@ int target_cli(int argc, char** argv) {
         anchor.mtp_first = checkpoint_owner ? checkpoint_owner->first_absolute_position() : 1;
         anchor.mtp_rows = checkpoint_owner ? checkpoint_owner->cache_rows() : 0;
         anchor.controller_state = has_speculative ? mtp_generation.controller_state() : StageAControllerState{};
+        if (dflash2) {
+            anchor.has_dflash2_verify_budget = true;
+            anchor.dflash2_verify_budget = dflash2->verify_budget();
+        }
 #endif
         if (has_logits) anchor.logits = retained.get(pfx).logits;
         anchor.payload.resize(size_t(total_payload));
@@ -6772,6 +7140,10 @@ int target_cli(int argc, char** argv) {
         if (has_speculative) {
             mtp_generation.controller_state() = restore_controller_policy(anchor.controller_state, mtp_generation.controller_policy(), mtp_generation.controller_policy() != default_controller_policy_digest);
         }
+        if (dflash2) {
+            if (anchor.has_dflash2_verify_budget) dflash2->set_verify_budget(anchor.dflash2_verify_budget);
+            else dflash2->reset_verify_budget();
+        }
         if (ssd_manager && ssd_manager->enabled()) {
             ssd_token_history.assign(anchor.tokens.begin(), anchor.tokens.end());
             last_ssd_spill_prefix = target_pfx;
@@ -6792,18 +7164,38 @@ int target_cli(int argc, char** argv) {
         if (lane_tokens.size() != pfx || !sampler.matches(pfx)) { ++parked.skips; return; }
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
         if (mtp && (mtp->deferred_prime_rows() || mtp->next_absolute_position() != pfx)) { ++parked.skips; return; }
-        if (dflash2 && (dflash2->deferred_context() || dflash2->context_len() != pfx)) { ++parked.skips; return; }
+        if (dflash2) {
+            if (dflash2->deferred_context()) {
+                const auto flush_started = Clock::now();
+                const auto flush = dflash2->flush_context();
+                if (flush.dispatches > 0) {
+                    mtp_prime_gpu_ms += flush.gpu_ms;
+                    mtp_prime_wall_ms += milliseconds(flush_started);
+                }
+            }
+            if (dflash2->context_len() != pfx) { ++parked.skips; return; }
+        }
         if (has_speculative && (mtp_generation.active() || mtp_generation.pending_overflow())) { ++parked.skips; return; }
 #endif
+        const auto fallback_spill_ssd = [&]() {
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+            if (ssd_manager && ssd_manager->enabled() &&
+                should_spill_ssd_tail(pfx, last_ssd_spill_prefix, SharedPrefixCacheState::boundary_tokens, 2048)) {
+                static_cast<void>(spill_to_ssd(lane_tokens, pfx <= 1024));
+            }
+#endif
+        };
         const uint64_t stack_bytes = stack.ssd_checkpoint_payload_bytes(pfx);
         uint64_t mtp_bytes = 0;
+        uint64_t verify_budget_bytes = 0;
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
         if (checkpoint_owner) mtp_bytes = checkpoint_owner->ssd_cache_bytes();
+        if (dflash2) verify_budget_bytes = uint64_t(dflash2->verify_budget().label_count()) * sizeof(DFlash2VerifyBudget::Label);
 #endif
         const bool has_logits = retained.matches(pfx);
         const uint64_t needed = checked_add(checked_add(stack_bytes, mtp_bytes),
-            (has_logits ? uint64_t(shape.vocabulary) * sizeof(float) : 0) + uint64_t(pfx) * sizeof(uint32_t));
-        if (needed > parked_lane_budget_bytes) { ++parked.skips; return; }
+            (has_logits ? uint64_t(shape.vocabulary) * sizeof(float) : 0) + uint64_t(pfx) * sizeof(uint32_t) + verify_budget_bytes);
+        if (needed > parked_lane_budget_bytes) { fallback_spill_ssd(); ++parked.skips; return; }
         // Keep a shorter restorable version until all replacement bytes have been copied.
         const auto supersedes = [&](const SharedPrefixAnchor& old) {
             return old.lane_sampling.compatible_lane(sampler.options()) && old.tokens.size() <= pfx &&
@@ -6811,7 +7203,7 @@ int target_cli(int argc, char** argv) {
         };
         uint64_t protected_bytes = 0;
         for (const auto& old : parked.lanes) if (supersedes(old)) protected_bytes += old.ram_bytes();
-        if (protected_bytes + needed > parked_lane_budget_bytes) { ++parked.skips; return; }
+        if (protected_bytes + needed > parked_lane_budget_bytes) { fallback_spill_ssd(); ++parked.skips; return; }
         while (parked.bytes + needed > parked_lane_budget_bytes) {
             auto victim = parked.lanes.end();
             for (auto it = parked.lanes.begin(); it != parked.lanes.end(); ++it) {
@@ -6822,7 +7214,12 @@ int target_cli(int argc, char** argv) {
             ++parked.evictions;
         }
         const auto m = memory();
-        if (!memory_work_admitted({checked_add(m.current, needed), m.pressure}, native_limit)) { ++parked.skips; return; }
+        if (!memory_work_admitted({checked_add(m.current, needed), m.pressure}, native_limit) ||
+            m.free_file < checked_add(needed, 8 * gib)) {
+            fallback_spill_ssd();
+            ++parked.skips;
+            return;
+        }
         SharedPrefixAnchor lane{};
         lane.tokens = lane_tokens;
         lane.kernel_policy = gpu.kernel_policy();
@@ -6837,6 +7234,10 @@ int target_cli(int argc, char** argv) {
         lane.mtp_first = checkpoint_owner ? checkpoint_owner->first_absolute_position() : 1;
         lane.mtp_rows = checkpoint_owner ? checkpoint_owner->cache_rows() : 0;
         lane.controller_state = has_speculative ? mtp_generation.controller_state() : StageAControllerState{};
+        if (dflash2) {
+            lane.has_dflash2_verify_budget = true;
+            lane.dflash2_verify_budget = dflash2->verify_budget();
+        }
 #endif
         if (has_logits) lane.logits = retained.get(pfx).logits;
         lane.payload.resize(size_t(stack_bytes + mtp_bytes));
@@ -6865,6 +7266,7 @@ int target_cli(int argc, char** argv) {
     double last_prefill_wall_ms = 0.0;
     uint64_t last_prefill_dispatches = 0;
     PrefillTop10MixtureTelemetry last_prefill_top10_mixture_stats{};
+    SavedPrefillTiming last_prefill_timing{};
 #endif
     const size_t max_wire_bytes = target_context_length > 65536 ? 4 * 1024 * 1024 : 1024 * 1024;
     const size_t max_wire_nodes = target_context_length > 65536 ? 600000 : 300000;
@@ -7021,9 +7423,12 @@ int target_cli(int argc, char** argv) {
                         uint32_t restored_mtp_rows = 0;
                         std::optional<SampledPathToken> restored_anchor{};
                         uint32_t restored_overflow = 0;
+                        DFlash2VerifyBudget restored_vb{};
+                        bool has_restored_vb = false;
                         branches->restore(*selected, retained, sampler, options,
                             [&](StackCheckpoint handle) { return stack.restore_checkpoint(handle); },
-                            &restored_ctrl, &restored_mtp_rows, &restored_anchor, &restored_overflow);
+                            &restored_ctrl, &restored_mtp_rows, &restored_anchor, &restored_overflow,
+                            &restored_vb, &has_restored_vb);
                         if (mtp) {
                             const uint32_t target_rows = stack.position() > 1 ? stack.position() - 1 : 0;
                             if (target_rows <= mtp->cache_rows()) mtp->truncate(target_rows);
@@ -7031,6 +7436,8 @@ int target_cli(int argc, char** argv) {
                         } else if (dflash2) {
                             if (stack.position() <= dflash2->context_len()) dflash2->truncate(stack.position());
                             else dflash2->reset();
+                            if (has_restored_vb) dflash2->set_verify_budget(restored_vb);
+                            else dflash2->reset_verify_budget();
                         }
                         if (has_speculative) {
                             mtp_generation.controller_state() = restore_controller_policy(restored_ctrl, mtp_generation.controller_policy(), mtp_generation.controller_policy() != default_controller_policy_digest);
@@ -7084,7 +7491,14 @@ int target_cli(int argc, char** argv) {
                         }
 #endif
                         if (!ssd_hit) {
-                            reset_session(retained, sampler, options, [&] { stack.reset(); }); branches->reset(); outcome = "cold_miss";
+                            reset_session(retained, sampler, options, [&] {
+                                stack.reset();
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+                                if (mtp) mtp->reset(1);
+                                if (dflash2) dflash2->reset();
+#endif
+                            });
+                            branches->reset(); outcome = "cold_miss";
                             session_generated_since_reset = false;
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
                             ssd_token_history.clear();
@@ -7106,6 +7520,7 @@ int target_cli(int argc, char** argv) {
                     const std::optional<SampledPathToken> anchor_val = anchor_p ? std::optional<SampledPathToken>(*anchor_p) : std::nullopt;
                     const uint32_t overflow_val = has_speculative ? mtp_generation.pending_overflow() : 0;
                     branches->capture(position, retained, &sampler, ctrl_p, 1, mtp_rows_val, anchor_val, overflow_val,
+                        dflash2 ? &dflash2->verify_budget() : nullptr,
                         [&] { return stack.retain_checkpoint(); });
                     if (ssd_manager && ssd_manager->enabled() && ssd_token_history.size() == position) {
                         static_cast<void>(spill_to_ssd(ssd_token_history, position <= 1024));
@@ -7349,6 +7764,8 @@ int target_cli(int argc, char** argv) {
             require(!job.lookup || !job.branch || (lookup_active && lookup->matches(position)), "branch lookup restore requires coherent current ancestry; use explicit cold reset");
             if (broker) broker->started(*ticket);
             const auto started = Clock::now();
+            PrefillTiming prefill_timing{};
+            std::optional<Clock::time_point> prefill_loop_started, prefill_loop_finished;
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM
             const uint64_t dispatches_before_prefill = gpu.lifetime_dispatches();
             if (!job.tokens.empty() || job.reset) {
@@ -7412,9 +7829,12 @@ int target_cli(int argc, char** argv) {
                 uint32_t restored_mtp_rows = 0;
                 std::optional<SampledPathToken> restored_anchor{};
                 uint32_t restored_overflow = 0;
+                DFlash2VerifyBudget restored_vb{};
+                bool has_restored_vb = false;
                 input_at = branches->restore(*selected, retained, sampler, job.sampling,
                     [&](StackCheckpoint handle) { return stack.restore_checkpoint(handle); },
-                    &restored_ctrl, &restored_mtp_rows, &restored_anchor, &restored_overflow);
+                    &restored_ctrl, &restored_mtp_rows, &restored_anchor, &restored_overflow,
+                    &restored_vb, &has_restored_vb);
                 if (mtp) {
                     const uint32_t target_rows = stack.position() > 1 ? stack.position() - 1 : 0;
                     if (target_rows <= mtp->cache_rows()) mtp->truncate(target_rows);
@@ -7422,6 +7842,8 @@ int target_cli(int argc, char** argv) {
                 } else if (dflash2) {
                     if (stack.position() <= dflash2->context_len()) dflash2->truncate(stack.position());
                     else dflash2->reset();
+                    if (has_restored_vb) dflash2->set_verify_budget(restored_vb);
+                    else dflash2->reset_verify_budget();
                 }
                 if (has_speculative) {
                     mtp_generation.controller_state() = restore_controller_policy(restored_ctrl, mtp_generation.controller_policy(), mtp_generation.controller_policy() != default_controller_policy_digest);
@@ -7442,6 +7864,7 @@ int target_cli(int argc, char** argv) {
                 input_at = branches->restore(*selected, retained, sampler, job.sampling,
                     [&](StackCheckpoint handle) { return stack.restore_checkpoint(handle); });
 #endif
+                lane_tokens.clear(); lane_tokens_valid = false;
                 if (job.lookup) lookup->restore(uint32_t(input_at)); else if (lookup) lookup->invalidate();
                 lookup_active = job.lookup;
                 session_generated_since_reset = true;
@@ -7463,6 +7886,7 @@ int target_cli(int argc, char** argv) {
                         const auto cand = std::span<const uint32_t>(job.tokens).first(entry.prefix_tokens);
                         if (entry.filename == ssd_filename_for_digest(cand, true, job_exec_digest) &&
                             restore_from_ssd_with_digest(cand, true, job.sampling, job_exec_digest)) {
+                            lane_tokens.clear(); lane_tokens_valid = false;
                             if (branches) {
                                 branches->reset();
                                 require(branches->committed(stack.position(), cand), "SSD branch history sync failed");
@@ -7530,23 +7954,85 @@ int target_cli(int argc, char** argv) {
             // configuration refusal cannot leave an old prefix under a new mode.
             if (job.small_splits != small_gemv_splits) { gpu.configure_small_gemv(job.small_splits); small_gemv_splits = job.small_splits; }
             if (job.block_formats != block_gemv_formats) { gpu.configure_block_gemv(job.block_formats); block_gemv_formats = job.block_formats; }
+            uint32_t lane_restored = 0;
+            size_t ssd_restored_prefix = 0;
+            const auto ram_eligible = parked_lane_budget_bytes && job.reset && !job.tokens.empty() && !job.branch && !broker &&
+                stack.position() == 0 && job.known_prefill;
+            const auto [ram_best_idx, ram_best_match] = ram_eligible ? parked.find(job) : std::pair<size_t, ParkedMatch>{parked.lanes.size(), ParkedMatch::miss};
+            const uint32_t ram_best_len = ram_best_idx != parked.lanes.size() ? uint32_t(parked.lanes[ram_best_idx].tokens.size()) : 0u;
+            const auto try_ram_parked_restore = [&]() {
+                if (!ram_eligible || lane_restored || ssd_restored_this_request || ram_best_idx == parked.lanes.size()) return;
+                const auto restore_started = Clock::now();
+                auto& lane = parked.lanes[ram_best_idx];
+                if (restore_shared_prefix_anchor(lane, ram_best_match == ParkedMatch::with_logits, lane.lane_sampling, nullptr)) {
+                    const uint32_t length = uint32_t(lane.tokens.size());
+                    const size_t in_packet = std::min<size_t>(length, job.tokens.size());
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+                    // Priming counts follow the packet: restored packet rows count as primed, rows beyond the packet do not.
+                    if (mtp || dflash2) mtp_prime_calls += uint32_t(in_packet) - (mtp ? 1u : 0u);
+#endif
+                    parked.bytes -= lane.ram_bytes();
+                    lane_tokens = std::move(lane.tokens); lane_tokens_valid = true;
+                    shared_prefix_cache.active_valid = false;
+                    shared_prefix_cache.active_tokens.clear();
+                    parked.lanes.erase(parked.lanes.begin() + ptrdiff_t(ram_best_idx));
+                    ++parked.restores; parked.restored_tokens += length;
+                    input_at = in_packet;
+                    lane_restored = length;
+                    shared_prefix_restored_this_request = in_packet == job.tokens.size();
+                    restore_ms = milliseconds(restore_started);
+                } else {
+                    ++parked.skips;
+                }
+            };
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+            uint32_t best_ssd_len = 0;
+            std::vector<uint32_t> ssd_candidate_history;
+            std::vector<SsdCheckpointManager::EntryInfo> ssd_entries;
+            const bool use_lane_prompt = !job.lane_prompt.empty();
+            const size_t max_ssd_prefix = use_lane_prompt
+                ? (ssd_token_history.size() + job.lane_prompt.size() - 1)
+                : (ssd_token_history.size() + job.tokens.size());
             if (!job.branch && !broker && !job.tokens.empty() && ssd_manager && ssd_manager->enabled() &&
                 ssd_token_history.size() == stack.position()) {
-                std::vector<uint32_t> candidate_history = ssd_token_history;
-                candidate_history.insert(candidate_history.end(), job.tokens.begin(), job.tokens.end());
+                ssd_candidate_history = ssd_token_history;
+                if (use_lane_prompt) {
+                    ssd_candidate_history.insert(ssd_candidate_history.end(), job.lane_prompt.begin(), job.lane_prompt.end());
+                } else {
+                    ssd_candidate_history.insert(ssd_candidate_history.end(), job.tokens.begin(), job.tokens.end());
+                }
+                ssd_entries = ssd_manager->list_entries();
+                std::sort(ssd_entries.begin(), ssd_entries.end(), [](const auto& a, const auto& b) { return a.prefix_tokens > b.prefix_tokens; });
+                const auto original_prefix = stack.position();
+                for (const auto& entry : ssd_entries) {
+                    if (entry.prefix_tokens <= original_prefix || entry.prefix_tokens > max_ssd_prefix) continue;
+                    const auto prefix = std::span<const uint32_t>(ssd_candidate_history).first(entry.prefix_tokens);
+                    const bool overshoot_packet = entry.prefix_tokens > original_prefix + job.tokens.size();
+                    const bool needs_logits = !overshoot_packet && packet_emits_logits &&
+                        entry.prefix_tokens == original_prefix + job.tokens.size();
+                    if ((needs_logits ? false : entry.filename == ssd_filename_for(prefix, false)) ||
+                        entry.filename == ssd_filename_for(prefix, true)) {
+                        best_ssd_len = entry.prefix_tokens;
+                        break;
+                    }
+                }
+            }
+            if (ram_best_len > 0 && ram_best_len >= best_ssd_len) {
+                try_ram_parked_restore();
+            }
+            if (!lane_restored && best_ssd_len > 0) {
                 const auto restore_started = Clock::now();
                 const auto opts = job.reset ? job.sampling : sampler.options();
                 // Copied before any restore: an append keeps this exact stream.
                 const SamplingRng live_stream = sampler.random();
                 const SamplingRng* const inherited_stream = job.reset ? nullptr : &live_stream;
                 const auto original_prefix = stack.position();
-                auto entries = ssd_manager->list_entries();
-                std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) { return a.prefix_tokens > b.prefix_tokens; });
-                for (const auto& entry : entries) {
-                    if (entry.prefix_tokens <= original_prefix || entry.prefix_tokens > candidate_history.size()) continue;
-                    const auto prefix = std::span<const uint32_t>(candidate_history).first(entry.prefix_tokens);
-                    const bool needs_logits = packet_emits_logits && entry.prefix_tokens == candidate_history.size();
+                for (const auto& entry : ssd_entries) {
+                    if (entry.prefix_tokens <= original_prefix || entry.prefix_tokens > max_ssd_prefix) continue;
+                    const auto prefix = std::span<const uint32_t>(ssd_candidate_history).first(entry.prefix_tokens);
+                    const bool overshoot_packet = entry.prefix_tokens > original_prefix + job.tokens.size();
+                    const bool needs_logits = !overshoot_packet && packet_emits_logits &&
+                        entry.prefix_tokens == original_prefix + job.tokens.size();
                     bool restored = false;
                     for (const bool logits : {true, false}) {
                         if ((!logits && needs_logits) || entry.filename != ssd_filename_for(prefix, logits)) continue;
@@ -7555,16 +8041,34 @@ int target_cli(int argc, char** argv) {
                     }
                     if (!restored) continue;
                     const uint32_t restored_delta = entry.prefix_tokens - original_prefix;
-                    if (mtp || dflash2) mtp_prime_calls += restored_delta - (mtp && job.reset ? 1u : 0u);
+                    const size_t in_packet = std::min<size_t>(restored_delta, job.tokens.size());
+                    const auto restored_span = std::span<const uint32_t>(ssd_candidate_history).subspan(original_prefix, restored_delta);
+                    if (restored_delta > job.tokens.size()) {
+                        retained.clear();
+                    }
+                    if (mtp || dflash2) mtp_prime_calls += uint32_t(in_packet) - (mtp && job.reset ? 1u : 0u);
                     if (branches) {
                         if (job.reset) branches->reset();
-                        require(branches->committed(stack.position(), std::span<const uint32_t>(job.tokens).first(restored_delta)), "SSD prefill branch history sync failed");
+                        require(branches->committed(stack.position(), restored_span), "SSD prefill branch history sync failed");
                     }
                     if (lookup_active) {
                         if (job.reset) lookup->reset();
-                        lookup->committed(stack.position(), std::span<const uint32_t>(job.tokens).first(restored_delta));
+                        lookup->committed(stack.position(), restored_span);
                     }
-                    input_at = restored_delta;
+                    if (shared_prefix_cache_enabled) {
+                        shared_prefix_cache.active_tokens = ssd_token_history;
+                        shared_prefix_cache.active_valid = true;
+                    }
+                    if (parked_lane_budget_bytes && job.reset && job.known_prefill) {
+                        lane_tokens = ssd_token_history;
+                        lane_tokens_valid = true;
+                        ssd_restored_prefix = restored_delta;
+                        const size_t prompt_len = use_lane_prompt ? job.lane_prompt.size() : job.tokens.size();
+                        if (restored_delta > job.tokens.size() || (job.lane_inherit_seed && restored_delta < prompt_len)) {
+                            lane_restored = restored_delta;
+                        }
+                    }
+                    input_at = in_packet;
                     ssd_restored_this_request = true;
                     session_generated_since_reset = true;
                     restore_ms = milliseconds(restore_started);
@@ -7572,34 +8076,8 @@ int target_cli(int argc, char** argv) {
                 }
             }
 #endif
-            uint32_t lane_restored = 0;
-            if (parked_lane_budget_bytes && job.reset && !job.tokens.empty() && !ssd_restored_this_request && !job.branch && !broker &&
-                stack.position() == 0 && job.known_prefill) {
-                const auto [best, match] = parked.find(job);
-                if (best != parked.lanes.size()) {
-                    const auto restore_started = Clock::now();
-                    auto& lane = parked.lanes[best];
-                    if (restore_shared_prefix_anchor(lane, match == ParkedMatch::with_logits, lane.lane_sampling, nullptr)) {
-                        const uint32_t length = uint32_t(lane.tokens.size());
-                        const size_t in_packet = std::min<size_t>(length, job.tokens.size());
-#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
-                        // Priming counts follow the packet: restored packet rows count as primed, rows beyond the packet do not.
-                        if (mtp || dflash2) mtp_prime_calls += uint32_t(in_packet) - (mtp ? 1u : 0u);
-#endif
-                        parked.bytes -= lane.ram_bytes();
-                        lane_tokens = std::move(lane.tokens); lane_tokens_valid = true;
-                        shared_prefix_cache.active_valid = false;
-                        shared_prefix_cache.active_tokens.clear();
-                        parked.lanes.erase(parked.lanes.begin() + ptrdiff_t(best));
-                        ++parked.restores; parked.restored_tokens += length;
-                        input_at = in_packet;
-                        lane_restored = length;
-                        shared_prefix_restored_this_request = in_packet == job.tokens.size();
-                        restore_ms = milliseconds(restore_started);
-                    } else {
-                        ++parked.skips;
-                    }
-                }
+            if (!lane_restored && !ssd_restored_this_request) {
+                try_ram_parked_restore();
             }
             if (shared_prefix_cache_enabled && !ssd_restored_this_request && !job.branch && !broker && !lane_restored &&
                 !job.tokens.empty() && shared_prefix_cache.active_valid &&
@@ -7684,15 +8162,12 @@ int target_cli(int argc, char** argv) {
                     std::min<size_t>(known_token_capacity, 512u);
 #endif
                 const size_t base_pos_at_input = stack.position();
-                size_t prefill_shared_lcp_boundary = 0;
+                size_t prefill_shared_lcp = 0;
                 if (shared_prefix_cache_enabled && !job.branch && !broker && shared_prefix_cache.active_valid &&
                     shared_prefix_cache.active_tokens.size() == base_pos_at_input &&
-                    base_pos_at_input < SharedPrefixCacheState::max_prefix_tokens) {
-                    std::vector<uint32_t> prospective = shared_prefix_cache.active_tokens;
-                    const size_t room = SharedPrefixCacheState::max_prefix_tokens - prospective.size();
-                    const size_t add_n = std::min<size_t>(job.tokens.size() - input_at, room);
-                    prospective.insert(prospective.end(), job.tokens.begin() + input_at, job.tokens.begin() + input_at + add_n);
-                    prefill_shared_lcp_boundary = shared_prefix_lcp_boundary(prospective);
+                    base_pos_at_input < shared_prefix_cache.max_prefix_tokens) {
+                    prefill_shared_lcp = shared_prefix_best_lcp(shared_prefix_cache.recent_prefixes, shared_prefix_cache.active_tokens,
+                        SharedPrefixCacheState::boundary_tokens, shared_prefix_cache.max_prefix_tokens, std::span(job.tokens).subspan(input_at));
                 }
                 const auto chunk_count_at = [&](size_t offset) -> size_t {
                     if (offset >= job.tokens.size()) return 0;
@@ -7708,9 +8183,12 @@ int target_cli(int argc, char** argv) {
                         }
                     }
                     const size_t clamped = clamp_chunk_to_shared_prefix_boundary(
-                        n, abs_pos, prefill_shared_lcp_boundary, SharedPrefixCacheState::boundary_tokens);
-                    const bool clamped_for_shared_prefix = clamped < n;
-                    n = clamped;
+                        n, abs_pos, prefill_shared_lcp, SharedPrefixCacheState::boundary_tokens);
+                    const bool clamped_for_shared_prefix =
+                        clamped < n && (job.tokens.size() - offset - clamped != 1);
+                    if (clamped_for_shared_prefix) {
+                        n = clamped;
+                    }
                     if (!clamped_for_shared_prefix && ple_async_gather_enabled && !split_boundary_16 && n > 2 &&
                         (job.tokens.size() - offset - n == 1)) {
                         --n;
@@ -7720,8 +8198,16 @@ int target_cli(int argc, char** argv) {
                 bool has_prefetched_chunk = false;
                 size_t prefetched_at = 0, prefetched_count = 0;
                 NgramHistory prefetched_entry_history{}, prefetched_exit_history{};
+                prefill_loop_started = Clock::now();
                 for (size_t at = input_at; at < job.tokens.size();) {
                     const size_t count = chunk_count_at(at);
+                    const auto chunk_started = Clock::now();
+                    PrefillChunkTiming chunk_timing{};
+                    chunk_timing.tokens = uint32_t(count);
+                    auto* command_timing = prefill_timing.chunks < PrefillTiming::command_timing_chunks ? &chunk_timing.stack_command : nullptr;
+                    const double chunk_capture_before = capture_ms, chunk_prime_gpu_before = mtp_prime_gpu_ms;
+                    last_known_step_batch = {};
+                    std::optional<Clock::time_point> advance_started, advance_finished;
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
                     std::optional<uint32_t> part_chunk_mode;
 #ifdef TOKSPUR_PRIVATE_CHUNKED_PREFILL
@@ -7789,8 +8275,11 @@ int target_cli(int argc, char** argv) {
                                         prefetch_error = std::current_exception();
                                     }
                                 })};
-                                advance_known_prepared(chunk_tokens, base, chunk_emit_logits, job.tokens.size() - next_at);
+                                advance_started = Clock::now();
+                                advance_known_prepared(chunk_tokens, base, chunk_emit_logits, job.tokens.size() - next_at, command_timing);
+                                advance_finished = Clock::now();
                                 prefetch_worker.join();
+                                chunk_timing.prefetch_join_wait_ms = milliseconds(*advance_finished);
                             }
                             if (prefetch_error) std::rethrow_exception(prefetch_error);
                             has_prefetched_chunk = true;
@@ -7799,30 +8288,54 @@ int target_cli(int argc, char** argv) {
                             prefetched_entry_history = current_exit_history;
                             prefetched_exit_history = next_exit_history;
                         } else {
-                            advance_known_prepared(chunk_tokens, base, chunk_emit_logits, job.tokens.size() - next_at);
+                            advance_started = Clock::now();
+                            advance_known_prepared(chunk_tokens, base, chunk_emit_logits, job.tokens.size() - next_at, command_timing);
+                            advance_finished = Clock::now();
                         }
                     } else {
-                        advance_known(chunk_tokens, chunk_emit_logits);
+                        advance_started = Clock::now();
+                        advance_known(chunk_tokens, chunk_emit_logits, job.tokens.size() - next_at, command_timing);
+                        advance_finished = Clock::now();
                     }
+                    chunk_timing.pre_advance_ms = milliseconds_between(chunk_started, *advance_started);
+                    chunk_timing.advance_ms = milliseconds_between(*advance_started, *advance_finished);
+                    chunk_timing.stack_wall_ms = last_known_step_batch.wall_ms;
+                    chunk_timing.stack_gpu_ms = last_known_step_batch.gpu_ms;
+                    chunk_timing.mtp_prime_gpu_ms = mtp_prime_gpu_ms - chunk_prime_gpu_before;
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
                     if (ssd_manager && ssd_manager->enabled() && ssd_token_history.size() == stack.position() - count) {
                         ssd_token_history.insert(ssd_token_history.end(), job.tokens.begin() + at, job.tokens.begin() + at + count);
+                        if (!job.branch && !broker && ssd_token_history.size() == stack.position()) {
+                            const uint32_t pfx = stack.position();
+                            const bool long_milestone = pfx > 2048 &&
+                                is_sqrt_checkpoint_milestone(pfx, SharedPrefixCacheState::boundary_tokens, 2048);
+                            const bool early_milestone = pfx == 1024 || pfx == 2048 ||
+                                (!session_generated_since_reset && pfx == 512 && job.tokens.size() < 2048);
+                            if ((long_milestone || early_milestone) && pfx > last_ssd_spill_prefix) {
+                                const auto spill_started = Clock::now();
+                                if (spill_to_ssd(ssd_token_history, !session_generated_since_reset && pfx <= 1024)) {
+                                    capture_ms += milliseconds(spill_started);
+                                }
+                            }
+                        }
                     }
 #endif
                     if (shared_prefix_cache_enabled && !job.branch && !broker && shared_prefix_cache.active_valid &&
                         shared_prefix_cache.active_tokens.size() == stack.position() - count &&
-                        shared_prefix_cache.active_tokens.size() < SharedPrefixCacheState::max_prefix_tokens) {
-                        const size_t room = SharedPrefixCacheState::max_prefix_tokens - shared_prefix_cache.active_tokens.size();
+                        shared_prefix_cache.active_tokens.size() < shared_prefix_cache.max_prefix_tokens) {
+                        const size_t room = shared_prefix_cache.max_prefix_tokens - shared_prefix_cache.active_tokens.size();
                         const size_t append_n = std::min(count, room);
                         shared_prefix_cache.active_tokens.insert(shared_prefix_cache.active_tokens.end(),
                             job.tokens.begin() + at, job.tokens.begin() + at + append_n);
                         if (stack.position() >= SharedPrefixCacheState::boundary_tokens &&
-                            stack.position() <= SharedPrefixCacheState::max_prefix_tokens &&
+                            stack.position() <= shared_prefix_cache.max_prefix_tokens &&
                             shared_prefix_cache.active_tokens.size() == stack.position()) {
-                            const bool aligned_boundary = (stack.position() % SharedPrefixCacheState::boundary_tokens == 0) &&
-                                shared_prefix_lcp_boundary(shared_prefix_cache.active_tokens) >= stack.position();
-                            const bool exact_packet_end = (at + count == job.tokens.size()) && chunk_emit_logits &&
-                                shared_prefix_best_lcp_len(shared_prefix_cache.active_tokens) >= stack.position();
+                            const uint32_t pfx = stack.position();
+                            const bool on_schedule = pfx <= 2048 ? (pfx % SharedPrefixCacheState::boundary_tokens == 0) :
+                                is_sqrt_checkpoint_milestone(pfx, SharedPrefixCacheState::boundary_tokens, 2048);
+                            // Recent prefixes stay fixed within a packet unless pressure reclamation clears active_valid.
+                            const bool aligned_boundary = on_schedule && pfx <= prefill_shared_lcp;
+                            const bool exact_packet_end = (at + count == job.tokens.size()) && chunk_emit_logits && pfx <= prefill_shared_lcp;
                             if (aligned_boundary || exact_packet_end) {
                                 const auto cap_started = Clock::now();
                                 if (capture_shared_prefix(shared_prefix_cache.active_tokens, exact_packet_end)) {
@@ -7831,8 +8344,12 @@ int target_cli(int argc, char** argv) {
                             }
                         }
                     }
+                    chunk_timing.capture_ms = capture_ms - chunk_capture_before;
+                    chunk_timing.wall_ms = milliseconds(chunk_started);
+                    prefill_timing.add(chunk_timing);
                     at += count;
                 }
+                prefill_loop_finished = Clock::now();
             } else for (size_t at = input_at; at < job.tokens.size(); ++at) {
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
                 std::optional<uint32_t> part_chunk_mode;
@@ -7849,7 +8366,7 @@ int target_cli(int argc, char** argv) {
 #endif
                 if (shared_prefix_cache_enabled && !job.branch && !broker && shared_prefix_cache.active_valid &&
                     shared_prefix_cache.active_tokens.size() == stack.position() - 1 &&
-                    shared_prefix_cache.active_tokens.size() < SharedPrefixCacheState::max_prefix_tokens) {
+                    shared_prefix_cache.active_tokens.size() < shared_prefix_cache.max_prefix_tokens) {
                     shared_prefix_cache.active_tokens.push_back(job.tokens[at]);
                 }
             }
@@ -7872,6 +8389,7 @@ int target_cli(int argc, char** argv) {
                 const std::optional<SampledPathToken> anchor_val = anchor_p ? std::optional<SampledPathToken>(*anchor_p) : std::nullopt;
                 const uint32_t overflow_val = has_speculative ? mtp_generation.pending_overflow() : 0;
                 branches->capture(stack.position(), retained, &sampler, ctrl_p, 1, mtp_rows_val, anchor_val, overflow_val,
+                    dflash2 ? &dflash2->verify_budget() : nullptr,
                     [&] { return stack.retain_checkpoint(); });
 #else
                 branches->capture(stack.position(), retained, [&] { return stack.retain_checkpoint(); });
@@ -7880,31 +8398,31 @@ int target_cli(int argc, char** argv) {
             }
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
             if (!broker && input_at < job.tokens.size() && prefill_packet_complete && ssd_manager && ssd_manager->enabled() &&
-                ssd_token_history.size() == stack.position() && stack.position() > last_ssd_spill_prefix) {
+                ssd_token_history.size() == stack.position() &&
+                should_spill_ssd_tail(stack.position(), last_ssd_spill_prefix, SharedPrefixCacheState::boundary_tokens, 2048)) {
                 const bool is_system_anchor = !session_generated_since_reset && stack.position() <= 1024;
-                const bool allow_ssd_spill = !shared_prefix_cache_enabled || is_system_anchor ||
-                    session_generated_since_reset ||
-                    shared_prefix_lcp_boundary(ssd_token_history) >= SharedPrefixCacheState::boundary_tokens;
-                if (allow_ssd_spill) {
-                    const double elapsed_s = std::chrono::duration<double>(Clock::now() - last_ssd_spill_time).count();
-                    const uint32_t newly_committed = stack.position() - last_ssd_spill_prefix;
-                    if (ssd_manager->should_coalesce(elapsed_s, newly_committed)) {
-                        const auto spill_started = Clock::now();
-                        if (spill_to_ssd(ssd_token_history, is_system_anchor)) {
-                            capture_ms += milliseconds(spill_started);
-                        }
+                const double elapsed_s = std::chrono::duration<double>(Clock::now() - last_ssd_spill_time).count();
+                const uint32_t newly_committed = stack.position() - last_ssd_spill_prefix;
+                if (ssd_manager->should_coalesce(elapsed_s, newly_committed)) {
+                    const auto spill_started = Clock::now();
+                    if (spill_to_ssd(ssd_token_history, is_system_anchor)) {
+                        capture_ms += milliseconds(spill_started);
                     }
                 }
             }
 #endif
-            const auto prefill_ms = milliseconds(started); Json::Array generated; double batch_wall = 0, batch_gpu = 0;
+            const auto prefill_finished = Clock::now();
+            const auto prefill_ms = milliseconds_between(started, prefill_finished); Json::Array generated; double batch_wall = 0, batch_gpu = 0;
+            prefill_timing.finish(prefill_ms, started, prefill_loop_started, prefill_loop_finished, prefill_finished);
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM
             const uint64_t prefill_dispatches = gpu.lifetime_dispatches() - dispatches_before_prefill;
             if (!job.tokens.empty()) {
+                last_prefill_timing = std::move(prefill_timing);
                 last_prefill_wall_ms = prefill_ms;
                 last_prefill_dispatches = prefill_dispatches;
                 last_prefill_top10_mixture_stats = gpu.prefill_top10_mixture_telemetry();
             } else if (job.reset) {
+                last_prefill_timing = PrefillTiming{};
                 last_prefill_wall_ms = 0.0;
                 last_prefill_dispatches = 0;
                 last_prefill_top10_mixture_stats = {};
@@ -8409,7 +8927,7 @@ int target_cli(int argc, char** argv) {
 #endif
             const auto lookup_report = [&](Json value) {
                 if (!lookup) return value;
-                auto fields = value.object();
+                auto fields = std::move(value).take_object();
                 const auto report = Json::Object{
                     {"prompt_lookup", Json(lookup_active)},
                     {"lookup_rounds", Json::integer(lookup_rounds)}, {"lookup_verified_rounds", Json::integer(lookup_verified_rounds)},
@@ -8435,16 +8953,13 @@ int target_cli(int argc, char** argv) {
                 fields.insert(fields.end(), report.begin(), report.end()); return Json(std::move(fields));
             };
             if (!generated.empty()) session_generated_since_reset = true;
-            if (parked_lane_budget_bytes && lane_tokens_valid) {
-                const size_t skip = lane_restored ? std::min<size_t>(lane_restored, job.tokens.size()) : 0;
-                lane_tokens.insert(lane_tokens.end(), job.tokens.begin() + ptrdiff_t(skip), job.tokens.end());
-                for (const auto& tok : generated) lane_tokens.push_back(uint32_t(tok.unsigned_integer()));
-                // Pending overflow rows may lag the history; a longer history than the committed prefix is never valid.
-                if (lane_tokens.size() > stack.position()) { lane_tokens_valid = false; lane_tokens.clear(); }
+            if (parked_lane_budget_bytes) {
+                sync_parked_lane_tokens(lane_tokens, lane_tokens_valid, job.tokens, generated,
+                    lane_restored, ssd_restored_prefix, stack.position());
             }
             const auto lane_report = [&](Json value) {
                 if (!parked_lane_budget_bytes) return value;
-                auto fields = value.object();
+                auto fields = std::move(value).take_object();
                 if (lane_restored && job.lane_inherit_seed) {
                     fields.emplace_back("lane_seed", Json::integer(sampler.options().seed));
                     fields.emplace_back("lane_restored_tokens", Json::integer(lane_restored));
@@ -8470,6 +8985,7 @@ int target_cli(int argc, char** argv) {
                 {"prefill_wall_ms", number(prefill_ms)},
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM
                 {"last_prefill_wall_ms", number(last_prefill_wall_ms)},
+                {"last_prefill_timing", prefill_timing_record(last_prefill_timing)},
 #endif
                 {"request_wall_ms", number(milliseconds(started))}, {"generation_batch_wall_ms", number(batch_wall)}, {"generation_batch_gpu_ms", number(batch_gpu)},
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM

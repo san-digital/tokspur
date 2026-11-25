@@ -15,16 +15,23 @@ namespace tokspur {
 
 // Maximum exact common prefix length (capped at max_prefix_tokens) shared with any recent session, or 0 when below boundary_tokens.
 template<class RecentPrefixes>
-[[nodiscard]] inline size_t shared_prefix_best_lcp(const RecentPrefixes& recent_prefixes, std::span<const uint32_t> candidate,
-    size_t boundary_tokens, size_t max_prefix_tokens) noexcept {
-    if (!boundary_tokens || candidate.size() < boundary_tokens) return 0;
-    const size_t limit = std::min(candidate.size(), max_prefix_tokens);
+[[nodiscard]] inline size_t shared_prefix_best_lcp(const RecentPrefixes& recent_prefixes, std::span<const uint32_t> prefix,
+    size_t boundary_tokens, size_t max_prefix_tokens, std::span<const uint32_t> continuation = {}) noexcept {
+    const size_t split = std::min(prefix.size(), max_prefix_tokens);
+    const size_t limit = split + std::min(continuation.size(), max_prefix_tokens - split);
+    if (!boundary_tokens || limit < boundary_tokens) return 0;
     size_t best = 0;
     for (const auto& prev : recent_prefixes) {
         const size_t bound = std::min(limit, prev.size());
+        if (bound <= best || bound < boundary_tokens) continue;
+        const size_t first = std::min(split, bound);
         size_t lcp = 0;
-        while (lcp < bound && prev[lcp] == candidate[lcp]) ++lcp;
+        while (lcp < first && prev[lcp] == prefix[lcp]) ++lcp;
+        if (lcp == split) {
+            while (lcp < bound && prev[lcp] == continuation[lcp - split]) ++lcp;
+        }
         best = std::max(best, lcp);
+        if (best == limit) break;
     }
     return best >= boundary_tokens ? best : 0;
 }

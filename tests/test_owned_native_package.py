@@ -1,4 +1,4 @@
-"""Tiny filesystem/proof fakes only; never build or execute a staged artifact."""
+"""Test package staging with inert artefacts and the native protocol checker's output."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import os
 import socket
 import stat
 import subprocess
+import sys
 import types
 from pathlib import Path
 
@@ -67,6 +68,7 @@ def case(tmp_path, package):
             write(root / name, f"Inert fixture notice: {name}\n".encode())
     checker = b'CPU_SUITES = tuple(("gguf numeric").split())\n'
     checker += b'METAL_SUITES = tuple(("graph stack").split())\n'
+    checker += b"PARKED_PROTOCOL_CHECKS = 17\n"
     write(root / "scripts/check_owned_gpu_experiments.py", checker)
     protocol = root / "scripts/check_owned_target_protocol.py"
     write(protocol, b"# inert fake protocol checker\n")
@@ -118,7 +120,8 @@ def case(tmp_path, package):
         )
     proof["commands"][5]["stdout"] = (
         "Owned CPU target protocol checks passed: 245\n"
-        "Owned CPU target stack-experiment protocol checks passed: 59\n"
+        "Owned CPU parked conversation checks passed: 17\n"
+        "Owned CPU target stack-experiment protocol checks passed: 76\n"
     )
     receipt = base / "verified build receipt.json"
     args = {
@@ -169,6 +172,45 @@ def test_exact_five_file_private_model_free_stage(package, case):
     assert str(args["receipt"]) not in manifest_bytes.decode()
     assert str(args["source_root"]) not in manifest_bytes.decode()
     assert not any(path.suffix == ".py" for path in output.iterdir())
+
+
+@pytest.fixture(scope="module")
+def current_protocol_output():
+    return subprocess.run(
+        [sys.executable, str(ROOT / "scripts/check_owned_target_protocol.py")],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def test_accept_current_protocol_output(current_protocol_output, package, case):
+    spec = importlib.util.spec_from_file_location(
+        "owned_receipt_producer", ROOT / "scripts/check_owned_gpu_experiments.py"
+    )
+    producer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(producer)
+    assert producer.complete_protocol_output(current_protocol_output)
+    args, proof, save = case
+    proof["commands"][5]["stdout"] = current_protocol_output
+    save()
+    package.stage(**args)
+    assert args["output"].is_dir()
+
+
+def test_stage_legacy_protocol_receipt(package, case):
+    args, proof, save = case
+    checker = args["source_root"] / "scripts/check_owned_gpu_experiments.py"
+    legacy = checker.read_bytes().replace(b"PARKED_PROTOCOL_CHECKS = 17\n", b"")
+    checker.write_bytes(legacy)
+    proof["harness_sha256"] = digest(legacy)
+    proof["commands"][5]["stdout"] = (
+        "Owned CPU target protocol checks passed: 245\n"
+        "Owned CPU target stack-experiment protocol checks passed: 59\n"
+    )
+    save()
+    package.stage(**args)
+    assert args["output"].is_dir()
 
 
 @pytest.mark.parametrize("kind", ["directory", "file", "symlink", "dangling"])
@@ -272,6 +314,8 @@ def test_explicit_digests_required(package, case, field, bad):
         "command_stderr_type",
         "command_wrong_artifact",
         "protocol_partial",
+        "protocol_missing_parked",
+        "protocol_old_stack",
         "protocol_duplicate",
         "link_missing",
         "link_external",
@@ -328,6 +372,15 @@ def test_refuse_incomplete_or_drifted_proof_before_output(package, case, mutatio
     elif mutation == "protocol_partial":
         proof["commands"][5]["stdout"] = (
             "Owned CPU target protocol checks passed: 245\n"
+        )
+    elif mutation == "protocol_missing_parked":
+        proof["commands"][5]["stdout"] = proof["commands"][5]["stdout"].replace(
+            "Owned CPU parked conversation checks passed: 17\n", ""
+        )
+    elif mutation == "protocol_old_stack":
+        proof["commands"][5]["stdout"] = proof["commands"][5]["stdout"].replace(
+            "stack-experiment protocol checks passed: 76",
+            "stack-experiment protocol checks passed: 59",
         )
     elif mutation == "protocol_duplicate":
         proof["commands"][5]["stdout"] *= 2

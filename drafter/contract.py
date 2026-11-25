@@ -29,6 +29,7 @@ VOCABULARY = 248320
 TARGET_LAYERS = 48
 TARGET_LAYER_IDS = (5, 15, 25, 35, 45)
 BLOCK = 8
+BLOCKS = (8, 16)
 CONV_KERNEL = 2
 CONV_GROUP = 16
 SELECTOR_RANK = 256
@@ -166,8 +167,16 @@ def check_config(config: object) -> list[str]:
     if not isinstance(draft, dict):
         problems.append("dflash_config must be a JSON object")
         return problems
+    block_found = draft.get("block_size", None)
+    if (
+        "block_size" not in draft
+        or isinstance(block_found, bool)
+        or block_found not in BLOCKS
+    ):
+        problems.append(
+            f"dflash_config.block_size must be one of {list(BLOCKS)!r}, found {block_found!r}"
+        )
     for key, wanted in (
-        ("block_size", BLOCK),
         ("conv_group_size", CONV_GROUP),
         ("conv_kernel_size", CONV_KERNEL),
         ("selector_rank", SELECTOR_RANK),

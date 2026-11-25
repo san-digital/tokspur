@@ -2169,9 +2169,9 @@ static inline void verify_bf16_rows(device const ushort* weights, device const f
 
 template<uint NR, uint SGsPerTG>
 static inline void dispatch_verify_bf16(device const ushort* weights, device const float* input, device float* output,
-    constant nax_detail::GroupedMmArgs& a, device atomic_uint* error, uint group_x, ushort tid, ushort sg, ushort lane,
+    constant nax_detail::GroupedMmArgs& a, uint nt, device atomic_uint* error, uint group_x, ushort tid, ushort sg, ushort lane,
     threadgroup float (*sx)[256]) {
-    switch (a.tokens) {
+    switch (nt) {
         case 1u: verify_bf16_rows<1, NR, SGsPerTG>(weights, input, output, a, error, group_x, tid, sg, lane, sx); break;
         case 2u: verify_bf16_rows<2, NR, SGsPerTG>(weights, input, output, a, error, group_x, tid, sg, lane, sx); break;
         case 3u: verify_bf16_rows<3, NR, SGsPerTG>(weights, input, output, a, error, group_x, tid, sg, lane, sx); break;
@@ -2223,13 +2223,17 @@ kernel void nax_verify_dense_bf16_r1_m8(device const ushort* weights [[buffer(0)
     device atomic_uint* error [[buffer(7)]], uint2 group [[threadgroup_position_in_grid]],
     ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]]) {
-    if (!a.tokens || a.tokens > 8u || !a.columns || a.columns % 32u != 0u || a.row_bytes != a.columns * 2u || !a.rows) {
+    if (!a.tokens || a.tokens > 16u || !a.columns || a.columns % 32u != 0u || a.row_bytes != a.columns * 2u || !a.rows) {
         if (!tid && !group.x && !group.y) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
         return;
     }
-    if (group.y > 0u) return;
+    const uint t0 = group.y * 8u;
+    if (t0 >= a.tokens) return;
+    const uint nt = min(8u, a.tokens - t0);
+    input = reinterpret_cast<device const float*>(reinterpret_cast<device const uchar*>(input) + ulong(t0) * a.input_stride_bytes);
+    output = reinterpret_cast<device float*>(reinterpret_cast<device uchar*>(output) + ulong(t0) * a.output_stride_bytes);
     threadgroup float sx[8][256];
-    switch (a.tokens) {
+    switch (nt) {
         case 1u: nax_verify_detail::verify_dense_bf16_rows_staged<1, 8, 1>(weights, input, output, a, error, group.x, sg, lane, tid, sx); break;
         case 2u: nax_verify_detail::verify_dense_bf16_rows_staged<2, 8, 1>(weights, input, output, a, error, group.x, sg, lane, tid, sx); break;
         case 3u: nax_verify_detail::verify_dense_bf16_rows_staged<3, 8, 1>(weights, input, output, a, error, group.x, sg, lane, tid, sx); break;
@@ -2265,13 +2269,17 @@ kernel void nax_verify_dense_bf16_m8(device const ushort* weights [[buffer(0)]],
     device atomic_uint* error [[buffer(7)]], uint2 group [[threadgroup_position_in_grid]],
     ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]]) {
-    if (!a.tokens || a.tokens > 8u || !a.columns || a.columns % 32u != 0u || a.row_bytes != a.columns * 2u || !a.rows) {
+    if (!a.tokens || a.tokens > 16u || !a.columns || a.columns % 32u != 0u || a.row_bytes != a.columns * 2u || !a.rows) {
         if (!tid && !group.x && !group.y) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
         return;
     }
-    if (group.y > 0u) return;
+    const uint t0 = group.y * 8u;
+    if (t0 >= a.tokens) return;
+    const uint nt = min(8u, a.tokens - t0);
+    input = reinterpret_cast<device const float*>(reinterpret_cast<device const uchar*>(input) + ulong(t0) * a.input_stride_bytes);
+    output = reinterpret_cast<device float*>(reinterpret_cast<device uchar*>(output) + ulong(t0) * a.output_stride_bytes);
     threadgroup float sx[8][256];
-    switch (a.tokens) {
+    switch (nt) {
         case 1u: nax_verify_detail::verify_dense_bf16_rows_staged<1, 8, 4>(weights, input, output, a, error, group.x, sg, lane, tid, sx); break;
         case 2u: nax_verify_detail::verify_dense_bf16_rows_staged<2, 8, 4>(weights, input, output, a, error, group.x, sg, lane, tid, sx); break;
         case 3u: nax_verify_detail::verify_dense_bf16_rows_staged<3, 8, 4>(weights, input, output, a, error, group.x, sg, lane, tid, sx); break;
@@ -2307,13 +2315,17 @@ kernel void nax_verify_dense_q8_m8(device const uchar* weights [[buffer(0)]], de
     device atomic_uint* error [[buffer(7)]], uint2 group [[threadgroup_position_in_grid]],
     ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]]) {
-    if (!a.tokens || a.tokens > 8u || !a.rows || !a.columns || a.columns % 32u != 0u || a.row_bytes != (a.columns / 32u) * 34u ||
+    if (!a.tokens || a.tokens > 16u || !a.rows || !a.columns || a.columns % 32u != 0u || a.row_bytes != (a.columns / 32u) * 34u ||
         a.maximum_tasks > 2u || (nax_layout == 1u && a.columns >= 512u && a.columns % 256u != 0u)) {
         if (!tid && !group.x && !group.y) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
         return;
     }
-    if (group.y > 0u) return;
-    switch (a.tokens) {
+    const uint t0 = group.y * 8u;
+    if (t0 >= a.tokens) return;
+    const uint nt = min(8u, a.tokens - t0);
+    input = reinterpret_cast<device const float*>(reinterpret_cast<device const uchar*>(input) + ulong(t0) * a.input_stride_bytes);
+    output = reinterpret_cast<device float*>(reinterpret_cast<device uchar*>(output) + ulong(t0) * a.output_stride_bytes);
+    switch (nt) {
         case 1u: nax_verify_detail::dispatch_verify_dense_q8<1>(weights, input, output, a, error, group.x, sg, lane); break;
         case 2u: nax_verify_detail::dispatch_verify_dense_q8<2>(weights, input, output, a, error, group.x, sg, lane); break;
         case 3u: nax_verify_detail::dispatch_verify_dense_q8<3>(weights, input, output, a, error, group.x, sg, lane); break;
@@ -2351,13 +2363,17 @@ kernel void nax_verify_dense_q8_swiglu_m8(device const uchar* gate_weights [[buf
     device atomic_uint* error [[buffer(7)]], uint2 group [[threadgroup_position_in_grid]],
     ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]]) {
-    if (!a.tokens || a.tokens > 8u || !a.rows || !a.columns || a.columns % 32u != 0u || a.row_bytes != (a.columns / 32u) * 34u ||
+    if (!a.tokens || a.tokens > 16u || !a.rows || !a.columns || a.columns % 32u != 0u || a.row_bytes != (a.columns / 32u) * 34u ||
         (nax_layout == 1u && a.columns >= 512u && a.columns % 256u != 0u)) {
         if (!tid && !group.x && !group.y) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
         return;
     }
-    if (group.y > 0u) return;
-    switch (a.tokens) {
+    const uint t0 = group.y * 8u;
+    if (t0 >= a.tokens) return;
+    const uint nt = min(8u, a.tokens - t0);
+    input = reinterpret_cast<device const float*>(reinterpret_cast<device const uchar*>(input) + ulong(t0) * a.input_stride_bytes);
+    output = reinterpret_cast<device float*>(reinterpret_cast<device uchar*>(output) + ulong(t0) * a.output_stride_bytes);
+    switch (nt) {
         case 1u: nax_verify_detail::verify_dense_q8_swiglu_rows<1>(gate_weights, up_weights, input, output, a, error, group.x, sg, lane); break;
         case 2u: nax_verify_detail::verify_dense_q8_swiglu_rows<2>(gate_weights, up_weights, input, output, a, error, group.x, sg, lane); break;
         case 3u: nax_verify_detail::verify_dense_q8_swiglu_rows<3>(gate_weights, up_weights, input, output, a, error, group.x, sg, lane); break;
@@ -2375,15 +2391,19 @@ kernel void nax_verify_bf16_m8(device const ushort* weights [[buffer(0)]], devic
     ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]],
     ushort lane [[thread_index_in_simdgroup]]) {
     alignas(16) threadgroup float sx[8][256];
-    if (!a.tokens || a.tokens > 8u || !a.columns || a.columns % 32u != 0u || !a.rows || a.row_bytes != a.columns * 2u) {
+    if (!a.tokens || a.tokens > 16u || !a.columns || a.columns % 32u != 0u || !a.rows || a.row_bytes != a.columns * 2u) {
         if (!tid && !group.x && !group.y) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
         return;
     }
-    if (group.y > 0u) return;
+    const uint t0 = group.y * 8u;
+    if (t0 >= a.tokens) return;
+    const uint nt = min(8u, a.tokens - t0);
+    input = reinterpret_cast<device const float*>(reinterpret_cast<device const uchar*>(input) + ulong(t0) * a.input_stride_bytes);
+    output = reinterpret_cast<device float*>(reinterpret_cast<device uchar*>(output) + ulong(t0) * a.output_stride_bytes);
     if (a.rows <= 512u) {
-        nax_verify_detail::dispatch_verify_bf16<1, 4>(weights, input, output, a, error, group.x, tid, sg, lane, sx);
+        nax_verify_detail::dispatch_verify_bf16<1, 4>(weights, input, output, a, nt, error, group.x, tid, sg, lane, sx);
     } else {
-        nax_verify_detail::dispatch_verify_bf16<2, 4>(weights, input, output, a, error, group.x, tid, sg, lane, sx);
+        nax_verify_detail::dispatch_verify_bf16<2, 4>(weights, input, output, a, nt, error, group.x, tid, sg, lane, sx);
     }
 }
 
@@ -2439,21 +2459,24 @@ static inline void verify_gdn_gates_accum_f32(device const float* wr, device con
 kernel void nax_verify_gdn_gates_f32(device const float* alpha_w [[buffer(0)]], device const float* beta_w [[buffer(1)]],
     device const float* input [[buffer(2)]], device float* alpha_out [[buffer(3)]], device float* beta_out [[buffer(4)]],
     constant uint4& shape [[buffer(5)]], device atomic_uint* error [[buffer(7)]],
-    uint group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
     // shape = {columns, heads, steps, 0}
     threadgroup float sg_sum[4][8];
     const uint cols = shape.x, heads = shape.y, steps = shape.z;
-    if (!cols || !heads || !steps || steps > 8u) {
-        if (!tid && !group) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
+    if (!cols || !heads || !steps || steps > 16u) {
+        if (!tid && !group.x && !group.y) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
         return;
     }
-    if (group >= heads * 2u) return;
-    const bool is_beta = group >= heads;
-    const uint head = is_beta ? (group - heads) : group;
+    const uint t0 = group.y * 8u;
+    if (group.x >= heads * 2u || t0 >= steps) return;
+    const uint nt = min(8u, steps - t0);
+    const bool is_beta = group.x >= heads;
+    const uint head = is_beta ? (group.x - heads) : group.x;
     device const float* wr = (is_beta ? beta_w : alpha_w) + ulong(head) * cols;
-    device float* dst = is_beta ? beta_out : alpha_out;
-    switch (steps) {
+    device float* dst = (is_beta ? beta_out : alpha_out) + ulong(t0) * heads;
+    input += ulong(t0) * cols;
+    switch (nt) {
         case 1u: nax_verify_detail::verify_gdn_gates_accum_f32<1>(wr, input, dst, cols, heads, head, tid, sg, lane, sg_sum, error); break;
         case 2u: nax_verify_detail::verify_gdn_gates_accum_f32<2>(wr, input, dst, cols, heads, head, tid, sg, lane, sg_sum, error); break;
         case 3u: nax_verify_detail::verify_gdn_gates_accum_f32<3>(wr, input, dst, cols, heads, head, tid, sg, lane, sg_sum, error); break;
@@ -6038,6 +6061,37 @@ static inline void stage_a_m8_t64(device const float* input, ulong in_stride, ui
     store_a_m8_t64(load_a_m8_t64(input, in_stride, tokens, k_col0, tid), tokens, tid, a_plane, bad);
 }
 
+struct Float8 {
+    float4 lo, hi;
+};
+
+static inline Float8 load_a_m16_t64(device const float* input, ulong in_stride, uint tokens, uint k_col0, ushort tid) {
+    const uint m = uint(tid) >> 2u;
+    const uint k8 = (uint(tid) & 3u) * 8u;
+    if (m < tokens) {
+        device const float* p = input + ulong(m) * in_stride + ulong(k_col0 + k8);
+        return {float4(*reinterpret_cast<device const packed_float4*>(p)),
+                float4(*reinterpret_cast<device const packed_float4*>(p + 4ul))};
+    }
+    return {float4(0.0f), float4(0.0f)};
+}
+
+static inline void store_a_m16_t64(Float8 v, uint tokens, ushort tid, threadgroup bfloat* a_plane, thread uint& bad) {
+    constexpr uint StageStride = 36u;
+    const uint m = uint(tid) >> 2u;
+    const uint k8 = (uint(tid) & 3u) * 8u;
+    threadgroup bfloat4* dst = reinterpret_cast<threadgroup bfloat4*>(a_plane + m * StageStride + k8);
+    if (m < tokens) {
+        dst[0] = bfloat4(nax_detail::clean_bf16(v.lo.x, bad), nax_detail::clean_bf16(v.lo.y, bad),
+                         nax_detail::clean_bf16(v.lo.z, bad), nax_detail::clean_bf16(v.lo.w, bad));
+        dst[1] = bfloat4(nax_detail::clean_bf16(v.hi.x, bad), nax_detail::clean_bf16(v.hi.y, bad),
+                         nax_detail::clean_bf16(v.hi.z, bad), nax_detail::clean_bf16(v.hi.w, bad));
+    } else {
+        dst[0] = bfloat4(0);
+        dst[1] = bfloat4(0);
+    }
+}
+
 static inline void load_q8_pair_m8(device const uchar* weights, uint rows, uint blocks, uint row_bytes,
     uint sg_col_base, uint b0, ushort lane, thread ushort (&q_dst)[32], thread half2& raw_sc2) {
     const uint run = b0 / 16u;
@@ -6516,18 +6570,22 @@ kernel void nax_m8_qmv_q8(device const uchar* weights [[buffer(0)]], device cons
     threadgroup uint arrival;
 
     const uint splits = max(1u, a.selected);
-    if (!a.tokens || a.tokens > 8u || !a.rows || !a.columns || a.columns % 32u != 0u || a.row_bytes != (a.columns / 32u) * 34u ||
+    if (!a.tokens || a.tokens > 16u || (a.tokens > 8u && splits > 1u) || !a.rows || !a.columns || a.columns % 32u != 0u || a.row_bytes != (a.columns / 32u) * 34u ||
         a.maximum_tasks > 2u || splits > 32u || a.input_stride_bytes % 4u != 0u || a.output_stride_bytes % 4u != 0u ||
         (splits > 1u && (a.columns % (splits * 512u)) != 0u) ||
         (nax_layout == 1u && a.columns >= 512u && a.columns % 256u != 0u)) {
-        if (!tid && !group.x && !group.y) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
+        if (!tid && !group.x && !group.y && !group.z) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
         return;
     }
+    const uint t0 = group.z * 8u;
     const uint max_nr = a.tokens <= 4u ? 4u : 2u;
     const uint nr = a.rows <= 1024u ? 1u : (a.rows <= 4096u ? 2u : max_nr);
-    if (group.x * (4u * nr) >= a.rows || group.y >= splits) return;
+    if (group.x * (4u * nr) >= a.rows || group.y >= splits || t0 >= a.tokens) return;
+    const uint nt = min(8u, a.tokens - t0);
+    input = reinterpret_cast<device const float*>(reinterpret_cast<device const uchar*>(input) + ulong(t0) * a.input_stride_bytes);
+    output = reinterpret_cast<device float*>(reinterpret_cast<device uchar*>(output) + ulong(t0) * a.output_stride_bytes);
 
-    switch (a.tokens) {
+    switch (nt) {
         case 1u: dispatch_qmv_q8_split<1>(weights, input, output, a, partials, counters, error, group.x, group.y, splits, tid, sg, lane, &arrival); break;
         case 2u: dispatch_qmv_q8_split<2>(weights, input, output, a, partials, counters, error, group.x, group.y, splits, tid, sg, lane, &arrival); break;
         case 3u: dispatch_qmv_q8_split<3>(weights, input, output, a, partials, counters, error, group.x, group.y, splits, tid, sg, lane, &arrival); break;
@@ -6745,16 +6803,20 @@ kernel void nax_m8_dense_q8_swiglu(device const uchar* gate_weights [[buffer(0)]
     threadgroup uint arrival;
 
     const uint splits = max(1u, a.selected);
-    if (!a.tokens || a.tokens > 8u || !a.rows || !a.columns || a.columns % 32u != 0u || a.row_bytes != (a.columns / 32u) * 34u ||
+    if (!a.tokens || a.tokens > 16u || (a.tokens > 8u && splits > 1u) || !a.rows || !a.columns || a.columns % 32u != 0u || a.row_bytes != (a.columns / 32u) * 34u ||
         splits > 32u || a.input_stride_bytes % 4u != 0u || a.output_stride_bytes % 4u != 0u ||
         (splits > 1u && (a.columns % (splits * 512u)) != 0u) ||
         (nax_layout == 1u && a.columns >= 512u && a.columns % 256u != 0u)) {
-        if (!tid && !group.x && !group.y) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
+        if (!tid && !group.x && !group.y && !group.z) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
         return;
     }
-    if (group.x * 4u >= a.rows || group.y >= splits) return;
+    const uint t0 = group.z * 8u;
+    if (group.x * 4u >= a.rows || group.y >= splits || t0 >= a.tokens) return;
+    const uint nt = min(8u, a.tokens - t0);
+    input = reinterpret_cast<device const float*>(reinterpret_cast<device const uchar*>(input) + ulong(t0) * a.input_stride_bytes);
+    output = reinterpret_cast<device float*>(reinterpret_cast<device uchar*>(output) + ulong(t0) * a.output_stride_bytes);
 
-    switch (a.tokens) {
+    switch (nt) {
         case 1u: qmv_q8_swiglu_split_rows<1>(gate_weights, up_weights, input, output, a, partials, counters, error, group.x, group.y, splits, tid, sg, lane, &arrival); break;
         case 2u: qmv_q8_swiglu_split_rows<2>(gate_weights, up_weights, input, output, a, partials, counters, error, group.x, group.y, splits, tid, sg, lane, &arrival); break;
         case 3u: qmv_q8_swiglu_split_rows<3>(gate_weights, up_weights, input, output, a, partials, counters, error, group.x, group.y, splits, tid, sg, lane, &arrival); break;
@@ -7058,6 +7120,296 @@ kernel void nax_m8_dense_q8_swiglu_t64(device const uchar* gate_plane0 [[buffer(
     if (bad) atomic_fetch_or_explicit(error, bad, memory_order_relaxed);
 }
 
+// 64-thread (2-SG), BN64 NAX matmul2d(16, 32, 32) on coalesced Q8_tile64 planes for 9..16 verify/draft rows.
+kernel void nax_m16_dense_q8_t64(device const uchar* plane0 [[buffer(0)]], device const ushort* meta [[buffer(1)]],
+    device const float* input [[buffer(2)]], device float* output [[buffer(3)]],
+    constant nax_detail::GroupedMmArgs& a [[buffer(4)]],
+    device coherent(device) float* partials [[buffer(5)]], device atomic_uint* counters [[buffer(6)]],
+    device atomic_uint* error [[buffer(7)]], uint3 group [[threadgroup_position_in_grid]],
+    ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr ushort Rows = 16, OutCols = 32, BN = 64, KS = 32, StageStride = 36;
+    constexpr uint APlane = uint(Rows) * StageStride, BPlane = uint(OutCols) * StageStride;
+    alignas(16) threadgroup bfloat a_stage[APlane];
+    alignas(16) threadgroup half b_stage[2 * BPlane];
+
+    const uint splits = max(1u, a.selected);
+    if (!a.tokens || a.tokens > 16u || !a.rows || !a.columns || a.columns % 32u != 0u ||
+        a.maximum_tasks > 2u || splits > 32u || a.input_stride_bytes % 4u != 0u || a.output_stride_bytes % 4u != 0u ||
+        ((a.columns / 32u) % splits) != 0u) {
+        if (!tid && !group.x && !group.y) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
+        return;
+    }
+    const uint first_col = group.x * BN;
+    const uint split = group.y;
+    if (first_col >= a.rows || split >= splits) return;
+
+    const uint sg_col_base = first_col + uint(sg) * OutCols;
+    const bool sg_live = sg_col_base < a.rows;
+
+    tensor<threadgroup bfloat, dextents<int, 2>, tensor_inline> at0(a_stage, dextents<int, 2>{KS, Rows}, array<int, 2>{1, StageStride});
+    tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(b_stage + uint(sg) * BPlane, dextents<int, 2>{KS, OutCols}, array<int, 2>{1, StageStride});
+    constexpr auto descriptor = matmul2d_descriptor(Rows, OutCols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+    static_assert(!descriptor.relaxed_precision, "BF16/FP16 inputs with exact FP32 accumulation");
+    matmul2d<descriptor, execution_simdgroups<1>> operation;
+    auto a_s0 = at0.slice<KS, Rows>(0, 0);
+    auto b_s0 = bt0.slice<KS, OutCols>(0, 0);
+    auto acc = operation.get_destination_cooperative_tensor<decltype(a_s0), decltype(b_s0), float>();
+    #pragma unroll
+    for (ushort i = 0; i < acc.get_capacity(); ++i) acc[i] = 0.0f;
+
+    const ulong in_stride = a.input_stride_bytes / sizeof(float);
+    const uint G = a.columns / KS;
+    const uint steps_per_split = splits > 1u ? (G / splits) : G;
+    const uint step_begin = split * steps_per_split;
+    const uint step_end = step_begin + steps_per_split;
+    uint bad = 0u;
+
+    const uint sg_col_in_tile = uint(sg) * 32u + uint(lane);
+    if (step_begin < step_end) {
+        nax_m8_split_detail::Float8 a_next = nax_m8_split_detail::load_a_m16_t64(input, in_stride, a.tokens, step_begin * 32u, tid);
+        nax_detail::Q8Tile64Ipt1 w_next{};
+        if (sg_live) {
+            w_next = nax_detail::load_q8_t64_ipt1(plane0, meta, G, group.x, step_begin, sg_col_in_tile);
+        }
+        for (uint s_rel = 0u; s_rel < steps_per_split; ++s_rel) {
+            const uint step = step_begin + s_rel;
+            const bool has_next = (s_rel + 1u) < steps_per_split;
+            nax_m8_split_detail::store_a_m16_t64(a_next, a.tokens, tid, a_stage, bad);
+            if (sg_live) {
+                nax_detail::store_q8_t64_ipt1(w_next, b_stage + uint(sg) * BPlane + uint(lane) * StageStride, bad);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (has_next) {
+                a_next = nax_m8_split_detail::load_a_m16_t64(input, in_stride, a.tokens, (step + 1u) * 32u, tid);
+                if (sg_live) {
+                    w_next = nax_detail::load_q8_t64_ipt1(plane0, meta, G, group.x, step + 1u, sg_col_in_tile);
+                }
+            }
+            if (sg_live) {
+                operation.run(a_s0, b_s0, acc);
+            }
+            if (has_next) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+    }
+    threadgroup uint* arrival_ptr = reinterpret_cast<threadgroup uint*>(b_stage);
+
+    const uint mode = a.maximum_tasks;
+    const float silu_scale = as_type<float>(a.experts);
+    const auto write_out = [&](uint r, uint col_out, float val) {
+        bad |= nax_detail::nonfinite_bit(val);
+        device float* y = reinterpret_cast<device float*>(reinterpret_cast<device uchar*>(output) + ulong(r) * a.output_stride_bytes);
+        if (mode == 1u) {
+            const float g0 = y[col_out];
+            bad |= nax_detail::nonfinite_bit(g0);
+            val = (g0 * nax_detail::sigmoid_f32(g0)) * val;
+            bad |= nax_detail::nonfinite_bit(val);
+        } else if (mode == 2u) {
+            const float x = val * silu_scale;
+            bad |= nax_detail::nonfinite_bit(silu_scale) | nax_detail::nonfinite_bit(x);
+            val = x * nax_detail::sigmoid_f32(x);
+            bad |= nax_detail::nonfinite_bit(val);
+        }
+        y[col_out] = val;
+    };
+
+    if (splits == 1u) {
+        if (sg_live) {
+            #pragma unroll
+            for (ushort i = 0; i < acc.get_capacity(); ++i) {
+                if (!acc.is_valid_element(i)) continue;
+                const auto idx = acc.get_multidimensional_index(i);
+                const uint col_out = sg_col_base + uint(idx[0]);
+                const uint r = uint(idx[1]);
+                if (r < a.tokens && col_out < a.rows) {
+                    write_out(r, col_out, float(acc[i]));
+                }
+            }
+        }
+    } else {
+        const ulong p_stride = ulong((a.rows + 63u) & ~63u);
+        if (sg_live) {
+            #pragma unroll
+            for (ushort i = 0; i < acc.get_capacity(); ++i) {
+                if (!acc.is_valid_element(i)) continue;
+                const auto idx = acc.get_multidimensional_index(i);
+                const uint col_out = sg_col_base + uint(idx[0]);
+                const uint r = uint(idx[1]);
+                if (r < a.tokens && col_out < a.rows) {
+                    partials[(ulong(split) * 16ul + r) * p_stride + col_out] = float(acc[i]);
+                }
+            }
+        }
+        const uint tiles_x = (a.rows + BN - 1u) / BN;
+        const uint cnt_stride = (tiles_x <= 32u) ? 32u : ((tiles_x <= 256u) ? 4u : 1u);
+        if (nax_m8_split_detail::split_arrive_last(counters + group.x * cnt_stride, splits, tid, arrival_ptr)) {
+            if (sg_live) {
+                #pragma unroll
+                for (ushort i = 0; i < acc.get_capacity(); ++i) {
+                    if (!acc.is_valid_element(i)) continue;
+                    const auto idx = acc.get_multidimensional_index(i);
+                    const uint col_out = sg_col_base + uint(idx[0]);
+                    const uint r = uint(idx[1]);
+                    if (r < a.tokens && col_out < a.rows) {
+                        float sum = 0.0f;
+                        for (uint s = 0u; s < splits; ++s) {
+                            sum += (s == split) ? float(acc[i]) : partials[(ulong(s) * 16ul + r) * p_stride + col_out];
+                        }
+                        write_out(r, col_out, sum);
+                    }
+                }
+            }
+            nax_m8_split_detail::split_release(counters + group.x * cnt_stride, tid);
+        }
+    }
+    if (bad) atomic_fetch_or_explicit(error, bad, memory_order_relaxed);
+}
+
+// 64-thread (2-SG: SG0 = gate, SG1 = up), 32 cols/TG fused gate + up + SwiGLU NAX matmul2d(16, 32, 32) on Q8_tile64.
+kernel void nax_m16_dense_q8_swiglu_t64(device const uchar* gate_plane0 [[buffer(0)]], device const ushort* gate_meta [[buffer(1)]],
+    device const uchar* up_plane0 [[buffer(2)]], device const ushort* up_meta [[buffer(3)]],
+    device const float* input [[buffer(4)]], device float* output [[buffer(5)]],
+    constant nax_detail::GroupedMmArgs& a [[buffer(6)]],
+    device atomic_uint* error [[buffer(7)]],
+    device coherent(device) float* partials [[buffer(8)]], device atomic_uint* counters [[buffer(9)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr ushort Rows = 16, OutCols = 32, KS = 32, StageStride = 36;
+    constexpr uint APlane = uint(Rows) * StageStride, BPlane = uint(OutCols) * StageStride;
+    alignas(16) threadgroup bfloat a_stage[APlane];
+    alignas(16) threadgroup half b_stage[2 * BPlane];
+
+    const uint splits = max(1u, a.selected);
+    if (!a.tokens || a.tokens > 16u || !a.rows || !a.columns || a.columns % 32u != 0u ||
+        splits > 32u || a.input_stride_bytes % 4u != 0u || a.output_stride_bytes % 4u != 0u ||
+        ((a.columns / 32u) % splits) != 0u) {
+        if (!tid && !group.x && !group.y) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
+        return;
+    }
+    const uint first_col = group.x * OutCols;
+    const uint split = group.y;
+    if (first_col >= a.rows || split >= splits) return;
+
+    const uint t64_tile = group.x >> 1u;
+    const uint src_col_in_tile = (group.x & 1u) * 32u + uint(lane);
+    device const uchar* sg_p0 = sg ? up_plane0 : gate_plane0;
+    device const ushort* sg_meta = sg ? up_meta : gate_meta;
+
+    tensor<threadgroup bfloat, dextents<int, 2>, tensor_inline> at0(a_stage, dextents<int, 2>{KS, Rows}, array<int, 2>{1, StageStride});
+    tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(b_stage + uint(sg) * BPlane, dextents<int, 2>{KS, OutCols}, array<int, 2>{1, StageStride});
+    constexpr auto descriptor = matmul2d_descriptor(Rows, OutCols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+    static_assert(!descriptor.relaxed_precision, "BF16/FP16 inputs with exact FP32 accumulation");
+    matmul2d<descriptor, execution_simdgroups<1>> operation;
+    auto a_s0 = at0.slice<KS, Rows>(0, 0);
+    auto b_s0 = bt0.slice<KS, OutCols>(0, 0);
+    auto acc = operation.get_destination_cooperative_tensor<decltype(a_s0), decltype(b_s0), float>();
+    #pragma unroll
+    for (ushort i = 0; i < acc.get_capacity(); ++i) acc[i] = 0.0f;
+
+    const ulong in_stride = a.input_stride_bytes / sizeof(float);
+    const uint G = a.columns / KS;
+    const uint steps_per_split = splits > 1u ? (G / splits) : G;
+    const uint step_begin = split * steps_per_split;
+    const uint step_end = step_begin + steps_per_split;
+    uint bad = 0u;
+
+    if (step_begin < step_end) {
+        nax_m8_split_detail::Float8 a_next = nax_m8_split_detail::load_a_m16_t64(input, in_stride, a.tokens, step_begin * 32u, tid);
+        nax_detail::Q8Tile64Ipt1 w_next = nax_detail::load_q8_t64_ipt1(sg_p0, sg_meta, G, t64_tile, step_begin, src_col_in_tile);
+        for (uint s_rel = 0u; s_rel < steps_per_split; ++s_rel) {
+            const uint step = step_begin + s_rel;
+            const bool has_next = (s_rel + 1u) < steps_per_split;
+            nax_m8_split_detail::store_a_m16_t64(a_next, a.tokens, tid, a_stage, bad);
+            nax_detail::store_q8_t64_ipt1(w_next, b_stage + uint(sg) * BPlane + uint(lane) * StageStride, bad);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (has_next) {
+                a_next = nax_m8_split_detail::load_a_m16_t64(input, in_stride, a.tokens, (step + 1u) * 32u, tid);
+                w_next = nax_detail::load_q8_t64_ipt1(sg_p0, sg_meta, G, t64_tile, step + 1u, src_col_in_tile);
+            }
+            operation.run(a_s0, b_s0, acc);
+            if (has_next) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+    }
+    threadgroup uint* arrival_ptr = reinterpret_cast<threadgroup uint*>(b_stage) + 1056u;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float (*epi)[16][33] = reinterpret_cast<threadgroup float (*)[16][33]>(b_stage);
+    if (splits == 1u) {
+        if (sg == 0u) {
+            #pragma unroll
+            for (ushort i = 0; i < acc.get_capacity(); ++i) {
+                if (!acc.is_valid_element(i)) continue;
+                const auto idx = acc.get_multidimensional_index(i);
+                epi[0][uint(idx[1])][uint(idx[0])] = float(acc[i]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 1u) {
+            #pragma unroll
+            for (ushort i = 0; i < acc.get_capacity(); ++i) {
+                if (!acc.is_valid_element(i)) continue;
+                const auto idx = acc.get_multidimensional_index(i);
+                const uint col_out = first_col + uint(idx[0]);
+                const uint r = uint(idx[1]);
+                if (r < a.tokens && col_out < a.rows) {
+                    const float g0 = epi[0][r][uint(idx[0])];
+                    const float u0 = float(acc[i]);
+                    bad |= nax_detail::nonfinite_bit(g0) | nax_detail::nonfinite_bit(u0);
+                    const float val = (g0 * nax_detail::sigmoid_f32(g0)) * u0;
+                    bad |= nax_detail::nonfinite_bit(val);
+                    device float* y = reinterpret_cast<device float*>(reinterpret_cast<device uchar*>(output) + ulong(r) * a.output_stride_bytes);
+                    y[col_out] = val;
+                }
+            }
+        }
+    } else {
+        #pragma unroll
+        for (ushort i = 0; i < acc.get_capacity(); ++i) {
+            if (!acc.is_valid_element(i)) continue;
+            const auto idx = acc.get_multidimensional_index(i);
+            epi[sg][uint(idx[1])][uint(idx[0])] = float(acc[i]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint col_out = first_col + uint(lane);
+        const bool col_live = col_out < a.rows;
+        const ulong p_stride = ulong((a.rows + 31u) & ~31u);
+        if (col_live) {
+            for (ushort r = 0; r < ushort(a.tokens); ++r) {
+                partials[((ulong(split) * 2ul + ulong(sg)) * 16ul + ulong(r)) * p_stride + col_out] = epi[sg][r][lane];
+            }
+        }
+        const uint tiles_x = (a.rows + OutCols - 1u) / OutCols;
+        const uint cnt_stride = (tiles_x <= 32u) ? 32u : ((tiles_x <= 256u) ? 4u : 1u);
+        if (nax_m8_split_detail::split_arrive_last(counters + group.x * cnt_stride, splits, tid, arrival_ptr)) {
+            if (col_live) {
+                #pragma unroll
+                for (ushort r_sub = 0; r_sub < 8; ++r_sub) {
+                    const uint r = uint(r_sub) * 2u + uint(sg);
+                    if (r < a.tokens) {
+                        float gs = 0.0f, us = 0.0f;
+                        for (uint s = 0u; s < splits; ++s) {
+                            gs += (s == split) ? epi[0][r][lane] : partials[((ulong(s) * 2ul + 0ul) * 16ul + ulong(r)) * p_stride + col_out];
+                            us += (s == split) ? epi[1][r][lane] : partials[((ulong(s) * 2ul + 1ul) * 16ul + ulong(r)) * p_stride + col_out];
+                        }
+                        bad |= nax_detail::nonfinite_bit(gs) | nax_detail::nonfinite_bit(us);
+                        const float val = (gs * nax_detail::sigmoid_f32(gs)) * us;
+                        bad |= nax_detail::nonfinite_bit(val);
+                        device float* y = reinterpret_cast<device float*>(reinterpret_cast<device uchar*>(output) + ulong(r) * a.output_stride_bytes);
+                        y[col_out] = val;
+                    }
+                }
+            }
+            nax_m8_split_detail::split_release(counters + group.x * cnt_stride, tid);
+        }
+    }
+    if (bad) atomic_fetch_or_explicit(error, bad, memory_order_relaxed);
+}
+
 kernel void nax_m8_dense_bf16(device const ushort* weights [[buffer(0)]], device const float* input [[buffer(1)]],
     device float* output [[buffer(2)]], constant nax_detail::GroupedMmArgs& a [[buffer(3)]],
     device coherent(device) float* partials [[buffer(4)]], device atomic_uint* counters [[buffer(5)]],
@@ -7071,15 +7423,19 @@ kernel void nax_m8_dense_bf16(device const ushort* weights [[buffer(0)]], device
     threadgroup uint arrival;
 
     const uint splits = max(1u, a.selected);
-    if (!a.tokens || a.tokens > 8u || !a.columns || a.columns % 32u != 0u || a.row_bytes != a.columns * 2u ||
+    if (!a.tokens || a.tokens > 16u || (a.tokens > 8u && splits > 1u) || !a.columns || a.columns % 32u != 0u || a.row_bytes != a.columns * 2u ||
         splits > 16u || a.input_stride_bytes % 4u != 0u || a.output_stride_bytes % 4u != 0u ||
         (splits > 1u && (a.columns % (splits * 128u)) != 0u)) {
-        if (!tid && !group.x && !group.y) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
+        if (!tid && !group.x && !group.y && !group.z) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
         return;
     }
     const uint first_col = group.x * OutCols;
     const uint split = group.y;
-    if (first_col >= a.rows || split >= splits) return;
+    const uint t0 = group.z * 8u;
+    if (first_col >= a.rows || split >= splits || t0 >= a.tokens) return;
+    const uint nt = min(8u, a.tokens - t0);
+    input = reinterpret_cast<device const float*>(reinterpret_cast<device const uchar*>(input) + ulong(t0) * a.input_stride_bytes);
+    output = reinterpret_cast<device float*>(reinterpret_cast<device uchar*>(output) + ulong(t0) * a.output_stride_bytes);
 
     tensor<threadgroup bfloat, dextents<int, 2>, tensor_inline> at(a_stage + uint(sg) * APlane, dextents<int, 2>{KS, Rows}, array<int, 2>{1, StageStride});
     tensor<threadgroup bfloat, dextents<int, 2>, tensor_inline> bt(b_stage + uint(sg) * BPlane, dextents<int, 2>{KS, OutCols}, array<int, 2>{1, StageStride});
@@ -7117,7 +7473,7 @@ kernel void nax_m8_dense_bf16(device const ushort* weights [[buffer(0)]], device
         load_bf16_raw(step, min(4u, step_end - step), raw_h);
         while (step < step_end) {
             const uint chunk = min(4u, step_end - step);
-            nax_m8_split_detail::stage_a_4slices(input, in_stride, a.tokens, step * 32u, chunk, tid, a_stage, bad);
+            nax_m8_split_detail::stage_a_4slices(input, in_stride, nt, step * 32u, chunk, tid, a_stage, bad);
             #pragma unroll
             for (ushort r = 0; r < 8; ++r) {
                 const uint col_local = uint(sg) * 8u + uint(r);
@@ -7154,10 +7510,10 @@ kernel void nax_m8_dense_bf16(device const ushort* weights [[buffer(0)]], device
     const bool col_live = col_out < a.rows;
     const uint r0_out = uint(sg), r1_out = uint(sg) + 4u;
     float own0 = 0.0f, own1 = 0.0f;
-    if (col_live && r0_out < a.tokens) {
+    if (col_live && r0_out < nt) {
         own0 = (red[0][r0_out][lane] + red[1][r0_out][lane]) + (red[2][r0_out][lane] + red[3][r0_out][lane]);
     }
-    if (col_live && r1_out < a.tokens) {
+    if (col_live && r1_out < nt) {
         own1 = (red[0][r1_out][lane] + red[1][r1_out][lane]) + (red[2][r1_out][lane] + red[3][r1_out][lane]);
     }
 
@@ -7168,21 +7524,21 @@ kernel void nax_m8_dense_bf16(device const ushort* weights [[buffer(0)]], device
     };
 
     if (splits == 1u) {
-        if (col_live && r0_out < a.tokens) write_out(r0_out, own0);
-        if (col_live && r1_out < a.tokens) write_out(r1_out, own1);
+        if (col_live && r0_out < nt) write_out(r0_out, own0);
+        if (col_live && r1_out < nt) write_out(r1_out, own1);
     } else {
         const ulong p_stride = ulong((a.rows + 31u) & ~31u);
-        if (col_live && r0_out < a.tokens) partials[(ulong(split) * 8ul + r0_out) * p_stride + col_out] = own0;
-        if (col_live && r1_out < a.tokens) partials[(ulong(split) * 8ul + r1_out) * p_stride + col_out] = own1;
+        if (col_live && r0_out < nt) partials[(ulong(split) * 8ul + r0_out) * p_stride + col_out] = own0;
+        if (col_live && r1_out < nt) partials[(ulong(split) * 8ul + r1_out) * p_stride + col_out] = own1;
         if (nax_m8_split_detail::split_arrive_last(counters + group.x, splits, tid, &arrival)) {
-            if (col_live && r0_out < a.tokens) {
+            if (col_live && r0_out < nt) {
                 float sum = 0.0f;
                 for (uint s = 0u; s < splits; ++s) {
                     sum += s == split ? own0 : partials[(ulong(s) * 8ul + r0_out) * p_stride + col_out];
                 }
                 write_out(r0_out, sum);
             }
-            if (col_live && r1_out < a.tokens) {
+            if (col_live && r1_out < nt) {
                 float sum = 0.0f;
                 for (uint s = 0u; s < splits; ++s) {
                     sum += s == split ? own1 : partials[(ulong(s) * 8ul + r1_out) * p_stride + col_out];

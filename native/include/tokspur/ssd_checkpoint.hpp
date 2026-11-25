@@ -24,7 +24,7 @@ constexpr uint64_t apfs_free_space_floor = 20ull << 30;          // 20.0 GiB
 constexpr size_t staging_slab_bytes = 64ull << 20;               // 64 MiB
 constexpr size_t checkpoint_chunk_bytes = 16ull << 20;           // 16 MiB
 constexpr uint32_t checkpoint_format_version = 3;
-constexpr double lambda_recompute_prefill = 1.0e7;               // 1.0e7 bytes / second
+constexpr double lambda_recompute_prefill = 1.0e9;               // 1.0e9 bytes / second
 
 #pragma pack(push, 1)
 struct CheckpointFileHeader {

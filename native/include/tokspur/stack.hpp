@@ -57,6 +57,7 @@ struct StackDFlashCapture {
 };
 #endif
 inline constexpr uint64_t maximum_stack_verification_budget = 128ull << 20;
+inline constexpr uint64_t maximum_stack_verification16_budget = 256ull << 20;
 struct StackVerificationMemory {
     bool prepared = false;
     uint64_t gpu_charged_bytes = 0, host_charged_bytes = 0, tape_payload_bytes = 0;
@@ -84,8 +85,8 @@ struct StackSampledVerificationRows {
     uint32_t position = 0, count = 0, residual_width = 0, vocabulary = 0;
     bool has_topk = false;
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP_DEPTH2
-    std::array<std::span<const float>, 8> logits{};
-    std::array<GpuLogitTopKRow, 8> topk{};
+    std::array<std::span<const float>, 16> logits{};
+    std::array<GpuLogitTopKRow, 16> topk{};
 #elif defined(TOKSPUR_PRIVATE_SAMPLED_VERIFICATION_COST)
     std::array<std::span<const float>, 3> logits{};
     std::array<GpuLogitTopKRow, 3> topk{};
@@ -190,7 +191,7 @@ public:
     [[nodiscard]] bool known_residual_reuse() const; // Never changes ordinary step.
     // Prepare once at an empty direct stack, before a verifier. Capacity eight
     // covers ordinary steps/known prefill. Persistent checkpoints are refused.
-    void prepare_final_hc_tap(uint64_t byte_budget);
+    void prepare_final_hc_tap(uint64_t byte_budget, uint32_t minimum_capacity = 8);
     void configure_gpu_final_hc_tap(bool enabled);
     [[nodiscard]] bool gpu_final_hc_tap() const;
     [[nodiscard]] StackFinalHcTapMemory final_hc_tap_memory() const;
@@ -201,7 +202,7 @@ public:
     [[nodiscard]] GpuView last_final_hc_gpu_rows() const;
     [[nodiscard]] GpuView last_final_hc_gpu_residual() const;
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
-    void prepare_dflash_tap(std::span<const uint32_t> layer_ids, uint64_t byte_budget);
+    void prepare_dflash_tap(std::span<const uint32_t> layer_ids, uint64_t byte_budget, uint32_t verify_rows = 8);
     [[nodiscard]] StackDFlashTapMemory dflash_tap_memory() const;
     [[nodiscard]] StackDFlashCapture last_dflash_capture() const;
 #endif
@@ -218,6 +219,8 @@ public:
 #ifdef TOKSPUR_PRIVATE_PREFILL_CHUNK
     // Empty-prefix diagnostic selector; prepared resources stay identical.
     // OFF is the chronological large-tile candidate with ordinary FFN math.
+    // Prepare scratch for the 512-token tiled path before serving. Direct callers can also prepare it on first use.
+    void prepare_tiled_prefill512();
     [[nodiscard]] bool known_grouped_ffn() const;
     void configure_known_grouped_ffn(bool enabled);
     [[nodiscard]] bool known_layer_submissions() const;
@@ -256,6 +259,8 @@ public:
     StackResult step_known(std::span<const uint32_t> tokens,
                            std::span<const float> token_rows,
                            std::span<const float> memory_rows, bool emit_logits = true);
+    StackResult step_known(std::span<const uint32_t> tokens, std::span<const float> token_rows,
+                           std::span<const float> memory_rows, bool emit_logits, std::optional<CommandTiming>* timing);
     // Default-off, fixed depth-two transient transaction, separately budgeted
     // from persistent checkpoints. Prepare once while empty/idle under the same
     // direct, unprofiled split0/16 block-Q8 policy as known-token prefill.
@@ -305,6 +310,15 @@ public:
         uint32_t committed_prefix, StackSampledVerificationSelector, StackVerificationCancellation = {});
     [[nodiscard]] std::array<StackVerificationLookup, 8> sampled_verification8_lookups(std::span<const uint32_t> tokens) const;
     StackSampledVerificationResult verify_sampled8(std::span<const uint32_t> tokens, std::span<const float> token_rows,
+        std::span<const float> memory_rows, uint32_t committed_prefix, StackSampledVerificationSelector selector,
+        StackVerificationCancellation cancellation = {});
+    void prepare_sampled_verification16(uint64_t byte_budget
+#ifdef TOKSPUR_PRIVATE_VERIFY_QSA_ROWS
+        , QsaVerifyRowsConfig qsa_rows = {}
+#endif
+        );
+    [[nodiscard]] std::array<StackVerificationLookup, 16> sampled_verification16_lookups(std::span<const uint32_t> tokens) const;
+    StackSampledVerificationResult verify_sampled16(std::span<const uint32_t> tokens, std::span<const float> token_rows,
         std::span<const float> memory_rows, uint32_t committed_prefix, StackSampledVerificationSelector selector,
         StackVerificationCancellation cancellation = {});
 #endif
@@ -396,6 +410,11 @@ private:
     StackResult step_with_logits(uint32_t token, std::span<const float> token_row,
                                  std::span<const float> memory_rows, bool emit_logits);
 #ifdef TOKSPUR_PRIVATE_VERIFY_EIGHT
+    void prepare_transient_verification8_impl(uint64_t byte_budget
+#ifdef TOKSPUR_PRIVATE_VERIFY_QSA_ROWS
+        , QsaVerifyRowsConfig qsa_rows
+#endif
+        , uint32_t capacity, uint64_t budget_limit);
     StackSampledVerificationResult verify_sampled_bounded(std::span<const uint32_t> tokens,
         std::span<const float> token_rows, std::span<const float> memory_rows,
         uint32_t committed_prefix, StackSampledVerificationSelector selector,

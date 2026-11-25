@@ -304,15 +304,19 @@ def rust_sources(root):
     return result
 
 
-def suites(checker):
-    """Read only the producer's two literal inventories; never import/execute it."""
-    assignments = {
+def producer_assignments(checker):
+    return {
         node.targets[0].id: node.value
         for node in ast.parse(checker).body
         if isinstance(node, ast.Assign)
         and len(node.targets) == 1
         and isinstance(node.targets[0], ast.Name)
     }
+
+
+def suites(checker):
+    """Read the suite inventories from the pinned producer source."""
+    assignments = producer_assignments(checker)
     result = []
     for name in ("CPU_SUITES", "METAL_SUITES"):
         node = assignments.get(name)
@@ -427,19 +431,29 @@ def admit(root, build, receipt_path, receipt_sha256, policy, policy_sha256):
             and isinstance(command.get("stderr"), str),
             "Missing, reordered, or failed regression command",
         )
+    parked = producer_assignments(checker).get("PARKED_PROTOCOL_CHECKS")
+    if parked is None:
+        counts = (("target protocol", 245), ("target stack-experiment protocol", 59))
+    else:
+        require(
+            isinstance(parked, ast.Constant)
+            and type(parked.value) is int
+            and parked.value == 17,
+            "Unknown parked protocol check count",
+        )
+        counts = (
+            ("target protocol", 245),
+            ("parked conversation", 17),
+            ("target stack-experiment protocol", 76),
+        )
     require(
-        re.findall(
-            r"^Owned CPU target protocol checks passed: (.*)$",
-            commands[5]["stdout"],
-            re.M,
-        )
-        == ["245"]
-        and re.findall(
-            r"^Owned CPU target stack-experiment protocol checks passed: (.*)$",
-            commands[5]["stdout"],
-            re.M,
-        )
-        == ["59"],
+        all(
+            re.findall(
+                rf"^Owned CPU {label} checks passed: (.*)$", commands[5]["stdout"], re.M
+            )
+            == [str(count)]
+            for label, count in counts
+        ),
         "Incomplete target protocol proof",
     )
     links = {

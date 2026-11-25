@@ -241,8 +241,19 @@ void protocol_case(Reader& in, Writer& out) {
     if (mode == 0) decode = [&](std::span<const uint32_t> ids) { ++calls; return fixture().decode_bytes(ids); };
     else if (mode == 2) decode = [&](std::span<const uint32_t>) { ++calls; return std::string("wrong terminal"); };
     else if (mode == 3) decode = [&](std::span<const uint32_t>) { ++calls; return std::string(response_request_bytes + 1, 'x'); };
+    const std::array<uint32_t, 4> controls{259, 260, 261, 262};
+    if (mode == 4) decode = [&](std::span<const uint32_t> ids) {
+        ++calls;
+        std::string text;
+        for (const auto& id : ids) {
+            if (id >= 259 && id <= 262) text += response_control_markers[id - 259];
+            else text += fixture().decode_bytes(std::span(&id, 1));
+        }
+        return text;
+    };
     try {
-        const auto result = parse_native_response(envelope, admission, decode);
+        const auto result = parse_native_response_with_controls(envelope, admission, decode, response_maximum_ids,
+            mode == 4 ? std::span<const uint32_t>(controls) : std::span<const uint32_t>{});
         out.u8('O');
         dump_or_error(out, result);
     } catch (const FormatError& error) { out.u8('E'); out.bytes(error.what()); }

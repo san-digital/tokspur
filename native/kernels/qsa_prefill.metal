@@ -121,16 +121,38 @@ kernel void qsa_prefill_index_pool(device const float* raw [[buffer(0)]],device 
     for(uint token=start;token<end;++token)sum=sum+raw[ulong(token-p.v[2])*p.v[3]+c];
     if(group<p.v[5])qpf_write(pooled,ulong(group)*p.v[4]+c,sum/4.0f,error);else qpf_write(next,c,sum,error);
 }
-kernel void qsa_prefill_index_scores(device const float* query [[buffer(0)]],device const ushort* keys [[buffer(1)]],
-    device float* output [[buffer(2)]],constant QsaPrefillParams& p [[buffer(6)]],device atomic_uint* error [[buffer(7)]],
-    uint2 group [[threadgroup_position_in_grid]],ushort sg [[simdgroup_index_in_threadgroup]],ushort lane [[thread_index_in_simdgroup]]) {
-    const uint b=group.x*4+sg,blocks=(p.v[1]+group.y+1)/4;if(b>=blocks || blocks<=p.v[6])return;
-    float result=0;
-    for(uint h=0;h<p.v[2];++h) {
-        float dot=0;for(uint d=lane;d<p.v[3];d+=32)dot+=query[ulong(group.y)*p.v[5]+h*p.v[3]+d]*qpf_bf16(keys[ulong(b)*p.v[3]+d]);
-        dot=simd_sum(dot);if(!isfinite(dot))atomic_fetch_or_explicit(error,1u,memory_order_relaxed);result+=max(dot,0.0f);
+kernel void qsa_prefill_index_scores(device const float* query [[buffer(0)]], device const ushort* keys [[buffer(1)]],
+    device float* output [[buffer(2)]], constant QsaPrefillParams& p [[buffer(6)]], device atomic_uint* error [[buffer(7)]],
+    uint2 group [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    const uint block = group.x * 4u + sg, row = group.y;
+    const uint blocks = (p.v[1] + row + 1u) / 4u;
+    if (block >= blocks || blocks <= p.v[6]) return;
+
+    const uint heads = p.v[2], width = p.v[3];
+    device const float* q = query + ulong(row) * p.v[5];
+    device const ushort* key = keys + ulong(block) * width;
+    float result = 0.0f;
+    if (heads == 4u && width == 128u) {
+        float4 dots = 0.0f;
+        for (uint d = lane; d < 128u; d += 32u) {
+            const float4 queries(q[d], q[128u + d], q[256u + d], q[384u + d]);
+            dots += queries * qpf_bf16(key[d]);
+        }
+        const float4 sums = simd_sum(dots);
+        if (lane == 0) {
+            if (!all(isfinite(sums))) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
+            for (uint h = 0; h < 4u; ++h) result += max(sums[h], 0.0f);
+        }
+    } else {
+        for (uint h = 0; h < heads; ++h) {
+            float dot = 0.0f;
+            for (uint d = lane; d < width; d += 32u) dot += q[h * width + d] * qpf_bf16(key[d]);
+            dot = simd_sum(dot);
+            if (!isfinite(dot)) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
+            result += max(dot, 0.0f);
+        }
     }
-    if(lane==0)qpf_write(output,ulong(group.y)*p.v[4]+b,result,error);
+    if (lane == 0) qpf_write(output, ulong(row) * p.v[4] + block, result, error);
 }
 kernel void qsa_prefill_select_sort(device const float* input [[buffer(0)]],device float* scores [[buffer(1)]],
     device uint* ids [[buffer(2)]],constant QsaPrefillParams& p [[buffer(6)]],device atomic_uint* error [[buffer(7)]],

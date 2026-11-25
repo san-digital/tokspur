@@ -49,15 +49,15 @@ uint32_t compose(uint32_t first_point, uint32_t second_point) {
     return found != last && found->pair == key ? found->point : 0;
 }
 
-} // namespace
-
-std::vector<uint32_t> unicode_scalars(std::string_view utf8) {
+void check_unicode_limit(std::string_view utf8) {
     if (utf8.size() > work_limit) throw FormatError("Unicode input exceeds limit");
-    std::vector<uint32_t> output;
-    output.reserve(utf8.size());
+}
+
+template<class Visit>
+void visit_scalars(std::string_view utf8, Visit visit) {
     for (size_t i = 0; i < utf8.size();) {
         const auto first = static_cast<unsigned char>(utf8[i++]);
-        if (first < 128) { output.push_back(first); continue; }
+        if (first < 128) { visit(first); continue; }
         const size_t tail = first >= 0xc2 && first <= 0xdf ? 1 :
                             (first >= 0xe0 && first <= 0xef ? 2 : (first >= 0xf0 && first <= 0xf4 ? 3 : 0));
         if (!tail || tail > utf8.size() - i) throw FormatError("invalid UTF-8 input");
@@ -69,8 +69,24 @@ std::vector<uint32_t> unicode_scalars(std::string_view utf8) {
         }
         if ((tail == 1 && point < 0x80) || (tail == 2 && point < 0x800) || (tail == 3 && point < 0x10000) ||
             point > 0x10ffff || (point >= 0xd800 && point <= 0xdfff)) throw FormatError("non-scalar or overlong UTF-8");
-        output.push_back(point);
+        visit(point);
     }
+}
+
+} // namespace
+
+size_t unicode_scalar_count(std::string_view utf8) {
+    check_unicode_limit(utf8);
+    size_t count = 0;
+    visit_scalars(utf8, [&](uint32_t) { ++count; });
+    return count;
+}
+
+std::vector<uint32_t> unicode_scalars(std::string_view utf8) {
+    check_unicode_limit(utf8);
+    std::vector<uint32_t> output;
+    output.reserve(utf8.size());
+    visit_scalars(utf8, [&](uint32_t point) { output.push_back(point); });
     return output;
 }
 

@@ -6,8 +6,10 @@
 #include <cstring>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <stdexcept>
+#include <string_view>
 
 namespace {
 using namespace tokspur;
@@ -127,6 +129,117 @@ void indexers(MetalGraph& g) {
         for(uint32_t c=0;c<8;++c)need(std::abs(gotk[r*8+c]-expected[r*24+16+c])<=2e-5f*(1+std::abs(expected[r*24+16+c])),"BF16 key projector generated control");}
     release_qsa_prefill_scratch(g,scratch);
 }
+void four_head_index_scores(MetalGraph& g) {
+    Fixture f{g};
+    constexpr uint32_t width = 128, query_stride = 5 * width + 3, score_stride = 7, base = 14, budget = 3;
+    std::vector<float> queries(4 * query_stride, 0.0f);
+    for (uint32_t row = 0; row < 4; ++row)
+        for (uint32_t column = 0; column < 4 * width; ++column)
+            queries[row * query_stride + column] = float(int(f.random() % 20001) - 10000) / 173.0f;
+    std::vector<uint16_t> keys(4 * width);
+    for (auto& key : keys)
+        key = uint16_t(std::bit_cast<uint32_t>(float(int(f.random() % 1025) - 512) / 61.0f) >> 16);
+    const auto key_view = g.upload(std::as_bytes(std::span(keys)), "generated index keys", true);
+    f.owned.push_back(key_view);
+    const auto query_view = f.floats(queries);
+    const std::vector<float> sentinel(4 * score_stride, -77.f);
+    const auto actual = f.floats(sentinel, false), reference = f.floats(sentinel, false);
+    for (uint32_t rows : {2u, 3u, 4u}) {
+        g.write(actual, std::as_bytes(std::span(sentinel)));
+        g.write(reference, std::as_bytes(std::span(sentinel)));
+        g.begin();
+        for (uint32_t heads : {4u, 5u}) {
+            const std::array buffers{query_view, key_view, heads == 4 ? actual : reference};
+            g.qsa_prefill_dispatch(QsaPrefillOp::index_scores, buffers,
+                {rows, base, heads, width, score_stride, query_stride, budget});
+        }
+        static_cast<void>(g.submit());
+        need(g.read(actual) == g.read(reference), "four index heads differ from the generic path with a zero fifth head");
+        const auto got = read<float>(g, actual);
+        for (uint32_t row = 0; row < 4; ++row)
+            for (uint32_t block = 0; block < score_stride; ++block) {
+                const auto blocks = (base + row + 1) / 4;
+                const bool active = row < rows && blocks > budget && block < blocks;
+                need(active ? got[row * score_stride + block] >= 0.0f : got[row * score_stride + block] == -77.f,
+                    "index score wrote outside its causal row or missed an active block");
+            }
+    }
+    queries[query_stride + 3 * width + width - 1] = std::numeric_limits<float>::quiet_NaN();
+    const auto bad_query = f.floats(queries);
+    g.begin();
+    const std::array buffers{bad_query, key_view, actual};
+    g.qsa_prefill_dispatch(QsaPrefillOp::index_scores, buffers, {2, base, 4, width, score_stride, query_stride, budget});
+    bool rejected = false;
+    try { static_cast<void>(g.submit()); } catch (const FormatError&) { rejected = true; }
+    need(rejected, "index score admitted a nonfinite dot in the fourth head");
+}
+void compare_index_selection(const char* candidate_path, const char* baseline_path) {
+    constexpr uint32_t heads = 4, width = 128, budget = 512, capacity = 32768;
+    constexpr uint32_t slots = ((capacity + 511) / 512) * budget, query_stride = heads * width;
+    struct Selection {
+        Fixture fixture;
+        GpuView query, keys, scores;
+        std::array<GpuView, 2> ranks, ids;
+        GpuView chosen;
+
+        Selection(MetalGraph& graph, uint32_t rows, std::span<const float> queries, std::span<const uint16_t> index_keys)
+            : fixture(graph), query(fixture.floats(queries)), keys(graph.upload(std::as_bytes(index_keys), "generated index keys", true)),
+              scores(fixture.zero(rows * capacity * sizeof(float))),
+              ranks{fixture.zero(rows * slots * sizeof(float)), fixture.zero(rows * slots * sizeof(float))},
+              ids{fixture.zero(rows * slots * sizeof(uint32_t)), fixture.zero(rows * slots * sizeof(uint32_t))},
+              chosen(fixture.zero(rows * budget * sizeof(uint32_t))) {
+            fixture.owned.push_back(keys);
+        }
+    };
+
+    MetalGraph baseline(baseline_path, 128ull << 20), candidate(candidate_path, 128ull << 20);
+    baseline.prepare_qsa_prefill();
+    candidate.prepare_qsa_prefill();
+    std::cout << "prefix_tokens,rows,pair,baseline_gpu_ms,candidate_gpu_ms\n";
+    for (uint32_t base : {65530u, 131064u}) for (uint32_t rows : {2u, 3u, 4u}) {
+        const uint32_t blocks = (base + rows) / 4;
+        std::mt19937 rng(84691 + rows + width + base);
+        const auto sample = [&] { return float(int(rng() % 20001) - 10000) / 4096.0f; };
+        std::vector<float> queries(rows * query_stride);
+        std::generate(queries.begin(), queries.end(), sample);
+        std::vector<uint16_t> keys(blocks * width);
+        for (auto& value : keys) value = uint16_t(std::bit_cast<uint32_t>(sample()) >> 16);
+        Selection before(baseline, rows, queries, keys), after(candidate, rows, queries, keys);
+
+        const auto run = [&](Selection& s, uint32_t repeats) {
+            auto& graph = s.fixture.g;
+            const auto encode = [&](QsaPrefillOp op, std::initializer_list<GpuView> buffers, const QsaPrefillParams& params) {
+                graph.qsa_prefill_dispatch(op, std::span(buffers.begin(), buffers.size()), params);
+            };
+            graph.begin();
+            for (uint32_t i = 0; i < repeats; ++i) {
+                encode(QsaPrefillOp::index_scores, {s.query, s.keys, s.scores}, {rows, base, heads, width, capacity, query_stride, budget});
+                encode(QsaPrefillOp::select_sort, {s.scores, s.ranks[0], s.ids[0]}, {rows, base, capacity, slots, budget});
+                unsigned source = 0;
+                for (uint32_t span = 512; span < blocks; span *= 2) {
+                    const unsigned dest = 1 - source;
+                    encode(QsaPrefillOp::select_merge, {s.ranks[source], s.ids[source], s.ranks[dest], s.ids[dest]}, {rows, base, slots, budget, span});
+                    source = dest;
+                }
+                encode(QsaPrefillOp::select_ids, {s.ids[source], s.chosen}, {rows, base, slots, budget, budget});
+            }
+            const double ms = graph.submit().gpu_ms / repeats;
+            need(std::isfinite(ms) && ms > 0.0, "GPU timestamp unavailable for index selection");
+            return ms;
+        };
+
+        run(before, 2);
+        run(after, 2);
+        need(baseline.read(before.scores) == candidate.read(after.scores), "index scores differ between libraries");
+        need(baseline.read(before.chosen) == candidate.read(after.chosen), "selected block IDs differ between libraries");
+        for (uint32_t pair = 0; pair < 17; ++pair) {
+            const bool baseline_first = pair % 2 == 0;
+            const double first = run(baseline_first ? before : after, 4);
+            const double second = run(baseline_first ? after : before, 4);
+            std::cout << base << ',' << rows << ',' << pair << ',' << (baseline_first ? first : second) << ',' << (baseline_first ? second : first) << '\n';
+        }
+    }
+}
 void invalid_ids(MetalGraph& g) {
     Fixture f{g};const auto query=f.floats(std::vector<float>(8)),keys=f.zero(16*8*2),values=f.zero(16*8*2),partials=f.zero(10*4);
     for(const auto bad: {std::array<uint32_t,2>{0,0},std::array<uint32_t,2>{1,0},std::array<uint32_t,2>{0,4}}) {
@@ -136,7 +249,14 @@ void invalid_ids(MetalGraph& g) {
     }
 }
 }
-int main(int argc,char** argv){try{if(argc!=2)throw std::runtime_error("usage: test-qsa_prefill metallib");MetalGraph g(argv[1],512ull<<20);g.prepare_qsa_prefill();g.prepare_gdn_chunk();
+int main(int argc,char** argv){try{
+    if (argc == 4 && std::string_view(argv[2]) == "--index-selection-control") {
+        compare_index_selection(argv[1], argv[3]);
+        return 0;
+    }
+    if (argc != 2) throw std::runtime_error("usage: test-qsa_prefill metallib [--index-selection-control baseline.metallib]");
+    MetalGraph g(argv[1],512ull<<20);g.prepare_qsa_prefill();g.prepare_gdn_chunk();
+    four_head_index_scores(g);
     indexers(g);g.configure_prefill_dense_f32(true);g.configure_prefill_dense_nax(true);g.prepare_qsa_prefill();indexers(g);
     g.configure_prefill_dense_nax(false);g.configure_prefill_dense_f32(false);invalid_ids(g);
     const QsaShape small{16,4,2,8,2,8,4,4,16,8192};

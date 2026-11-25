@@ -113,7 +113,7 @@ QsaPrefillDispatchSpec qsa_prefill_spec(QsaPrefillOp op,const QsaPrefillParams& 
         out.buffers=6;out.writable_mask=48;out.groups={div_up(p[4]+1,4),1,1};break;
     case QsaPrefillOp::verify_index_pool:
         rows(p[0],p[1],p[3],allow_nax_2k);
-        need(p[0]>=2 && p[0]<=8 && p[1]<=256 && p[2]<131072 && p[0]<=131072-p[2] && p[6]==4 &&
+        need(p[0]>=2 && p[0]<=16 && p[1]<=256 && p[2]<131072 && p[0]<=131072-p[2] && p[6]==4 &&
             p[5]==(p[2]+p[0])/4-p[2]/4 && p[4]>=p[1] && p[4]<=1048576,"invalid QSA verify_index_pool geometry");
         tail_zero(p,7);
         out.buffers=5;out.writable_mask=28;out.groups={div_up(p[1],128),1,1};break;

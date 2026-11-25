@@ -507,6 +507,8 @@ def test_serve_default_uses_f32_and_keeps_speed_lead_paths_opt_in(harness):
         ("--native-hc-consumer-fused", "on"),
         ("--native-ple-overlap", "on"),
         ("--shared-prefix-cache", "on"),
+        ("--native-parked-lanes-mib", "4096"),
+        ("--native-mtp-lookup", "hybrid"),
         ("--tool-enum-validation", "strict"),
     )
     for flag, expected_val in expected_pairs:
@@ -522,7 +524,6 @@ def test_serve_default_uses_f32_and_keeps_speed_lead_paths_opt_in(harness):
         "--native-mtp-draft-slice",
         "--native-verify-nax",
         "--native-drafter",
-        "--native-mtp-lookup",
         "--native-mtp-lookup-match",
         "--native-dflash2-lookup",
         "--native-dflash2-lookup-match",
@@ -533,7 +534,6 @@ def test_serve_default_uses_f32_and_keeps_speed_lead_paths_opt_in(harness):
         "--checkpoint-cap-gib",
         "--checkpoint-floor-gib",
         "--checkpoint-policy",
-        "--native-parked-lanes-mib",
     ):
         assert opt_in_flag not in command
 
@@ -565,10 +565,11 @@ def test_serve_opt_out_flags_disable_default_exact_optimisations(harness):
         "--native-qsa-prefill-fused",
         "--native-hc-consumer-fused",
         "--native-ple-overlap",
-        "--shared-prefix-cache",
         "--checkpoint-ssd",
     ):
         assert disabled_flag not in command
+    assert command[command.index("--shared-prefix-cache") + 1] == "off"
+    assert command[command.index("--native-parked-lanes-mib") + 1] == "0"
 
 
 def test_serve_opt_in_speed_lead_flags_are_forwarded(harness, tmp_path):
@@ -624,7 +625,10 @@ def test_serve_opt_in_speed_lead_flags_are_forwarded(harness, tmp_path):
     assert dflash2_cmd[dflash2_cmd.index("--native-prefill-grouped") + 1] == "nax"
     assert dflash2_cmd[dflash2_cmd.index("--native-verify-nax") + 1] == "on"
     assert "--checkpoint-ssd" not in dflash2_cmd
-    assert "--shared-prefix-cache" not in dflash2_cmd
+    assert dflash2_cmd[dflash2_cmd.index("--shared-prefix-cache") + 1] == "on"
+    assert dflash2_cmd[dflash2_cmd.index("--native-parked-lanes-mib") + 1] == "4096"
+    assert dflash2_cmd[dflash2_cmd.index("--native-dflash2-defer-context") + 1] == "on"
+    assert dflash2_cmd[dflash2_cmd.index("--native-dflash2-lookup") + 1] == "hybrid"
 
     with pytest.raises(SystemExit):
         cli.serve(
@@ -640,7 +644,7 @@ def test_serve_opt_in_speed_lead_flags_are_forwarded(harness, tmp_path):
     assert cached[cached.index("--checkpoint-ssd") + 1] == "on"
     assert cached[cached.index("--native-dflash2-lookup") + 1] == "hybrid"
     assert cached[cached.index("--native-dflash2-lookup-match") + 1] == "4"
-    assert "--native-parked-lanes-mib" not in cached
+    assert cached[cached.index("--native-parked-lanes-mib") + 1] == "4096"
 
     with pytest.raises(SystemExit):
         cli.serve(speed_preset=True)
@@ -649,13 +653,21 @@ def test_serve_opt_in_speed_lead_flags_are_forwarded(harness, tmp_path):
 
     with pytest.raises(SystemExit):
         cli.serve(speed_preset=True, parked_lanes_mib=0)
-    assert "--native-parked-lanes-mib" not in harness.last_command
+    assert (
+        harness.last_command[
+            harness.last_command.index("--native-parked-lanes-mib") + 1
+        ]
+        == "0"
+    )
 
     with pytest.raises(ValueError, match="requires the shared prefix cache"):
         cli.serve(shared_prefix_cache=False, parked_lanes_mib=1024)
 
-    with pytest.raises(ValueError, match="incompatible with SSD checkpoints"):
+    with pytest.raises(SystemExit):
         cli.serve(checkpoint_cap_gib=4.0, parked_lanes_mib=1024)
+    coexist_cmd = harness.last_command
+    assert coexist_cmd[coexist_cmd.index("--checkpoint-ssd") + 1] == "on"
+    assert coexist_cmd[coexist_cmd.index("--native-parked-lanes-mib") + 1] == "1024"
 
     for bad_kwargs in (
         {"drafter": "dflash2"},
@@ -687,7 +699,7 @@ def test_dflash2_speed_preset_requires_an_explicit_parking_budget(
         )
     command = harness.last_command
     if budget is None:
-        assert "--native-parked-lanes-mib" not in command
+        assert command[command.index("--native-parked-lanes-mib") + 1] == "4096"
     else:
         assert command[command.index("--native-parked-lanes-mib") + 1] == str(budget)
 

@@ -28,6 +28,11 @@ void basics() {
     require(object.find("ids")->array().at(2).unsigned_integer() == 4294967295ULL, "JSON uint32 maximum");
     require(tokspur::parse_json("18446744073709551615").unsigned_integer() == uint64_t(-1), "JSON uint64 maximum");
     require(tokspur::parse_json(object.dump()).dump() == object.dump(), "JSON stable dump/parse");
+    auto owned = object;
+    const auto* entries = owned.object().data();
+    auto fields = std::move(owned).take_object();
+    require(fields.data() == entries && tokspur::Json(std::move(fields)).dump() == object.dump(), "taking a JSON object must transfer its entries in order");
+    rejected([] { static_cast<void>(tokspur::parse_json("[]").take_object()); });
     require(tokspur::parse_json(R"("\ud83e\udd89")").string() == "🦉", "JSON surrogate pair");
     require(tokspur::parse_json(R"("\"\\\/\b\f\n\r\t")").string() == "\"\\/\b\f\n\r\t", "JSON escapes");
     require(tokspur::parse_json(" \n [true, false, null, -1.25e+20] \t").dump() == "[true,false,null,-1.25e+20]", "JSON number lexeme and whitespace");

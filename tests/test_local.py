@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import socket
 from pathlib import Path
 
@@ -267,6 +268,9 @@ def test_scalar_identity_retains_permission_and_disappearance_handling(monkeypat
 
 
 def test_child_environment_is_an_allowlist(sandbox, monkeypatch):
+    for key in tuple(os.environ):
+        if key.startswith(("LC_", "TOKSPUR_")):
+            monkeypatch.delenv(key)
     for key in (
         "HF_TOKEN",
         "HF_API_TOKEN",

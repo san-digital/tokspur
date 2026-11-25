@@ -1668,6 +1668,7 @@ pub fn copy_options(options: &WorkerOptions) -> WorkerOptions {
         ple_overlap: options.ple_overlap,
         shared_prefix_cache: options.shared_prefix_cache,
         parked_lanes_mib: options.parked_lanes_mib,
+        parked_lanes_explicit: options.parked_lanes_explicit,
     }
 }
 

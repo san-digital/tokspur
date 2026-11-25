@@ -143,6 +143,7 @@ struct Fake {
         if (job.find("op")) { previous = control(job); return previous; }
         check(!job.find("reset")->boolean(), "new branch wire reset must be a distinct control");
         const auto n = uint32_t(integer(job, "generate")), input = uint32_t(job.find("tokens")->array().size());
+        if (input) next = 0;
         std::vector<Round> rounds; const size_t first = next;
         for (uint32_t t = 0; t < n && next < output.size(); ++t, ++next) {
             const bool terminal = output[next] == 248046; rounds.push_back({0, 0, 1, terminal}); if (terminal) { ++next; break; }

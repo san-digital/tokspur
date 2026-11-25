@@ -394,7 +394,8 @@ struct SealTemporary {
 } // namespace
 
 std::string encode_local_seal(const LocalSeal& seal) {
-    std::string out(local_seal_format);
+    const bool v3 = seal.certification == SealCertification::dm_fp16_v1;
+    std::string out(v3 ? local_seal_format_v3 : local_seal_format);
     out += "\nmanifest_sha256=" + seal.manifest_sha256 + "\n";
     out += "compared=" + std::string(seal_scope_text(seal.compared)) + "\n";
     out += "inode=" + std::to_string(seal.pack.inode) + "\n";
@@ -402,6 +403,9 @@ std::string encode_local_seal(const LocalSeal& seal) {
     append_seal_time(out, "mtime", seal.pack.mtime_seconds, seal.pack.mtime_nanoseconds);
     append_seal_time(out, "ctime", seal.pack.ctime_seconds, seal.pack.ctime_nanoseconds);
     append_seal_time(out, "birthtime", seal.pack.birthtime_seconds, seal.pack.birthtime_nanoseconds);
+    if (v3) {
+        out += "certification=" + std::string(local_seal_certification_dm_fp16_v1) + "\n";
+    }
     return out;
 }
 
@@ -418,12 +422,19 @@ ParsedLocalSeal parse_local_seal(std::string_view text) {
     }
 
     auto rest = text;
-    if (!rest.starts_with(local_seal_format) || rest.size() <= local_seal_format.size() ||
-        rest[local_seal_format.size()] != '\n') {
+    SealCertification expected_cert = SealCertification::none;
+    if (rest.starts_with(local_seal_format_v3) && rest.size() > local_seal_format_v3.size() &&
+        rest[local_seal_format_v3.size()] == '\n') {
+        rest.remove_prefix(local_seal_format_v3.size() + 1);
+        expected_cert = SealCertification::dm_fp16_v1;
+    } else if (rest.starts_with(local_seal_format) && rest.size() > local_seal_format.size() &&
+               rest[local_seal_format.size()] == '\n') {
+        rest.remove_prefix(local_seal_format.size() + 1);
+    } else {
         return parsed;
     }
-    rest.remove_prefix(local_seal_format.size() + 1);
     LocalSeal seal;
+    seal.certification = expected_cert;
     const auto manifest = take_seal_field(rest, "manifest_sha256");
     const auto compared = take_seal_field(rest, "compared");
     const auto inode = take_seal_field(rest, "inode");
@@ -431,6 +442,11 @@ ParsedLocalSeal parse_local_seal(std::string_view text) {
     const auto mtime = take_seal_field(rest, "mtime");
     const auto ctime = take_seal_field(rest, "ctime");
     const auto birthtime = take_seal_field(rest, "birthtime");
+    std::optional<std::string_view> cert;
+    if (expected_cert == SealCertification::dm_fp16_v1) {
+        cert = take_seal_field(rest, "certification");
+        if (!cert || *cert != local_seal_certification_dm_fp16_v1) return parsed;
+    }
     const auto scope = compared ? parse_seal_scope(*compared) : std::nullopt;
     if (!manifest || !scope || !inode || !size || !mtime || !ctime || !birthtime || !rest.empty() ||
         !is_manifest_hash(*manifest) ||
@@ -450,11 +466,13 @@ ParsedLocalSeal parse_local_seal(std::string_view text) {
 }
 
 bool local_seal_vouches(std::string_view seal_text, std::string_view manifest_sha256, const PackFileIdentity& pack,
-                        SealScope needed) {
+                        SealScope needed, SealCertification required_certification) {
     const auto parsed = parse_local_seal(seal_text);
     return parsed.form == LocalSealForm::current && is_manifest_hash(manifest_sha256) &&
            parsed.seal.manifest_sha256 == manifest_sha256 && parsed.seal.pack == pack &&
-           parsed.seal.compared.covers(needed);
+           parsed.seal.compared.covers(needed) &&
+           (required_certification == SealCertification::none ||
+            parsed.seal.certification == required_certification);
 }
 
 PackFileIdentity pack_file_identity(int fd) {
@@ -471,7 +489,8 @@ std::optional<std::string> local_seal_name(const std::string& pack_name) {
 }
 
 LocalSealReading read_local_seal(int directory_fd, const std::string& pack_name,
-                                 std::string_view manifest_sha256, const PackFileIdentity& pack, SealScope needed) {
+                                 std::string_view manifest_sha256, const PackFileIdentity& pack, SealScope needed,
+                                 SealCertification required_certification) {
     LocalSealReading reading;
     const auto derived_name = local_seal_name(pack_name);
     if (!derived_name) {
@@ -517,9 +536,12 @@ LocalSealReading read_local_seal(int directory_fd, const std::string& pack_name,
                              parsed.seal.manifest_sha256 == manifest_sha256;
     if (parsed.form == LocalSealForm::current) {
         reading.compared = parsed.seal.compared;
+        reading.certification = parsed.seal.certification;
         reading.names_file = reading.names_manifest && parsed.seal.pack == pack;
     }
-    reading.vouches = reading.names_file && reading.compared.covers(needed);
+    reading.vouches = reading.names_file && reading.compared.covers(needed) &&
+                      (required_certification == SealCertification::none ||
+                       parsed.seal.certification == required_certification);
     return reading;
 }
 
@@ -546,7 +568,8 @@ void publish_local_seal(int directory_fd, const std::string& pack_name, const Lo
 }
 
 bool refresh_local_seal(int directory_fd, const std::string& pack_name, int pack_fd,
-                        std::string_view manifest_sha256, const PackFileIdentity& before, SealScope verified) noexcept {
+                        std::string_view manifest_sha256, const PackFileIdentity& before, SealScope verified,
+                        SealCertification certification) noexcept {
     try {
         if (!local_seal_name(pack_name)) return false;
         // The seal may only name bytes that were verified: the file must be
@@ -565,14 +588,16 @@ bool refresh_local_seal(int directory_fd, const std::string& pack_name, int pack
             int fd;
             ~Unlock() { ::flock(fd, LOCK_UN); }
         } unlock{directory_fd};
-        const auto found = read_local_seal(directory_fd, pack_name, manifest_sha256, now, verified);
+        const auto found = read_local_seal(directory_fd, pack_name, manifest_sha256, now, verified, certification);
         if (found.vouches) return true;
         if (found.entry == LocalSealReading::Entry::other) return false;
         // Earlier comparisons still hold only for a seal that names this
-        // manifest and exactly this file. Any other seal contributes nothing.
-        const auto compared = found.names_file ? (found.compared | verified) : verified;
-        publish_local_seal(directory_fd, pack_name, {std::string(manifest_sha256), now, compared}, true);
-        return read_local_seal(directory_fd, pack_name, manifest_sha256, now, verified).vouches;
+        // manifest, this exact file, and satisfies the required certification.
+        const bool keep_prior_scope = found.names_file &&
+            (certification == SealCertification::none || found.certification == certification);
+        const auto compared = keep_prior_scope ? (found.compared | verified) : verified;
+        publish_local_seal(directory_fd, pack_name, {std::string(manifest_sha256), now, compared, certification}, true);
+        return read_local_seal(directory_fd, pack_name, manifest_sha256, now, verified, certification).vouches;
     } catch (...) {
         return false;
     }

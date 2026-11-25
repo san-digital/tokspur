@@ -30,7 +30,7 @@ AttentionTileScratch allocate_attention_tile_scratch(MetalGraph& graph, Attentio
 // Only the24 capacity-eight QSA views are newly owned. A whole-stack prefill
 // caller may combine these with its existing19 recurrent common views; it must
 // never release the resulting borrowed composition as46 independent owners.
-QsaScratch allocate_attention_tile_qsa_scratch(MetalGraph& graph, AttentionLayerShape shape);
+QsaScratch allocate_attention_tile_qsa_scratch(MetalGraph& graph, AttentionLayerShape shape, uint32_t capacity = 8);
 void release_attention_tile_scratch(MetalGraph& graph, const AttentionTileScratch& scratch);
 AttentionLayerScratch attention_tile_token(MetalGraph& graph, const AttentionTileScratch& scratch,
     AttentionLayerShape shape, uint32_t row);

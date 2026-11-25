@@ -446,6 +446,9 @@ impl Fake {
         );
         let n = integer(job, "generate") as u32;
         let input = array(job, "tokens").len() as u32;
+        if input != 0 {
+            self.next = 0;
+        }
         let mut rounds = Vec::new();
         let first = self.next;
         let mut t = 0;

@@ -2655,10 +2655,14 @@ fn pack_only_variant_adoption_seals_pack_and_refuses_raw_gguf_and_repack() {
     );
 
     // `tokspur serve --raw-gguf` refuses when the adopted target requires pack-backed serving.
-    let raw_refused = Command::new(fixture.cli_bin())
-        .args(["serve", "--raw-gguf"])
-        .output()
-        .unwrap();
+    let raw_refused = output_serve_retrying_transient_workers(
+        || {
+            let mut cmd = Command::new(fixture.cli_bin());
+            cmd.args(["serve", "--raw-gguf"]);
+            cmd
+        },
+        Duration::from_secs(15),
+    );
     assert!(!raw_refused.status.success());
     assert!(
         String::from_utf8_lossy(&raw_refused.stderr)
@@ -3539,10 +3543,11 @@ fn pull_interrupted_during_a_transfer_stops_curl_and_adopts_nothing() {
     let draft_bytes = b"synthetic-pull-draft\n";
     let target = PinnedFile::of("target.gguf", &target_bytes);
     let draft = PinnedFile::of("draft.gguf", draft_bytes);
-    pin_pull_profile(&fixture, &target, &draft);
+    let managed = pin_pull_profile(&fixture, &target, &draft);
 
     // SIGTERM reaches only the CLI. SIGINT is sent the same way, as `kill -INT` would; a terminal Ctrl-C also reaches curl directly.
     for signal in [SIGTERM, SIGINT] {
+        let _ignored = fs::remove_file(managed.join("target.gguf.part"));
         let server = AssetServer::start(BTreeMap::from([
             (target.route(), Reply::Stall(target_bytes.clone())),
             (draft.route(), Reply::Sized(draft_bytes.to_vec())),

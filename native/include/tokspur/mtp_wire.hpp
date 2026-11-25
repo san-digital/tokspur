@@ -115,6 +115,9 @@ public:
     void event(const Json&);
     void finish(const Json&);
     [[nodiscard]] std::span<const Json> events() const;
+    [[nodiscard]] std::optional<uint64_t> lane_seed() const;
+    [[nodiscard]] uint32_t lane_restored_prefix() const;
+    [[nodiscard]] uint32_t restored_input_tokens() const;
 private:
     const Json &ready_, &previous_, &job_;
 #ifdef TOKSPUR_PRIVATE_MTP_OUTPUT64
@@ -135,6 +138,8 @@ private:
     MtpGenerationCommand generation_{};
     bool reset_ = false, resync_ = false, carry_ = false, stopped_ = false, finished_ = false;
     bool final_input_logits_ = false, final_input_ = true;
+    uint32_t restored_input_tokens_ = 0, lane_prompt_ = 0, lane_restored_prefix_ = 0;
+    std::optional<uint64_t> lane_seed_;
 };
 } // namespace tokspur
 #endif

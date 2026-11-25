@@ -153,6 +153,18 @@ ByteBpe::ByteBpe(BpeData data) : vocabulary_(std::move(data.vocabulary)), specia
     }
 }
 
+std::optional<uint32_t> ByteBpe::added_token(std::string_view content) const {
+    size_t node = 0;
+    for (const unsigned char byte : content) {
+        const auto& next = markers_[node].next;
+        const auto edge = next.find(byte);
+        if (edge == next.end()) return std::nullopt;
+        node = edge->second;
+    }
+    if (markers_[node].id < 0) return std::nullopt;
+    return uint32_t(markers_[node].id);
+}
+
 std::vector<uint32_t> ByteBpe::nonordinary_token_ids() const {
     std::vector<uint32_t> ids;
     for (const auto& marker : markers_) if (marker.id >= 0) ids.push_back(uint32_t(marker.id));

@@ -1,3 +1,4 @@
+#include "tokspur/owned_worker.hpp"
 #include "tokspur/serve.hpp"
 #include "tokspur/gguf.hpp"
 
@@ -452,6 +453,302 @@ void extended_output_budget() {
     refusal([&] { session.complete(with(request(std::string(65536,'A')), "max_tokens", Json::integer(32768)), "no-context",target,sink); });
     check(before==fake.prefills+fake.generations);
 }
+void parked_lane_http_fast_math_compatibility() {
+    ServeSession session(codec(), "tokspur", "direct", Json()
+#ifdef TOKSPUR_PRIVATE_HTTP_VERIFY8
+        , false, Json()
+#endif
+#ifdef TOKSPUR_PRIVATE_HTTP_BRANCH8
+        , false
+#endif
+        , ToolEnumValidation::strict
+#ifdef TOKSPUR_PRIVATE_HTTP_SAMPLED_PREFILL
+        , false
+#endif
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+        , Json()
+#endif
+#ifdef TOKSPUR_PRIVATE_LANE_LAYOUT
+        , Json()
+#endif
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+        , std::nullopt
+#endif
+        , ToolArgValidation::strict, 65536, true);
+    Fake fake;
+    fake.reply("ok<|im_end|>");
+    const ServeSink sink{{}, [] { return false; }, [] { return uint64_t(42); }};
+    const auto res = session.complete(request("A"), "fast-math-compat", [&](const Json& job, const auto& cb) { return fake(job, cb); }, sink);
+    check(finish(res).string() == "stop");
+}
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+Json parked_mtp_ready() {
+    return parse_json(R"({
+      "event":"ready","small_gemv_column_splits":16,"block_gemv_formats":3,"stack_execution":"direct",
+      "maximum_generated_tokens":4096,"known_token_capacity":8,"known_residual_reuse":true,
+      "prompt_lookup":false,"verification_max_tokens":2,"verification_head_many":false,"verification8_branch_reuse":false,
+      "sampling":{"valid":true,"seed":0,"entropy_prefix":0,"entropy_words":0,"filter_order":"fixture","rng":"fixture","ownership":"fixture","temperature":1,"top_k":20,"top_p":0.95,"min_p":0},
+      "hc_q8_splits":0,"hc_q8_numerical_tier":"ordinary","hc_q8_scratch_logical_bytes":0,"hc_q8_scratch_charged_bytes":0,
+      "replay_prepared":false,"recurrent_replay_captures":0,"mapped_weight_region_limit_bytes":0,
+      "capture_resource_bytes":0,"capture_binding_aliases":0,"capture_binding_alias_span_bytes":0,
+      "capture_binding_alias_resource_bytes":0,"live_captures":0,"profile_counter_payload_bytes":0,
+      "checkpoint_slots":0,"checkpoint_combined_budget_bytes":0,"checkpoint_host_bytes":0,
+      "checkpoint_store_host_bytes":0,"checkpoint_gpu_bytes":0,"checkpoint_broker":false,"broker_epoch":0,
+      "native_limit_bytes":103079215104,"weight_copy":false,"gpu_profile_mode":"disabled","timings_qualified":false,
+      "allow_prompt_lookup_experiments":false,"allow_request_kernel_experiments":false,
+      "allow_request_stack_experiments":false,"allow_request_prefill_experiments":false,
+      "lookup_match_tokens":0,"lookup_history_tokens":0,"lookup_proposal_tokens":0,
+      "lookup_verification_budget_bytes":0,"lookup_caller_host_bytes":0,
+      "verification_host_bytes":1000000,"verification_gpu_bytes":4000000,
+      "lookup_verification_charged_bytes":0,"verification_tape_payload_bytes":1024,
+      "tracked_metal_buffer_bytes":84214816768,"peak_metal_buffer_bytes":84214816768,
+      "gpu_buffer_limit_bytes":100394860544,"imported_weight_backing_bytes":81848123392,"gpu_allocation_count":613,
+      "hc_exact_mode":"combined","hc_exact_rows_per_group":1,"hc_exact_unroll":16,
+      "hc_exact_scratch_logical_bytes":0,"hc_exact_scratch_charged_bytes":0,
+      "hc_exact_routes":{"scalar":0,"many1":0,"many2":0,"many4":0,"many8":0},
+      "wide_q8_exact_enabled":false,"wide_q8_exact_rows_per_group":4,"wide_q8_exact_unroll":16,
+      "wide_q8_exact_scratch_logical_bytes":0,"wide_q8_exact_scratch_charged_bytes":0,
+      "wide_q8_exact_routes":{"qkv_scalar":0,"qkv_many1":0,"output_scalar":0,"output_many1":0},
+      "wide_q8_many_enabled":false,"wide_q8_many_rows_per_group":4,"wide_q8_many_unroll":4,
+      "wide_q8_many_scratch_logical_bytes":0,"wide_q8_many_scratch_charged_bytes":0,
+      "wide_q8_many_routes":{"qkv_many2":0,"qkv_many4":0,"qkv_many8":0,"output_many2":0,"output_many4":0,"output_many8":0},
+      "qsa_stage_v8_prepared":true,"qsa_stage_v8_enabled":true,"qsa_stage_v8_scratch_logical_bytes":196896,
+      "qsa_stage_v8_scratch_charged_bytes":212992,"qsa_stage_v8_calls":0,"qsa_stage_v8_physical_dispatches":0,"qsa_stage_v8_extra_dispatches":0,
+      "ple_gate_transform":"signed-root","ple_gate_transform_schema":1,
+      "qsa_channel_chronological_mode":"on","qsa_channel_chronological_schema":1,
+      "qsa_channel_factor_logical_bytes":393792,"qsa_channel_factor_charged_bytes":409600,
+      "qsa_channel_calls":0,"qsa_channel_extra_dispatches":0,
+      "known_qsa_rows_schema":1,"known_qsa_rows_mode":"q8","known_qsa_rows_logical_bytes":8000000,
+      "known_qsa_rows_charged_bytes":8003584,"known_qsa_rows_allocations":46,"known_qsa_rows_physical_tiles":0,
+      "known_qsa_rows_logical_rows":0,"known_qsa_rows_http_admitted":false,
+      "native_mtp_protocol":"native-mtp-depth1-lookahead-v2","native_mtp_depth":1,"native_mtp_attention":"dense-compression0",
+      "native_mtp_first_cache_position":1,"native_mtp_lookahead_anchor":true,
+      "native_mtp_visible_frontier":"all emitted tokens physically consumed; sampled terminal carried invisibly within request",
+      "native_mtp_workspace_bytes":1000000,
+      "native_mtp_head_calls":0,"native_mtp_prime_calls":0,"native_mtp_rounds":0,"native_mtp_proposed":0,
+      "native_mtp_accepted":0,"native_mtp_recovery_rounds":0,"native_mtp_carried_anchors":0,"native_mtp_discarded_anchors":0,
+      "native_mtp_head_gpu_ms":0,"native_mtp_head_wall_ms":0,"native_mtp_prime_gpu_ms":0,"native_mtp_prime_wall_ms":0
+    })");
+}
+void parked_lane_prefix_respelling_and_hoisting() {
+    size_t render_calls = 0, encode_calls = 0;
+    auto parked_codec = codec();
+    parked_codec.nonordinary_ids = {301};
+    parked_codec.render = [&](const Json& req) {
+        ++render_calls;
+        std::string prompt;
+        for (const auto& msg : req.find("messages")->array()) {
+            const auto role = msg.find("role")->string();
+            const auto content = msg.find("content")->string();
+            if (role == "assistant") {
+                if (const auto* r = msg.find("reasoning_content"); r && !r->is_null()) {
+                    prompt += std::string(r->string()) + "</think>";
+                }
+                prompt += std::string(content) + "<|im_end|>";
+            } else {
+                prompt += std::string(content);
+            }
+        }
+        return RenderedChat{std::move(prompt), Json(Json::Array{}), 0, 0};
+    };
+    parked_codec.encode = [&](const RenderedChat& r) {
+        ++encode_calls;
+        std::vector<uint32_t> out;
+        const std::string& s = r.prompt;
+        for (size_t i = 0; i < s.size();) {
+            if (s.substr(i).starts_with("<|im_end|>")) { out.push_back(1000); i += 10; }
+            else if (s.substr(i).starts_with("</think>")) { out.push_back(301); i += 8; }
+            else out.push_back(static_cast<unsigned char>(s[i++]) + 1U);
+        }
+        return out;
+    };
+    parked_codec.decode = [&](std::span<const uint32_t> ids) {
+        std::string out;
+        for (const auto id : ids) {
+            if (id == 300) out += "Vi";
+            else if (id == 301) out += "</think>";
+            else out += decode(std::span<const uint32_t>(&id, 1));
+        }
+        return out;
+    };
+
+    const auto make_parked_session = [&] {
+        return ServeSession(parked_codec, "tokspur", "direct", Json()
+#ifdef TOKSPUR_PRIVATE_HTTP_VERIFY8
+            , false, Json()
+#endif
+#ifdef TOKSPUR_PRIVATE_HTTP_BRANCH8
+            , false
+#endif
+            , ToolEnumValidation::strict
+#ifdef TOKSPUR_PRIVATE_HTTP_SAMPLED_PREFILL
+            , false
+#endif
+            , parked_mtp_ready()
+#ifdef TOKSPUR_PRIVATE_LANE_LAYOUT
+            , Json()
+#endif
+            , std::nullopt, ToolArgValidation::strict, 65536, true);
+    };
+
+    const auto mtp_ready = parked_mtp_ready();
+    std::vector<uint32_t> out_tokens;
+    uint32_t mtp_pos = 0;
+    uint64_t mtp_primes = 0, mtp_tiles = 0, mtp_rows = 0, mtp_stage = 0;
+    uint64_t mtp_seed = 42;
+    Json mtp_sampling;
+    const auto mtp_target = [&](const Json& job, const std::function<void(const Json&)>& event) -> Json {
+        const bool reset = job.find("reset")->boolean();
+        if (reset) { mtp_pos = 0; mtp_seed = job.find("seed")->unsigned_integer(); mtp_sampling = *job.find("sampling"); }
+        const auto n = uint32_t(job.find("tokens")->array().size());
+        const auto maximum = uint32_t(job.find("generate")->unsigned_integer());
+        Json::Array gen_ids;
+        uint32_t ordinary = 0;
+        bool stopped = false;
+        if (n > 0) {
+            mtp_pos += n;
+            mtp_primes += n - (reset ? 1u : 0u);
+            mtp_tiles += 12;
+            mtp_rows += 12 * n;
+        } else {
+            while (gen_ids.size() < maximum && !out_tokens.empty() && !stopped) {
+                const auto id = out_tokens.front(); out_tokens.erase(out_tokens.begin());
+                ++mtp_pos; ++ordinary; ++mtp_primes;
+                mtp_stage += 12;
+                gen_ids.push_back(Json::integer(id));
+                event(Json(Json::Object{{"event", Json("token")}, {"id", Json::integer(id)}, {"source_logit", parse_json("0.5")},
+                    {"committed_prefix", Json::integer(mtp_pos)}, {"entropy_words", Json::integer(0)}, {"gpu_profile", Json()}}));
+                stopped = (id == 1000);
+            }
+        }
+        auto done = with(mtp_ready, "event", Json("done"));
+        for (const auto name : {"lookup_verification_budget_bytes", "lookup_caller_host_bytes", "verification_host_bytes",
+            "verification_gpu_bytes", "lookup_verification_charged_bytes", "verification_tape_payload_bytes",
+            "prompt_lookup", "checkpoint_broker", "broker_epoch", "gpu_profile_mode",
+            "allow_prompt_lookup_experiments", "allow_request_kernel_experiments",
+            "allow_request_stack_experiments", "allow_request_prefill_experiments"}) {
+            done = without(std::move(done), name);
+        }
+        done = with(std::move(done), "committed_prefix", Json::integer(mtp_pos));
+        done = with(std::move(done), "generated_ids", Json(std::move(gen_ids)));
+        done = with(std::move(done), "known_token_prefill", Json(true));
+        done = with(std::move(done), "status", Json(n ? "prefilled" : stopped ? "stopped" : "length"));
+        done = with(std::move(done), "finish_reason", n ? Json() : Json(stopped ? "stop" : "length"));
+        done = with(std::move(done), "stop_id", stopped ? Json::integer(1000) : Json());
+        done = with(std::move(done), "continuation_allowed", Json(!stopped));
+        auto samp = mtp_sampling.object();
+        for (const auto& item : Json::Object{{"valid", Json(true)}, {"seed", Json::integer(mtp_seed)},
+            {"entropy_prefix", Json::integer(mtp_pos)}, {"entropy_words", Json::integer(0)},
+            {"filter_order", Json("fixture")}, {"rng", Json("fixture")}, {"ownership", Json("fixture")}}) {
+            samp.push_back(item);
+        }
+        done = with(std::move(done), "sampling", Json(std::move(samp)));
+        done = with(std::move(done), "native_mtp_prime_calls", Json::integer(mtp_primes));
+        done = with(std::move(done), "known_qsa_rows_physical_tiles", Json::integer(mtp_tiles));
+        done = with(std::move(done), "known_qsa_rows_logical_rows", Json::integer(mtp_rows));
+        done = with(std::move(done), "qsa_stage_v8_calls", Json::integer(mtp_stage));
+        done = with(std::move(done), "qsa_stage_v8_physical_dispatches", Json::integer(2 * mtp_stage));
+        done = with(std::move(done), "qsa_stage_v8_extra_dispatches", Json::integer(mtp_stage));
+        done = with(std::move(done), "qsa_channel_calls", Json::integer(mtp_stage));
+        done = with(std::move(done), "qsa_channel_extra_dispatches", Json::integer(mtp_stage));
+        done = with(std::move(done), "qsa_stage_v8_request_calls", Json::integer(12 * ordinary));
+        done = with(std::move(done), "qsa_channel_request_calls", Json::integer(12 * ordinary));
+        done = with(std::move(done), "hc_exact_request_routes", parse_json(R"({"scalar":0,"many1":0,"many2":0,"many4":0,"many8":0})"));
+        return done;
+    };
+
+    const ServeSink sink{{}, [] { return false; }, [] { return uint64_t(42); }};
+    const auto trace_contains = [](const Json& trace, uint32_t id) {
+        const auto& arr = trace.find("prompt_ids")->array();
+        return std::any_of(arr.begin(), arr.end(), [id](const Json& v) { return v.unsigned_integer() == id; });
+    };
+
+    // 1. enable_thinking=false parks lane A (seed=11) & lane A2 (seed=22) with non-canonical token 300 ("Vi").
+    //    Switch to B (seed=99), verify ambiguous_seed miss when seed omitted, explicit seed=11 hit, and temp mismatch miss.
+    {
+        auto session = make_parked_session();
+        for (uint64_t s : {11ull, 22ull}) {
+            out_tokens = {300};
+            for (char c : std::string_view("sible")) out_tokens.push_back(static_cast<unsigned char>(c) + 1U);
+            out_tokens.push_back(1000);
+            const auto r = with(with(request("A", false, false), "seed", Json::integer(s)), "temperature", parse_json("0.7"));
+            static_cast<void>(session.complete(r, "park-a", mtp_target, sink));
+        }
+        // Park second lane by switching to B (seed=99).
+        out_tokens = {uint32_t('B') + 1U, 1000};
+        static_cast<void>(session.complete(with(with(request("Z", false, false), "seed", Json::integer(99)), "temperature", parse_json("0.7")), "park-b", mtp_target, sink));
+
+        const auto msgs_a = parse_json(R"([{"role":"user","content":"A"},{"role":"assistant","content":"Visible"},{"role":"user","content":"B"}])");
+        const auto ret_no_seed = with(with(request(), "temperature", parse_json("0.7")), "messages", msgs_a);
+        const auto trace_ambig = refused_prefix_trace(session, ret_no_seed);
+        check(!trace_contains(trace_ambig, 300)); // ambiguous_seed across seeds 11 vs 22!
+
+        const auto ret_seed_11 = with(ret_no_seed, "seed", Json::integer(11));
+        render_calls = encode_calls = 0;
+        const auto trace_11 = refused_prefix_trace(session, ret_seed_11);
+        check(trace_contains(trace_11, 300));
+        check(render_calls == 1 && encode_calls == 1); // empty turns hoisted to base_prompt!
+
+        const auto ret_bad_temp = with(with(ret_no_seed, "seed", Json::integer(11)), "temperature", parse_json("0.5"));
+        const auto trace_bad_temp = refused_prefix_trace(session, ret_bad_temp);
+        check(!trace_contains(trace_bad_temp, 300));
+    }
+
+    // 2. Echoed reasoning_content falls back to base_prompt and respells; tampered reasoning misses;
+    //    omitted reasoning with identical turns deduplicates render/encode.
+    {
+        mtp_primes = mtp_tiles = mtp_rows = mtp_stage = 0;
+        auto session = make_parked_session();
+        out_tokens.clear();
+        for (char c : std::string_view("why</think>")) out_tokens.push_back(static_cast<unsigned char>(c) + 1U);
+        // Replace "</think>" bytes with token 301 and "Vi" with 300.
+        out_tokens = {uint32_t('w') + 1U, uint32_t('h') + 1U, uint32_t('y') + 1U, 301, 300};
+        for (char c : std::string_view("sible")) out_tokens.push_back(static_cast<unsigned char>(c) + 1U);
+        out_tokens.push_back(1000);
+        static_cast<void>(session.complete(with(with(request("A", false, true), "seed", Json::integer(42)), "temperature", parse_json("0.7")), "think-a", mtp_target, sink));
+
+        // Park think-a by switching to B.
+        out_tokens = {uint32_t('B') + 1U, 1000};
+        static_cast<void>(session.complete(with(with(request("Z", false, false), "seed", Json::integer(99)), "temperature", parse_json("0.7")), "think-b", mtp_target, sink));
+
+        const auto echoed = with(with(with(request(), "seed", Json::integer(42)), "temperature", parse_json("0.7")), "messages",
+            parse_json(R"([{"role":"user","content":"A"},{"role":"assistant","reasoning_content":"why","content":"Visible"},{"role":"user","content":"B"}])"));
+        render_calls = encode_calls = 0;
+        const auto trace_echoed = refused_prefix_trace(session, echoed);
+        check(trace_contains(trace_echoed, 300) && render_calls == 1 && encode_calls == 1);
+
+        const auto tampered = with(echoed, "messages",
+            parse_json(R"([{"role":"user","content":"A"},{"role":"assistant","reasoning_content":"wrong","content":"Visible"},{"role":"user","content":"B"}])"));
+        check(!trace_contains(refused_prefix_trace(session, tampered), 300));
+
+        const auto omitted = with(echoed, "messages",
+            parse_json(R"([{"role":"user","content":"A"},{"role":"assistant","content":"Visible"},{"role":"user","content":"B"}])"));
+        render_calls = encode_calls = 0;
+        const auto trace_omitted = refused_prefix_trace(session, omitted);
+        check(trace_contains(trace_omitted, 300) && render_calls == 2 && encode_calls == 2);
+    }
+
+    // 3. Capacity > 16 evicts oldest parked lane cleanly.
+    {
+        mtp_primes = mtp_tiles = mtp_rows = mtp_stage = 0;
+        auto session = make_parked_session();
+        for (uint64_t s = 1; s <= 18; ++s) {
+            out_tokens = {300};
+            for (char c : std::string_view("sible")) out_tokens.push_back(static_cast<unsigned char>(c) + 1U);
+            out_tokens.push_back(1000);
+            const auto r = with(with(request("L" + std::to_string(s), false, false), "seed", Json::integer(s)), "temperature", parse_json("0.7"));
+            static_cast<void>(session.complete(r, "cap-" + std::to_string(s), mtp_target, sink));
+        }
+        // Lane 1 (L1, seed 1) was evicted (17 parked + 1 active = 18 total -> first parked evicted); Lane 17 (L17, seed 17) remains parked.
+        const auto probe_1 = with(with(with(request(), "seed", Json::integer(1)), "temperature", parse_json("0.7")), "messages",
+            parse_json(R"([{"role":"user","content":"L1"},{"role":"assistant","content":"Visible"},{"role":"user","content":"B"}])"));
+        check(!trace_contains(refused_prefix_trace(session, probe_1), 300));
+        const auto probe_17 = with(with(with(request(), "seed", Json::integer(17)), "temperature", parse_json("0.7")), "messages",
+            parse_json(R"([{"role":"user","content":"L17"},{"role":"assistant","content":"Visible"},{"role":"user","content":"B"}])"));
+        check(trace_contains(refused_prefix_trace(session, probe_17), 300));
+    }
+}
+#endif
 void startup_execution_policy() {
     for (const auto* invalid : {"", "capture", "indirect-compatible", "unknown"})
         refusal([&] { ServeSession rejected(codec(), "tokspur", invalid); });
@@ -658,6 +955,575 @@ void executor_arg_contract() {
         else refusal([&] { admit_chat(with(next,"messages",Json(bad)),"tokspur",ToolEnumValidation::strict,deferred); });
     }
 }
+// The refusal text of one call, or empty when it is admitted.
+template<class F> std::string refusal_text(F&& function) { try { function(); } catch (const FormatError& error) { return error.what(); } return {}; }
+// Checks one table row, naming the row when it differs.
+void expect_text(const std::string& actual, std::string_view expected, std::string_view row, std::source_location at = std::source_location::current()) {
+    if (actual != expected) std::cerr << "schema keyword row " << row << ": got '" << actual << "', expected '" << expected << "'\n";
+    check(actual == expected, at);
+}
+// The same rows as generator_schema_keywords in rust/crates/tokspur-server/tests/serve_protocol.rs, with the same refusal text.
+void generator_schema_keywords() {
+    // Tool declarations: each schema is one property of the parameters object. Empty text means admitted.
+    for (const auto& [schema, expected] : std::initializer_list<std::pair<const char*, const char*>>{
+        {R"({"type":"number","exclusiveMaximum":1})", ""},
+        {R"({"type":"integer","minimum":0,"exclusiveMaximum":10})", ""},
+        {R"({"type":"number","exclusiveMinimum":0,"exclusiveMaximum":1})", ""},
+        {R"({"type":"number","maximum":5,"exclusiveMaximum":5})", ""},
+        {R"({"type":"number","exclusiveMaximum":-1e300})", ""},
+        {R"({"type":"number","minimum":1,"exclusiveMaximum":1.0000000000000000001})", ""},
+        {R"({"type":"number","exclusiveMaximum":true})", "expected JSON number"},
+        {R"({"type":"number","exclusiveMaximum":"1"})", "expected JSON number"},
+        {R"({"type":"number","exclusiveMaximum":1e301})", "API number outside supported range"},
+        {R"({"type":"string","exclusiveMaximum":0})", "numeric bound on other schema type"},
+        {R"({"type":"number","minimum":1,"exclusiveMaximum":1})", "inverted schema bounds"},
+        {R"({"type":"number","minimum":1.0000000000000000001,"exclusiveMaximum":1})", "inverted schema bounds"},
+        {R"({"type":"number","exclusiveMinimum":1,"exclusiveMaximum":1})", "inverted schema bounds"},
+        {R"({"type":"number","exclusiveMinimum":2,"exclusiveMaximum":1})", "inverted schema bounds"},
+        {R"({"type":"number","exclusiveMaximum":0,"minimum":"x"})", "expected JSON number"},
+        {R"({"anyOf":[{"type":"number"}],"exclusiveMaximum":1})", "unsupported API/schema field"},
+        {R"({"type":"string","minLength":1,"maxLength":3})", ""},
+        {R"({"type":"string","minLength":0,"maxLength":0})", ""},
+        {R"({"type":"string","minLength":65536})", ""},
+        {R"({"type":"string","maxLength":65537})", ""},
+        {R"({"type":"string","minLength":65536,"maxLength":18446744073709551615})", ""},
+        {R"({"type":"string","minLength":65537})", "minLength exceeds the tool call byte limit"},
+        {R"({"type":"string","minLength":65537,"maxLength":2})", "minLength exceeds the tool call byte limit"},
+        {R"({"type":"string","minLength":3,"maxLength":2})", "inverted schema bounds"},
+        {R"({"type":"string","minLength":-1})", "JSON unsigned integer out of range or nonintegral"},
+        {R"({"type":"string","minLength":1.0})", "JSON unsigned integer out of range or nonintegral"},
+        {R"({"type":"string","minLength":18446744073709551616})", "JSON unsigned integer out of range or nonintegral"},
+        {R"({"type":"string","maxLength":"2"})", "expected JSON unsigned integer"},
+        {R"({"type":"string","maxLength":true,"minLength":1.5})", "JSON unsigned integer out of range or nonintegral"},
+        {R"({"type":"integer","minLength":1})", "string schema keyword on other type"},
+        {R"({"type":"array","items":{"type":"string"},"maxLength":2})", "string schema keyword on other type"},
+        {R"({"anyOf":[{"type":"string"}],"minLength":1})", "unsupported API/schema field"},
+        {R"({"type":"string","enum":["abc"],"minLength":3})", ""},
+        {R"({"type":"string","enum":["ab"],"minLength":3})", "tool string below minLength"},
+        {R"({"type":"array","items":{"type":"string"},"uniqueItems":true})", ""},
+        {R"({"type":"array","items":{"type":"string"},"uniqueItems":false})", ""},
+        {R"({"type":"array","items":{"type":"string"},"uniqueItems":1})", "expected JSON boolean"},
+        {R"({"type":"array","items":{"type":"string"},"uniqueItems":"true"})", "expected JSON boolean"},
+        {R"({"type":"array","items":{"type":"string"},"minItems":3,"maxItems":2,"uniqueItems":1})", "inverted schema bounds"},
+        {R"({"type":"string","uniqueItems":true})", "array schema keyword on other type"},
+        {R"({"type":"object","properties":{},"uniqueItems":false})", "array schema keyword on other type"},
+        {R"({"anyOf":[{"type":"array","items":{"type":"string"}}],"uniqueItems":true})", "unsupported API/schema field"},
+        {R"({"type":"string","const":"a"})", ""},
+        {R"({"type":"integer","const":3})", ""},
+        {R"({"type":"number","const":1.50})", ""},
+        {R"({"type":"boolean","const":true})", ""},
+        {R"({"type":"null","const":null})", ""},
+        {R"({"type":"string","enum":["a"],"const":"a"})", ""},
+        {R"({"type":"string","const":1})", "tool value is not string"},
+        {R"({"type":"boolean","const":"true"})", "tool value is not boolean"},
+        {R"({"type":"integer","const":1.0})", "tool integer must use exact safe-integer syntax"},
+        {R"({"type":"integer","const":5,"maximum":3})", "tool value above maximum"},
+        {R"({"type":"string","const":"abc","maxLength":2})", "tool string above maxLength"},
+        {R"({"type":"number","const":1e301})", "API number outside supported range"},
+        {R"({"type":"string","enum":["a","b"],"const":"a"})", "tool value differs from const"},
+        {R"({"type":"string","enum":["a"],"const":"b"})", "tool value differs from const"},
+        {R"({"type":"object","properties":{},"const":{}})", "unsupported const"},
+        {R"({"type":"array","items":{"type":"string"},"const":[]})", "unsupported const"},
+        {R"({"anyOf":[{"type":"string"}],"const":"a"})", "unsupported API/schema field"},
+        {R"({"type":"integer","multipleOf":5})", ""},
+        {R"({"type":"number","multipleOf":0.01})", ""},
+        {R"({"type":"number","multipleOf":1e-7})", ""},
+        {R"({"type":"number","multipleOf":0.30000000000000004})", ""},
+        {R"({"type":"number","multipleOf":123456789012345678})", ""},
+        {R"({"type":"number","multipleOf":1234567890123456780})", ""},
+        {R"({"type":"number","multipleOf":1234567890123456789})", "multipleOf digit bound"},
+        {R"({"type":"number","multipleOf":0})", "multipleOf must be positive"},
+        {R"({"type":"number","multipleOf":0.0})", "multipleOf must be positive"},
+        {R"({"type":"number","multipleOf":-2})", "multipleOf must be positive"},
+        {R"({"type":"number","multipleOf":"2"})", "expected JSON number"},
+        {R"({"type":"number","multipleOf":1e301})", "API number outside supported range"},
+        {R"({"type":"number","minimum":2,"maximum":1,"multipleOf":0})", "inverted schema bounds"},
+        {R"({"type":"string","multipleOf":2})", "numeric bound on other schema type"},
+        {R"({"anyOf":[{"type":"integer"}],"multipleOf":2})", "unsupported API/schema field"},
+        {R"({"type":"integer","enum":[4,6],"multipleOf":2})", ""},
+        {R"({"type":"integer","enum":[4,5],"multipleOf":2})", "tool value is not a multiple of multipleOf"},
+        {R"({"type":"integer","enum":[4],"multipleOf":0})", "multipleOf must be positive"},
+    }) {
+        auto declaration = tools().array()[0];
+        auto function = with(*declaration.find("function"), "parameters", parse_json(std::string(R"({"type":"object","properties":{"p":)") + schema + "}}"));
+        expect_text(refusal_text([&] { static_cast<void>(admit_chat(with(request(), "tools", Json(Json::Array{with(declaration, "function", function)})), "tokspur")); }), expected, schema);
+    }
+    // Strict validation of one value against one schema.
+    for (const auto& [schema, rows] : std::initializer_list<std::pair<const char*, std::vector<std::pair<const char*, const char*>>>>{
+        {R"({"type":"number","minimum":0,"exclusiveMaximum":1})", {
+            {R"(0)", ""}, {R"(-0.0)", ""}, {R"(0.5)", ""}, {R"(9.9e-1)", ""}, {R"(0.99999999999999999999)", ""}, {R"(1)", "tool value at or above exclusive maximum"},
+            {R"(1.0)", "tool value at or above exclusive maximum"}, {R"(1e0)", "tool value at or above exclusive maximum"}, {R"(1.00000000000000000001)", "tool value at or above exclusive maximum"},
+            {R"(2)", "tool value at or above exclusive maximum"}, {R"(-0.1)", "tool value below minimum"},
+        }},
+        {R"({"type":"integer","exclusiveMinimum":1,"exclusiveMaximum":4})", {
+            {R"(2)", ""}, {R"(3)", ""}, {R"(1)", "tool value at or below exclusive minimum"}, {R"(4)", "tool value at or above exclusive maximum"},
+        }},
+        {R"({"type":"number","maximum":1,"exclusiveMaximum":2})", {
+            {R"(1)", ""}, {R"(1.5)", "tool value above maximum"}, {R"(2)", "tool value above maximum"},
+        }},
+        {R"({"type":"number","exclusiveMaximum":-1.5})", {
+            {R"(-1.6)", ""}, {R"(-1.5)", "tool value at or above exclusive maximum"}, {R"(-1.50)", "tool value at or above exclusive maximum"}, {R"(-1.4)", "tool value at or above exclusive maximum"},
+        }},
+        {R"({"type":"string","minLength":2,"maxLength":3})", {
+            {R"("ab")", ""}, {R"("abc")", ""}, {R"("")", "tool string below minLength"}, {R"("a")", "tool string below minLength"}, {R"("abcd")", "tool string above maxLength"},
+            {R"("é")", "tool string below minLength"}, {R"("éé")", ""}, {R"("日本語")", ""}, {R"("日本語x")", "tool string above maxLength"}, {R"("😀")", "tool string below minLength"}, {R"("😀😀")", ""}, {R"("😀😀😀")", ""},
+            {R"("😀😀😀😀")", "tool string above maxLength"}, {R"("\ud83d\ude00")", "tool string below minLength"}, {R"("\u0061\u0062")", ""},
+            {R"("\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00")", "tool string above maxLength"}, {R"("e\u0301")", ""}, {R"(5)", "tool value is not string"},
+        }},
+        {R"({"type":"string","minLength":0,"maxLength":0})", {
+            {R"("")", ""}, {R"("a")", "tool string above maxLength"},
+        }},
+        {R"({"type":"array","items":{"type":"number"},"uniqueItems":true})", {
+            {R"([])", ""}, {R"([1])", ""}, {R"([1,2,3])", ""}, {R"([1,1.00000000000000000001])", ""}, {R"([1,1])", "tool array repeats an item"}, {R"([1,2,1])", "tool array repeats an item"},
+            {R"([1,1.0])", "tool array repeats an item"}, {R"([1,1e0])", "tool array repeats an item"}, {R"([10,1e1])", "tool array repeats an item"}, {R"([0,-0.0])", "tool array repeats an item"},
+            {R"([1.5,15e-1])", "tool array repeats an item"}, {R"([1,1,"x"])", "expected JSON number"},
+        }},
+        {R"({"type":"array","items":{"type":"number"},"uniqueItems":false})", {
+            {R"([1,1])", ""},
+        }},
+        {R"({"type":"array","items":{"type":"integer"},"minItems":2,"uniqueItems":true})", {
+            {R"([1,2])", ""}, {R"([1])", "tool array below minItems"}, {R"([1,1])", "tool array repeats an item"},
+        }},
+        {R"({"type":"array","items":{"type":"string"},"uniqueItems":true})", {
+            {R"(["a","b"])", ""}, {R"(["a","A"])", ""}, {R"(["é","e\u0301"])", ""}, {R"(["a","a"])", "tool array repeats an item"}, {R"(["\u0061","a"])", "tool array repeats an item"},
+        }},
+        {R"({"type":"array","items":{"anyOf":[{"type":"integer"},{"type":"string"},{"type":"boolean"},{"type":"null"}]},"uniqueItems":true})", {
+            {R"([1,"1",true,null])", ""}, {R"([1,"1e0"])", ""}, {R"([0,false])", ""}, {R"(["true",true])", ""}, {R"(["null",null])", ""}, {R"([null,null])", "tool array repeats an item"},
+            {R"([true,true])", "tool array repeats an item"}, {R"([1,"1",1])", "tool array repeats an item"},
+        }},
+        {R"({"type":"array","items":{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"string"}}},"uniqueItems":true})", {
+            {R"([{"a":1,"b":"x"},{"a":1,"b":"y"}])", ""}, {R"([{"a":1},{"b":"1"}])", ""}, {R"([{"a":1},{}])", ""}, {R"([{"a":1,"b":"x"},{"b":"x","a":1.0}])", "tool array repeats an item"},
+            {R"([{},{}])", "tool array repeats an item"},
+        }},
+        {R"({"type":"array","items":{"type":"array","items":{"type":"number"}},"uniqueItems":true})", {
+            {R"([[1,2],[2,1]])", ""}, {R"([[1],[1,1]])", ""}, {R"([[],[0]])", ""}, {R"([[1,2],[1.0,2e0]])", "tool array repeats an item"}, {R"([[],[]])", "tool array repeats an item"},
+        }},
+        {R"({"type":"string","const":"a"})", {
+            {R"("a")", ""}, {R"("\u0061")", ""}, {R"("b")", "tool value differs from const"}, {R"("A")", "tool value differs from const"}, {R"(1)", "tool value is not string"},
+        }},
+        {R"({"type":"number","const":1.50})", {
+            {R"(1.5)", ""}, {R"(15e-1)", ""}, {R"(1.50000000000000000001)", "tool value differs from const"}, {R"(1)", "tool value differs from const"},
+        }},
+        {R"({"type":"integer","const":0})", {
+            {R"(0)", ""}, {R"(-0)", ""}, {R"(1)", "tool value differs from const"},
+        }},
+        {R"({"type":"boolean","const":true})", {
+            {R"(true)", ""}, {R"(false)", "tool value differs from const"},
+        }},
+        {R"({"type":"null","const":null})", {
+            {R"(null)", ""}, {R"(0)", "tool value is not null"},
+        }},
+        {R"({"type":"integer","multipleOf":5})", {
+            {R"(0)", ""}, {R"(5)", ""}, {R"(-10)", ""}, {R"(7)", "tool value is not a multiple of multipleOf"}, {R"(-3)", "tool value is not a multiple of multipleOf"},
+        }},
+        {R"({"type":"number","multipleOf":0.01})", {
+            {R"(1.23)", ""}, {R"(0.1)", ""}, {R"(1e2)", ""}, {R"(-4.5)", ""}, {R"(0.0)", ""}, {R"(1.234)", "tool value is not a multiple of multipleOf"}, {R"(1e-3)", "tool value is not a multiple of multipleOf"},
+        }},
+        {R"({"type":"number","multipleOf":0.1})", {
+            {R"(0.3)", ""}, {R"(1e300)", ""}, {R"(0.30000000000000004)", "tool value is not a multiple of multipleOf"},
+        }},
+        {R"({"type":"number","multipleOf":1.5})", {
+            {R"(3)", ""}, {R"(4.5)", ""}, {R"(3e1)", ""}, {R"(1.5e299)", ""}, {R"(1)", "tool value is not a multiple of multipleOf"}, {R"(1e1)", "tool value is not a multiple of multipleOf"},
+        }},
+        {R"({"type":"number","multipleOf":2.5})", {
+            {R"(5)", ""}, {R"(7.5)", ""}, {R"(1e1)", ""}, {R"(1)", "tool value is not a multiple of multipleOf"},
+        }},
+        {R"({"type":"number","multipleOf":8})", {
+            {R"(1e3)", ""}, {R"(1e300)", ""}, {R"(1e2)", "tool value is not a multiple of multipleOf"}, {R"(4)", "tool value is not a multiple of multipleOf"},
+        }},
+        {R"({"type":"number","multipleOf":3})", {
+            {R"(3e299)", ""}, {R"(9007199254740993)", ""}, {R"(9007199254740992)", "tool value is not a multiple of multipleOf"}, {R"(1e300)", "tool value is not a multiple of multipleOf"},
+        }},
+        {R"({"type":"number","multipleOf":1e-7})", {
+            {R"(0.0000001)", ""}, {R"(1)", ""}, {R"(0.00000005)", "tool value is not a multiple of multipleOf"},
+        }},
+        {R"({"type":"number","multipleOf":123456789012345678})", {
+            {R"(123456789012345678)", ""}, {R"(246913578024691356)", ""}, {R"(1234567890123456780)", ""}, {R"(123456789012345679)", "tool value is not a multiple of multipleOf"},
+        }},
+        {R"({"type":"number","multipleOf":576460752303423488})", {
+            {R"(1e59)", ""}, {R"(1e60)", ""}, {R"(1e58)", "tool value is not a multiple of multipleOf"},
+        }},
+        {R"({"type":"number","multipleOf":298023223876953125})", {
+            {R"(1e25)", ""}, {R"(1e24)", "tool value is not a multiple of multipleOf"},
+        }},
+        {R"({"type":"number","multipleOf":999999999999999999})", {
+            {R"(999999999999999999)", ""}, {R"(122999999999999999877)", ""}, {R"(999999999999999999e40)", ""}, {R"(999999999999999998999999999999999998)", "tool value is not a multiple of multipleOf"},
+        }},
+        {R"({"type":"integer","minimum":0,"exclusiveMaximum":100,"multipleOf":25})", {
+            {R"(75)", ""}, {R"(0)", ""}, {R"(100)", "tool value at or above exclusive maximum"}, {R"(30)", "tool value is not a multiple of multipleOf"}, {R"(50.0)", "tool integer must use exact safe-integer syntax"},
+            {R"(-25)", "tool value below minimum"},
+        }},
+    }) {
+        const auto parsed = parse_json(schema);
+        for (const auto& [value, expected] : rows) expect_text(refusal_text([&] { validate_tool_value(parsed, parse_json(value)); }), expected, std::string(schema) + " " + value);
+    }
+    // A value built in memory can hold bytes that are not UTF-8. Its length cannot be counted, so it is refused as the JSON codec refuses it.
+    expect_text(refusal_text([&] { validate_tool_value(parse_json(R"({"type":"string","maxLength":4})"), Json(std::string("a\xff"))); }), "invalid UTF-8 input", "bytes that are not UTF-8");
+    // With enum validation deferred to the executor only const is deferred with it; every bound is still enforced.
+    for (const auto& [schema, value, expected] : std::initializer_list<std::array<const char*, 3>>{
+        {R"({"type":"string","const":"a"})", R"("b")", ""},
+        {R"({"type":"string","const":"a"})", R"(1)", "tool value is not string"},
+        {R"({"type":"number","const":1,"exclusiveMaximum":2})", R"(1.5)", ""},
+        {R"({"type":"number","const":1,"exclusiveMaximum":2})", R"(2)", "tool value at or above exclusive maximum"},
+        {R"({"type":"integer","multipleOf":5})", R"(7)", "tool value is not a multiple of multipleOf"},
+        {R"({"type":"string","maxLength":1})", R"("ab")", "tool string above maxLength"},
+        {R"({"type":"array","items":{"type":"integer"},"uniqueItems":true})", R"([1,1])", "tool array repeats an item"},
+    }) expect_text(refusal_text([&] { validate_tool_value(parse_json(schema), parse_json(value), ToolEnumValidation::executor); }), expected, std::string(schema) + " " + value);
+    // A recorded call: strict argument validation refuses each violation with its own text, and executor validation defers all of them.
+    const auto declared = parse_json(R"([{"type":"function","function":{"name":"save","parameters":{"type":"object","properties":{"name":{"type":"string","minLength":2,"maxLength":4},"tags":{"type":"array","items":{"type":"string"},"uniqueItems":true},"ratio":{"type":"number","exclusiveMaximum":1},"step":{"type":"integer","multipleOf":5},"kind":{"type":"string","const":"file"}},"additionalProperties":false}}}])");
+    for (const auto& [arguments, strict, deferred_enum] : std::initializer_list<std::array<const char*, 3>>{
+        {R"({"name":"ab","tags":["a","b"],"ratio":0.5,"step":10,"kind":"file"})", "", ""},
+        {R"({"name":"a"})", "tool string below minLength", "tool string below minLength"},
+        {R"({"name":"abcde"})", "tool string above maxLength", "tool string above maxLength"},
+        {R"({"tags":["a","a"]})", "tool array repeats an item", "tool array repeats an item"},
+        {R"({"ratio":1})", "tool value at or above exclusive maximum", "tool value at or above exclusive maximum"},
+        {R"({"step":7})", "tool value is not a multiple of multipleOf", "tool value is not a multiple of multipleOf"},
+        {R"({"kind":"dir"})", "tool value differs from const", ""},
+    }) {
+        const auto history = parse_json(std::string(R"([{"role":"user","content":"save it"},{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"save","arguments":)") + arguments + R"(}}]},{"role":"tool","tool_call_id":"call_1","content":"saved"},{"role":"user","content":"again"}])");
+        const auto job = with(with(request(), "tools", declared), "messages", history);
+        expect_text(refusal_text([&] { static_cast<void>(admit_chat(job, "tokspur")); }), strict, arguments);
+        expect_text(refusal_text([&] { static_cast<void>(admit_chat(job, "tokspur", ToolEnumValidation::executor)); }), deferred_enum, arguments);
+        expect_text(refusal_text([&] { static_cast<void>(admit_chat(job, "tokspur", ToolEnumValidation::strict, ToolArgValidation::executor)); }), "", arguments);
+    }
+    // A generated call takes the same validator: the strict session refuses with its text and the executor session passes the call on.
+    const auto job = with(request(), "tools", declared);
+    ServeSink sink{[](const Json&){}, []{return false;}, []{return uint64_t(44);}};
+    for (const auto& [parameter, value, expected] : std::initializer_list<std::array<const char*, 3>>{
+        {"name", R"(abc)", ""},
+        {"name", R"(a)", "tool string below minLength"},
+        {"name", R"(abcde)", "tool string above maxLength"},
+        {"tags", R"(["a","a"])", "tool array repeats an item"},
+        {"ratio", R"(1)", "tool value at or above exclusive maximum"},
+        {"step", R"(7)", "tool value is not a multiple of multipleOf"},
+        {"kind", R"(dir)", "tool value differs from const"},
+    }) {
+        const auto frame = std::string("<tool_call><function=save><parameter=") + parameter + ">\n" + value + "\n</parameter></function></tool_call><|im_end|>";
+        auto strict = arg_session(ToolArgValidation::strict); Fake rejected; rejected.reply(frame);
+        expect_text(refusal_text([&] { static_cast<void>(strict.complete(job, "strict-keyword", [&](const Json& command, const auto& event){return rejected(command,event);}, sink)); }), expected, frame);
+        auto executor = arg_session(ToolArgValidation::executor); Fake accepted; accepted.reply(frame);
+        check(message(executor.complete(job, "executor-keyword", [&](const Json& command, const auto& event){return accepted(command,event);}, sink)).find("tool_calls")->array().size() == 1);
+    }
+}
+// The same rows as tool_schema_patterns in rust/crates/tokspur-server/tests/serve_protocol.rs, with the same refusal text. Both are written from one table.
+void tool_schema_patterns() {
+    // Tool declarations: each schema is one property of the parameters object. Empty text means admitted.
+    for (const auto& [schema, expected] : std::initializer_list<std::pair<const char*, const char*>>{
+        {R"~({"type":"string","pattern":"^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"})~", ""},
+        {R"~({"type":"string","pattern":"^(?=.{1,253}\\.?$)[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\\.[a-zA-Z0-9](?:[-0-9a-zA-Z]{0,61}[0-9a-zA-Z])?)*\\.?$"})~", ""},
+        {R"~({"type":"string","pattern":"^P(?:(\\d+W)|(?!.*W)(?=\\d|T\\d)(\\d+Y)?(\\d+M)?(\\d+D)?(T(?=\\d)(\\d+H)?(\\d+M)?(\\d+([.,]\\d+)?S)?)?)$"})~", ""},
+        {R"~({"type":"string","pattern":"^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"})~", ""},
+        {R"~({"type":"string","pattern":"^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])$"})~", ""},
+        {R"~({"type":"string","pattern":"^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))$"})~", ""},
+        {R"~({"type":"string","pattern":"^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"})~", ""},
+        {R"~({"type":"string","pattern":"^$|^(?:[0-9a-zA-Z+/]{4})*(?:(?:[0-9a-zA-Z+/]{2}==)|(?:[0-9a-zA-Z+/]{3}=))?$"})~", ""},
+        {R"~({"type":"string","pattern":"^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"})~", ""},
+        {R"~({"type":"string","pattern":"^(?!^[-+.]*$)[+-]?0*(?:\\d{0,3}|(?=[\\d.]{1,6}0*$)\\d{0,3}\\.\\d{0,2}0*$)"})~", ""},
+        {R"~({"type":"string","pattern":"^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))\\/(12[0-8]|1[01][0-9]|[1-9]?[0-9])$"})~", ""},
+        {R"~({"type":"string","pattern":"^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"})~", ""},
+        {R"~({"type":"string","pattern":"^[a-zA-Z0-9_-]{21}$"})~", ""},
+        {R"~({"type":"string","pattern":"^[cC][^\\s-]{8,}$"})~", ""},
+        {R"~({"type":"string","pattern":"^[0-9a-z]+$"})~", ""},
+        {R"~({"type":"string","pattern":"^[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{26}$"})~", ""},
+        {R"~({"type":"string","pattern":"^[0-9a-vA-V]{20}$"})~", ""},
+        {R"~({"type":"string","pattern":"^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\\/([0-9]|[1-2][0-9]|3[0-2])$"})~", ""},
+        {R"~({"type":"string","pattern":"^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|::|([0-9a-fA-F]{1,4})?::([0-9a-fA-F]{1,4}:?){0,6})\\/(12[0-8]|1[01][0-9]|[1-9]?[0-9])$"})~", ""},
+        {R"~({"type":"string","pattern":"^[A-Za-z0-9_-]*$"})~", ""},
+        {R"~({"type":"string","pattern":"^\\+(?:[0-9]){6,14}[0-9]$"})~", ""},
+        {R"~({"type":"string","pattern":"^(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?$"})~", ""},
+        {R"~({"type":"string","pattern":"^https:\\/\\/a b_c-d\\..*"})~", ""},
+        {R"~({"type":"string","pattern":".*\\.json$"})~", ""},
+        {R"~({"type":"string","pattern":"a\\+b \\(c\\)"})~", ""},
+        {R"~({"type":"string","pattern":"^id--?\\d+(?:\\.\\d+)?-(a|b)$"})~", ""},
+        {R"~({"type":"string","pattern":"^[^A-Z]*$"})~", ""},
+        {R"~({"type":"string","pattern":"^[0-9a-fA-F]{8}\\b-[0-9a-fA-F]{4}\\b-[0-9a-fA-F]{4}\\b-[0-9a-fA-F]{4}\\b-[0-9a-fA-F]{12}$"})~", ""},
+        {R"~({"type":"string","pattern":"^(([a-f0-9]{1,4}:){7}|::([a-f0-9]{1,4}:){0,6}|([a-f0-9]{1,4}:){1}:([a-f0-9]{1,4}:){0,5}|([a-f0-9]{1,4}:){2}:([a-f0-9]{1,4}:){0,4}|([a-f0-9]{1,4}:){3}:([a-f0-9]{1,4}:){0,3}|([a-f0-9]{1,4}:){4}:([a-f0-9]{1,4}:){0,2}|([a-f0-9]{1,4}:){5}:([a-f0-9]{1,4}:){0,1})([a-f0-9]{1,4}|(((25[0-5])|(2[0-4][0-9])|(1[0-9]{2})|([0-9]{1,2}))\\.){3}((25[0-5])|(2[0-4][0-9])|(1[0-9]{2})|([0-9]{1,2})))$"})~", ""},
+        {R"~({"type":"string","pattern":"^([0-9a-zA-Z-_]{4})*(([0-9a-zA-Z-_]{2}(==)?)|([0-9a-zA-Z-_]{3}(=)?))?$"})~", ""},
+        {R"~({"type":"string","pattern":"^[A-Za-z0-9-_]+\\.[A-Za-z0-9-_]+\\.[A-Za-z0-9-_]*$"})~", ""},
+        {R"~({"type":"string","pattern":"^https\\:\\/\\/a\\ b\\_c\\-d\\."})~", ""},
+        {R"~({"type":"string","pattern":"^(?!^[-+.]*$)[+-]?0*(?:\\d{0,8}|(?=[\\d.]{1,9}0*$)\\d*\\.\\d*0*$)"})~", ""},
+        {R"~({"type":"string","pattern":"^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d{0,3}0*$"})~", ""},
+        {R"~({"type":"string","pattern":"^\\s*(\\d*\\.?\\d+)\\s*(\\w+)?"})~", ""},
+        {R"~({"type":"string","pattern":"^\\d{3}-\\d{2}-\\d{4}$"})~", ""},
+        {R"~({"type":"string","pattern":"^[a-z_][a-z0-9_]*$"})~", ""},
+        {R"~({"type":"string","pattern":"^(\\p{Extended_Pictographic}|\\p{Emoji_Component})+$"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"^(?P<area>\\d{3})-\\d{4}$"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"(a)\\1"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\1"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\9"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"(?<n>a)"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"(?<n>a)\\k<n>"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\k<n>"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\p{L}"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\P{Lu}"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"[\\p{L}]"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"(?i)a"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"(?i:a)"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"(?#c)a"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\uD83D"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\uDE00"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\uD83Dx"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\uD83D\\u0041"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\u{D800}"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\\ud83d\ude00"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"[\\\ud83d\ude00]"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\a"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\e"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\A"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\Z"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\z"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\G"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\Q"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"[\\B]"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"[\\1]"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"[\\c1]"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\c1"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\c"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\00"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\01"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\x1"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\xg0"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\u12"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\u{}"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\u{110000}"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\u{1F600"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"*"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"+a"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"?"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"a**"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"a+*"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"a*??"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"a{"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"a{1"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"a{,2}"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"a{1,2"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"a{2,1}"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"a{x}"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"{1}"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"a}"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"a]"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"^*"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"$+"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"\\b?"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"(?=a)*"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"(?<!a){2}"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"("})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":")"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"(a"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"a)"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"(?"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"(?a)"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"(?<"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"["})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"[a"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"[a-"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"[b-a]"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"[\\d-z]"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"[a-\\w]"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"[a--]"})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"a{4096}"})~", "pattern exceeds the tool pattern bound"},
+        {R"~({"type":"string","pattern":"(?:a{64}){64}"})~", "pattern exceeds the tool pattern bound"},
+        {R"~({"type":"string","pattern":"a{0,2048}"})~", "pattern exceeds the tool pattern bound"},
+        {R"~({"type":"string","pattern":"(?:(?:(?:a{20}){20}){20}){20}"})~", "pattern exceeds the tool pattern bound"},
+        {R"~({"type":"string","pattern":"(){4097}"})~", "pattern exceeds the tool pattern bound"},
+        {R"~({"type":"string","pattern":"a{5000,4000}"})~", "pattern exceeds the tool pattern bound"},
+        {R"~({"type":"string","pattern":"a{99999999999999999999999999}"})~", "pattern exceeds the tool pattern bound"},
+        {R"~({"type":"string","pattern":"a{4096,}"})~", "pattern exceeds the tool pattern bound"},
+        {R"~({"type":"string","pattern":"(((((((((((((((((((((((((((((((((a)))))))))))))))))))))))))))))))))"})~", "pattern exceeds the tool pattern bound"},
+        {R"~({"type":"string","pattern":"(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=(?=a"})~", "pattern exceeds the tool pattern bound"},
+        {R"~({"type":"string","pattern":"(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)"})~", "pattern exceeds the tool pattern bound"},
+        {R"~({"type":"string","pattern":"(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})(?:(?:(?=a)){0})"})~", "pattern exceeds the tool pattern bound"},
+        {R"~({"type":"string","pattern":"a{4095}"})~", ""},
+        {R"~({"type":"string","pattern":"(?:a{63}){65}"})~", ""},
+        {R"~({"type":"string","pattern":"a{0,2047}"})~", ""},
+        {R"~({"type":"string","pattern":"(?:(?:(?:a*)*)*)*"})~", ""},
+        {R"~({"type":"string","pattern":"(){4096}"})~", ""},
+        {R"~({"type":"string","pattern":"((((((((((((((((((((((((((((((((a))))))))))))))))))))))))))))))))"})~", ""},
+        {R"~({"type":"string","pattern":"(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)(?=a)"})~", ""},
+        {R"~({"type":"string","pattern":7})~", "expected JSON string"},
+        {R"~({"type":"string","pattern":null})~", "expected JSON string"},
+        {R"~({"type":"integer","pattern":"^1"})~", "string schema keyword on other type"},
+        {R"~({"type":"array","items":{"type":"string"},"pattern":"a"})~", "string schema keyword on other type"},
+        {R"~({"type":"array","items":{"type":"string","pattern":"^a"}})~", ""},
+        {R"~({"anyOf":[{"type":"string"}],"pattern":"a"})~", "unsupported API/schema field"},
+        {R"~({"anyOf":[{"type":"number"},{"type":"string","pattern":"^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"}]})~", ""},
+        {R"~({"anyOf":[{"type":"number"},{"type":"string","pattern":"(a)\\1"}]})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"^a","enum":["ab","ac"]})~", ""},
+        {R"~({"type":"string","pattern":"^a","enum":["ab","b"]})~", "tool string does not match pattern"},
+        {R"~({"type":"string","pattern":"^a","const":"ab"})~", ""},
+        {R"~({"type":"string","pattern":"^a","const":"b"})~", "tool string does not match pattern"},
+        {R"~({"type":"string","pattern":"(","minLength":3,"maxLength":2})~", "inverted schema bounds"},
+        {R"~({"type":"string","pattern":"(","minLength":65537})~", "minLength exceeds the tool call byte limit"},
+        {R"~({"type":"string","pattern":"(","enum":[1]})~", "unsupported pattern"},
+        {R"~({"type":"string","pattern":"^b","enum":["abc"],"minLength":4})~", "tool string below minLength"},
+        {R"~({"type":"string","pattern":"^b","enum":["abc"],"minLength":3})~", "tool string does not match pattern"},
+    }) {
+        auto declaration = tools().array()[0];
+        auto function = with(*declaration.find("function"), "parameters", parse_json(std::string(R"({"type":"object","properties":{"p":)") + schema + "}}"));
+        expect_text(refusal_text([&] { static_cast<void>(admit_chat(with(request(), "tools", Json(Json::Array{with(declaration, "function", function)})), "tokspur")); }), expected, schema);
+    }
+    // The pattern text is bounded too, whatever it compiles to: a class of 16382 members is one step.
+    for (const auto& [members, expected] : std::initializer_list<std::pair<size_t, const char*>>{{16382, ""}, {16383, "pattern exceeds the tool pattern bound"}}) {
+        const Json schema(Json::Object{{"type", Json(std::string("string"))}, {"pattern", Json("[" + std::string(members, 'a') + "]")}});
+        expect_text(refusal_text([&] { validate_tool_value(schema, Json(std::string("a"))); }), expected, "pattern text length");
+    }
+    // Strict validation of one string against one pattern: the strings it matches, then the strings it does not.
+    struct Matching { const char* schema; std::vector<const char*> yes, no; };
+    for (const auto& [schema, yes, no] : std::initializer_list<Matching>{
+        {R"~({"type":"string","pattern":"b"})~", {R"~("b")~", R"~("abc")~"}, {R"~("")~", R"~("a")~", R"~("B")~"}},
+        {R"~({"type":"string","pattern":"^b"})~", {R"~("b")~", R"~("bc")~"}, {R"~("ab")~", R"~("a\nb")~"}},
+        {R"~({"type":"string","pattern":"b$"})~", {R"~("b")~", R"~("ab")~"}, {R"~("ba")~", R"~("b\n")~"}},
+        {R"~({"type":"string","pattern":"^$"})~", {R"~("")~"}, {R"~("a")~", R"~("\n")~"}},
+        {R"~({"type":"string","pattern":""})~", {R"~("")~", R"~("a")~"}, {}},
+        {R"~({"type":"string","pattern":"^a|b$"})~", {R"~("ax")~", R"~("xb")~"}, {R"~("xa")~", R"~("bx")~"}},
+        {R"~({"type":"string","pattern":"a^b"})~", {}, {R"~("ab")~", R"~("a\nb")~"}},
+        {R"~({"type":"string","pattern":"a$b"})~", {}, {R"~("ab")~", R"~("a\nb")~"}},
+        {R"~({"type":"string","pattern":"^[a-c]$"})~", {R"~("a")~", R"~("c")~"}, {R"~("d")~", R"~("-")~", R"~("ab")~"}},
+        {R"~({"type":"string","pattern":"^[^a-c]$"})~", {R"~("d")~", R"~("\n")~", R"~("\ud83d\ude00")~"}, {R"~("a")~", R"~("")~"}},
+        {R"~({"type":"string","pattern":"^[-a]$"})~", {R"~("-")~", R"~("a")~"}, {R"~("b")~"}},
+        {R"~({"type":"string","pattern":"^[a-]$"})~", {R"~("-")~", R"~("a")~"}, {R"~("b")~"}},
+        {R"~({"type":"string","pattern":"^[a\\-c]$"})~", {R"~("a")~", R"~("-")~", R"~("c")~"}, {R"~("b")~"}},
+        {R"~({"type":"string","pattern":"^[+--]$"})~", {R"~("+")~", R"~(",")~", R"~("-")~"}, {R"~(".")~"}},
+        {R"~({"type":"string","pattern":"^[a-c-e]$"})~", {R"~("b")~", R"~("-")~", R"~("e")~"}, {R"~("d")~"}},
+        {R"~({"type":"string","pattern":"^[A-Za-z0-9-_]$"})~", {R"~("Q")~", R"~("5")~", R"~("-")~", R"~("_")~"}, {R"~("+")~"}},
+        {R"~({"type":"string","pattern":"^[\\d-]$"})~", {R"~("7")~", R"~("-")~"}, {R"~("a")~"}},
+        {R"~({"type":"string","pattern":"^[\\w.]$"})~", {R"~("a")~", R"~("_")~", R"~(".")~"}, {R"~("-")~"}},
+        {R"~({"type":"string","pattern":"^[^\\s-]$"})~", {R"~("a")~"}, {R"~(" ")~", R"~("-")~", R"~("\t")~"}},
+        {R"~({"type":"string","pattern":"^[\\b]$"})~", {R"~("\b")~"}, {R"~("b")~"}},
+        {R"~({"type":"string","pattern":"^[.*+?(){}|^$\\[\\]\\\\]$"})~", {R"~(".")~", R"~("{")~", R"~("^")~", R"~("[")~", R"~("]")~", R"~("\\")~"}, {R"~("a")~"}},
+        {R"~({"type":"string","pattern":"^[]$"})~", {}, {R"~("")~", R"~("a")~"}},
+        {R"~({"type":"string","pattern":"^[^]$"})~", {R"~("a")~", R"~("\n")~", R"~("\udbff\udfff")~"}, {R"~("")~", R"~("ab")~"}},
+        {R"~({"type":"string","pattern":"^\\d$"})~", {R"~("0")~", R"~("9")~"}, {R"~("\u0663")~", R"~("a")~", R"~("\uff11")~"}},
+        {R"~({"type":"string","pattern":"^\\D$"})~", {R"~("\u0663")~", R"~("a")~", R"~("\n")~"}, {R"~("0")~"}},
+        {R"~({"type":"string","pattern":"^\\w$"})~", {R"~("a")~", R"~("Z")~", R"~("0")~", R"~("_")~"}, {R"~("\u00e9")~", R"~("-")~", R"~("\u017f")~", R"~("\u212a")~"}},
+        {R"~({"type":"string","pattern":"^\\W$"})~", {R"~("\u00e9")~", R"~("-")~", R"~(" ")~"}, {R"~("a")~", R"~("_")~"}},
+        {R"~({"type":"string","pattern":"^\\s$"})~", {R"~("\t")~", R"~("\n")~", R"~("\u000b")~", R"~("\f")~", R"~("\r")~", R"~(" ")~", R"~("\u00a0")~", R"~("\u1680")~", R"~("\u2000")~", R"~("\u200a")~", R"~("\u2028")~", R"~("\u2029")~", R"~("\u202f")~", R"~("\u205f")~", R"~("\u3000")~", R"~("\ufeff")~"}, {R"~("\u0085")~", R"~("\u180e")~", R"~("\u200b")~", R"~("\u2060")~", R"~("a")~", R"~("\u001c")~"}},
+        {R"~({"type":"string","pattern":"^\\S$"})~", {R"~("\u0085")~", R"~("\u180e")~", R"~("\u200b")~", R"~("a")~"}, {R"~(" ")~", R"~("\u00a0")~", R"~("\u2028")~", R"~("\ufeff")~"}},
+        {R"~({"type":"string","pattern":"^.$"})~", {R"~("a")~", R"~("\u0085")~", R"~("\t")~", R"~("\u000b")~", R"~("\ud83d\ude00")~"}, {R"~("\n")~", R"~("\r")~", R"~("\u2028")~", R"~("\u2029")~", R"~("")~"}},
+        {R"~({"type":"string","pattern":"^.{2}$"})~", {R"~("e\u0301")~", R"~("\ud83d\ude00a")~"}, {R"~("\ud83d\ude00")~", R"~("\u00e9")~"}},
+        {R"~({"type":"string","pattern":"^\ud83d\ude00+$"})~", {R"~("\ud83d\ude00")~", R"~("\ud83d\ude00\ud83d\ude00")~"}, {R"~("")~", R"~("\ud83d\ude01")~"}},
+        {R"~({"type":"string","pattern":"^[\ud83d\ude00-\ud83d\ude4f]$"})~", {R"~("\ud83d\ude00")~", R"~("\ud83d\ude4f")~"}, {R"~("\ud83d\ude50")~", R"~("a")~"}},
+        {R"~({"type":"string","pattern":"^\\u{1F600}\\uD83D\\uDE00$"})~", {R"~("\ud83d\ude00\ud83d\ude00")~"}, {R"~("\ud83d\ude00")~"}},
+        {R"~({"type":"string","pattern":"^\\u00e9\\xe9\\u{0000e9}$"})~", {R"~("\u00e9\u00e9\u00e9")~"}, {R"~("eee")~"}},
+        {R"~({"type":"string","pattern":"^\\t\\n\\v\\f\\r\\0\\cJ\\cj$"})~", {R"~("\t\n\u000b\f\r\u0000\n\n")~"}, {R"~("\t\n\u000b\f\r0\n\n")~"}},
+        {R"~({"type":"string","pattern":"^a*$"})~", {R"~("")~", R"~("aaa")~"}, {R"~("b")~", R"~("ab")~"}},
+        {R"~({"type":"string","pattern":"^a+?$"})~", {R"~("a")~", R"~("aaa")~"}, {R"~("")~"}},
+        {R"~({"type":"string","pattern":"^a??b$"})~", {R"~("b")~", R"~("ab")~"}, {R"~("aab")~"}},
+        {R"~({"type":"string","pattern":"^a{2}$"})~", {R"~("aa")~"}, {R"~("a")~", R"~("aaa")~"}},
+        {R"~({"type":"string","pattern":"^a{2,}$"})~", {R"~("aa")~", R"~("aaaaa")~"}, {R"~("a")~"}},
+        {R"~({"type":"string","pattern":"^a{1,3}?$"})~", {R"~("a")~", R"~("aaa")~"}, {R"~("")~", R"~("aaaa")~"}},
+        {R"~({"type":"string","pattern":"^a{0}b$"})~", {R"~("b")~"}, {R"~("ab")~"}},
+        {R"~({"type":"string","pattern":"^a{0,0}$"})~", {R"~("")~"}, {R"~("a")~"}},
+        {R"~({"type":"string","pattern":"^(ab|c)+$"})~", {R"~("ab")~", R"~("c")~", R"~("abcab")~"}, {R"~("a")~", R"~("ac")~", R"~("")~"}},
+        {R"~({"type":"string","pattern":"^(?:a|)b$"})~", {R"~("ab")~", R"~("b")~"}, {R"~("aab")~"}},
+        {R"~({"type":"string","pattern":"^(|a|)$"})~", {R"~("")~", R"~("a")~"}, {R"~("aa")~"}},
+        {R"~({"type":"string","pattern":"^()*a(?:)+$"})~", {R"~("a")~"}, {R"~("")~", R"~("aa")~"}},
+        {R"~({"type":"string","pattern":"^(a*)*$"})~", {R"~("")~", R"~("aaaa")~"}, {R"~("b")~"}},
+        {R"~({"type":"string","pattern":"^(a*)+b$"})~", {R"~("b")~", R"~("aab")~"}, {R"~("a")~"}},
+        {R"~({"type":"string","pattern":"^(a|ab)(c|bcd)(d*)$"})~", {R"~("abcd")~", R"~("ac")~", R"~("abc")~", R"~("acdd")~"}, {R"~("ab")~", R"~("abd")~"}},
+        {R"~({"type":"string","pattern":"^((a)|(b))*?c$"})~", {R"~("c")~", R"~("abbac")~"}, {R"~("abd")~"}},
+        {R"~({"type":"string","pattern":"^(?:a{2}){2,3}$"})~", {R"~("aaaa")~", R"~("aaaaaa")~"}, {R"~("aa")~", R"~("aaaaa")~", R"~("aaaaaaaa")~"}},
+        {R"~({"type":"string","pattern":"\\bcat\\b"})~", {R"~("cat")~", R"~("a cat.")~", R"~("cat-flap")~"}, {R"~("cats")~", R"~("concat")~", R"~("\u00e9cat_")~"}},
+        {R"~({"type":"string","pattern":"\\Bcat"})~", {R"~("concat")~", R"~("_cat")~"}, {R"~("cat")~", R"~(" cat")~", R"~("\u00e9cat")~"}},
+        {R"~({"type":"string","pattern":"^\\b"})~", {R"~("a")~"}, {R"~("")~", R"~("-a")~", R"~("\u00e9")~"}},
+        {R"~({"type":"string","pattern":"\\b$"})~", {R"~("a")~", R"~("-a")~"}, {R"~("")~", R"~("a-")~"}},
+        {R"~({"type":"string","pattern":"^\\B$"})~", {R"~("")~"}, {R"~("a")~"}},
+        {R"~({"type":"string","pattern":"^(?=.*\\d)(?=.*[a-z]).{4,}$"})~", {R"~("ab12")~", R"~("1a..")~"}, {R"~("abcd")~", R"~("1234")~", R"~("a1")~"}},
+        {R"~({"type":"string","pattern":"^(?!ab)\\w+$"})~", {R"~("ba")~", R"~("a")~", R"~("aab")~"}, {R"~("ab")~", R"~("abc")~"}},
+        {R"~({"type":"string","pattern":"a(?=b)"})~", {R"~("ab")~", R"~("xab")~"}, {R"~("a")~", R"~("ac")~", R"~("ba")~"}},
+        {R"~({"type":"string","pattern":"a(?!b)"})~", {R"~("a")~", R"~("ac")~", R"~("aba")~"}, {R"~("ab")~", R"~("xab")~"}},
+        {R"~({"type":"string","pattern":"(?<=a)b"})~", {R"~("ab")~", R"~("xab")~"}, {R"~("b")~", R"~("cb")~"}},
+        {R"~({"type":"string","pattern":"(?<!a)b"})~", {R"~("b")~", R"~("cb")~", R"~("abb")~"}, {R"~("ab")~", R"~("xab")~"}},
+        {R"~({"type":"string","pattern":"^(?=a$)a$"})~", {R"~("a")~"}, {R"~("aa")~"}},
+        {R"~({"type":"string","pattern":"^a(?<=^a)$"})~", {R"~("a")~"}, {R"~("aa")~"}},
+        {R"~({"type":"string","pattern":"^(?:(?=a)\\w|-)+$"})~", {R"~("a-a")~", R"~("-")~", R"~("aa")~"}, {R"~("ab")~", R"~("b")~"}},
+        {R"~({"type":"string","pattern":"^(?=(?!ab)a)\\w+$"})~", {R"~("ac")~", R"~("a")~"}, {R"~("ab")~", R"~("b")~"}},
+        {R"~({"type":"string","pattern":"^(?=a(?<=^a)b)ab$"})~", {R"~("ab")~"}, {R"~("abb")~"}},
+        {R"~({"type":"string","pattern":"(?<=(?<!x)a)b"})~", {R"~("ab")~"}, {R"~("xab")~", R"~("b")~"}},
+        {R"~({"type":"string","pattern":"^(?!)"})~", {}, {R"~("")~", R"~("a")~"}},
+        {R"~({"type":"string","pattern":"^(?=)$"})~", {R"~("")~"}, {R"~("a")~"}},
+        {R"~({"type":"string","pattern":"(?=\\b)a"})~", {R"~("a")~", R"~(" a")~"}, {R"~("ba")~"}},
+        {R"~({"type":"string","pattern":"^(?=(a|b)*c)\\w+$"})~", {R"~("abc")~", R"~("c")~", R"~("cab")~"}, {R"~("abd")~"}},
+        {R"~({"type":"string","pattern":"(?<=\\d{2})-(?=\\d{2})"})~", {R"~("12-34")~", R"~("x99-00y")~"}, {R"~("1-23")~", R"~("12-3")~", R"~("ab-cd")~"}},
+        {R"~({"type":"string","pattern":"^https\\:\\/\\/a\\ b\\_c\\-d\\.$"})~", {R"~("https://a b_c-d.")~"}, {R"~("https://a b_c-dx")~"}},
+        {R"~({"type":"string","pattern":"^\\@\\#\\%\\&\\,\\;\\<\\=\\>\\~\\`\\!\\'\\\"$"})~", {R"~("@#%&,;<=>~`!'\"")~"}, {R"~("@")~"}},
+        {R"~({"type":"string","pattern":"^na\\\u00efve\\\u2028$"})~", {R"~("na\u00efve\u2028")~"}, {R"~("naive")~"}},
+        {R"~({"type":"string","pattern":"^[\\ -\\~]+$"})~", {R"~("a b~")~"}, {R"~("\t")~", R"~("\u00e9")~"}},
+        {R"~({"type":"string","pattern":"^\\^\\$\\\\\\.\\*\\+\\?\\(\\)\\[\\]\\{\\}\\|$"})~", {R"~("^$\\.*+?()[]{}|")~"}, {R"~("^")~"}},
+        {R"~({"type":"string","pattern":"^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"})~", {R"~("a@b.co")~", R"~("first.last+tag@sub.example.org")~", R"~("o'neil@x-y.io")~"}, {R"~(".a@b.co")~", R"~("a..b@c.de")~", R"~("a.@b.co")~", R"~("a@b")~", R"~("a@-b.co")~", R"~("a b@c.de")~", R"~("a@b.c")~"}},
+        {R"~({"type":"string","pattern":"^(?=.{1,253}\\.?$)[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\\.[a-zA-Z0-9](?:[-0-9a-zA-Z]{0,61}[0-9a-zA-Z])?)*\\.?$"})~", {R"~("example.com")~", R"~("a")~", R"~("x-1.y.")~", R"~("localhost")~"}, {R"~("")~", R"~("-a.com")~", R"~("a-.com")~", R"~("a..b")~", R"~("a_b.com")~", R"~("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")~"}},
+        {R"~({"type":"string","pattern":"^P(?:(\\d+W)|(?!.*W)(?=\\d|T\\d)(\\d+Y)?(\\d+M)?(\\d+D)?(T(?=\\d)(\\d+H)?(\\d+M)?(\\d+([.,]\\d+)?S)?)?)$"})~", {R"~("P1W")~", R"~("P1Y2M3D")~", R"~("PT1H")~", R"~("P1DT2H3M4.5S")~", R"~("PT0,5S")~"}, {R"~("P")~", R"~("PT")~", R"~("P1WT1H")~", R"~("P1S")~", R"~("1Y")~", R"~("P1Y2W")~"}},
+        {R"~({"type":"string","pattern":"^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"})~", {R"~("123e4567-e89b-12d3-a456-426614174000")~", R"~("00000000-0000-0000-0000-000000000000")~"}, {R"~("123e4567-e89b-02d3-a456-426614174000")~", R"~("123e4567e89b12d3a456426614174000")~", R"~("")~"}},
+        {R"~({"type":"string","pattern":"^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])$"})~", {R"~("0.0.0.0")~", R"~("192.168.1.255")~"}, {R"~("256.1.1.1")~", R"~("1.2.3")~", R"~("01.2.3.4")~", R"~("1.2.3.4 ")~"}},
+        {R"~({"type":"string","pattern":"^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))$"})~", {R"~("::")~", R"~("::1")~", R"~("2001:db8::8a2e:370:7334")~", R"~("1:2:3:4:5:6:7:8")~"}, {R"~("1:2:3:4:5:6:7")~", R"~(":::")~", R"~("g::1")~", R"~("1::2::3")~"}},
+        {R"~({"type":"string","pattern":"^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"})~", {R"~("2024-02-29T23:59:59Z")~", R"~("2025-12-31T00:00:00.123+05:30")~", R"~("2000-01-01T12:30Z")~"}, {R"~("2023-02-29T00:00:00Z")~", R"~("2024-13-01T00:00:00Z")~", R"~("2024-01-01 00:00:00Z")~", R"~("2024-01-01T24:00:00Z")~", R"~("2024-01-01T00:00:00")~"}},
+        {R"~({"type":"string","pattern":"^$|^(?:[0-9a-zA-Z+/]{4})*(?:(?:[0-9a-zA-Z+/]{2}==)|(?:[0-9a-zA-Z+/]{3}=))?$"})~", {R"~("")~", R"~("QUJD")~", R"~("QUI=")~", R"~("QQ==")~"}, {R"~("QUJ")~", R"~("QQ=")~", R"~("QU JD")~", R"~("QUJD==")~"}},
+        {R"~({"type":"string","pattern":"^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"})~", {R"~("1")~", R"~("-1.5")~", R"~("+.5")~", R"~("007")~", R"~("1.")~"}, {R"~("")~", R"~("-")~", R"~("+.")~", R"~(".")~", R"~("1.2.3")~", R"~("1e5")~", R"~("--1")~"}},
+        {R"~({"type":"string","pattern":"^(?!^[-+.]*$)[+-]?0*(?:\\d{0,3}|(?=[\\d.]{1,6}0*$)\\d{0,3}\\.\\d{0,2}0*$)"})~", {R"~("123")~", R"~("123.45")~", R"~("-0.5")~", R"~("1.50")~"}, {R"~("-")~", R"~(".")~", R"~("+")~"}},
+        {R"~({"type":"string","pattern":"^[cC][^\\s-]{8,}$"})~", {R"~("cjld2cjxh0000qzrmn831i7rn")~", R"~("C12345678")~"}, {R"~("c1234567")~", R"~("c1234 5678")~", R"~("djld2cjxh0000")~"}},
+        {R"~({"type":"string","pattern":"^id--?\\d+(?:\\.\\d+)?-(a|b)$"})~", {R"~("id-1-a")~", R"~("id--2.5-b")~"}, {R"~("id-1-c")~", R"~("id-1.-a")~"}},
+        {R"~({"type":"string","pattern":"^https\\:\\/\\/a\\ b\\_c\\-d\\."})~", {R"~("https://a b_c-d.x")~"}, {R"~("http://a b_c-d.")~"}},
+    }) {
+        const auto parsed = parse_json(schema);
+        for (const auto& [values, expected] : {std::pair{yes, ""}, std::pair{no, "tool string does not match pattern"}})
+            for (const auto* value : values) expect_text(refusal_text([&] { validate_tool_value(parsed, parse_json(value)); }), expected, std::string(schema) + " " + value);
+    }
+    // Matching follows every thread at once, so nested quantifiers that would take a backtracking matcher longer than this suite runs are answered at once.
+    const Json lengthy(std::string(20000, 'a'));
+    for (const auto& [schema, expected] : std::initializer_list<std::pair<const char*, const char*>>{
+        {R"~({"type":"string","pattern":"^(a*)*b$"})~", "tool string does not match pattern"},
+        {R"~({"type":"string","pattern":"^(a|a)*b$"})~", "tool string does not match pattern"},
+        {R"~({"type":"string","pattern":"^(a+)+b$"})~", "tool string does not match pattern"},
+        {R"~({"type":"string","pattern":"(.*a){12}b"})~", "tool string does not match pattern"},
+        {R"~({"type":"string","pattern":"^(?=(a*)*$)(a|aa)+$"})~", ""},
+        {R"~({"type":"string","pattern":"^(?!(a+)+$)"})~", "tool string does not match pattern"},
+        {R"~({"type":"string","pattern":"(?<=(a*)*)a$"})~", ""},
+        {R"~({"type":"string","pattern":"^(?:a{64}){63}a{0,31}"})~", ""},
+    }) expect_text(refusal_text([&] { validate_tool_value(parse_json(schema), lengthy); }), expected, schema);
+    // A value built in memory can hold bytes that are not UTF-8. It cannot be read as code points, so it is refused as the JSON codec refuses it.
+    expect_text(refusal_text([&] { validate_tool_value(parse_json(R"({"type":"string","pattern":"a"})"), Json(std::string("a\xff"))); }), "invalid UTF-8 input", "bytes that are not UTF-8");
+    // With enum validation deferred to the executor a pattern is still enforced.
+    for (const auto& [schema, value, expected] : std::initializer_list<std::array<const char*, 3>>{
+        {R"~({"type":"string","pattern":"^a","enum":["ab"]})~", R"~("ac")~", ""},
+        {R"~({"type":"string","pattern":"^a","enum":["ab"]})~", R"~("b")~", "tool string does not match pattern"},
+        {R"~({"type":"string","pattern":"^a","const":"ab"})~", R"~("ac")~", ""},
+        {R"~({"type":"string","pattern":"^a","const":"ab"})~", R"~("b")~", "tool string does not match pattern"},
+    }) expect_text(refusal_text([&] { validate_tool_value(parse_json(schema), parse_json(value), ToolEnumValidation::executor); }), expected, std::string(schema) + " " + value);
+    // A recorded call: strict argument validation refuses a string that does not match, and executor validation defers it.
+    const auto declared = parse_json(R"~([{"type":"function","function":{"name":"tag","parameters":{"type":"object","properties":{"slug":{"type":"string","pattern":"^[a-z]+(?:-[a-z]+)*$","maxLength":12},"email":{"type":"string","pattern":"^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"},"amount":{"anyOf":[{"type":"number"},{"type":"string","pattern":"^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"}]}},"additionalProperties":false}}}])~");
+    for (const auto& [arguments, strict] : std::initializer_list<std::pair<const char*, const char*>>{
+        {R"~({"slug":"ab-cd","email":"a@b.co","amount":"1.5"})~", ""},
+        {R"~({"slug":"ab--cd"})~", "tool string does not match pattern"},
+        {R"~({"slug":"Ab"})~", "tool string does not match pattern"},
+        {R"~({"slug":"ab-cd-ef-gh-ij"})~", "tool string above maxLength"},
+        {R"~({"email":"a..b@c.de"})~", "tool string does not match pattern"},
+        {R"~({"amount":2})~", ""},
+        {R"~({"amount":"-."})~", "tool value matches no schema alternative"},
+    }) {
+        const auto history = parse_json(std::string(R"([{"role":"user","content":"tag it"},{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"tag","arguments":)") + arguments + R"(}}]},{"role":"tool","tool_call_id":"call_1","content":"tagged"},{"role":"user","content":"again"}])");
+        const auto job = with(with(request(), "tools", declared), "messages", history);
+        expect_text(refusal_text([&] { static_cast<void>(admit_chat(job, "tokspur")); }), strict, arguments);
+        expect_text(refusal_text([&] { static_cast<void>(admit_chat(job, "tokspur", ToolEnumValidation::executor)); }), strict, arguments);
+        expect_text(refusal_text([&] { static_cast<void>(admit_chat(job, "tokspur", ToolEnumValidation::strict, ToolArgValidation::executor)); }), "", arguments);
+    }
+    // A generated call takes the same validator: the strict session refuses with its text and the executor session passes the call on.
+    const auto job = with(request(), "tools", declared);
+    ServeSink sink{[](const Json&){}, []{return false;}, []{return uint64_t(44);}};
+    for (const auto& [parameter, value, expected] : std::initializer_list<std::array<const char*, 3>>{
+        {"slug", "ab-cd", ""},
+        {"slug", "ab--cd", "tool string does not match pattern"},
+        {"slug", "ab-cd-ef-gh-ij", "tool string above maxLength"},
+        {"email", "a@b.co", ""},
+        {"email", ".a@b.co", "tool string does not match pattern"},
+    }) {
+        const auto frame = std::string("<tool_call><function=tag><parameter=") + parameter + ">\n" + value + "\n</parameter></function></tool_call><|im_end|>";
+        auto strict = arg_session(ToolArgValidation::strict); Fake rejected; rejected.reply(frame);
+        expect_text(refusal_text([&] { static_cast<void>(strict.complete(job, "strict-pattern", [&](const Json& command, const auto& event){return rejected(command,event);}, sink)); }), expected, frame);
+        auto executor = arg_session(ToolArgValidation::executor); Fake accepted; accepted.reply(frame);
+        check(message(executor.complete(job, "executor-pattern", [&](const Json& command, const auto& event){return accepted(command,event);}, sink)).find("tool_calls")->array().size() == 1);
+    }
+}
 void server_generation_clock_contract() {
     ServeSession session(codec(), "tokspur");
     Fake fake;
@@ -776,6 +1642,88 @@ void translated_history_metadata() {
         else refusal([&] { admit_chat(job, "m"); });
     }
 }
+void added_token_framing() {
+    constexpr uint32_t open = 2500, close = 2501;
+    for (const bool stream : {false, true}) {
+        for (const bool marked : {false, true}) {
+            auto bindings = codec();
+            bindings.control_ids = {open, close, 2502, 2503};
+            bindings.decode = [](std::span<const uint32_t> ids) {
+                std::string text;
+                for (const auto& id : ids) {
+                    if (id >= 2500 && id < 2504) text += response_control_markers[id - 2500];
+                    else text += decode(std::span(&id, 1));
+                }
+                return text;
+            };
+            ServeSession session(std::move(bindings));
+            Fake fake;
+            if (marked) fake.output = {open, 'A' + 1, close, 'B' + 1, 1000};
+            else fake.reply("<think>A</think>B<|im_end|>");
+            std::string content, thinking;
+            ServeSink sink{[&](const Json& chunk) {
+                const auto* delta = chunk.find("choices")->array()[0].find("delta");
+                if (const auto* part = delta->find("content")) content += part->string();
+                if (const auto* part = delta->find("reasoning_content")) thinking += part->string();
+            }, [] { return false; }, [] { return uint64_t(42); }};
+            const auto result = session.complete(request("fixture", stream), "frames", [&](const Json& job, const auto& event) { return fake(job, event); }, sink);
+            const std::string expected = marked ? "B" : "<think>A</think>B";
+            check(message(result).find("content")->string() == expected);
+            const auto* reasoning = message(result).find("reasoning_content");
+            check(marked ? reasoning && reasoning->string() == "A" : !reasoning);
+            check(content == (stream ? expected : ""));
+            check(thinking == (stream && marked ? "A" : ""));
+        }
+    }
+}
+
+void accumulated_frame_refusal_order() {
+    const auto input = parse_json(R"({"ids":[66,67],"tools":[],"initial_thinking":false,"finish_reason":"length","stop_id":null})");
+    const std::array<uint32_t, 1> controls{2500};
+    for (const bool decoder_fails : {true, false}) {
+        size_t singles = 0;
+        const auto decoder = [&](std::span<const uint32_t> ids) -> std::string {
+            if (ids.size() == 2) return "AB";
+            ++singles;
+            if (ids[0] == 67 && decoder_fails) throw FormatError("fixture decoder failure");
+            return "X";
+        };
+        try {
+            static_cast<void>(parse_native_response_with_controls(input, {4096, 1000, 1001, 1002}, decoder, 32, controls));
+            check(false);
+        } catch (const FormatError& error) {
+            check(std::string_view(error.what()) == (decoder_fails ? "fixture decoder failure" : "response decoder/terminal identity mismatch"));
+        }
+        check(singles == 2);
+    }
+}
+
+void final_prefix_check() {
+    for (const bool stream : {false, true}) {
+        auto bindings = codec();
+        bindings.decode = [](std::span<const uint32_t> ids) {
+            auto text = decode(ids);
+            if (ids.size() > 1 && text == "AB<|im_end|>") text.front() = 'X';
+            return text;
+        };
+        ServeSession session(std::move(bindings));
+        Fake fake;
+        fake.reply("AB<|im_end|>");
+        std::string delivered;
+        ServeSink sink{[&](const Json& chunk) {
+            const auto* delta = chunk.find("choices")->array()[0].find("delta")->find("content");
+            if (delta) delivered += delta->string();
+        }, [] { return false; }, [] { return uint64_t(42); }};
+        try {
+            session.complete(request("fixture", stream), "prefix", [&](const Json& job, const auto& event) { return fake(job, event); }, sink);
+            check(false);
+        } catch (const FormatError& error) {
+            check(std::string_view(error.what()) == "final response disagrees with streamed prefix");
+        }
+        check(delivered == (stream ? "AB" : ""));
+    }
+}
+
 void parallel_tool_streams() {
     for (const bool valid : {true, false}) {
         ServeSession session(codec()); Fake fake; Json::Array chunks;
@@ -804,6 +1752,9 @@ void parallel_tool_streams() {
 }
 int main() {
     try {
+        added_token_framing();
+        accumulated_frame_refusal_order();
+        final_prefix_check();
         parallel_tool_streams();
         translated_history_metadata();
         literal_marker_serving();
@@ -813,10 +1764,16 @@ int main() {
         respelled_prefix_reuse();
         respelled_prefix_preserves_nonordinary_tokens();
         respelled_prefix_decodes_only_changed_tokens();
+        parked_lane_http_fast_math_compatibility();
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+        parked_lane_prefix_respelling_and_hoisting();
+#endif
         startup_execution_policy();
         broker_sessions();
         executor_enum_contract();
         executor_arg_contract();
+        generator_schema_keywords();
+        tool_schema_patterns();
         server_generation_clock_contract();
         server_generation_terminal_and_determinism_contract();
         for (const auto text : {
@@ -1177,6 +2134,12 @@ int main() {
                 check(job_failure_kind(persist, false) == "server_error");
                 check(job_failure_status(persist, false, false) == 500);
                 const FormatError refused("missing required API field");
+                const WorkerHostMemoryPressure pressure;
+                for (bool started : {false, true}) {
+                    check(job_failure_kind(pressure, started) == "host_memory_pressure");
+                    check(job_failure_status(pressure, false, started) == 503);
+                    check(job_failure_status(pressure, true, started) == 408);
+                }
                 check(job_failure_kind(refused, false) == "invalid_request_error");
                 check(job_failure_status(refused, false, false) == 400);
                 check(job_failure_kind(refused, true) == "generation_failed_no_retry");

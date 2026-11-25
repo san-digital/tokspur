@@ -229,7 +229,7 @@ std::string chat_trim(std::string_view value) {
 std::string template_json(const Json& value) {
     Builder output;
     const auto quoted = [&](std::string_view text) {
-        static_cast<void>(unicode_scalars(text));
+        static_cast<void>(unicode_scalar_count(text));
         output.add("\"");
         for (unsigned char c : text) {
             switch (c) {
