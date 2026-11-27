@@ -2,6 +2,7 @@
 //!
 //! [`ChatStrings`] are literal DATA read from the pinned model template, not executable template code. The rendering rules are independently authored and reproduce that template: message normalization, tool-argument parsing, system-message hoisting, reasoning history and the Python-`json.dumps`-like [`template_json`]. Every refusal carries the exact C++ `FormatError` text.
 
+use std::borrow::Cow;
 use std::fmt;
 
 use tokspur_json::{Json, JsonError, Kind, UnicodeError, parse_json, scalar_str};
@@ -165,12 +166,12 @@ fn role(message: &Json) -> Result<&[u8], ChatError> {
     Ok(name)
 }
 
-fn content(value: Option<&Json>) -> Result<Vec<u8>, ChatError> {
+fn content(value: Option<&Json>) -> Result<Cow<'_, [u8]>, ChatError> {
     let Some(value) = value.filter(|value| !value.is_null()) else {
-        return Ok(Vec::new());
+        return Ok(Cow::Borrowed(b""));
     };
     if value.kind() == Kind::String {
-        return Ok(value.string()?.to_vec());
+        return Ok(Cow::Borrowed(value.string()?));
     }
     if value.kind() != Kind::Array {
         return Err(ChatError::Render("unexpected text content type"));
@@ -202,7 +203,7 @@ fn content(value: Option<&Json>) -> Result<Vec<u8>, ChatError> {
         };
         output.add(text.string()?)?;
     }
-    Ok(output.finish())
+    Ok(Cow::Owned(output.finish()))
 }
 
 fn message_content(message: &Json) -> Result<Vec<u8>, ChatError> {
@@ -681,7 +682,7 @@ impl ChatRenderer {
         let parse_arguments = option(request, "parse_tool_arguments", true)?;
         for message in &mut messages {
             let assistant = role(message)? == b"assistant";
-            message_content(message)?;
+            scalar_str(&content(message.find("content")?)?)?;
             if parse_arguments && assistant {
                 *message = normalize_arguments(message, &mut result.parsed_tool_arguments)?;
             }
@@ -1192,6 +1193,36 @@ mod tests {
         assert_eq!(
             literals(&oversized),
             Err(ChatError::Extract("template source exceeds profile limit"))
+        );
+    }
+
+    #[test]
+    fn preflight_validates_joined_text_before_the_next_role() {
+        let request = |tail: &[u8], next_role: &[u8]| {
+            let parts = [b"\xe3".as_slice(), tail]
+                .map(|bytes| Json::Object(vec![(b"text".to_vec(), Json::String(bytes.to_vec()))]));
+            let message = Json::Object(vec![
+                (b"role".to_vec(), Json::String(b"user".to_vec())),
+                (b"content".to_vec(), Json::Array(parts.into())),
+            ]);
+            let next = Json::Object(vec![(b"role".to_vec(), Json::String(next_role.to_vec()))]);
+            Json::Object(vec![(
+                b"messages".to_vec(),
+                Json::Array(vec![message, next]),
+            )])
+        };
+        let rendered = renderer().render(&request(b"\x81\x82", b"user")).unwrap();
+        assert!(
+            rendered
+                .prompt
+                .windows(3)
+                .any(|bytes| bytes == b"\xe3\x81\x82")
+        );
+        assert_eq!(
+            renderer().render(&request(b"(\xa1", b"bad")),
+            Err(ChatError::Text(UnicodeError::Decode(
+                "invalid UTF-8 continuation"
+            )))
         );
     }
 
