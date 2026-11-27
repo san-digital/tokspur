@@ -1,0 +1,20 @@
+rust/crates/tokspur-text/src/chat.rs
+  s_d912b190fb24bb::t_ae7272101dc273 5,169,171,174,206,685,1199-1226
+  s_d912b190fb24bb::t_4786800c6cc58e 1227-1228
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "34ab0a94956e71009c466db6ce15f21b68abdc6d",
+  "prompts": {},
+  "sessions": {
+    "s_d912b190fb24bb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a21ba0-de77-7102-9ec6-4b7aecfb3cd1",
+        "model": "gpt-6.2-astra"
+      },
+      "human_author": "Lee Crossley <leee@hotmail.co.uk>"
+    }
+  }
+}
